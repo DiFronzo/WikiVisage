@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}WikiVisage{% endblock %}</title>
+    <style>
+        :root {
+            --bg: #090e17;
+            --surface: #141f33;
+            --border: #213559;
+            --text-main: #f8fafc;
+            --text-muted: #94a3b8;
+            --primary: #14b8a6;
+            --primary-hover: #0d9488;
+            --danger: #ef4444;
+            --success: #10b981;
+            --warning: #f59e0b;
+            --info: #3b82f6;
+            --shadow: 6px 6px 0px rgba(20, 184, 166, 0.2);
+            --shadow-hover: 8px 8px 0px rgba(20, 184, 166, 0.4);
+        }
+        
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen-Sans, Ubuntu, Cantarell, "Helvetica Neue", sans-serif;
+            background-color: var(--bg);
+            color: var(--text-main);
+            line-height: 1.6;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+
+        a { color: var(--primary); text-decoration: none; font-weight: 600; transition: all 0.2s; }
+        a:hover { color: var(--primary-hover); text-decoration: underline; }
+
+        h1, h2, h3, h4 { line-height: 1.1; margin-bottom: 1rem; font-weight: 800; letter-spacing: -0.03em; }
+        h1 { font-size: 3rem; text-transform: uppercase; }
+        h2 { font-size: 2rem; border-bottom: 2px solid var(--border); padding-bottom: 0.5rem; display: inline-block; }
+        p { margin-bottom: 1rem; }
+
+        .container { max-width: 900px; margin: 0 auto; padding: 0 1.5rem; width: 100%; }
+
+        nav {
+            border-bottom: 2px solid var(--border);
+            padding: 1.5rem 0;
+            margin-bottom: 3rem;
+            background-color: var(--surface);
+        }
+        .nav-inner { display: flex; justify-content: space-between; align-items: center; }
+        .nav-brand { font-size: 1.5rem; font-weight: 900; color: var(--primary); text-transform: uppercase; letter-spacing: 0.1em; text-decoration: none !important; }
+        .nav-links { display: flex; gap: 1.5rem; align-items: center; font-weight: bold; text-transform: uppercase; font-size: 0.875rem; }
+
+        main { flex: 1; }
+
+        footer {
+            margin-top: 5rem;
+            padding: 2rem 0;
+            border-top: 2px solid var(--border);
+            text-align: center;
+            color: var(--text-muted);
+            font-size: 0.875rem;
+            background-color: var(--surface);
+            letter-spacing: 0.05em;
+        }
+
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            padding: 0.75rem 1.5rem;
+            background-color: var(--bg);
+            color: var(--primary);
+            border: 2px solid var(--primary);
+            font-weight: 800;
+            text-transform: uppercase;
+            letter-spacing: 0.1em;
+            cursor: pointer;
+            box-shadow: var(--shadow);
+            transition: all 0.2s ease;
+            text-decoration: none !important;
+        }
+        .btn:hover { transform: translate(-2px, -2px); box-shadow: var(--shadow-hover); }
+        .btn:active { transform: translate(4px, 4px); box-shadow: none; }
+        .btn-primary { background-color: var(--primary); color: var(--bg); }
+        .btn-primary:hover { color: var(--bg); }
+        .btn-danger { border-color: var(--danger); color: var(--danger); box-shadow: 4px 4px 0px rgba(239, 68, 68, 0.2); }
+        .btn-danger:hover { box-shadow: 6px 6px 0px rgba(239, 68, 68, 0.4); color: var(--danger); }
+        .btn-sm { padding: 0.5rem 1rem; font-size: 0.75rem; }
+
+        .form-group { margin-bottom: 1.5rem; }
+        label { display: block; margin-bottom: 0.5rem; font-weight: 700; text-transform: uppercase; font-size: 0.875rem; letter-spacing: 0.05em; color: var(--primary); }
+        input[type="text"], input[type="number"], select {
+            width: 100%;
+            padding: 1rem;
+            background-color: var(--bg);
+            border: 2px solid var(--border);
+            color: var(--text-main);
+            font-family: inherit;
+            font-size: 1rem;
+            transition: border-color 0.2s;
+        }
+        input:focus, select:focus { outline: none; border-color: var(--primary); }
+        input[readonly] { opacity: 0.6; cursor: not-allowed; }
+        .help-text { font-size: 0.875rem; color: var(--text-muted); margin-top: 0.5rem; font-style: italic; }
+
+        .flash-messages { margin-bottom: 2.5rem; }
+        .flash {
+            padding: 1rem 1.5rem;
+            margin-bottom: 1rem;
+            border-left: 4px solid;
+            background-color: var(--surface);
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+        }
+        .flash.success { border-color: var(--success); color: var(--success); }
+        .flash.error { border-color: var(--danger); color: var(--danger); }
+        .flash.warning { border-color: var(--warning); color: var(--warning); }
+        .flash.info { border-color: var(--info); color: var(--info); }
+
+        .card {
+            background-color: var(--surface);
+            border: 2px solid var(--border);
+            padding: 2rem;
+            margin-bottom: 2rem;
+            position: relative;
+            transition: transform 0.2s;
+        }
+        .card:hover { border-color: var(--primary); }
+
+        .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(350px, 1fr)); gap: 2rem; }
+        .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 2rem; }
+        @media (max-width: 600px) { .grid-2 { grid-template-columns: 1fr; } }
+
+        .badge {
+            display: inline-block;
+            padding: 0.25rem 0.5rem;
+            font-size: 0.75rem;
+            font-weight: 800;
+            text-transform: uppercase;
+            border: 2px solid currentColor;
+            letter-spacing: 0.05em;
+        }
+        .badge-active { color: var(--success); }
+        .badge-paused { color: var(--warning); }
+        .badge-completed { color: var(--info); }
+
+        .progress-wrap { background-color: var(--bg); border: 2px solid var(--border); height: 2rem; width: 100%; margin: 1rem 0; position: relative; }
+        .progress-bar { background-color: var(--primary); height: 100%; transition: width 0.3s ease; }
+        .progress-text { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-size: 0.875rem; font-weight: 800; mix-blend-mode: difference; color: white; text-transform: uppercase; letter-spacing: 0.05em; }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+            gap: 1rem;
+            margin: 2rem 0;
+        }
+        .stat-box {
+            background-color: var(--bg);
+            border: 2px solid var(--border);
+            padding: 1.5rem;
+            text-align: center;
+        }
+        .stat-value { font-size: 2.5rem; font-weight: 900; color: var(--primary); line-height: 1; margin-bottom: 0.5rem; }
+        .stat-label { font-size: 0.75rem; text-transform: uppercase; color: var(--text-muted); font-weight: 700; letter-spacing: 0.05em; }
+        
+        .header-actions { display: flex; justify-content: space-between; align-items: center; margin-bottom: 2rem; flex-wrap: wrap; gap: 1rem; }
+
+        @keyframes pulse { 0%, 100% { opacity: 0.1; } 50% { opacity: 0.25; } }
+    </style>
+    {% block extra_head %}{% endblock %}
+</head>
+<body>
+    <nav>
+        <div class="container nav-inner">
+            <a href="{{ url_for('index') }}" class="nav-brand">WikiVisage</a>
+            <div class="nav-links">
+                {% if g.user %}
+                    <a href="{{ url_for('dashboard') }}">Dashboard</a>
+                    <a href="{{ url_for('logout') }}" style="color: var(--text-muted);">Logout ({{ g.user.wiki_username }})</a>
+                {% else %}
+                    <a href="{{ url_for('login') }}" class="btn btn-primary btn-sm">Log in</a>
+                {% endif %}
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <div class="flash-messages">
+            {% for category, message in get_flashed_messages(with_categories=true) %}
+                <div class="flash {{ category }}">{{ message }}</div>
+            {% endfor %}
+        </div>
+        
+        {% block content %}{% endblock %}
+    </main>
+
+    <footer>
+        <div class="container">
+            <p>Powered by Wikimedia Commons &bull; Active Learning Facial Recognition</p>
+        </div>
+    </footer>
+</body>
+</html>

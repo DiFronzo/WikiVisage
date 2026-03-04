@@ -1,0 +1,92 @@
+{% extends "base.html" %}
+
+{% block title %}{{ project.label or project.wikidata_qid }} - WikiVisage{% endblock %}
+
+{% block content %}
+<div class="header-actions">
+    <div>
+        <h1 style="margin-bottom: 0.5rem;">{{ project.label or project.wikidata_qid }}</h1>
+        <p style="color: var(--text-muted);">
+            <a href="https://www.wikidata.org/wiki/{{ project.wikidata_qid }}" target="_blank" rel="noopener">{{ project.wikidata_qid }}</a> &bull; 
+            <a href="https://commons.wikimedia.org/wiki/Category:{{ project.commons_category | urlencode }}" target="_blank" rel="noopener">Category:{{ project.commons_category }}</a>
+        </p>
+    </div>
+    <div>
+        <span class="badge badge-{{ project.status }}" style="font-size: 1rem; padding: 0.5rem 1rem;">{{ project.status }}</span>
+    </div>
+</div>
+
+<div class="card">
+    {% if project.images_total == 0 %}
+        <h2>Processing Progress</h2>
+        <p style="color: var(--text-muted); margin-top: 1rem; margin-bottom: 0;">
+            The background worker hasn't discovered images in this category yet. This usually takes a minute or two after creating a project.
+        </p>
+        <div class="progress-wrap" style="height: 2.5rem; margin-top: 1.5rem;">
+            <div class="progress-bar" style="width: 100%; opacity: 0.15; animation: pulse 2s ease-in-out infinite;"></div>
+            <div class="progress-text" style="font-size: 1rem;">Waiting for worker&hellip;</div>
+        </div>
+    {% elif project.images_processed == project.images_total %}
+        <div style="display: flex; justify-content: space-between; align-items: flex-end; margin-bottom: 1rem;">
+            <h2>Processing Progress</h2>
+            <span style="font-weight: bold; color: var(--success);">Complete</span>
+        </div>
+        <div class="progress-wrap" style="height: 2.5rem;">
+            <div class="progress-bar" style="width: 100%;"></div>
+            <div class="progress-text" style="font-size: 1rem;">{{ project.images_total }} images processed</div>
+        </div>
+    {% else %}
+        <div style="display: flex; justify-content: space-between; align-items: flex-end; margin-bottom: 1rem;">
+            <h2>Processing Progress</h2>
+            <span style="font-weight: bold; color: var(--primary);">{{ project.images_processed }} / {{ project.images_total }} images</span>
+        </div>
+        {% set pct = (project.images_processed / project.images_total * 100) %}
+        <div class="progress-wrap" style="height: 2.5rem;">
+            <div class="progress-bar" style="width: {{ pct }}%;"></div>
+            <div class="progress-text" style="font-size: 1rem;">{{ "%.1f"|format(pct) }}%</div>
+        </div>
+    {% endif %}
+</div>
+
+{% if project.images_total > 0 %}
+<h2>Project Statistics</h2>
+<div class="stats-grid">
+    <div class="stat-box">
+        <div class="stat-value">{{ stats.total_faces or 0 }}</div>
+        <div class="stat-label">Total Faces Found</div>
+    </div>
+    <div class="stat-box" style="border-color: var(--success);">
+        <div class="stat-value" style="color: var(--success);">{{ stats.confirmed_matches or 0 }}</div>
+        <div class="stat-label">Target Matches</div>
+    </div>
+    <div class="stat-box" style="border-color: var(--danger);">
+        <div class="stat-value" style="color: var(--danger);">{{ stats.confirmed_non_matches or 0 }}</div>
+        <div class="stat-label">Not Target</div>
+    </div>
+    <div class="stat-box" style="border-color: var(--warning);">
+        <div class="stat-value" style="color: var(--warning);">{{ stats.unclassified or 0 }}</div>
+        <div class="stat-label">Needs Classification</div>
+    </div>
+    <div class="stat-box" style="border-color: var(--info);">
+        <div class="stat-value" style="color: var(--info);">{{ stats.sdc_written or 0 }}</div>
+        <div class="stat-label">SDC Tags Written</div>
+    </div>
+</div>
+{% endif %}
+
+<div style="margin: 3rem 0; display: flex; gap: 1rem; flex-wrap: wrap;">
+    {% if project.images_total > 0 %}
+    <a href="{{ url_for('classify', project_id=project.id) }}" class="btn btn-primary" style="font-size: 1.25rem;">Start Classifying</a>
+    {% endif %}
+    <a href="{{ url_for('project_settings', project_id=project.id) }}" class="btn" style="font-size: 1.25rem;">Settings</a>
+</div>
+
+<div class="card" style="border-color: var(--danger); background: rgba(239, 68, 68, 0.05); margin-top: 4rem;">
+    <h3 style="color: var(--danger);">Danger Zone</h3>
+    <p style="color: var(--text-muted); margin-bottom: 1.5rem;">Deleting this project will remove all face bounding boxes and classification data. Images on Commons will remain untouched.</p>
+    <form method="POST" action="{{ url_for('project_delete', project_id=project.id) }}" onsubmit="return confirm('Are you absolutely sure you want to delete this project? This cannot be undone.');">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <button type="submit" class="btn btn-danger">Delete Project</button>
+    </form>
+</div>
+{% endblock %}

@@ -1,0 +1,176 @@
+{% extends "base.html" %}
+
+{% block title %}Classify - {{ project.label or project.wikidata_qid }}{% endblock %}
+
+{% block extra_head %}
+<style>
+    .classification-container {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        max-width: 800px;
+        margin: 0 auto;
+    }
+    .image-wrapper {
+        position: relative;
+        background-color: var(--surface);
+        border: 4px solid var(--border);
+        box-shadow: 8px 8px 0px rgba(0, 0, 0, 0.5);
+        margin-bottom: 2rem;
+        max-width: 100%;
+        overflow: hidden;
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        min-height: 300px;
+    }
+    .image-wrapper img {
+        display: block;
+        max-width: 100%;
+        max-height: 60vh;
+        object-fit: contain;
+    }
+    .controls {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 1.5rem;
+        width: 100%;
+        max-width: 600px;
+    }
+    .btn-yes {
+        background-color: var(--success);
+        border-color: var(--success);
+        color: white;
+        font-size: 1.25rem;
+        padding: 1.5rem;
+        box-shadow: 6px 6px 0px rgba(16, 185, 129, 0.3);
+    }
+    .btn-yes:hover {
+        background-color: #059669;
+        box-shadow: 8px 8px 0px rgba(16, 185, 129, 0.5);
+        color: white;
+    }
+    .btn-no {
+        background-color: var(--danger);
+        border-color: var(--danger);
+        color: white;
+        font-size: 1.25rem;
+        padding: 1.5rem;
+        box-shadow: 6px 6px 0px rgba(239, 68, 68, 0.3);
+    }
+    .btn-no:hover {
+        background-color: #dc2626;
+        box-shadow: 8px 8px 0px rgba(239, 68, 68, 0.5);
+        color: white;
+    }
+    .face-info {
+        font-family: monospace;
+        color: var(--text-muted);
+        margin-bottom: 1.5rem;
+        text-align: center;
+        background: var(--surface);
+        padding: 0.5rem 1rem;
+        border: 1px solid var(--border);
+    }
+    .loading-overlay {
+        position: fixed;
+        inset: 0;
+        background: rgba(9, 14, 23, 0.8);
+        display: none;
+        justify-content: center;
+        align-items: center;
+        z-index: 1000;
+        color: var(--primary);
+        font-size: 2rem;
+        font-weight: 900;
+        text-transform: uppercase;
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="header-actions">
+    <h1>{{ project.label or project.wikidata_qid }}</h1>
+    <span class="badge badge-info" style="font-size: 1.25rem; padding: 0.75rem 1rem;">
+        {{ remaining }} faces remaining
+    </span>
+</div>
+
+<div class="classification-container">
+    {% if face is none %}
+        <div class="card" style="text-align: center; padding: 4rem 2rem; width: 100%;">
+            <h2 style="border: none; color: var(--success);">All Caught Up!</h2>
+            <p style="color: var(--text-muted); font-size: 1.25rem;">No more faces to classify for this project right now.</p>
+            <div style="margin-top: 2rem;">
+                <a href="{{ url_for('project_detail', project_id=project.id) }}" class="btn btn-primary">Back to Project</a>
+            </div>
+        </div>
+    {% else %}
+        <div class="face-info">
+            File: {{ face.file_title }}<br>
+            Face Bounds: T:{{ face.bbox_top }}, R:{{ face.bbox_right }}, B:{{ face.bbox_bottom }}, L:{{ face.bbox_left }}
+        </div>
+
+        <div class="image-wrapper">
+            <img src="https://commons.wikimedia.org/wiki/Special:FilePath/{{ face.file_title | urlencode }}?width=800" alt="Face to classify" loading="eager">
+        </div>
+
+        <div class="controls">
+            <button class="btn btn-yes" onclick="submitClassification(1)">Yes &mdash; Target</button>
+            <button class="btn btn-no" onclick="submitClassification(0)">No &mdash; Not Target</button>
+        </div>
+    {% endif %}
+</div>
+
+<div class="loading-overlay" id="loadingOverlay">Saving...</div>
+
+{% if face %}
+<script>
+    function submitClassification(isTarget) {
+        const overlay = document.getElementById('loadingOverlay');
+        overlay.style.display = 'flex';
+        
+        const formData = new FormData();
+        formData.append('csrf_token', '{{ csrf_token() }}');
+        formData.append('face_id', '{{ face.face_id }}');
+        formData.append('project_id', '{{ project.id }}');
+        formData.append('is_target', isTarget);
+
+        fetch('{{ url_for("api_classify") }}', {
+            method: 'POST',
+            body: formData
+        })
+        .then(response => {
+            if (!response.ok) {
+                throw new Error('Network response was not ok');
+            }
+            return response.json();
+        })
+        .then(data => {
+            if (data.error) {
+                alert('Error: ' + data.error);
+                overlay.style.display = 'none';
+            } else {
+                // Reload to fetch the next face
+                window.location.reload();
+            }
+        })
+        .catch(error => {
+            console.error('Error:', error);
+            alert('An error occurred while saving. Please try again.');
+            overlay.style.display = 'none';
+        });
+    }
+
+    // Keyboard shortcuts
+    document.addEventListener('keydown', function(e) {
+        if (e.key === 'y' || e.key === 'Y' || e.key === 'ArrowLeft') {
+            submitClassification(1);
+        } else if (e.key === 'n' || e.key === 'N' || e.key === 'ArrowRight') {
+            submitClassification(0);
+        }
+    });
+</script>
+{% endif %}
+
+{% endblock %}

@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+
+{% block title %}New Project - WikiVisage{% endblock %}
+
+{% block content %}
+<div style="max-width: 600px; margin: 0 auto;">
+    <h1>Create New Project</h1>
+    <p style="color: var(--text-muted); margin-bottom: 2rem;">Set up a new facial recognition active learning project for a specific person.</p>
+
+    <div class="card">
+        <form method="POST" action="{{ url_for('project_new') }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+
+            <div class="form-group">
+                <label for="wikidata_qid">Wikidata Q-ID</label>
+                <input type="text" id="wikidata_qid" name="wikidata_qid" value="{{ wikidata_qid or '' }}" placeholder="Q42" required>
+            </div>
+
+            <div class="form-group">
+                <label for="commons_category">Commons Category</label>
+                <input type="text" id="commons_category" name="commons_category" value="{{ commons_category or '' }}" placeholder="Douglas Adams" required>
+                <div class="help-text">Category name without the "Category:" prefix</div>
+            </div>
+
+            <div class="form-group">
+                <label for="label">Project Label (Optional)</label>
+                <input type="text" id="label" name="label" value="{{ label or '' }}" placeholder="e.g. Douglas Adams">
+                <div class="help-text">Human-readable name for your dashboard</div>
+            </div>
+
+            <div class="grid-2">
+                <div class="form-group">
+                    <label for="distance_threshold">Distance Threshold</label>
+                    <input type="number" id="distance_threshold" name="distance_threshold" value="{{ distance_threshold or 0.6 }}" step="0.05" min="0.1" max="1.0" required>
+                    <div class="help-text">Lower = stricter matching (default 0.6)</div>
+                </div>
+
+                <div class="form-group">
+                    <label for="min_confirmed">Min Confirmed Faces</label>
+                    <input type="number" id="min_confirmed" name="min_confirmed" value="{{ min_confirmed or 5 }}" min="1" required>
+                    <div class="help-text">Faces needed before auto-tagging</div>
+                </div>
+            </div>
+
+            <div style="margin-top: 2rem;">
+                <button type="submit" class="btn btn-primary" style="width: 100%;">Create Project</button>
+            </div>
+        </form>
+    </div>
+</div>
+{% endblock %}

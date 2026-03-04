@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+
+{% block title %}Settings - {{ project.label or project.wikidata_qid }}{% endblock %}
+
+{% block content %}
+<div class="header-actions">
+    <h1>Project Settings</h1>
+    <a href="{{ url_for('project_detail', project_id=project.id) }}" class="btn">Back to Project</a>
+</div>
+
+<div class="card" style="max-width: 600px; margin: 0 auto;">
+    <form method="POST" action="{{ url_for('project_settings', project_id=project.id) }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+
+        <div class="form-group">
+            <label>Wikidata Q-ID</label>
+            <input type="text" value="{{ project.wikidata_qid }}" readonly>
+            <div class="help-text">Target identity cannot be changed after creation</div>
+        </div>
+
+        <div class="form-group">
+            <label>Commons Category</label>
+            <input type="text" value="{{ project.commons_category }}" readonly>
+            <div class="help-text">Category scope cannot be changed after creation</div>
+        </div>
+
+        <div class="form-group">
+            <label for="label">Project Label</label>
+            <input type="text" id="label" name="label" value="{{ project.label or '' }}" placeholder="e.g. Douglas Adams">
+        </div>
+
+        <div class="form-group">
+            <label for="status">Project Status</label>
+            <select id="status" name="status">
+                <option value="active" {% if project.status == 'active' %}selected{% endif %}>Active - Processing & Tagging</option>
+                <option value="paused" {% if project.status == 'paused' %}selected{% endif %}>Paused - No Tagging</option>
+                <option value="completed" {% if project.status == 'completed' %}selected{% endif %}>Completed</option>
+            </select>
+        </div>
+
+        <div class="grid-2">
+            <div class="form-group">
+                <label for="distance_threshold">Distance Threshold</label>
+                <input type="number" id="distance_threshold" name="distance_threshold" value="{{ project.distance_threshold }}" step="0.05" min="0.1" max="1.0" required>
+            </div>
+
+            <div class="form-group">
+                <label for="min_confirmed">Min Confirmed Faces</label>
+                <input type="number" id="min_confirmed" name="min_confirmed" value="{{ project.min_confirmed }}" min="1" required>
+            </div>
+        </div>
+
+        <div style="margin-top: 2rem;">
+            <button type="submit" class="btn btn-primary" style="width: 100%;">Save Settings</button>
+        </div>
+    </form>
+</div>
+{% endblock %}

@@ -1,0 +1,68 @@
+{% extends "base.html" %}
+
+{% block title %}Dashboard - WikiVisage{% endblock %}
+
+{% block content %}
+<div class="header-actions">
+    <h1>Welcome, {{ g.user.wiki_username }}</h1>
+    <a href="{{ url_for('project_new') }}" class="btn btn-primary">New Project</a>
+</div>
+
+{% if projects %}
+    <div class="grid">
+        {% for project in projects %}
+            <div class="card">
+                <h3 style="margin-bottom: 0.25rem;">
+                    <a href="{{ url_for('project_detail', project_id=project.id) }}">
+                        {{ project.label or project.wikidata_qid }}
+                    </a>
+                </h3>
+                <p style="color: var(--text-muted); font-size: 0.875rem; margin-bottom: 1rem;">
+                    Category: {{ project.commons_category }}
+                </p>
+                
+                <span class="badge badge-{{ project.status }}">{{ project.status }}</span>
+                
+                {% if project.images_total == 0 %}
+                    <div class="progress-wrap">
+                        <div class="progress-bar" style="width: 100%; opacity: 0.15; animation: pulse 2s ease-in-out infinite;"></div>
+                        <div class="progress-text">Waiting for worker to discover images&hellip;</div>
+                    </div>
+                {% elif project.images_processed == project.images_total %}
+                    <div class="progress-wrap">
+                        <div class="progress-bar" style="width: 100%;"></div>
+                        <div class="progress-text">Complete &mdash; {{ project.images_total }} images processed</div>
+                    </div>
+                {% else %}
+                    {% set pct = (project.images_processed / project.images_total * 100) %}
+                    <div class="progress-wrap">
+                        <div class="progress-bar" style="width: {{ pct }}%;"></div>
+                        <div class="progress-text">{{ project.images_processed }} / {{ project.images_total }} processed</div>
+                    </div>
+                {% endif %}
+                
+                {% if project.faces_confirmed > 0 %}
+                <p style="font-size: 0.875rem; margin-bottom: 1.5rem; font-weight: bold;">
+                    Faces confirmed: <span style="color: var(--primary);">{{ project.faces_confirmed }}</span>
+                </p>
+                {% else %}
+                <p style="font-size: 0.875rem; margin-bottom: 1.5rem; color: var(--text-muted);">
+                    No faces classified yet
+                </p>
+                {% endif %}
+                
+                <div style="display: flex; gap: 0.5rem; flex-wrap: wrap;">
+                    <a href="{{ url_for('classify', project_id=project.id) }}" class="btn btn-primary btn-sm">Classify</a>
+                    <a href="{{ url_for('project_settings', project_id=project.id) }}" class="btn btn-sm">Settings</a>
+                </div>
+            </div>
+        {% endfor %}
+    </div>
+{% else %}
+    <div class="card" style="text-align: center; padding: 4rem 2rem;">
+        <h2 style="border: none;">No Projects Yet</h2>
+        <p style="color: var(--text-muted); margin-bottom: 2rem;">Create your first project to start classifying faces.</p>
+        <a href="{{ url_for('project_new') }}" class="btn btn-primary">Create New Project</a>
+    </div>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,71 @@
+{% extends "base.html" %}
+
+{% block title %}WikiVisage - Active Learning for Wikimedia{% endblock %}
+
+{% block extra_head %}
+<style>
+    .hero {
+        padding: 4rem 0;
+        text-align: center;
+        border-bottom: 2px solid var(--border);
+        margin-bottom: 3rem;
+    }
+    .hero h1 {
+        font-size: 4rem;
+        margin-bottom: 1.5rem;
+        color: var(--primary);
+        text-shadow: 4px 4px 0px rgba(20, 184, 166, 0.2);
+    }
+    .hero p {
+        font-size: 1.25rem;
+        color: var(--text-muted);
+        max-width: 600px;
+        margin: 0 auto 2.5rem;
+    }
+    .features {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+        gap: 2rem;
+        margin-top: 3rem;
+    }
+    .feature-card {
+        padding: 2rem;
+        border: 2px solid var(--border);
+        background: var(--bg);
+        text-align: left;
+    }
+    .feature-card h3 {
+        color: var(--primary);
+        font-size: 1.5rem;
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="hero">
+    <h1>WikiVisage</h1>
+    <p>Active learning facial recognition for Wikimedia Commons. Train an ML model to recognize specific people and automatically add P180 (depicts) Structured Data to matching images.</p>
+    
+    {% if not g.user %}
+        <a href="{{ url_for('login') }}" class="btn btn-primary" style="font-size: 1.25rem; padding: 1rem 2rem;">Log in with Wikimedia</a>
+    {% else %}
+        <a href="{{ url_for('dashboard') }}" class="btn btn-primary" style="font-size: 1.25rem; padding: 1rem 2rem;">Go to Dashboard</a>
+    {% endif %}
+</div>
+
+<h2>How it works</h2>
+<div class="features">
+    <div class="feature-card">
+        <h3>1. Create a Project</h3>
+        <p>Enter a Wikidata Q-ID and a Wikimedia Commons category. The system will scan all images for faces.</p>
+    </div>
+    <div class="feature-card">
+        <h3>2. Active Learning</h3>
+        <p>Classify a few faces as "Yes" or "No". The machine learning model actively learns from your input.</p>
+    </div>
+    <div class="feature-card">
+        <h3>3. Auto-Tagging</h3>
+        <p>Once confident, the system automatically writes "depicts" (P180) statements to Structured Data on Commons.</p>
+    </div>
+</div>
+{% endblock %}
