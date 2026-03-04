@@ -1,0 +1,7 @@
+# WikiVisage - System dependencies for Toolforge Build Service
+# Packages from Ubuntu 22.04 (jammy) repositories
+# Installed via fagiani/apt buildpack (auto-detected)
+
+# Math libraries for dlib/numpy (required even with dlib-bin for runtime linking)
+libopenblas0
+liblapack3
