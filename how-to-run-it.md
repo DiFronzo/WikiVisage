@@ -151,6 +151,11 @@ The worker job is defined in `jobs.yaml`:
 toolforge jobs load jobs.yaml
 ```
 
+if fails
+```bash
+toolforge jobs run ml-worker --command "python -u worker.py" --image tool-wikivisage/tool-wikivisage:latest --continuous --mem 2G
+```
+
 This starts a continuous job (`ml-worker`) that crawls Commons categories, downloads images, detects faces, and runs the classification model. It polls for new work every 60 seconds.
 
 Check worker status:
