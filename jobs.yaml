@@ -4,6 +4,6 @@
 ---
 - name: ml-worker
   command: python -u worker.py
-  image: tool-wikivisage/tool-wikivisage:latest
+  image: tool-wikivisage
   continuous: true
-  mem: 2Gi
+  mem: 2G

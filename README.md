@@ -76,17 +76,17 @@ WikiVisage/
 
 ```bash
 # Database credentials (find yours in ~/replica.my.cnf on Toolforge)
-toolforge envvars create TOOL_TOOLSDB_USER     --value "s<NNNNN>"
-toolforge envvars create TOOL_TOOLSDB_PASSWORD  --value "<password>"
-toolforge envvars create WIKIVISAGE_DB_NAME     --value "s<NNNNN>__wikiface"
+toolforge envvars create TOOL_TOOLSDB_USER     "s<NNNNN>"
+toolforge envvars create TOOL_TOOLSDB_PASSWORD  "<password>"
+toolforge envvars create WIKIVISAGE_DB_NAME     "s<NNNNN>__wikiface"
 
 # OAuth 2.0
-toolforge envvars create OAUTH_CLIENT_ID        --value "<client-id>"
-toolforge envvars create OAUTH_CLIENT_SECRET    --value "<client-secret>"
-toolforge envvars create OAUTH_REDIRECT_URI     --value "https://<toolname>.toolforge.org/auth/callback"
+toolforge envvars create OAUTH_CLIENT_ID        "<client-id>"
+toolforge envvars create OAUTH_CLIENT_SECRET    "<client-secret>"
+toolforge envvars create OAUTH_REDIRECT_URI     "https://<toolname>.toolforge.org/auth/callback"
 
 # Flask
-toolforge envvars create FLASK_SECRET_KEY       --value "$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+toolforge envvars create FLASK_SECRET_KEY       "$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
 ```
 
 ### 2. Create Database

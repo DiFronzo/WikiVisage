@@ -44,17 +44,17 @@ cat ~/replica.my.cnf
 
 ```bash
 # Database
-toolforge envvars create TOOL_TOOLSDB_USER    --value "s<NNNNN>"
-toolforge envvars create TOOL_TOOLSDB_PASSWORD --value "<your-tools-db-password>"
-toolforge envvars create WIKIVISAGE_DB_NAME    --value "s<NNNNN>__wikiface"
+toolforge envvars create TOOL_TOOLSDB_USER    "s<NNNNN>"
+toolforge envvars create TOOL_TOOLSDB_PASSWORD "<your-tools-db-password>"
+toolforge envvars create WIKIVISAGE_DB_NAME    "s<NNNNN>__wikiface"
 
 # OAuth 2.0 (from your consumer registration on Meta-Wiki)
-toolforge envvars create OAUTH_CLIENT_ID       --value "<client-id>"
-toolforge envvars create OAUTH_CLIENT_SECRET   --value "<client-secret>"
-toolforge envvars create OAUTH_REDIRECT_URI    --value "https://wikivisage.toolforge.org/auth/callback"
+toolforge envvars create OAUTH_CLIENT_ID       "<client-id>"
+toolforge envvars create OAUTH_CLIENT_SECRET   "<client-secret>"
+toolforge envvars create OAUTH_REDIRECT_URI    "https://wikivisage.toolforge.org/auth/callback"
 
 # Flask secret key (generate a strong random one)
-toolforge envvars create FLASK_SECRET_KEY      --value "$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+toolforge envvars create FLASK_SECRET_KEY      "$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
 ```
 
 Verify with:
@@ -85,7 +85,7 @@ exit;
 
 ```bash
 # Build from your GitHub repo
-toolforge build start https://github.com/<you>/WikiVisage.git
+toolforge build start https://github.com/DiFronzo/WikiVisage.git
 
 # Check build status (wait for "ok")
 toolforge build show
@@ -134,7 +134,7 @@ The file is checked on every request (no restart needed after changes). To updat
 ## 7. Start the Web Service
 
 ```bash
-toolforge webservice buildservice start
+toolforge webservice buildservice start --mount none
 ```
 
 The `Procfile` tells it to run gunicorn with 4 workers on port 8000.
@@ -187,7 +187,7 @@ toolforge jobs logs ml-worker
 
 ```bash
 # Rebuild the image
-toolforge build start https://github.com/<you>/WikiVisage.git
+toolforge build start https://github.com/DiFronzo/WikiVisage.git
 
 # Wait for build to finish
 toolforge build show
@@ -226,7 +226,7 @@ toolforge jobs run migrate \
 ```bash
 # Delete and recreate (there's no "update" command)
 toolforge envvars delete FLASK_SECRET_KEY
-toolforge envvars create FLASK_SECRET_KEY --value "<new-value>"
+toolforge envvars create FLASK_SECRET_KEY "<new-value>"
 
 # Restart services to pick up changes
 toolforge webservice restart
@@ -238,7 +238,7 @@ toolforge jobs restart ml-worker
 Edit `whitelist.txt` in the repo, then rebuild and restart:
 
 ```bash
-toolforge build start https://github.com/<you>/WikiVisage.git
+toolforge build start https://github.com/DiFronzo/WikiVisage.git
 toolforge webservice restart
 ```
 
