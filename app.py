@@ -81,21 +81,63 @@ OAUTH_TOKEN_URL = "https://meta.wikimedia.org/w/rest.php/oauth2/access_token"
 OAUTH_PROFILE_URL = "https://meta.wikimedia.org/w/rest.php/oauth2/resource/profile"
 OAUTH_REDIRECT_URI = os.environ.get("OAUTH_REDIRECT_URI", "")
 
-# Beta whitelist — one username per line in whitelist.txt (empty/missing = open to all)
+# Beta whitelist — fetched from GitHub every 5 minutes, falls back to local file
 _WHITELIST_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "whitelist.txt"
 )
+_WHITELIST_URL = (
+    "https://raw.githubusercontent.com/DiFronzo/WikiVisage/main/whitelist.txt"
+)
+_WHITELIST_CACHE_TTL = 300  # seconds
+_whitelist_cache: set[str] = set()
+_whitelist_cache_time: float = 0.0
+
+
+def _parse_whitelist(text: str) -> set[str]:
+    """Parse whitelist text into a set of usernames."""
+    return {
+        line.strip()
+        for line in text.splitlines()
+        if line.strip() and not line.startswith("#")
+    }
 
 
 def _load_whitelist() -> set[str]:
-    """Load allowed usernames from whitelist.txt (re-read on every call)."""
+    """Return cached whitelist, refreshing from GitHub every 5 minutes.
+
+    Fetch order: GitHub raw → local file → last-known-good cache.
+    """
+    global _whitelist_cache, _whitelist_cache_time
+
+    now = time.monotonic()
+    if _whitelist_cache and (now - _whitelist_cache_time) < _WHITELIST_CACHE_TTL:
+        return _whitelist_cache
+
+    # Try GitHub first
+    try:
+        resp = requests.get(_WHITELIST_URL, timeout=5)
+        resp.raise_for_status()
+        fresh = _parse_whitelist(resp.text)
+        if fresh:
+            _whitelist_cache = fresh
+            _whitelist_cache_time = now
+            return _whitelist_cache
+    except Exception:
+        logger.debug("Failed to fetch whitelist from GitHub, trying local file")
+
+    # Fall back to local file
     try:
         with open(_WHITELIST_PATH, "r", encoding="utf-8") as f:
-            return {
-                line.strip() for line in f if line.strip() and not line.startswith("#")
-            }
+            fresh = _parse_whitelist(f.read())
+            if fresh:
+                _whitelist_cache = fresh
+                _whitelist_cache_time = now
+                return _whitelist_cache
     except FileNotFoundError:
-        return set()
+        pass
+
+    # Return last-known-good (may be empty on first boot if both fail)
+    return _whitelist_cache
 
 
 ALLOWED_USERS = _load_whitelist()
