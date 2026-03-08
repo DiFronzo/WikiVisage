@@ -2281,13 +2281,16 @@ def internal_error(e):
 # App factory / startup
 # ---------------------------------------------------------------------------
 
+# Initialize DB pool at import time so gunicorn `app:app` works without a
+# factory call.  The `create_app()` factory is kept for backwards compat
+# (e.g. tests, one-off scripts) but is no longer required for production.
+init_db()
+
 
 def create_app() -> Flask:
     """Application factory for programmatic usage and testing."""
-    init_db()
     return app
 
 
 if __name__ == "__main__":
-    init_db()
     app.run(debug=True, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
