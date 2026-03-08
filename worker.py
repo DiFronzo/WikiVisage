@@ -1014,7 +1014,7 @@ def main():
     signal.signal(signal.SIGTERM, signal_handler)
 
     try:
-        init_db(pool_size=15)
+        init_db(pool_size=6)
     except Exception as e:
         logger.error(f"Database initialization failed: {e}")
         sys.exit(1)

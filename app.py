@@ -2337,7 +2337,7 @@ def internal_error(e):
 # Initialize DB pool at import time so gunicorn `app:app` works without a
 # factory call.  The `create_app()` factory is kept for backwards compat
 # (e.g. tests, one-off scripts) but is no longer required for production.
-init_db()
+init_db(pool_size=2)
 
 
 def create_app() -> Flask:
