@@ -1023,7 +1023,7 @@ def project_detail(project_id: int):
             "  SUM(CASE WHEN f.is_target = 0 THEN 1 ELSE 0 END) AS confirmed_non_matches, "
             "  SUM(CASE WHEN f.is_target IS NULL THEN 1 ELSE 0 END) AS unclassified, "
             "  SUM(CASE WHEN f.sdc_written = 1 THEN 1 ELSE 0 END) AS sdc_written, "
-            "  SUM(CASE WHEN f.is_target = 1 AND f.sdc_written = 0 THEN 1 ELSE 0 END) AS sdc_pending, "
+            "  SUM(CASE WHEN f.is_target = 1 AND f.sdc_written = 0 AND f.classified_by != 'bootstrap' THEN 1 ELSE 0 END) AS sdc_pending, "
             "  SUM(CASE WHEN f.classified_by = 'human' THEN 1 ELSE 0 END) AS by_human, "
             "  SUM(CASE WHEN f.classified_by = 'model' THEN 1 ELSE 0 END) AS by_model, "
             "  SUM(CASE WHEN f.classified_by = 'bootstrap' THEN 1 ELSE 0 END) AS by_bootstrap "
@@ -2036,7 +2036,8 @@ def api_write_sdc(project_id: int):
         pending = execute_query(
             "SELECT COUNT(*) AS cnt FROM faces f "
             "JOIN images i ON f.image_id = i.id "
-            "WHERE i.project_id = %s AND f.is_target = 1 AND f.sdc_written = 0",
+            "WHERE i.project_id = %s AND f.is_target = 1 AND f.sdc_written = 0 "
+            "AND f.classified_by != 'bootstrap'",
             (project_id,),
             fetch=True,
         )
@@ -2094,7 +2095,7 @@ def api_sdc_status(project_id: int):
         counts = execute_query(
             "SELECT "
             "  SUM(CASE WHEN f.is_target = 1 AND f.sdc_written = 1 THEN 1 ELSE 0 END) AS written, "
-            "  SUM(CASE WHEN f.is_target = 1 AND f.sdc_written = 0 THEN 1 ELSE 0 END) AS pending "
+            "  SUM(CASE WHEN f.is_target = 1 AND f.sdc_written = 0 AND f.classified_by != 'bootstrap' THEN 1 ELSE 0 END) AS pending "
             "FROM faces f "
             "JOIN images i ON f.image_id = i.id "
             "WHERE i.project_id = %s",

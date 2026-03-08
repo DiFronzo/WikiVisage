@@ -778,6 +778,7 @@ def write_sdc_claims(project: Dict[str, Any]) -> int:
             FROM faces f
             JOIN images i ON f.image_id = i.id
             WHERE i.project_id = %s AND f.is_target = 1 AND f.sdc_written = 0
+            AND f.classified_by != 'bootstrap'
             LIMIT %s
             """,
             (project_id, SDC_BATCH),
