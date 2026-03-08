@@ -1,14 +1,14 @@
 {% extends "base.html" %}
 
-{% block title %}Error {{ code }} - WikiVisage{% endblock %}
+{% block title %}{{ _('Error') }} {{ code }} - WikiVisage BETA{% endblock %}
 
 {% block content %}
 <div class="card" style="text-align: center; padding: 4rem 2rem; max-width: 600px; margin: 2rem auto;">
     <h1 style="color: var(--danger); font-size: 4rem; margin-bottom: 0.5rem; border: none;">{{ code }}</h1>
-    <h2 style="border: none; margin-bottom: 2rem;">Something went wrong</h2>
+    <h2 style="border: none; margin-bottom: 2rem;">{{ _('Something went wrong') }}</h2>
     
     <p style="font-size: 1.25rem; color: var(--text-main); margin-bottom: 3rem;">{{ message }}</p>
     
-    <a href="{{ url_for('index') }}" class="btn btn-primary">Go Back Home</a>
+    <a href="{{ url_for('index') }}" class="btn btn-primary">{{ _('Go Back Home') }}</a>
 </div>
 {% endblock %}

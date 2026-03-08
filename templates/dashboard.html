@@ -1,68 +1,240 @@
 {% extends "base.html" %}
 
-{% block title %}Dashboard - WikiVisage{% endblock %}
+{% block title %}{{ _('Dashboard') }} - WikiVisage BETA{% endblock %}
+
+{% block extra_head %}
+<style>
+    .dash-card-inner {
+        display: flex;
+        gap: 1.5rem;
+        align-items: flex-start;
+    }
+    .dash-thumb {
+        width: 80px;
+        height: 80px;
+        flex-shrink: 0;
+        border: 2px solid var(--border);
+        background: var(--bg);
+        overflow: hidden;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+    }
+    .dash-thumb img {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+        object-position: top center;
+    }
+    .dash-thumb-placeholder {
+        font-size: 1.75rem;
+        color: var(--text-muted);
+        opacity: 0.4;
+        font-weight: 900;
+    }
+    .dash-card-body {
+        flex: 1;
+        min-width: 0;
+    }
+    .dash-progress {
+        background: var(--bg);
+        border: 2px solid var(--border);
+        height: 0.5rem;
+        width: 100%;
+        margin: 1rem 0 0.5rem;
+    }
+    .dash-progress-bar {
+        background: var(--primary);
+        height: 100%;
+        transition: width 0.3s ease;
+    }
+    .dash-progress-label {
+        display: block;
+        font-size: 0.75rem;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        color: var(--text-muted);
+        margin-bottom: 1rem;
+    }
+    .dash-progress-complete {
+        color: var(--success);
+    }
+    .dash-status {
+        margin: 1rem 0;
+        padding: 0.75rem 1rem;
+        border: 2px solid var(--border);
+        background: var(--bg);
+        text-align: center;
+        position: relative;
+        overflow: hidden;
+    }
+    .dash-status-pulse {
+        position: absolute;
+        inset: 0;
+        background: var(--primary);
+        opacity: 0.08;
+        animation: pulse 2s ease-in-out infinite;
+    }
+    .dash-status-label {
+        font-size: 0.75rem;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        color: var(--text-muted);
+        position: relative;
+    }
+    .pagination {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 0.25rem;
+        margin: 2rem 0 1rem;
+        flex-wrap: wrap;
+    }
+    .pagination a, .pagination span {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 2.25rem;
+        height: 2.25rem;
+        padding: 0 0.5rem;
+        font-size: 0.8rem;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        border: 2px solid var(--border);
+        background: var(--surface);
+        color: var(--text-main);
+        text-decoration: none;
+        transition: all 0.15s ease;
+    }
+    .pagination a:hover {
+        border-color: var(--primary);
+        color: var(--primary);
+        transform: translate(-1px, -1px);
+        box-shadow: 3px 3px 0px var(--primary);
+    }
+    .pagination .active {
+        background: var(--primary);
+        color: var(--bg);
+        border-color: var(--primary);
+    }
+    .pagination .disabled {
+        opacity: 0.35;
+        pointer-events: none;
+    }
+    .pagination .ellipsis {
+        border: none;
+        background: none;
+        color: var(--text-muted);
+        min-width: auto;
+        padding: 0 0.25rem;
+    }
+</style>
+{% endblock %}
 
 {% block content %}
 <div class="header-actions">
-    <h1>Welcome, {{ g.user.wiki_username }}</h1>
-    <a href="{{ url_for('project_new') }}" class="btn btn-primary">New Project</a>
+    <h1>{{ _('Welcome, %(username)s', username=g.user.wiki_username) }}</h1>
+    <a href="{{ url_for('project_new') }}" class="btn btn-primary">{{ _('New Project') }}</a>
 </div>
 
 {% if projects %}
     <div class="grid">
         {% for project in projects %}
             <div class="card">
-                <h3 style="margin-bottom: 0.25rem;">
-                    <a href="{{ url_for('project_detail', project_id=project.id) }}">
-                        {{ project.label or project.wikidata_qid }}
-                    </a>
-                </h3>
-                <p style="color: var(--text-muted); font-size: 0.875rem; margin-bottom: 1rem;">
-                    Category: {{ project.commons_category }}
-                </p>
-                
-                <span class="badge badge-{{ project.status }}">{{ project.status }}</span>
-                
-                {% if project.images_total == 0 %}
-                    <div class="progress-wrap">
-                        <div class="progress-bar" style="width: 100%; opacity: 0.15; animation: pulse 2s ease-in-out infinite;"></div>
-                        <div class="progress-text">Waiting for worker to discover images&hellip;</div>
+                <div class="dash-card-inner">
+                    <div class="dash-thumb">
+                        {% if project.p18_thumb_url %}
+                            <img src="{{ project.p18_thumb_url }}" alt="{{ project.label or project.wikidata_qid }}" loading="lazy">
+                        {% else %}
+                            <span class="dash-thumb-placeholder">?</span>
+                        {% endif %}
                     </div>
-                {% elif project.images_processed == project.images_total %}
-                    <div class="progress-wrap">
-                        <div class="progress-bar" style="width: 100%;"></div>
-                        <div class="progress-text">Complete &mdash; {{ project.images_total }} images processed</div>
+                    <div class="dash-card-body">
+                        <h3 style="margin-bottom: 0.25rem;">
+                            <a href="{{ url_for('project_detail', project_id=project.id) }}">
+                                {{ project.label or project.wikidata_qid }}
+                            </a>
+                        </h3>
+                        <p style="color: var(--text-muted); font-size: 0.875rem; margin-bottom: 1rem;">
+                            {{ _('Category:') }} {{ project.commons_category }}
+                        </p>
+                        
+                        <span class="badge badge-{{ project.status }}">{{ project.status }}</span>
+                        
+                        {% if project.images_total == 0 %}
+                            <div class="dash-status">
+                                <div class="dash-status-pulse"></div>
+                                <span class="dash-status-label">{{ _('Waiting for worker') }}&hellip;</span>
+                            </div>
+                        {% elif project.images_processed == project.images_total %}
+                            <div class="dash-progress">
+                                <div class="dash-progress-bar" style="width: 100%;"></div>
+                            </div>
+                            <span class="dash-progress-label dash-progress-complete">{{ _('Complete') }} &mdash; {{ _('%(num)d images processed', num=project.images_total) }}</span>
+                        {% else %}
+                            {% set pct = (project.images_processed / project.images_total * 100) %}
+                            <div class="dash-progress">
+                                <div class="dash-progress-bar" style="width: {{ pct }}%;"></div>
+                            </div>
+                            <span class="dash-progress-label">{{ _('%(done)d / %(total)d processed', done=project.images_processed, total=project.images_total) }}</span>
+                        {% endif %}
+                        
+                        {% if project.faces_confirmed > 0 %}
+                        <p style="font-size: 0.875rem; margin-bottom: 1.5rem; font-weight: bold;">
+                            {{ _('Faces confirmed:') }} <span style="color: var(--primary);">{{ project.faces_confirmed }}</span>
+                        </p>
+                        {% else %}
+                        <p style="font-size: 0.875rem; margin-bottom: 1.5rem; color: var(--text-muted);">
+                            {{ _('No faces classified yet') }}
+                        </p>
+                        {% endif %}
+                        
+                        <div style="display: flex; gap: 0.5rem; flex-wrap: wrap;">
+                            <a href="{{ url_for('classify', project_id=project.id) }}" class="btn btn-primary btn-sm">{{ _('Classify') }}</a>
+                            <a href="{{ url_for('project_settings', project_id=project.id) }}" class="btn btn-sm">{{ _('Settings') }}</a>
+                        </div>
                     </div>
-                {% else %}
-                    {% set pct = (project.images_processed / project.images_total * 100) %}
-                    <div class="progress-wrap">
-                        <div class="progress-bar" style="width: {{ pct }}%;"></div>
-                        <div class="progress-text">{{ project.images_processed }} / {{ project.images_total }} processed</div>
-                    </div>
-                {% endif %}
-                
-                {% if project.faces_confirmed > 0 %}
-                <p style="font-size: 0.875rem; margin-bottom: 1.5rem; font-weight: bold;">
-                    Faces confirmed: <span style="color: var(--primary);">{{ project.faces_confirmed }}</span>
-                </p>
-                {% else %}
-                <p style="font-size: 0.875rem; margin-bottom: 1.5rem; color: var(--text-muted);">
-                    No faces classified yet
-                </p>
-                {% endif %}
-                
-                <div style="display: flex; gap: 0.5rem; flex-wrap: wrap;">
-                    <a href="{{ url_for('classify', project_id=project.id) }}" class="btn btn-primary btn-sm">Classify</a>
-                    <a href="{{ url_for('project_settings', project_id=project.id) }}" class="btn btn-sm">Settings</a>
                 </div>
             </div>
         {% endfor %}
     </div>
+
+    {% if total_pages > 1 %}
+    <nav class="pagination">
+        {% if page > 1 %}
+            <a href="{{ url_for('dashboard', page=page-1) }}">&laquo; {{ _('Prev') }}</a>
+        {% else %}
+            <span class="disabled">&laquo; {{ _('Prev') }}</span>
+        {% endif %}
+
+        {% for p in range(1, total_pages + 1) %}
+            {% if p == page %}
+                <span class="active">{{ p }}</span>
+            {% elif p == 1 or p == total_pages or (p >= page - 2 and p <= page + 2) %}
+                <a href="{{ url_for('dashboard', page=p) }}">{{ p }}</a>
+            {% elif p == 2 and page > 4 %}
+                <span class="ellipsis">&hellip;</span>
+            {% elif p == total_pages - 1 and page < total_pages - 3 %}
+                <span class="ellipsis">&hellip;</span>
+            {% endif %}
+        {% endfor %}
+
+        {% if page < total_pages %}
+            <a href="{{ url_for('dashboard', page=page+1) }}">{{ _('Next') }} &raquo;</a>
+        {% else %}
+            <span class="disabled">{{ _('Next') }} &raquo;</span>
+        {% endif %}
+    </nav>
+    {% endif %}
+
 {% else %}
     <div class="card" style="text-align: center; padding: 4rem 2rem;">
-        <h2 style="border: none;">No Projects Yet</h2>
-        <p style="color: var(--text-muted); margin-bottom: 2rem;">Create your first project to start classifying faces.</p>
-        <a href="{{ url_for('project_new') }}" class="btn btn-primary">Create New Project</a>
+        <h2 style="border: none;">{{ _('No Projects Yet') }}</h2>
+        <p style="color: var(--text-muted); margin-bottom: 2rem;">{{ _('Create your first project to start classifying faces.') }}</p>
+        <a href="{{ url_for('project_new') }}" class="btn btn-primary">{{ _('Create New Project') }}</a>
     </div>
 {% endif %}
 {% endblock %}

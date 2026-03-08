@@ -1,0 +1,137 @@
+{% extends "base.html" %}
+
+{% block title %}{{ _('Leaderboard') }} - WikiVisage BETA{% endblock %}
+
+{% block extra_head %}
+<style>
+    .leaderboard-table {
+        width: 100%;
+        border-collapse: collapse;
+        margin-top: 2rem;
+    }
+    .leaderboard-table th {
+        text-align: left;
+        padding: 1rem 1.5rem;
+        font-size: 0.75rem;
+        text-transform: uppercase;
+        letter-spacing: 0.1em;
+        color: var(--text-muted);
+        border-bottom: 2px solid var(--border);
+        font-weight: 800;
+        white-space: nowrap;
+    }
+    .leaderboard-table th.num {
+        text-align: right;
+    }
+    .leaderboard-table td {
+        padding: 1rem 1.5rem;
+        border-bottom: 1px solid var(--border);
+        font-weight: 600;
+    }
+    .leaderboard-table td.num {
+        text-align: right;
+        font-variant-numeric: tabular-nums;
+    }
+    .leaderboard-table tr:hover td {
+        background-color: var(--surface);
+    }
+    .rank {
+        color: var(--text-muted);
+        font-weight: 800;
+        min-width: 2rem;
+        display: inline-block;
+    }
+    .rank-1 { color: #fbbf24; }
+    .rank-2 { color: #94a3b8; }
+    .rank-3 { color: #d97706; }
+    .username-link {
+        color: var(--text-main);
+        font-weight: 800;
+    }
+    .username-link:hover {
+        color: var(--primary);
+    }
+    .table-scroll {
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
+    }
+    @media (max-width: 600px) {
+        .leaderboard-table th,
+        .leaderboard-table td {
+            padding: 0.75rem;
+            font-size: 0.875rem;
+        }
+        .leaderboard-table th { font-size: 0.625rem; }
+        .stats-grid { grid-template-columns: 1fr !important; }
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<h1>{{ _('Leaderboard') }}</h1>
+
+<div class="stats-grid" style="margin-bottom: 3rem; grid-template-columns: repeat(3, 1fr);">
+    <div class="stat-box">
+        <div class="stat-value">{{ totals.classifications }}</div>
+        <div class="stat-label">{{ _('Classified') }}</div>
+    </div>
+    <div class="stat-box">
+        <div class="stat-value">{{ totals.sdc_tags }}</div>
+        <div class="stat-label">{{ _('SDC Tags') }}</div>
+    </div>
+    <div class="stat-box">
+        <div class="stat-value">{{ rows | length }}</div>
+        <div class="stat-label">{{ _('Contributors') }}</div>
+    </div>
+</div>
+
+{% if rows %}
+<div class="card" style="padding: 0; overflow: hidden;">
+    <div class="table-scroll">
+    <table class="leaderboard-table">
+        <thead>
+            <tr>
+                <th style="width: 4rem;">#</th>
+                <th>{{ _('User') }}</th>
+                <th class="num">{{ _('Class.') }}</th>
+                <th class="num">{{ _('SDC Tags') }}</th>
+                <th class="num">{{ _('Total') }}</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for row in rows %}
+            <tr>
+                <td>
+                    <span class="rank rank-{{ loop.index }}">{{ loop.index }}</span>
+                </td>
+                <td>
+                    <a href="https://commons.wikimedia.org/wiki/User:{{ row.wiki_username | urlencode }}"
+                       class="username-link"
+                       target="_blank"
+                       rel="noopener">{{ row.wiki_username }}</a>
+                </td>
+                <td class="num">{{ row.classifications }}</td>
+                <td class="num">{{ row.sdc_tags }}</td>
+                <td class="num" style="color: var(--primary); font-weight: 900;">
+                    {{ row.classifications + row.sdc_tags }}
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    </div>
+</div>
+{% else %}
+<div class="card" style="text-align: center; padding: 4rem 2rem;">
+    <h2 style="border: none;">{{ _('No contributions yet') }}</h2>
+    <p style="color: var(--text-muted); margin-bottom: 2rem;">
+        {{ _('Start classifying faces in a project to appear on the leaderboard.') }}
+    </p>
+    {% if g.user %}
+        <a href="{{ url_for('dashboard') }}" class="btn btn-primary">{{ _('Go to Dashboard') }}</a>
+    {% else %}
+        <a href="{{ url_for('login') }}" class="btn btn-primary">{{ _('Log In') }}</a>
+    {% endif %}
+</div>
+{% endif %}
+{% endblock %}

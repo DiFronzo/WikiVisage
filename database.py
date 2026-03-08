@@ -21,8 +21,9 @@ logger = logging.getLogger(__name__)
 
 # Connection pool configuration
 _pool: Optional[Queue] = None
-_pool_size: int = 5
+_pool_size: int = int(os.environ.get("WIKIVISAGE_DB_POOL_SIZE", 5))
 _db_config: Dict[str, Any] = {}
+_pool_initialized: bool = False
 
 # Retry configuration
 MAX_RETRIES = 3
@@ -325,7 +326,82 @@ def execute_query(
         raise DatabaseError(f"Query execution failed: {e}") from e
 
 
-def init_db(pool_size: int = 5) -> None:
+def execute_insert(sql: str, params: Optional[Union[Tuple, Dict]] = None) -> int:
+    """
+    Execute an INSERT query and return the auto-generated row ID.
+
+    Uses cursor.lastrowid which is connection-local and race-free,
+    unlike SELECT ... ORDER BY id DESC LIMIT 1.
+
+    Args:
+        sql: The INSERT SQL query to execute.
+        params: Parameters to bind to the query.
+
+    Returns:
+        The auto-increment ID of the inserted row.
+
+    Raises:
+        DatabaseError: If query execution fails.
+    """
+
+    def _execute() -> int:
+        with get_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(sql, params)
+                conn.commit()
+                return cursor.lastrowid
+
+    try:
+        return _execute_with_retry(_execute)
+    except Exception as e:
+        logger.error(f"Insert execution failed: {sql[:100]}... Error: {e}")
+        raise DatabaseError(f"Insert execution failed: {e}") from e
+
+
+def execute_transaction(
+    operations: Callable[[Any, Any], Any],
+) -> Any:
+    """
+    Execute multiple queries in a single database transaction.
+
+    The callable receives (connection, cursor) and should execute all
+    queries on that cursor. The transaction is committed on success
+    or rolled back on failure.
+
+    Args:
+        operations: A callable(conn, cursor) that performs all DB work.
+
+    Returns:
+        Whatever the callable returns.
+
+    Raises:
+        DatabaseError: If the transaction fails.
+
+    Example:
+        def do_work(conn, cursor):
+            cursor.execute("INSERT INTO ...", (...,))
+            new_id = cursor.lastrowid
+            cursor.execute("UPDATE ...", (...,))
+            return new_id
+
+        result = execute_transaction(do_work)
+    """
+
+    def _execute() -> Any:
+        with get_connection() as conn:
+            with conn.cursor() as cursor:
+                result = operations(conn, cursor)
+                conn.commit()
+                return result
+
+    try:
+        return _execute_with_retry(_execute)
+    except Exception as e:
+        logger.error(f"Transaction execution failed: {e}")
+        raise DatabaseError(f"Transaction execution failed: {e}") from e
+
+
+def init_db(pool_size: Optional[int] = None) -> None:
     """
     Initialize the database connection pool and verify connectivity.
 
@@ -333,6 +409,7 @@ def init_db(pool_size: int = 5) -> None:
 
     Args:
         pool_size: Number of connections to maintain in the pool.
+                   Defaults to WIKIVISAGE_DB_POOL_SIZE env var or 15.
 
     Raises:
         ConfigurationError: If database configuration is invalid.
@@ -343,24 +420,26 @@ def init_db(pool_size: int = 5) -> None:
     """
     global _pool, _pool_size, _db_config
 
-    logger.info("Initializing database connection pool")
+    if pool_size is not None:
+        _pool_size = pool_size
+
+    logger.info(f"Initializing database connection pool (size={_pool_size})")
 
     # Get and validate configuration
     _db_config = _get_db_config()
-    _pool_size = pool_size
 
     # Create the pool
-    _pool = Queue(maxsize=pool_size)
+    _pool = Queue(maxsize=_pool_size)
 
     # Pre-populate with connections
-    for i in range(pool_size):
+    for i in range(_pool_size):
         try:
             conn = _create_connection()
             _pool.put_nowait(conn)
-            logger.debug(f"Created connection {i + 1}/{pool_size}")
+            logger.debug(f"Created connection {i + 1}/{_pool_size}")
         except Exception as e:
             logger.error(
-                f"Failed to create initial connection {i + 1}/{pool_size}: {e}"
+                f"Failed to create initial connection {i + 1}/{_pool_size}: {e}"
             )
             # Clean up any connections created so far
             close_pool()
@@ -375,7 +454,7 @@ def init_db(pool_size: int = 5) -> None:
                 if result:
                     logger.info(
                         f"Database connection pool initialized successfully. "
-                        f"Pool size: {pool_size}, Database: {_db_config['database']}"
+                        f"Pool size: {_pool_size}, Database: {_db_config['database']}"
                     )
                 else:
                     raise DatabaseError("Connectivity test failed: No result returned")

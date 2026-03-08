@@ -1,0 +1,9 @@
+# WikiVisage — Toolforge Jobs
+# Load with: toolforge jobs load jobs.yaml
+# Docs: https://wikitech.wikimedia.org/wiki/Help:Toolforge/Running_jobs
+---
+- name: ml-worker
+  command: python -u worker.py
+  image: tool-wikivisage/tool-wikivisage:latest
+  continuous: true
+  mem: 2Gi

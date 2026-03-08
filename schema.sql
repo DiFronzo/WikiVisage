@@ -43,9 +43,12 @@ CREATE TABLE IF NOT EXISTS projects (
     distance_threshold  FLOAT           NOT NULL DEFAULT 0.6 COMMENT 'Face distance threshold for autonomous inference',
     min_confirmed       INT UNSIGNED    NOT NULL DEFAULT 5 COMMENT 'Minimum confirmed faces before autonomous mode',
     status              ENUM('active', 'paused', 'completed') NOT NULL DEFAULT 'active',
+    p18_thumb_url       VARCHAR(1024)   NULL COMMENT 'Cached Wikidata P18 image thumbnail URL',
     images_total        INT UNSIGNED    NOT NULL DEFAULT 0,
     images_processed    INT UNSIGNED    NOT NULL DEFAULT 0,
     faces_confirmed     INT UNSIGNED    NOT NULL DEFAULT 0,
+    sdc_write_requested TINYINT(1)      NOT NULL DEFAULT 0 COMMENT '1=user requested SDC writes, worker picks up',
+    sdc_write_error     VARCHAR(1024)   NULL COMMENT 'Error message from last SDC write attempt',
     created_at          DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at          DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
 
@@ -94,6 +97,7 @@ CREATE TABLE IF NOT EXISTS faces (
     is_target       TINYINT(1)      NULL DEFAULT NULL COMMENT 'NULL=unclassified, 1=match, 0=non-match',
     confidence      FLOAT           NULL COMMENT 'Face distance from known target centroid',
     classified_by   ENUM('human', 'model', 'bootstrap') NULL COMMENT 'How this face was classified',
+    classified_by_user_id BIGINT UNSIGNED NULL COMMENT 'User who classified this face (human classifications)',
     sdc_written     TINYINT(1)      NOT NULL DEFAULT 0 COMMENT 'Whether P180 claim was written to SDC',
     created_at      DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at      DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -102,7 +106,20 @@ CREATE TABLE IF NOT EXISTS faces (
     INDEX idx_faces_is_target (is_target),
     INDEX idx_faces_classification (image_id, is_target, classified_by),
     INDEX idx_faces_sdc (is_target, sdc_written),
+    INDEX idx_faces_classified_by_user (classified_by_user_id),
 
     CONSTRAINT fk_faces_image
-        FOREIGN KEY (image_id) REFERENCES images (id) ON DELETE CASCADE
+        FOREIGN KEY (image_id) REFERENCES images (id) ON DELETE CASCADE,
+    CONSTRAINT fk_faces_classified_by_user
+        FOREIGN KEY (classified_by_user_id) REFERENCES users (id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+
+-- Worker heartbeat table: single-row table tracking when the background worker last ran.
+-- Used by the web app to detect worker downtime and display a banner.
+CREATE TABLE IF NOT EXISTS worker_heartbeat (
+    id          INT             NOT NULL DEFAULT 1 PRIMARY KEY,
+    last_seen   DATETIME        NOT NULL,
+
+    CONSTRAINT single_row CHECK (id = 1)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

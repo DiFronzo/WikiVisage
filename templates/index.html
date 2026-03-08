@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 
-{% block title %}WikiVisage - Active Learning for Wikimedia{% endblock %}
+{% block title %}{{ _('WikiVisage BETA - Active Learning for Wikimedia') }}{% endblock %}
 
 {% block extra_head %}
 <style>
@@ -16,6 +16,11 @@
         color: var(--primary);
         text-shadow: 4px 4px 0px rgba(20, 184, 166, 0.2);
     }
+    .hero-logo {
+        width: 160px;
+        height: auto;
+        margin-bottom: 1rem;
+    }
     .hero p {
         font-size: 1.25rem;
         color: var(--text-muted);
@@ -24,7 +29,8 @@
     }
     .features {
         display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+        /* 4 cards look awkward as 3+1 on desktop; prefer a balanced 2x2. */
+        grid-template-columns: repeat(2, minmax(0, 1fr));
         gap: 2rem;
         margin-top: 3rem;
     }
@@ -33,39 +39,58 @@
         border: 2px solid var(--border);
         background: var(--bg);
         text-align: left;
+        display: flex;
+        flex-direction: column;
+        min-height: 100%;
+        box-shadow: 6px 6px 0px rgba(20, 184, 166, 0.08);
+        transition: transform 0.2s ease, box-shadow 0.2s ease, border-color 0.2s ease;
+    }
+    .feature-card:hover {
+        border-color: var(--primary);
+        transform: translate(-2px, -2px);
+        box-shadow: 8px 8px 0px rgba(20, 184, 166, 0.18);
     }
     .feature-card h3 {
         color: var(--primary);
         font-size: 1.5rem;
+    }
+
+    @media (max-width: 700px) {
+        .features { grid-template-columns: 1fr; }
     }
 </style>
 {% endblock %}
 
 {% block content %}
 <div class="hero">
+    <img src="{{ url_for('static', filename='wikivisage-logo-notext.svg') }}" alt="{{ _('WikiVisage logo') }}" class="hero-logo">
     <h1>WikiVisage</h1>
-    <p>Active learning facial recognition for Wikimedia Commons. Train an ML model to recognize specific people and automatically add P180 (depicts) Structured Data to matching images.</p>
+    <p>{{ _('Active learning facial recognition for Wikimedia Commons. Train an ML model to recognize specific people and automatically add P180 (depicts) Structured Data to matching images.') }}</p>
     
     {% if not g.user %}
-        <a href="{{ url_for('login') }}" class="btn btn-primary" style="font-size: 1.25rem; padding: 1rem 2rem;">Log in with Wikimedia</a>
+        <a href="{{ url_for('login') }}" class="btn btn-primary" style="font-size: 1.25rem; padding: 1rem 2rem;">{{ _('Log in with Wikimedia') }}</a>
     {% else %}
-        <a href="{{ url_for('dashboard') }}" class="btn btn-primary" style="font-size: 1.25rem; padding: 1rem 2rem;">Go to Dashboard</a>
+        <a href="{{ url_for('dashboard') }}" class="btn btn-primary" style="font-size: 1.25rem; padding: 1rem 2rem;">{{ _('Go to Dashboard') }}</a>
     {% endif %}
 </div>
 
-<h2>How it works</h2>
+<h2>{{ _('How it works') }}</h2>
 <div class="features">
     <div class="feature-card">
-        <h3>1. Create a Project</h3>
-        <p>Enter a Wikidata Q-ID and a Wikimedia Commons category. The system will scan all images for faces.</p>
+        <h3>{{ _('1. Create a Project') }}</h3>
+        <p>{{ _('Enter a Wikidata Q-ID and a Wikimedia Commons category. The system will scan all images for faces.') }}</p>
     </div>
     <div class="feature-card">
-        <h3>2. Active Learning</h3>
-        <p>Classify a few faces as "Yes" or "No". The machine learning model actively learns from your input.</p>
+        <h3>{{ _('2. Classify Faces') }}</h3>
+        <p>{{ _('Review detected faces one by one with simple Yes/No buttons. After enough examples, the model classifies remaining faces automatically.') }}</p>
     </div>
     <div class="feature-card">
-        <h3>3. Auto-Tagging</h3>
-        <p>Once confident, the system automatically writes "depicts" (P180) statements to Structured Data on Commons.</p>
+        <h3>{{ _('3. Review Results') }}</h3>
+        <p>{{ _('Check the model\'s classifications. Approve correct matches, reject false positives, and redraw bounding boxes if needed.') }}</p>
+    </div>
+    <div class="feature-card">
+        <h3>{{ _('4. Send to Commons') }}</h3>
+        <p>{{ _('When you\'re satisfied, send the results to Wikimedia Commons. P180 (depicts) Structured Data claims are written for all approved faces.') }}</p>
     </div>
 </div>
 {% endblock %}

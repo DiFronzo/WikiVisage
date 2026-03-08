@@ -1,9 +1,10 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="{{ current_locale }}" dir="{{ text_direction }}">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{% block title %}WikiVisage{% endblock %}</title>
+    <title>{% block title %}WikiVisage BETA{% endblock %}</title>
+    <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='wikivisage-logo.svg') }}">
     <style>
         :root {
             --bg: #090e17;
@@ -42,16 +43,70 @@
         p { margin-bottom: 1rem; }
 
         .container { max-width: 900px; margin: 0 auto; padding: 0 1.5rem; width: 100%; }
+        .nav-container { max-width: 1100px; margin: 0 auto; padding: 0 1.5rem; width: 100%; }
 
         nav {
             border-bottom: 2px solid var(--border);
-            padding: 1.5rem 0;
+            padding: 1.75rem 0;
             margin-bottom: 3rem;
             background-color: var(--surface);
         }
         .nav-inner { display: flex; justify-content: space-between; align-items: center; }
-        .nav-brand { font-size: 1.5rem; font-weight: 900; color: var(--primary); text-transform: uppercase; letter-spacing: 0.1em; text-decoration: none !important; }
-        .nav-links { display: flex; gap: 1.5rem; align-items: center; font-weight: bold; text-transform: uppercase; font-size: 0.875rem; }
+        .nav-brand { font-size: 1.25rem; font-weight: 900; color: var(--primary); text-transform: uppercase; letter-spacing: 0.05em; text-decoration: none !important; display: inline-flex; align-items: center; gap: 0.5rem; min-width: 0; overflow: hidden; text-overflow: ellipsis; flex-shrink: 0; }
+        .beta-tag { font-size: 0.6rem; padding: 0.15rem 0.4rem; background-color: var(--warning); color: var(--bg); font-weight: 900; letter-spacing: 0.08em; border-radius: 2px; line-height: 1; vertical-align: middle; }
+        .nav-links { display: flex; gap: 1.5rem; align-items: center; font-weight: bold; text-transform: uppercase; font-size: 0.875rem; white-space: nowrap; }
+        .nav-toggle { display: none; background: none; border: none; color: var(--primary); font-size: 1.5rem; cursor: pointer; padding: 0.5rem; line-height: 1; min-width: 44px; min-height: 44px; align-items: center; justify-content: center; }
+        .nav-toggle:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+        .nav-links a:focus-visible, .nav-links .btn:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+        .lang-select { background: var(--bg); color: var(--text-main); border: 2px solid var(--border); padding: 0.5rem 0.75rem; font-size: 0.75rem; font-weight: 700; text-transform: uppercase; cursor: pointer; font-family: inherit; letter-spacing: 0.05em; transition: border-color 0.2s; width: auto; }
+        .lang-select:hover { border-color: var(--primary); }
+        .lang-select:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; border-color: var(--primary); }
+
+        .nav-separator { display: none; }
+
+        @media (max-width: 600px) {
+            .nav-inner { flex-wrap: wrap; }
+            .nav-toggle { display: inline-flex; }
+            .nav-links {
+                display: none;
+                flex-direction: column;
+                width: 100%;
+                gap: 0;
+                padding-top: 0.75rem;
+                border-top: 1px solid var(--border);
+                margin-top: 1rem;
+                align-items: stretch;
+            }
+            .nav-links.open { display: flex; }
+            .nav-links a:not(.btn) {
+                display: flex;
+                align-items: center;
+                min-height: 44px;
+                padding: 0.5rem 0;
+                font-size: 0.9375rem;
+            }
+            .nav-separator {
+                display: block;
+                height: 1px;
+                background: var(--border);
+                margin: 0.25rem 0;
+                width: 100%;
+            }
+            .nav-links .btn {
+                width: auto;
+                align-self: flex-start;
+                min-height: 44px;
+                padding: 0.75rem 2.5rem;
+                font-size: 0.875rem;
+                margin-top: 0.25rem;
+            }
+            .nav-links .lang-select {
+                width: auto;
+                align-self: flex-start;
+                min-height: 44px;
+                margin-top: 0.25rem;
+            }
+        }
 
         main { flex: 1; }
 
@@ -115,11 +170,51 @@
             font-weight: 600;
             display: flex;
             align-items: center;
+            justify-content: space-between;
+            gap: 1rem;
         }
+        .flash-close {
+            background: none;
+            border: none;
+            font-size: 1.25rem;
+            line-height: 1;
+            cursor: pointer;
+            color: inherit;
+            opacity: 0.6;
+            padding: 0 0.25rem;
+            flex-shrink: 0;
+        }
+        .flash-close:hover { opacity: 1; }
         .flash.success { border-color: var(--success); color: var(--success); }
         .flash.error { border-color: var(--danger); color: var(--danger); }
         .flash.warning { border-color: var(--warning); color: var(--warning); }
         .flash.info { border-color: var(--info); color: var(--info); }
+
+        .system-banner {
+            background-color: color-mix(in srgb, var(--warning) 12%, var(--bg));
+            border-bottom: 2px solid var(--warning);
+            color: var(--warning);
+            text-align: center;
+            padding: 0.75rem 1.5rem;
+            font-weight: 700;
+            font-size: 0.9rem;
+            letter-spacing: 0.01em;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 1rem;
+        }
+        .banner-close {
+            background: none;
+            border: none;
+            font-size: 1.25rem;
+            line-height: 1;
+            cursor: pointer;
+            color: inherit;
+            opacity: 0.6;
+            flex-shrink: 0;
+        }
+        .banner-close:hover { opacity: 1; }
 
         .card {
             background-color: var(--surface);
@@ -163,6 +258,8 @@
             border: 2px solid var(--border);
             padding: 1.5rem;
             text-align: center;
+            overflow-wrap: break-word;
+            min-width: 0;
         }
         .stat-value { font-size: 2.5rem; font-weight: 900; color: var(--primary); line-height: 1; margin-bottom: 0.5rem; }
         .stat-label { font-size: 0.75rem; text-transform: uppercase; color: var(--text-muted); font-weight: 700; letter-spacing: 0.05em; }
@@ -175,23 +272,41 @@
 </head>
 <body>
     <nav>
-        <div class="container nav-inner">
-            <a href="{{ url_for('index') }}" class="nav-brand">WikiVisage</a>
+        <div class="nav-container nav-inner">
+            <a href="{{ url_for('index') }}" class="nav-brand">WikiVisage <span class="beta-tag">BETA</span></a>
+            <button class="nav-toggle" onclick="var nl=document.querySelector('.nav-links');nl.classList.toggle('open');this.setAttribute('aria-expanded',nl.classList.contains('open'))" aria-label="{{ _('Toggle menu') }}" aria-expanded="false">&#9776;</button>
             <div class="nav-links">
                 {% if g.user %}
-                    <a href="{{ url_for('dashboard') }}">Dashboard</a>
-                    <a href="{{ url_for('logout') }}" style="color: var(--text-muted);">Logout ({{ g.user.wiki_username }})</a>
+                    <a href="{{ url_for('dashboard') }}">{{ _('Dashboard') }}</a>
+                    <a href="{{ url_for('leaderboard') }}">{{ _('Leaderboard') }}</a>
+                    <span class="nav-separator"></span>
+                    <form action="{{ url_for('logout') }}" method="post" style="display: inline;">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                        <button type="submit" class="nav-logout" style="background: none; border: none; color: var(--text-muted); cursor: pointer; font: inherit; padding: 0;">{{ _('Logout') }} ({{ g.user.wiki_username }})</button>
+                    </form>
                 {% else %}
-                    <a href="{{ url_for('login') }}" class="btn btn-primary btn-sm">Log in</a>
+                    <a href="{{ url_for('leaderboard') }}">{{ _('Leaderboard') }}</a>
+                    <span class="nav-separator"></span>
+                    <a href="{{ url_for('login') }}" class="btn btn-primary btn-sm">{{ _('Log in') }}</a>
                 {% endif %}
+                <span class="nav-separator"></span>
+                <select class="lang-select" onchange="var u='/set-language/'+this.value;if(localStorage.getItem('cookie_consent')!=='accepted')u+='?nocookie=1';window.location.href=u" aria-label="{{ _('Language') }}">
+                    {% for code, name in languages.items() %}
+                    <option value="{{ code }}" {% if current_locale == code %}selected{% endif %}>🌐 {{ name }}</option>
+                    {% endfor %}
+                </select>
             </div>
         </div>
     </nav>
 
+    {% if worker_down and request.endpoint not in ('index', 'leaderboard') %}
+    <div class="system-banner"><span>⚠ {{ _('The background worker appears to be offline. Image processing and face detection are paused.') }}</span><button class="banner-close" onclick="this.parentElement.remove()" aria-label="{{ _('Close') }}">&times;</button></div>
+    {% endif %}
+
     <main class="container">
         <div class="flash-messages">
             {% for category, message in get_flashed_messages(with_categories=true) %}
-                <div class="flash {{ category }}">{{ message }}</div>
+                <div class="flash {{ category }}"><span>{{ message }}</span><button class="flash-close" onclick="this.parentElement.remove()" aria-label="{{ _('Close') }}">&times;</button></div>
             {% endfor %}
         </div>
         
@@ -200,8 +315,68 @@
 
     <footer>
         <div class="container">
-            <p>Powered by Wikimedia Commons &bull; Active Learning Facial Recognition</p>
+            <p>WikiVisage v{{ app_version }} &bull; 2026 &copy; Powered by Toolforge &bull; Tool by User:Premeditated</p>
         </div>
     </footer>
+
+    <div id="cookie-consent" class="cookie-banner" style="display:none;">
+        <div class="cookie-banner-inner">
+            <p class="cookie-text">{{ _('This site uses a cookie to remember your language preference. The session cookie is required for the site to function.') }}</p>
+            <div class="cookie-actions">
+                <button class="btn btn-primary btn-sm" onclick="acceptCookies()">{{ _('Accept') }}</button>
+                <button class="btn btn-sm" onclick="declineCookies()">{{ _('Decline') }}</button>
+            </div>
+        </div>
+    </div>
+    <style>
+        .cookie-banner {
+            position: fixed;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            z-index: 9999;
+            background-color: var(--surface);
+            border-top: 2px solid var(--primary);
+            padding: 1.25rem 1.5rem;
+            box-shadow: 0 -4px 20px rgba(0,0,0,0.5);
+        }
+        .cookie-banner-inner {
+            max-width: 900px;
+            margin: 0 auto;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 1.5rem;
+            flex-wrap: wrap;
+        }
+        .cookie-text {
+            margin: 0;
+            font-size: 0.875rem;
+            color: var(--text-muted);
+            flex: 1;
+            min-width: 200px;
+        }
+        .cookie-actions {
+            display: flex;
+            gap: 0.75rem;
+            flex-shrink: 0;
+        }
+    </style>
+    <script>
+        (function() {
+            var consent = localStorage.getItem('cookie_consent');
+            if (!consent) {
+                document.getElementById('cookie-consent').style.display = 'block';
+            }
+        })();
+        function acceptCookies() {
+            localStorage.setItem('cookie_consent', 'accepted');
+            document.getElementById('cookie-consent').style.display = 'none';
+        }
+        function declineCookies() {
+            localStorage.setItem('cookie_consent', 'declined');
+            document.getElementById('cookie-consent').style.display = 'none';
+        }
+    </script>
 </body>
 </html>

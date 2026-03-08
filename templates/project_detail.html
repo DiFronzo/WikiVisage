@@ -1,15 +1,264 @@
 {% extends "base.html" %}
 
-{% block title %}{{ project.label or project.wikidata_qid }} - WikiVisage{% endblock %}
+{% block title %}{{ project.label or project.wikidata_qid }} - WikiVisage BETA{% endblock %}
+
+{% block extra_head %}
+<style>
+    .results-gallery {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+        gap: 1.25rem;
+    }
+    .result-card {
+        background: var(--surface);
+        border: 2px solid var(--border);
+        overflow: hidden;
+        transition: border-color 0.2s, transform 0.2s;
+        position: relative;
+    }
+    .result-card:hover { border-color: var(--primary); transform: translateY(-2px); }
+    .result-card[data-result="match"] { border-left: 4px solid var(--success); }
+    .result-card[data-result="non-match"] { border-left: 4px solid var(--danger); }
+    .result-card.hidden { display: none; }
+    .result-thumb {
+        position: relative;
+        width: 100%;
+        height: 180px;
+        overflow: hidden;
+        background: var(--bg);
+    }
+    .result-thumb img {
+        width: 100%;
+        height: 100%;
+        object-fit: contain;
+        background: var(--bg);
+    }
+    .result-actions {
+        position: absolute;
+        top: 0.5rem;
+        right: 0.5rem;
+        display: flex;
+        gap: 0.25rem;
+        opacity: 0;
+        transition: opacity 0.2s;
+    }
+    .result-card:hover .result-actions {
+        opacity: 1;
+    }
+    .btn-icon {
+        width: 32px;
+        height: 32px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: var(--surface);
+        border: 2px solid var(--border);
+        color: var(--text-main);
+        cursor: pointer;
+        font-family: monospace;
+        font-size: 1.2rem;
+        font-weight: bold;
+        transition: all 0.2s;
+    }
+    .btn-icon:hover {
+        background: var(--primary);
+        color: var(--bg);
+        border-color: var(--primary);
+    }
+    .btn-icon.success:hover {
+        background: var(--success);
+        border-color: var(--success);
+    }
+    .btn-icon.danger:hover {
+        background: var(--danger);
+        border-color: var(--danger);
+    }
+    .result-loading {
+        position: absolute;
+        inset: 0;
+        background: rgba(0, 0, 0, 0.5);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        color: white;
+        font-weight: bold;
+        z-index: 10;
+        display: none;
+    }
+    .result-loading.active {
+        display: flex;
+    }
+    .result-info {
+        padding: 0.75rem;
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        flex-wrap: wrap;
+    }
+    .result-distance {
+        font-family: monospace;
+        font-size: 0.8rem;
+        font-weight: 700;
+        color: var(--text-main);
+    }
+    .result-method {
+        font-size: 0.65rem;
+        text-transform: uppercase;
+        color: var(--text-muted);
+        font-weight: 700;
+        letter-spacing: 0.05em;
+        margin-left: auto;
+    }
+    .results-filter.active {
+        background-color: var(--primary);
+        color: var(--bg);
+    }
+    
+    /* Modal Styles */
+    .modal-overlay {
+        position: fixed;
+        inset: 0;
+        background: rgba(0, 0, 0, 0.85);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        z-index: 9999;
+        opacity: 0;
+        pointer-events: none;
+        transition: opacity 0.2s;
+    }
+    .modal-overlay.active {
+        opacity: 1;
+        pointer-events: auto;
+    }
+    .modal-content {
+        background: var(--surface);
+        border: 2px solid var(--border);
+        width: 90vw;
+        max-width: 1024px;
+        max-height: 90vh;
+        display: flex;
+        flex-direction: column;
+        position: relative;
+    }
+    .modal-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 1rem;
+        border-bottom: 2px solid var(--border);
+    }
+    .modal-close {
+        background: none;
+        border: none;
+        font-size: 2rem;
+        line-height: 1;
+        color: var(--text-main);
+        cursor: pointer;
+    }
+    .modal-body {
+        padding: 1rem;
+        flex: 1;
+        overflow: hidden;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+    }
+    .drawing-area {
+        position: relative;
+        display: inline-block;
+        max-width: 100%;
+        max-height: 100%;
+        overflow: hidden;
+        user-select: none;
+    }
+    .drawing-area img {
+        max-width: 100%;
+        max-height: 60vh;
+        display: block;
+        object-fit: contain;
+        cursor: crosshair;
+    }
+    .drawing-box {
+        position: absolute;
+        border: 3px dashed var(--primary);
+        background: rgba(20, 184, 166, 0.2);
+        pointer-events: none;
+        display: none;
+        box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.5);
+    }
+    .old-bbox {
+        position: absolute;
+        border: 3px solid var(--danger);
+        background: rgba(239, 68, 68, 0.15);
+        pointer-events: none;
+        box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.5);
+    }
+    .pagination {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 0.25rem;
+        margin: 2rem 0 1rem;
+        flex-wrap: wrap;
+    }
+    .pagination button, .pagination span {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 2.25rem;
+        height: 2.25rem;
+        padding: 0 0.5rem;
+        font-size: 0.8rem;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        border: 2px solid var(--border);
+        background: var(--surface);
+        color: var(--text-main);
+        text-decoration: none;
+        cursor: pointer;
+        transition: all 0.15s ease;
+        font-family: inherit;
+    }
+    .pagination button:hover:not(:disabled) {
+        border-color: var(--primary);
+        color: var(--primary);
+        transform: translate(-1px, -1px);
+        box-shadow: 3px 3px 0px var(--primary);
+    }
+    .pagination .active {
+        background: var(--primary);
+        color: var(--bg);
+        border-color: var(--primary);
+    }
+    .pagination button:disabled {
+        opacity: 0.35;
+        cursor: default;
+    }
+    .pagination .ellipsis {
+        border: none;
+        background: none;
+        color: var(--text-muted);
+        min-width: auto;
+        padding: 0 0.25rem;
+    }
+</style>
+{% endblock %}
 
 {% block content %}
 <div class="header-actions">
-    <div>
-        <h1 style="margin-bottom: 0.5rem;">{{ project.label or project.wikidata_qid }}</h1>
-        <p style="color: var(--text-muted);">
-            <a href="https://www.wikidata.org/wiki/{{ project.wikidata_qid }}" target="_blank" rel="noopener">{{ project.wikidata_qid }}</a> &bull; 
-            <a href="https://commons.wikimedia.org/wiki/Category:{{ project.commons_category | urlencode }}" target="_blank" rel="noopener">Category:{{ project.commons_category }}</a>
-        </p>
+    <div style="display: flex; gap: 1.25rem; align-items: flex-start;">
+        {% if project.p18_thumb_url %}
+        <img src="{{ project.p18_thumb_url }}" alt="{{ project.label or project.wikidata_qid }}" loading="lazy" style="width: 80px; height: 80px; object-fit: cover; object-position: top center; border: 2px solid var(--border); flex-shrink: 0;">
+        {% endif %}
+        <div>
+            <h1 style="margin-bottom: 0.5rem;">{{ project.label or project.wikidata_qid }}</h1>
+            <p style="color: var(--text-muted);">
+                <a href="https://www.wikidata.org/wiki/{{ project.wikidata_qid }}" target="_blank" rel="noopener">{{ project.wikidata_qid }}</a> &bull; 
+                <a href="https://commons.wikimedia.org/wiki/Category:{{ project.commons_category | urlencode }}" target="_blank" rel="noopener">Category:{{ project.commons_category }}</a>
+            </p>
+        </div>
     </div>
     <div>
         <span class="badge badge-{{ project.status }}" style="font-size: 1rem; padding: 0.5rem 1rem;">{{ project.status }}</span>
@@ -18,27 +267,27 @@
 
 <div class="card">
     {% if project.images_total == 0 %}
-        <h2>Processing Progress</h2>
+        <h2>{{ _('Processing Progress') }}</h2>
         <p style="color: var(--text-muted); margin-top: 1rem; margin-bottom: 0;">
-            The background worker hasn't discovered images in this category yet. This usually takes a minute or two after creating a project.
+            {{ _("The background worker hasn't discovered images in this category yet. This usually takes a minute or two after creating a project.") }}
         </p>
         <div class="progress-wrap" style="height: 2.5rem; margin-top: 1.5rem;">
             <div class="progress-bar" style="width: 100%; opacity: 0.15; animation: pulse 2s ease-in-out infinite;"></div>
-            <div class="progress-text" style="font-size: 1rem;">Waiting for worker&hellip;</div>
+            <div class="progress-text" style="font-size: 1rem;">{{ _('Waiting for worker') }}&hellip;</div>
         </div>
     {% elif project.images_processed == project.images_total %}
         <div style="display: flex; justify-content: space-between; align-items: flex-end; margin-bottom: 1rem;">
-            <h2>Processing Progress</h2>
-            <span style="font-weight: bold; color: var(--success);">Complete</span>
+            <h2>{{ _('Processing Progress') }}</h2>
+            <span style="font-weight: bold; color: var(--success);">{{ _('Complete') }}</span>
         </div>
         <div class="progress-wrap" style="height: 2.5rem;">
             <div class="progress-bar" style="width: 100%;"></div>
-            <div class="progress-text" style="font-size: 1rem;">{{ project.images_total }} images processed</div>
+            <div class="progress-text" style="font-size: 1rem;">{{ _('%(num)d images processed', num=project.images_total) }}</div>
         </div>
     {% else %}
         <div style="display: flex; justify-content: space-between; align-items: flex-end; margin-bottom: 1rem;">
-            <h2>Processing Progress</h2>
-            <span style="font-weight: bold; color: var(--primary);">{{ project.images_processed }} / {{ project.images_total }} images</span>
+            <h2>{{ _('Processing Progress') }}</h2>
+            <span style="font-weight: bold; color: var(--primary);">{{ _('%(done)d / %(total)d images', done=project.images_processed, total=project.images_total) }}</span>
         </div>
         {% set pct = (project.images_processed / project.images_total * 100) %}
         <div class="progress-wrap" style="height: 2.5rem;">
@@ -49,44 +298,741 @@
 </div>
 
 {% if project.images_total > 0 %}
-<h2>Project Statistics</h2>
+<h2>{{ _('Project Statistics') }}</h2>
 <div class="stats-grid">
     <div class="stat-box">
         <div class="stat-value">{{ stats.total_faces or 0 }}</div>
-        <div class="stat-label">Total Faces Found</div>
+        <div class="stat-label">{{ _('Total Faces Found') }}</div>
     </div>
     <div class="stat-box" style="border-color: var(--success);">
         <div class="stat-value" style="color: var(--success);">{{ stats.confirmed_matches or 0 }}</div>
-        <div class="stat-label">Target Matches</div>
+        <div class="stat-label">{{ _('Target Matches') }}</div>
     </div>
     <div class="stat-box" style="border-color: var(--danger);">
         <div class="stat-value" style="color: var(--danger);">{{ stats.confirmed_non_matches or 0 }}</div>
-        <div class="stat-label">Not Target</div>
+        <div class="stat-label">{{ _('Not Target') }}</div>
     </div>
     <div class="stat-box" style="border-color: var(--warning);">
         <div class="stat-value" style="color: var(--warning);">{{ stats.unclassified or 0 }}</div>
-        <div class="stat-label">Needs Classification</div>
+        <div class="stat-label">{{ _('Unclassified') }}</div>
+    </div>
+    <div class="stat-box" data-stat="sdc_written" style="border-color: var(--info);">
+        <div class="stat-value" style="color: var(--info);">{{ stats.sdc_written or 0 }}</div>
+        <div class="stat-label">{{ _('SDC Written') }}</div>
+    </div>
+</div>
+
+{% set by_human = stats.by_human or 0 %}
+{% set by_model = stats.by_model or 0 %}
+{% set by_bootstrap = stats.by_bootstrap or 0 %}
+{% set classified_total = by_human + by_model + by_bootstrap %}
+{% if classified_total > 0 %}
+<h2 style="margin-top: 3rem;">{{ _('Classification Breakdown') }}</h2>
+<div class="stats-grid">
+    <div class="stat-box">
+        <div class="stat-value">{{ by_human }}</div>
+        <div class="stat-label">{{ _('By Human') }}</div>
+    </div>
+    <div class="stat-box" style="border-color: var(--primary);">
+        <div class="stat-value" style="color: var(--primary);">{{ by_model }}</div>
+        <div class="stat-label">{{ _('By Model') }}</div>
     </div>
     <div class="stat-box" style="border-color: var(--info);">
-        <div class="stat-value" style="color: var(--info);">{{ stats.sdc_written or 0 }}</div>
-        <div class="stat-label">SDC Tags Written</div>
+        <div class="stat-value" style="color: var(--info);">{{ by_bootstrap }}</div>
+        <div class="stat-label">{{ _('By Bootstrap') }}</div>
     </div>
+</div>
+{% endif %}
+{% endif %}
+
+{% set unclassified = stats.unclassified or 0 %}
+{% if unclassified > 0 %}
+<div class="card" style="margin-top: 2rem; border-color: var(--info); background: rgba(59, 130, 246, 0.05);">
+    {% if project.faces_confirmed >= project.min_confirmed %}
+    <p style="color: var(--info); font-weight: 700; margin-bottom: 0;">
+        {{ ngettext('%(num)d face waiting for model inference. The background worker will classify it automatically within the next minute.', '%(num)d faces waiting for model inference. The background worker will classify them automatically within the next minute.', unclassified, num=unclassified) }}
+    </p>
+    {% else %}
+    <p style="color: var(--warning); font-weight: 700; margin-bottom: 0;">
+        {{ _('%(count)d unclassified faces remaining. Classify at least %(needed)d more target faces to enable autonomous inference (%(confirmed)d/%(min)d confirmed).', count=unclassified, needed=project.min_confirmed - project.faces_confirmed, confirmed=project.faces_confirmed, min=project.min_confirmed) }}
+    </p>
+    {% endif %}
 </div>
 {% endif %}
 
 <div style="margin: 3rem 0; display: flex; gap: 1rem; flex-wrap: wrap;">
     {% if project.images_total > 0 %}
-    <a href="{{ url_for('classify', project_id=project.id) }}" class="btn btn-primary" style="font-size: 1.25rem;">Start Classifying</a>
+    <a href="{{ url_for('classify', project_id=project.id) }}" class="btn btn-primary" style="font-size: 1.25rem;">{{ _('Start Classifying') }}</a>
     {% endif %}
-    <a href="{{ url_for('project_settings', project_id=project.id) }}" class="btn" style="font-size: 1.25rem;">Settings</a>
+    <a href="{{ url_for('project_settings', project_id=project.id) }}" class="btn" style="font-size: 1.25rem;">{{ _('Settings') }}</a>
 </div>
 
-<div class="card" style="border-color: var(--danger); background: rgba(239, 68, 68, 0.05); margin-top: 4rem;">
-    <h3 style="color: var(--danger);">Danger Zone</h3>
-    <p style="color: var(--text-muted); margin-bottom: 1.5rem;">Deleting this project will remove all face bounding boxes and classification data. Images on Commons will remain untouched.</p>
-    <form method="POST" action="{{ url_for('project_delete', project_id=project.id) }}" onsubmit="return confirm('Are you absolutely sure you want to delete this project? This cannot be undone.');">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-        <button type="submit" class="btn btn-danger">Delete Project</button>
-    </form>
+{% if model_faces %}
+<h2 style="margin-top: 3rem;">{{ _('Model Results') }}</h2>
+<p style="color: var(--text-muted); margin-bottom: 1.5rem;">
+    {{ _('Faces classified autonomously by the model or bootstrap. Lower distance = closer match to the target. Threshold: %(threshold)s.', threshold=project.distance_threshold) }}
+</p>
+
+<div class="results-filters" style="display: flex; gap: 0.75rem; margin-bottom: 1.5rem; flex-wrap: wrap;">
+    <button class="btn btn-sm results-filter active" data-filter="all" data-filter-type="result" onclick="filterResults('all', 'result')">{{ _('All') }} ({{ model_faces | length }})</button>
+    <button class="btn btn-sm results-filter" data-filter="match" data-filter-type="result" onclick="filterResults('match', 'result')">{{ _('Matches') }}</button>
+    <button class="btn btn-sm results-filter" data-filter="non-match" data-filter-type="result" onclick="filterResults('non-match', 'result')">{{ _('Non-matches') }}</button>
+    <span style="border-left: 2px solid var(--border); margin: 0 0.25rem;"></span>
+    <button class="btn btn-sm results-filter" data-filter="model" data-filter-type="source" onclick="filterResults('model', 'source')">{{ _('Model') }}</button>
+    <button class="btn btn-sm results-filter" data-filter="bootstrap" data-filter-type="source" onclick="filterResults('bootstrap', 'source')">{{ _('Bootstrap') }}</button>
 </div>
+
+<div class="results-gallery" id="resultsGallery">
+    {% for face in model_faces %}
+    <div class="result-card" data-result="{{ 'match' if face.is_target == 1 else 'non-match' }}" data-source="{{ face.classified_by }}" data-face-id="{{ face.id }}" data-image-id="{{ face.image_id }}" data-sdc-written="{{ face.sdc_written }}">
+        <div class="result-thumb" data-file-title="{{ face.file_title }}"
+             data-bbox-top="{{ face.bbox_top }}" data-bbox-right="{{ face.bbox_right }}"
+             data-bbox-bottom="{{ face.bbox_bottom }}" data-bbox-left="{{ face.bbox_left }}">
+            <img src="{{ commons_thumb_url(face.file_title, 330) }}"
+                 alt="{{ face.file_title }}" loading="lazy">
+            <div class="result-actions">
+                <button class="btn-icon success" onclick="reclassifyFace(this, 1)" title="{{ _('Approve') }}">&#10003;</button>
+                <button class="btn-icon danger" onclick="reclassifyFace(this, 0)" title="{{ _('Reject') }}">&#10007;</button>
+                <button class="btn-icon" onclick="openBboxModal(this)" title="{{ _('Edit bounding box') }}">&#9998;</button>
+            </div>
+            <div class="result-loading">{{ _('Loading...') }}</div>
+        </div>
+        <div class="result-info">
+            <span class="badge {{ 'badge-active' if face.is_target == 1 else 'badge-paused' }}" style="font-size: 0.65rem;">
+                {{ _('Match') if face.is_target == 1 else _('Not target') }}
+            </span>
+            <span class="result-distance" title="{{ _('Face distance from target centroid') }}">
+                {{ "%.3f"|format(face.confidence) if face.confidence is not none else '—' }}
+            </span>
+            <span class="result-method">{{ face.classified_by }}</span>
+        </div>
+        <div class="sdc-note" style="display: none; padding: 0 0.75rem 0.75rem; font-size: 0.65rem; color: var(--danger);"></div>
+    </div>
+    {% endfor %}
+</div>
+<nav class="pagination" id="resultsPagination"></nav>
+{% endif %}
+
+{% if project.images_total > 0 %}
+{% set sdc_pending = stats.sdc_pending or 0 %}
+<div class="card" id="sdcWriteSection" style="border-color: var(--primary); background: rgba(59, 130, 246, 0.05); margin-top: 4rem;">
+    <h3 style="color: var(--primary); margin-bottom: 0.5rem;">{{ _('Send Edits to Wikimedia Commons') }}</h3>
+    <p style="color: var(--text-muted); margin-bottom: 1.5rem;">
+        {{ _('Write P180 depicts claims for all approved target faces that have not yet been written to Commons. Review the Model Results above to remove false positives before sending.') }}
+    </p>
+    <div id="sdcStatus" style="margin-bottom: 1rem;">
+        {% if sdc_pending > 0 %}
+        <p style="font-weight: 700;">
+            {{ ngettext('%(num)d face ready to send.', '%(num)d faces ready to send.', sdc_pending, num=sdc_pending) }}
+        </p>
+        {% else %}
+        <p style="color: var(--text-muted);">{{ _('No pending faces to write. All approved faces have already been sent.') }}</p>
+        {% endif %}
+    </div>
+    <div id="sdcProgress" style="display: none; margin-bottom: 1rem;">
+        <div class="progress-wrap" style="height: 2rem;">
+            <div class="progress-bar" id="sdcProgressBar" style="width: 0%; transition: width 0.3s ease;"></div>
+            <div class="progress-text" id="sdcProgressText" style="font-size: 0.85rem;">{{ _('Starting...') }}</div>
+        </div>
+    </div>
+    <div id="sdcResult" style="display: none; margin-bottom: 1rem;"></div>
+    <button class="btn btn-primary" id="sdcWriteBtn" onclick="startSdcWrite()" {{ 'disabled' if sdc_pending == 0 or project.sdc_write_requested }}>
+        {{ _('Send Edits to Wikimedia Commons') }}
+    </button>
+</div>
+{% endif %}
+
+<div class="modal-overlay" id="bboxModal">
+    <div class="modal-content">
+        <div class="modal-header">
+            <h3 style="margin: 0;">{{ _('Edit Bounding Box') }}</h3>
+            <button class="modal-close" onclick="closeBboxModal()">&times;</button>
+        </div>
+        <div class="modal-body">
+            <p style="color: var(--text-muted); margin-bottom: 1rem; text-align: center;">
+                {{ _('Click and drag on the image to draw a new bounding box.') }}
+                <a id="modalCommonsLink" href="" target="_blank" rel="noopener" style="margin-left: 0.5rem;">{{ _('View on Commons') }} &rarr;</a>
+            </p>
+            <div class="drawing-area" id="drawingArea">
+                <img id="modalImg" src="" alt="{{ _('Full resolution') }}" draggable="false">
+                <div class="old-bbox" id="oldBbox"></div>
+                <div class="drawing-box" id="drawingBox"></div>
+            </div>
+            <div style="margin-top: 1rem; display: flex; gap: 1rem; justify-content: center;">
+                <button class="btn" onclick="closeBboxModal()">{{ _('Cancel') }}</button>
+                <button class="btn btn-primary" id="saveBboxBtn" onclick="saveNewBbox()" disabled>{{ _('Save') }}</button>
+            </div>
+            <div class="result-loading" id="modalLoading">{{ _('Saving...') }}</div>
+        </div>
+    </div>
+</div>
+
+{% if model_faces %}
+<script>
+    var csrfToken = {{ csrf_token()|tojson }};
+    var apiReclassifyUrl = {{ url_for('api_reclassify')|tojson }};
+    var apiUpdateBboxUrl = {{ url_for('api_update_face_bbox')|tojson }};
+    var i18nReclassify = {
+        verified: {{ _('Verified')|tojson }},
+        rejected: {{ _('Rejected')|tojson }},
+        human: {{ _('human')|tojson }},
+        sdcRemoved: {{ _('SDC claim was removed.')|tojson }},
+        saveError: {{ _('Error saving classification')|tojson }},
+        bboxError: {{ _('Error saving new bounding box')|tojson }}
+    };
+
+    function reclassifyFace(btn, isTarget) {
+        var card = btn.closest('.result-card');
+        var faceId = card.dataset.faceId;
+        var loading = card.querySelector('.result-loading');
+        loading.classList.add('active');
+
+        var formData = new FormData();
+        formData.append('csrf_token', csrfToken);
+        formData.append('face_id', faceId);
+        formData.append('is_target', isTarget);
+
+        fetch(apiReclassifyUrl, {
+            method: 'POST',
+            body: formData
+        }).then(function(r) {
+            if (!r.ok) throw new Error('Network response was not ok');
+            return r.json();
+        }).then(function(data) {
+            loading.classList.remove('active');
+            if (data.status === 'ok') {
+                card.dataset.result = isTarget === 1 ? 'match' : 'non-match';
+                
+                var badge = card.querySelector('.badge');
+                badge.className = 'badge ' + (isTarget === 1 ? 'badge-active' : 'badge-paused');
+                badge.textContent = isTarget === 1 ? i18nReclassify.verified + ' \u2713' : i18nReclassify.rejected;
+                
+                card.querySelector('.result-method').textContent = i18nReclassify.human;
+                
+                if (data.sdc_removed) {
+                    var sdcNote = card.querySelector('.sdc-note');
+                    sdcNote.textContent = i18nReclassify.sdcRemoved;
+                    sdcNote.style.display = 'block';
+                }
+            } else {
+                alert(data.error || i18nReclassify.saveError);
+            }
+        }).catch(function(e) {
+            console.error(e);
+            loading.classList.remove('active');
+            alert(i18nReclassify.saveError);
+        });
+    }
+
+    var currentEditFaceId = null;
+    var isDrawing = false;
+    var drawStartX = 0, drawStartY = 0;
+    var currentBbox = null;
+    var imgScale = 1;
+    var imgOffsetX = 0;
+    var imgOffsetY = 0;
+
+    var VIDEO_EXTENSIONS = ['.webm', '.ogv', '.ogg'];
+    var TIF_EXTENSIONS = ['.tif', '.tiff'];
+
+    // Wikimedia Commons enforces standard thumbnail step sizes ($wgThumbnailSteps).
+    var THUMB_STEPS = [20, 40, 60, 120, 250, 330, 500, 960, 1280, 1920, 3840];
+    function snapThumbWidth(w) {
+        for (var i = 0; i < THUMB_STEPS.length; i++) {
+            if (THUMB_STEPS[i] >= w) return THUMB_STEPS[i];
+        }
+        return THUMB_STEPS[THUMB_STEPS.length - 1];
+    }
+
+    function commonsThumbUrl(fileTitle, width) {
+        width = snapThumbWidth(width);
+        var clean = fileTitle.replace('File:', '').replace(/ /g, '_');
+        // Spark MD5 not available — use the commons-thumb endpoint for non-standard files
+        var ext = '.' + clean.split('.').pop().toLowerCase();
+        if (VIDEO_EXTENSIONS.indexOf(ext) !== -1 || TIF_EXTENSIONS.indexOf(ext) !== -1 || ext === '.svg') {
+            return '/commons-thumb/' + encodeURIComponent(clean) + '?width=' + width;
+        }
+        return 'https://commons.wikimedia.org/wiki/Special:FilePath/' + encodeURIComponent(clean) + '?width=' + width;
+    }
+
+    function openBboxModal(btn) {
+        var card = btn.closest('.result-card');
+        currentEditFaceId = card.dataset.faceId;
+        var thumb = card.querySelector('.result-thumb');
+        var fileTitle = thumb.dataset.fileTitle.replace('File:', '');
+        
+        var modal = document.getElementById('bboxModal');
+        var img = document.getElementById('modalImg');
+        
+        img.src = commonsThumbUrl(fileTitle, 1280);
+        document.getElementById('modalCommonsLink').href = 'https://commons.wikimedia.org/wiki/File:' + encodeURIComponent(fileTitle);
+        
+        currentBbox = null;
+        document.getElementById('drawingBox').style.display = 'none';
+        document.getElementById('saveBboxBtn').disabled = true;
+        document.getElementById('oldBbox').style.display = 'none';
+        
+        img.onload = function() {
+            var containerW = img.parentElement.clientWidth;
+            var containerH = img.parentElement.clientHeight;
+            var natW = img.naturalWidth;
+            var natH = img.naturalHeight;
+            imgScale = Math.min(containerW / natW, containerH / natH);
+            var renderedW = natW * imgScale;
+            var renderedH = natH * imgScale;
+            imgOffsetX = (containerW - renderedW) / 2;
+            imgOffsetY = (containerH - renderedH) / 2;
+            
+            var t = parseInt(thumb.dataset.bboxTop);
+            var r = parseInt(thumb.dataset.bboxRight);
+            var b = parseInt(thumb.dataset.bboxBottom);
+            var l = parseInt(thumb.dataset.bboxLeft);
+            
+            var oldBox = document.getElementById('oldBbox');
+            oldBox.style.left = (imgOffsetX + l * imgScale) + 'px';
+            oldBox.style.top = (imgOffsetY + t * imgScale) + 'px';
+            oldBox.style.width = ((r - l) * imgScale) + 'px';
+            oldBox.style.height = ((b - t) * imgScale) + 'px';
+            oldBox.style.display = 'block';
+        };
+        
+        modal.classList.add('active');
+    }
+
+    function closeBboxModal() {
+        document.getElementById('bboxModal').classList.remove('active');
+        currentEditFaceId = null;
+    }
+
+    document.addEventListener('keydown', function(e) {
+        if (e.key === 'Escape' && document.getElementById('bboxModal').classList.contains('active')) {
+            closeBboxModal();
+        }
+    });
+
+    var drawingArea = document.getElementById('drawingArea');
+    var drawingBox = document.getElementById('drawingBox');
+
+    drawingArea.addEventListener('mousedown', function(e) {
+        if (e.button !== 0) return;
+        var rect = drawingArea.getBoundingClientRect();
+        var clickX = e.clientX - rect.left;
+        var clickY = e.clientY - rect.top;
+        
+        var img = document.getElementById('modalImg');
+        var renderedW = img.naturalWidth * imgScale;
+        var renderedH = img.naturalHeight * imgScale;
+        
+        if (clickX < imgOffsetX || clickX > imgOffsetX + renderedW ||
+            clickY < imgOffsetY || clickY > imgOffsetY + renderedH) {
+            return;
+        }
+        
+        isDrawing = true;
+        drawStartX = clickX;
+        drawStartY = clickY;
+        
+        drawingBox.style.left = drawStartX + 'px';
+        drawingBox.style.top = drawStartY + 'px';
+        drawingBox.style.width = '0px';
+        drawingBox.style.height = '0px';
+        drawingBox.style.display = 'block';
+        document.getElementById('oldBbox').style.display = 'none';
+    });
+
+    document.addEventListener('mousemove', function(e) {
+        if (!isDrawing) return;
+        var rect = drawingArea.getBoundingClientRect();
+        var currentX = e.clientX - rect.left;
+        var currentY = e.clientY - rect.top;
+        
+        var img = document.getElementById('modalImg');
+        var renderedW = img.naturalWidth * imgScale;
+        var renderedH = img.naturalHeight * imgScale;
+        
+        currentX = Math.max(imgOffsetX, Math.min(currentX, imgOffsetX + renderedW));
+        currentY = Math.max(imgOffsetY, Math.min(currentY, imgOffsetY + renderedH));
+        
+        var x = Math.min(drawStartX, currentX);
+        var y = Math.min(drawStartY, currentY);
+        var w = Math.abs(currentX - drawStartX);
+        var h = Math.abs(currentY - drawStartY);
+        
+        drawingBox.style.left = x + 'px';
+        drawingBox.style.top = y + 'px';
+        drawingBox.style.width = w + 'px';
+        drawingBox.style.height = h + 'px';
+    });
+
+    document.addEventListener('mouseup', function(e) {
+        if (!isDrawing) return;
+        isDrawing = false;
+        
+        var w = parseFloat(drawingBox.style.width);
+        var h = parseFloat(drawingBox.style.height);
+        
+        if (w > 10 && h > 10) {
+            var boxLeft = parseFloat(drawingBox.style.left);
+            var boxTop = parseFloat(drawingBox.style.top);
+            
+            currentBbox = {
+                top: Math.round((boxTop - imgOffsetY) / imgScale),
+                right: Math.round((boxLeft + w - imgOffsetX) / imgScale),
+                bottom: Math.round((boxTop + h - imgOffsetY) / imgScale),
+                left: Math.round((boxLeft - imgOffsetX) / imgScale)
+            };
+            document.getElementById('saveBboxBtn').disabled = false;
+        } else {
+            drawingBox.style.display = 'none';
+            document.getElementById('oldBbox').style.display = 'block';
+            currentBbox = null;
+            document.getElementById('saveBboxBtn').disabled = true;
+        }
+    });
+
+    function saveNewBbox() {
+        if (!currentEditFaceId || !currentBbox) return;
+        
+        var loading = document.getElementById('modalLoading');
+        loading.classList.add('active');
+        
+        var formData = new FormData();
+        formData.append('csrf_token', csrfToken);
+        formData.append('face_id', currentEditFaceId);
+        formData.append('bbox_top', currentBbox.top);
+        formData.append('bbox_right', currentBbox.right);
+        formData.append('bbox_bottom', currentBbox.bottom);
+        formData.append('bbox_left', currentBbox.left);
+        
+        fetch(apiUpdateBboxUrl, {
+            method: 'POST',
+            body: formData
+        }).then(function(r) {
+            if (!r.ok) throw new Error('Network response was not ok');
+            return r.json();
+        }).then(function(data) {
+            if (data.status === 'ok') {
+                window.location.reload();
+            } else {
+                alert(data.error || i18nReclassify.bboxError);
+                loading.classList.remove('active');
+            }
+        }).catch(function(e) {
+            console.error(e);
+            loading.classList.remove('active');
+            alert(i18nReclassify.bboxError);
+        });
+    }
+
+    var activeResultFilter = 'all';
+    var activeSourceFilter = 'all';
+    var currentPage = 1;
+    var perPage = 27;
+    var i18nPagination = {
+        prev: {{ _('Prev')|tojson }},
+        next: {{ _('Next')|tojson }},
+        pageOf: {{ _('Page {current} of {total}')|tojson }}
+    };
+
+    function getFilteredCards() {
+        var cards = Array.prototype.slice.call(document.querySelectorAll('.result-card'));
+        return cards.filter(function(card) {
+            var matchResult = (activeResultFilter === 'all' || card.dataset.result === activeResultFilter);
+            var matchSource = (activeSourceFilter === 'all' || card.dataset.source === activeSourceFilter);
+            return matchResult && matchSource;
+        });
+    }
+
+    function applyPagination() {
+        var allCards = Array.prototype.slice.call(document.querySelectorAll('.result-card'));
+        var filtered = getFilteredCards();
+        var totalPages = Math.max(1, Math.ceil(filtered.length / perPage));
+        if (currentPage > totalPages) currentPage = totalPages;
+
+        var start = (currentPage - 1) * perPage;
+        var end = start + perPage;
+        var visible = filtered.slice(start, end);
+
+        allCards.forEach(function(card) {
+            card.classList.add('hidden');
+        });
+        visible.forEach(function(card) {
+            card.classList.remove('hidden');
+        });
+
+        renderPagination(totalPages, filtered.length);
+    }
+
+    function renderPagination(totalPages, totalItems) {
+        var nav = document.getElementById('resultsPagination');
+        if (totalPages <= 1) {
+            nav.innerHTML = '';
+            return;
+        }
+
+        var html = '';
+        html += '<button type="button"' + (currentPage <= 1 ? ' disabled' : '') + ' onclick="goToPage(' + (currentPage - 1) + ')">' + i18nPagination.prev + '</button>';
+
+        var startPage = Math.max(1, currentPage - 2);
+        var endPage = Math.min(totalPages, currentPage + 2);
+
+        if (startPage > 1) {
+            html += '<button type="button" onclick="goToPage(1)">1</button>';
+            if (startPage > 2) html += '<span class="ellipsis">&hellip;</span>';
+        }
+
+        for (var p = startPage; p <= endPage; p++) {
+            if (p === currentPage) {
+                html += '<span class="active">' + p + '</span>';
+            } else {
+                html += '<button type="button" onclick="goToPage(' + p + ')">' + p + '</button>';
+            }
+        }
+
+        if (endPage < totalPages) {
+            if (endPage < totalPages - 1) html += '<span class="ellipsis">&hellip;</span>';
+            html += '<button type="button" onclick="goToPage(' + totalPages + ')">' + totalPages + '</button>';
+        }
+
+        html += '<button type="button"' + (currentPage >= totalPages ? ' disabled' : '') + ' onclick="goToPage(' + (currentPage + 1) + ')">' + i18nPagination.next + '</button>';
+
+        nav.innerHTML = html;
+    }
+
+    function goToPage(page) {
+        var filtered = getFilteredCards();
+        var totalPages = Math.max(1, Math.ceil(filtered.length / perPage));
+        if (page < 1 || page > totalPages) return;
+        currentPage = page;
+        applyPagination();
+        document.getElementById('resultsGallery').scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+
+    function filterResults(filter, type) {
+        if (type === 'result') {
+            activeResultFilter = filter;
+        } else {
+            // Clicking same source filter again toggles it off
+            activeSourceFilter = (activeSourceFilter === filter) ? 'all' : filter;
+        }
+
+        // Update button states
+        document.querySelectorAll('.results-filter[data-filter-type="result"]').forEach(function(btn) {
+            btn.classList.toggle('active', btn.dataset.filter === activeResultFilter);
+        });
+        document.querySelectorAll('.results-filter[data-filter-type="source"]').forEach(function(btn) {
+            btn.classList.toggle('active', btn.dataset.filter === activeSourceFilter);
+        });
+
+        // Reset to page 1 when filter changes
+        currentPage = 1;
+        applyPagination();
+    }
+
+    // Initial pagination on load
+    applyPagination();
+</script>
+{% endif %}
+
+<script>
+    var sdcCsrfToken = {{ csrf_token()|tojson }};
+    var apiWriteSdcUrl = {{ url_for('api_write_sdc', project_id=project.id)|tojson }};
+    var apiSdcStatusUrl = {{ url_for('api_sdc_status', project_id=project.id)|tojson }};
+    var i18nSdc = {
+        queued: {{ _('Queued — waiting for background worker...')|tojson }},
+        writing: {{ _('Worker is writing claims...')|tojson }},
+        written: {{ _('{written} of {total} written...')|tojson }},
+        done: {{ _('Done!')|tojson }},
+        allSent: {{ _('All {num} claims written successfully!')|tojson }},
+        noFaces: {{ _('No pending faces to write. All approved faces have already been sent.')|tojson }},
+        sendError: {{ _('Failed to queue edits. Please try again.')|tojson }},
+        workerError: {{ _('Worker error: {error}')|tojson }},
+        btnLabel: {{ _('Send Edits to Wikimedia Commons')|tojson }},
+        btnInProgress: {{ _('Writing in progress...')|tojson }}
+    };
+
+    var sdcInitialPending = {{ (stats.sdc_pending or 0)|tojson }};
+    var sdcPollTimer = null;
+    var sdcInitialWritten = {{ (stats.sdc_written or 0)|tojson }};
+
+    // Helper: safely set message text without innerHTML
+    function sdcShowMessage(container, text, color) {
+        container.innerHTML = '';
+        var p = document.createElement('p');
+        p.style.color = color;
+        p.style.fontWeight = '700';
+        p.textContent = text;
+        container.appendChild(p);
+    }
+
+    function startSdcWrite() {
+        var btn = document.getElementById('sdcWriteBtn');
+        var progress = document.getElementById('sdcProgress');
+        var progressBar = document.getElementById('sdcProgressBar');
+        var progressText = document.getElementById('sdcProgressText');
+        var result = document.getElementById('sdcResult');
+        var status = document.getElementById('sdcStatus');
+
+        btn.disabled = true;
+        btn.textContent = i18nSdc.btnInProgress;
+        result.style.display = 'none';
+
+        var formData = new FormData();
+        formData.append('csrf_token', sdcCsrfToken);
+
+        fetch(apiWriteSdcUrl, {
+            method: 'POST',
+            body: formData
+        }).then(function(r) {
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            return r.json();
+        }).then(function(data) {
+            if (data.error) {
+                result.style.display = 'block';
+                sdcShowMessage(result, data.error, 'var(--danger)');
+                btn.disabled = false;
+                btn.textContent = i18nSdc.btnLabel;
+                return;
+            }
+
+            if (data.pending === 0) {
+                // Nothing to write
+                status.style.display = 'block';
+                sdcShowMessage(status, i18nSdc.noFaces, 'var(--text-muted)');
+                btn.disabled = true;
+                return;
+            }
+
+            // Flag set — show queued state and start polling
+            sdcInitialPending = data.pending;
+            progress.style.display = 'block';
+            progressBar.style.width = '0%';
+            progressText.textContent = i18nSdc.queued;
+            status.style.display = 'none';
+            startSdcPolling();
+        }).catch(function(e) {
+            console.error(e);
+            result.style.display = 'block';
+            sdcShowMessage(result, i18nSdc.sendError, 'var(--danger)');
+            btn.disabled = false;
+            btn.textContent = i18nSdc.btnLabel;
+        });
+    }
+
+    function startSdcPolling() {
+        if (sdcPollTimer) return;  // Already polling
+        sdcPollTimer = setInterval(pollSdcStatus, 5000);
+        // First poll immediately
+        pollSdcStatus();
+    }
+
+    function stopSdcPolling() {
+        if (sdcPollTimer) {
+            clearInterval(sdcPollTimer);
+            sdcPollTimer = null;
+        }
+    }
+
+    function pollSdcStatus() {
+        var btn = document.getElementById('sdcWriteBtn');
+        var progress = document.getElementById('sdcProgress');
+        var progressBar = document.getElementById('sdcProgressBar');
+        var progressText = document.getElementById('sdcProgressText');
+        var result = document.getElementById('sdcResult');
+        var status = document.getElementById('sdcStatus');
+
+        fetch(apiSdcStatusUrl).then(function(r) {
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            return r.json();
+        }).then(function(data) {
+            if (data.error && !data.in_progress) {
+                // API-level error (not worker error)
+                stopSdcPolling();
+                progress.style.display = 'none';
+                result.style.display = 'block';
+                sdcShowMessage(result, data.error, 'var(--danger)');
+                btn.disabled = false;
+                btn.textContent = i18nSdc.btnLabel;
+                return;
+            }
+
+            var written = data.written || 0;
+            var pending = data.pending || 0;
+            var total = written + pending;
+            // Use the larger of initial pending or current total for progress calculation
+            var progressTotal = Math.max(sdcInitialPending, total) || 1;
+            var newlyWritten = written - sdcInitialWritten;
+            if (newlyWritten < 0) newlyWritten = 0;
+            var pct = Math.min(100, Math.round(newlyWritten / (sdcInitialPending || 1) * 100));
+
+            if (data.in_progress) {
+                // Worker is actively writing
+                progress.style.display = 'block';
+                progressBar.style.width = pct + '%';
+                if (newlyWritten > 0) {
+                    progressText.textContent = i18nSdc.written
+                        .replace('{written}', newlyWritten)
+                        .replace('{total}', sdcInitialPending);
+                } else {
+                    progressText.textContent = i18nSdc.writing;
+                }
+                btn.disabled = true;
+                btn.textContent = i18nSdc.btnInProgress;
+            } else {
+                // Worker finished (flag cleared)
+                stopSdcPolling();
+                progress.style.display = 'block';
+                progressBar.style.width = '100%';
+                progressText.textContent = i18nSdc.done;
+
+                if (data.error) {
+                    // Worker encountered an error
+                    result.style.display = 'block';
+                    sdcShowMessage(result, i18nSdc.workerError.replace('{error}', data.error), 'var(--danger)');
+                    btn.disabled = false;
+                    btn.textContent = i18nSdc.btnLabel;
+                } else if (pending === 0) {
+                    // All done successfully
+                    result.style.display = 'block';
+                    sdcShowMessage(result, i18nSdc.allSent.replace('{num}', newlyWritten || written), 'var(--success)');
+                    status.style.display = 'block';
+                    sdcShowMessage(status, i18nSdc.noFaces, 'var(--text-muted)');
+                    btn.disabled = true;
+                    btn.textContent = i18nSdc.btnLabel;
+                } else {
+                    // Finished but some faces still pending (partial success)
+                    result.style.display = 'block';
+                    sdcShowMessage(result, i18nSdc.allSent.replace('{num}', newlyWritten), 'var(--success)');
+                    btn.disabled = false;
+                    btn.textContent = i18nSdc.btnLabel;
+                    sdcInitialPending = pending;
+                    sdcInitialWritten = written;
+                }
+
+                // Update SDC Written stat box on the page
+                var sdcStatEl = document.querySelector('.stat-box[data-stat="sdc_written"] .stat-value');
+                if (sdcStatEl) {
+                    sdcStatEl.textContent = written;
+                }
+            }
+        }).catch(function(e) {
+            // Network error during poll — don't stop polling, just log
+            console.error('SDC status poll error:', e);
+        });
+    }
+
+    // On page load: if SDC write is already in progress, start polling
+    {% if project.sdc_write_requested %}
+    (function() {
+        var btn = document.getElementById('sdcWriteBtn');
+        var progress = document.getElementById('sdcProgress');
+        var progressText = document.getElementById('sdcProgressText');
+        btn.disabled = true;
+        btn.textContent = i18nSdc.btnInProgress;
+        progress.style.display = 'block';
+        progressText.textContent = i18nSdc.writing;
+        startSdcPolling();
+    })();
+    {% endif %}
+</script>
 {% endblock %}

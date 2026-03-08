@@ -1,11 +1,11 @@
 {% extends "base.html" %}
 
-{% block title %}Settings - {{ project.label or project.wikidata_qid }}{% endblock %}
+{% block title %}{{ _('Settings') }} - {{ project.label or project.wikidata_qid }} - WikiVisage BETA{% endblock %}
 
 {% block content %}
 <div class="header-actions">
-    <h1>Project Settings</h1>
-    <a href="{{ url_for('project_detail', project_id=project.id) }}" class="btn">Back to Project</a>
+    <h1>{{ _('Project Settings') }}</h1>
+    <a href="{{ url_for('project_detail', project_id=project.id) }}" class="btn">{{ _('Back to Project') }}</a>
 </div>
 
 <div class="card" style="max-width: 600px; margin: 0 auto;">
@@ -13,46 +13,67 @@
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
 
         <div class="form-group">
-            <label>Wikidata Q-ID</label>
+            <label>{{ _('Wikidata Q-ID') }}</label>
             <input type="text" value="{{ project.wikidata_qid }}" readonly>
-            <div class="help-text">Target identity cannot be changed after creation</div>
+            <div class="help-text">{{ _('Target identity cannot be changed after creation') }}</div>
         </div>
 
         <div class="form-group">
-            <label>Commons Category</label>
+            <label>{{ _('Commons Category') }}</label>
             <input type="text" value="{{ project.commons_category }}" readonly>
-            <div class="help-text">Category scope cannot be changed after creation</div>
+            <div class="help-text">{{ _('Category scope cannot be changed after creation') }}</div>
         </div>
 
         <div class="form-group">
-            <label for="label">Project Label</label>
+            <label for="label">{{ _('Project Label') }}</label>
             <input type="text" id="label" name="label" value="{{ project.label or '' }}" placeholder="e.g. Douglas Adams">
         </div>
 
         <div class="form-group">
-            <label for="status">Project Status</label>
+            <label for="status">{{ _('Project Status') }}</label>
             <select id="status" name="status">
-                <option value="active" {% if project.status == 'active' %}selected{% endif %}>Active - Processing & Tagging</option>
-                <option value="paused" {% if project.status == 'paused' %}selected{% endif %}>Paused - No Tagging</option>
-                <option value="completed" {% if project.status == 'completed' %}selected{% endif %}>Completed</option>
+                <option value="active" {% if project.status == 'active' %}selected{% endif %}>{{ _('Active - Processing & Tagging') }}</option>
+                <option value="paused" {% if project.status == 'paused' %}selected{% endif %}>{{ _('Paused - No Tagging') }}</option>
+                <option value="completed" {% if project.status == 'completed' %}selected{% endif %}>{{ _('Completed') }}</option>
             </select>
         </div>
 
         <div class="grid-2">
             <div class="form-group">
-                <label for="distance_threshold">Distance Threshold</label>
+                <label for="distance_threshold">{{ _('Distance Threshold') }}</label>
                 <input type="number" id="distance_threshold" name="distance_threshold" value="{{ project.distance_threshold }}" step="0.05" min="0.1" max="1.0" required>
             </div>
 
             <div class="form-group">
-                <label for="min_confirmed">Min Confirmed Faces</label>
+                <label for="min_confirmed">{{ _('Min Confirmed Faces') }}</label>
                 <input type="number" id="min_confirmed" name="min_confirmed" value="{{ project.min_confirmed }}" min="1" required>
             </div>
         </div>
 
         <div style="margin-top: 2rem;">
-            <button type="submit" class="btn btn-primary" style="width: 100%;">Save Settings</button>
+            <button type="submit" class="btn btn-primary" style="width: 100%;">{{ _('Save Settings') }}</button>
         </div>
+
     </form>
 </div>
+
+<div class="card" style="max-width: 600px; margin: 3rem auto 0; border-color: var(--danger); background: rgba(239, 68, 68, 0.05);">
+    <h3 style="color: var(--danger);">{{ _('Danger Zone') }}</h3>
+    <p style="color: var(--text-muted); margin-bottom: 1.5rem;">{{ _('Deleting this project will remove all face bounding boxes and classification data. Images on Commons will remain untouched.') }}</p>
+    <form method="POST" action="{{ url_for('project_delete', project_id=project.id) }}" onsubmit="return confirmDelete(event);">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <button type="submit" class="btn btn-danger" style="width: 100%;">{{ _('Delete Project') }}</button>
+    </form>
+</div>
+
+<script>
+var DELETE_CONFIRM_MSG = {{ _('Are you absolutely sure you want to delete this project? This cannot be undone.')|tojson }};
+function confirmDelete(e) {
+    if (!confirm(DELETE_CONFIRM_MSG)) {
+        e.preventDefault();
+        return false;
+    }
+    return true;
+}
+</script>
 {% endblock %}

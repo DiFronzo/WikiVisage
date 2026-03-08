@@ -9,7 +9,7 @@ Active-learning web app for Wikimedia Commons. Users train an ML model via simpl
 3. **Bootstrap** — if the entity already has depicts claims on Commons, the worker uses SPARQL to find them and seed the model automatically
 4. **Classify** — you review detected faces one by one with simple Yes/No buttons (keyboard shortcuts: Y/N)
 5. **Autonomous inference** — after enough confirmed faces (default 5), the model classifies remaining faces automatically using centroid distance
-6. **Write to Commons** — confirmed matches get a P180 depicts claim written to the file's Structured Data via the Wikibase API
+6. **Write to Commons** — click "Send Edits to Wikimedia Commons" to write P180 depicts claims for all approved matches via the Wikibase API
 
 ## Architecture
 
@@ -46,19 +46,23 @@ WikiVisage/
 ├── Procfile             # Process types: web (gunicorn) + worker
 ├── requirements.txt     # Python dependencies
 ├── database.py          # MariaDB connection pool with retry logic
-├── schema.sql           # DDL for 5 tables: users, sessions, projects, images, faces
+├── schema.sql           # DDL for 6 tables: users, sessions, projects, images, faces, worker_heartbeat
 ├── migrate.py           # Schema migration script
 ├── app.py               # Flask app: OAuth 2.0, routes, classification API
-├── worker.py            # Background ML pipeline
-└── templates/
-    ├── base.html            # Base layout with embedded CSS
-    ├── index.html           # Landing page
-    ├── dashboard.html       # Project list
-    ├── project_new.html     # Create project form
-    ├── project_detail.html  # Project stats and progress
-    ├── project_settings.html# Edit project settings
-    ├── classify.html        # Active learning face classification UI
-    └── error.html           # Error page
+├── worker.py            # Background ML pipeline: crawl, detect, infer
+├── whitelist.txt        # Allowed usernames (one per line)
+├── templates/           # Jinja2 templates (9 files)
+│   ├── base.html            # Base layout with embedded CSS
+│   ├── index.html           # Landing page
+│   ├── dashboard.html       # Project list
+│   ├── project_new.html     # Create project form
+│   ├── project_detail.html  # Project stats, model results gallery, SDC write button
+│   ├── project_settings.html# Edit project settings
+│   ├── classify.html        # Active learning face classification UI
+│   ├── leaderboard.html     # Top classifiers
+│   └── error.html           # Error page
+├── static/              # Logo SVGs
+└── translations/        # i18n: en, nb, es, fr
 ```
 
 ## Setup
@@ -66,7 +70,7 @@ WikiVisage/
 ### Prerequisites
 
 - A [Toolforge](https://toolsadmin.wikimedia.org/) tool account
-- An [OAuth 2.0 consumer](https://meta.wikimedia.org/wiki/Special:OAuthConsumerRegistration/propose) registered on Meta with grants: `editpage`, `createeditmovepage`, `basic` and callback URL `https://<toolname>.toolforge.org/oauth/callback`
+- An [OAuth 2.0 consumer](https://meta.wikimedia.org/wiki/Special:OAuthConsumerRegistration/propose) registered on Meta with grants: `Basic rights`, `Edit existing pages` and callback URL `https://<toolname>.toolforge.org/auth/callback`
 
 ### 1. Environment Variables
 
@@ -79,7 +83,7 @@ toolforge envvars create WIKIVISAGE_DB_NAME     --value "s<NNNNN>__wikiface"
 # OAuth 2.0
 toolforge envvars create OAUTH_CLIENT_ID        --value "<client-id>"
 toolforge envvars create OAUTH_CLIENT_SECRET    --value "<client-secret>"
-toolforge envvars create OAUTH_REDIRECT_URI     --value "https://<toolname>.toolforge.org/oauth/callback"
+toolforge envvars create OAUTH_REDIRECT_URI     --value "https://<toolname>.toolforge.org/auth/callback"
 
 # Flask
 toolforge envvars create FLASK_SECRET_KEY       --value "$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
@@ -105,17 +109,13 @@ python3 migrate.py
 
 ```bash
 # Build container image
-toolforge build start https://github.com/<you>/WikiVisage.git
+toolforge build start https://github.com/DiFronzo/WikiVisage.git
 
 # Start web service
 toolforge webservice buildservice start
 
-# Start background worker
-toolforge jobs run ml-worker \
-  --command "python -u worker.py" \
-  --image tool-<toolname>/tool-<toolname>:latest \
-  --continuous \
-  --mem 2Gi
+# Start background worker (uses jobs.yaml)
+toolforge jobs load jobs.yaml
 ```
 
 The app will be live at `https://<toolname>.toolforge.org`.

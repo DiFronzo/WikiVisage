@@ -32,3 +32,9 @@ Flask-Session==0.8.0
 
 # Rate limiting
 Flask-Limiter==3.8.0
+
+# Internationalization
+Flask-Babel==4.0.0
+
+# Environment variables from .env files
+python-dotenv==1.1.0
