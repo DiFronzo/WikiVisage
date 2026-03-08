@@ -24,7 +24,6 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-import face_recognition
 import requests
 from flask import (
     Flask,
@@ -1518,6 +1517,8 @@ def api_manual_face():
     try:
         image_bytes = _download_image(url)
 
+        import face_recognition  # lazy: dlib is ~130 MB; avoid loading at startup
+
         image_data = face_recognition.load_image_file(io.BytesIO(image_bytes))
 
         face_location = [(bbox_top, bbox_right, bbox_bottom, bbox_left)]
@@ -1889,6 +1890,8 @@ def api_update_face_bbox():
 
     try:
         image_bytes = _download_image(url)
+
+        import face_recognition  # lazy: dlib is ~130 MB; avoid loading at startup
 
         image_data = face_recognition.load_image_file(io.BytesIO(image_bytes))
         face_location = [(bbox_top, bbox_right, bbox_bottom, bbox_left)]
