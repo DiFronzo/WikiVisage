@@ -65,6 +65,14 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", secrets.token_hex(32))
 
+# Trust reverse-proxy headers (Toolforge nginx → gunicorn).
+# x_for=1, x_proto=1, x_host=1 so Flask sees the real client IP,
+# HTTPS scheme, and correct Host — required for secure cookies and
+# OAuth redirect URLs.
+from werkzeug.middleware.proxy_fix import ProxyFix
+
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
+
 # OAuth 2.0 configuration (Wikimedia Meta)
 OAUTH_CLIENT_ID = os.environ.get("OAUTH_CLIENT_ID", "")
 OAUTH_CLIENT_SECRET = os.environ.get("OAUTH_CLIENT_SECRET", "")
