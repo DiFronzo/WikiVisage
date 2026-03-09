@@ -163,6 +163,21 @@ _ALTER_MIGRATIONS = [
         "ALTER TABLE projects ADD COLUMN sdc_write_error VARCHAR(1024) NULL "
         "COMMENT 'Error message from last SDC write attempt' AFTER sdc_write_requested",
     ),
+    (
+        "Add bootstrapped flag to images",
+        "ALTER TABLE images ADD COLUMN bootstrapped TINYINT(1) NOT NULL DEFAULT 0 "
+        "COMMENT '1=image found via P180 bootstrap' AFTER face_count",
+    ),
+    (
+        "Add detection_width to images",
+        "ALTER TABLE images ADD COLUMN detection_width SMALLINT UNSIGNED NULL "
+        "COMMENT 'Image width in pixels at which face detection was run' AFTER face_count",
+    ),
+    (
+        "Add detection_height to images",
+        "ALTER TABLE images ADD COLUMN detection_height SMALLINT UNSIGNED NULL "
+        "COMMENT 'Image height in pixels at which face detection was run' AFTER detection_width",
+    ),
 ]
 
 

@@ -6,13 +6,14 @@ Provides OAuth 2.0 authentication, project management, and an active
 learning interface for classifying detected faces.
 """
 
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.2.0"
 
 import hashlib
 import io
 import json
 import logging
 import os
+import random
 import secrets
 import time
 from datetime import datetime, timedelta, timezone
@@ -843,6 +844,162 @@ def dashboard():
     )
 
 
+@app.route("/api/category-info")
+@login_required
+@limiter.limit("5 per minute")
+def api_category_info():
+    """Return total file count for a Commons category (including subcategories).
+
+    Does a BFS traversal of subcategories, batch-fetching categoryinfo to sum
+    file counts. Bounded to MAX_CATS categories and a wall-clock timeout to
+    stay responsive.
+    """
+    category = request.args.get("category", "").strip()
+    if not category:
+        return jsonify({"error": "missing category"}), 400
+
+    if len(category) > 200 or any(c in category for c in "|\n\r\x00"):
+        return jsonify({"error": "invalid category name"}), 400
+
+    MAX_CATS = 50
+    TIMEOUT = 8
+
+    deadline = time.monotonic() + TIMEOUT
+
+    root_title = f"Category:{category}"
+
+    try:
+        # 1. Check root category exists
+        resp = requests.get(
+            COMMONS_API_URL,
+            params={
+                "action": "query",
+                "titles": root_title,
+                "prop": "categoryinfo",
+                "format": "json",
+            },
+            headers={"User-Agent": USER_AGENT},
+            timeout=3,
+        )
+        resp.raise_for_status()
+        pages = resp.json().get("query", {}).get("pages", {})
+        if "-1" in pages:
+            return jsonify({"error": "not_found"}), 404
+
+        page = next(iter(pages.values()))
+        root_info = page.get("categoryinfo", {})
+        total_files = root_info.get("files", 0)
+        total_subcats = root_info.get("subcats", 0)
+
+        # 2. BFS subcategory traversal to sum file counts
+        cat_queue = []
+        visited = {root_title}
+        approximate = False
+
+        # Seed queue with subcategories of root
+        if total_subcats > 0:
+            sub_resp = requests.get(
+                COMMONS_API_URL,
+                params={
+                    "action": "query",
+                    "list": "categorymembers",
+                    "cmtitle": root_title,
+                    "cmtype": "subcat",
+                    "cmlimit": "500",
+                    "format": "json",
+                },
+                headers={"User-Agent": USER_AGENT},
+                timeout=3,
+            )
+            sub_resp.raise_for_status()
+            sub_data = sub_resp.json()
+            for m in sub_data.get("query", {}).get("categorymembers", []):
+                if m["title"] not in visited:
+                    cat_queue.append(m["title"])
+            if "continue" in sub_data:
+                approximate = True
+
+        while cat_queue and len(visited) < MAX_CATS and time.monotonic() < deadline:
+            # Batch up to 50 titles for categoryinfo
+            batch = []
+            while (
+                cat_queue and len(batch) < 50 and len(visited) + len(batch) < MAX_CATS
+            ):
+                title = cat_queue.pop(0)
+                if title not in visited:
+                    batch.append(title)
+
+            if not batch:
+                break
+
+            for title in batch:
+                visited.add(title)
+
+            info_resp = requests.get(
+                COMMONS_API_URL,
+                params={
+                    "action": "query",
+                    "titles": "|".join(batch),
+                    "prop": "categoryinfo",
+                    "format": "json",
+                },
+                headers={"User-Agent": USER_AGENT},
+                timeout=3,
+            )
+            info_resp.raise_for_status()
+            info_pages = info_resp.json().get("query", {}).get("pages", {})
+
+            subcats_to_fetch = []
+            for p in info_pages.values():
+                ci = p.get("categoryinfo", {})
+                total_files += ci.get("files", 0)
+                total_subcats += ci.get("subcats", 0)
+                if ci.get("subcats", 0) > 0:
+                    subcats_to_fetch.append(p["title"])
+
+            for sub_title in subcats_to_fetch:
+                if time.monotonic() >= deadline or len(visited) >= MAX_CATS:
+                    break
+                sub_resp = requests.get(
+                    COMMONS_API_URL,
+                    params={
+                        "action": "query",
+                        "list": "categorymembers",
+                        "cmtitle": sub_title,
+                        "cmtype": "subcat",
+                        "cmlimit": "500",
+                        "format": "json",
+                    },
+                    headers={"User-Agent": USER_AGENT},
+                    timeout=3,
+                )
+                sub_resp.raise_for_status()
+                sub_data = sub_resp.json()
+                for m in sub_data.get("query", {}).get("categorymembers", []):
+                    if m["title"] not in visited:
+                        cat_queue.append(m["title"])
+                if "continue" in sub_data:
+                    approximate = True
+
+        approximate = (
+            approximate
+            or len(visited) >= MAX_CATS
+            or (cat_queue and time.monotonic() >= deadline)
+        )
+
+        return jsonify(
+            {
+                "files": total_files,
+                "subcats": total_subcats,
+                "categories_visited": len(visited),
+                "approximate": approximate,
+            }
+        )
+    except Exception:
+        logger.debug(f"Failed to fetch category info: {category}", exc_info=True)
+        return jsonify({"error": "api_error"}), 502
+
+
 @app.route("/project/new", methods=["GET", "POST"])
 @login_required
 @limiter.limit("20 per hour")
@@ -1024,9 +1181,9 @@ def project_detail(project_id: int):
             "  SUM(CASE WHEN f.is_target IS NULL THEN 1 ELSE 0 END) AS unclassified, "
             "  SUM(CASE WHEN f.sdc_written = 1 THEN 1 ELSE 0 END) AS sdc_written, "
             "  SUM(CASE WHEN f.is_target = 1 AND f.sdc_written = 0 AND f.classified_by != 'bootstrap' THEN 1 ELSE 0 END) AS sdc_pending, "
-            "  SUM(CASE WHEN f.classified_by = 'human' THEN 1 ELSE 0 END) AS by_human, "
-            "  SUM(CASE WHEN f.classified_by = 'model' THEN 1 ELSE 0 END) AS by_model, "
-            "  SUM(CASE WHEN f.classified_by = 'bootstrap' THEN 1 ELSE 0 END) AS by_bootstrap "
+            "  SUM(CASE WHEN f.classified_by_user_id IS NOT NULL THEN 1 ELSE 0 END) AS by_human, "
+            "  SUM(CASE WHEN f.classified_by = 'model' AND f.classified_by_user_id IS NULL THEN 1 ELSE 0 END) AS by_model, "
+            "  SUM(CASE WHEN f.classified_by = 'bootstrap' AND f.classified_by_user_id IS NULL THEN 1 ELSE 0 END) AS by_bootstrap "
             "FROM faces f "
             "JOIN images i ON f.image_id = i.id "
             "WHERE i.project_id = %s",
@@ -1044,11 +1201,14 @@ def project_detail(project_id: int):
         rows = execute_query(
             "SELECT f.id, f.image_id, f.is_target, f.confidence, f.classified_by, "
             "  f.bbox_top, f.bbox_right, f.bbox_bottom, f.bbox_left, "
-            "  f.sdc_written, "
-            "  i.file_title, i.commons_page_id "
+            "  f.sdc_written, f.classified_by_user_id, "
+            "  i.file_title, i.commons_page_id, "
+            "  i.detection_width, i.detection_height "
             "FROM faces f "
             "JOIN images i ON f.image_id = i.id "
-            "WHERE i.project_id = %s AND f.classified_by IN ('model', 'bootstrap') "
+            "WHERE i.project_id = %s "
+            "  AND (f.classified_by IN ('model', 'bootstrap') "
+            "       OR (f.is_target = 0 AND f.classified_by = 'human' AND f.classified_by_user_id IS NOT NULL)) "
             "  AND LOWER(i.file_title) NOT REGEXP '\\\\.(webm|ogv|ogg|mp3|wav|flac|opus|mid|oga)$' "
             "ORDER BY f.is_target DESC, f.confidence ASC "
             "LIMIT 200",
@@ -1059,11 +1219,24 @@ def project_detail(project_id: int):
     except DatabaseError:
         logger.exception("Failed to load model faces")
 
+    pending_images = 0
+    if project.get("status") == "active":
+        try:
+            pending_row = execute_query(
+                "SELECT COUNT(*) AS cnt FROM images "
+                "WHERE project_id = %s AND status = 'pending'",
+                (project_id,),
+            )
+            pending_images = pending_row[0]["cnt"] if pending_row else 0
+        except DatabaseError:
+            pass
+
     return render_template(
         "project_detail.html",
         project=project,
         stats=face_stats,
         model_faces=model_faces,
+        pending_images=pending_images,
     )
 
 
@@ -1112,7 +1285,8 @@ def classify(project_id: int):
         if forced_image_id:
             # Force-load a specific image (used after undo to return to the undone image)
             image_row = execute_query(
-                "SELECT DISTINCT i.id AS image_id, i.file_title, i.commons_page_id "
+                "SELECT DISTINCT i.id AS image_id, i.file_title, i.commons_page_id, "
+                "i.detection_width, i.detection_height "
                 "FROM images i "
                 "JOIN faces f ON f.image_id = i.id "
                 "WHERE i.project_id = %s AND i.id = %s "
@@ -1132,24 +1306,28 @@ def classify(project_id: int):
         elif skipped_ids:
             placeholders = ",".join(["%s"] * len(skipped_ids))
             image_row = execute_query(
-                "SELECT DISTINCT i.id AS image_id, i.file_title, i.commons_page_id "
+                "SELECT DISTINCT i.id AS image_id, i.file_title, i.commons_page_id, "
+                "i.detection_width, i.detection_height "
                 "FROM images i "
                 "JOIN faces f ON f.image_id = i.id "
                 f"WHERE i.project_id = %s AND f.is_target IS NULL AND i.id NOT IN ({placeholders}) "
-                "ORDER BY i.id ASC "
-                "LIMIT 1",
+                "LIMIT 200",
                 (project_id, *skipped_ids),
             )
+            if image_row:
+                image_row = [random.choice(image_row)]
         else:
             image_row = execute_query(
-                "SELECT DISTINCT i.id AS image_id, i.file_title, i.commons_page_id "
+                "SELECT DISTINCT i.id AS image_id, i.file_title, i.commons_page_id, "
+                "i.detection_width, i.detection_height "
                 "FROM images i "
                 "JOIN faces f ON f.image_id = i.id "
                 "WHERE i.project_id = %s AND f.is_target IS NULL "
-                "ORDER BY i.id ASC "
-                "LIMIT 1",
+                "LIMIT 200",
                 (project_id,),
             )
+            if image_row:
+                image_row = [random.choice(image_row)]
 
         # Fallback: if no unclassified faces, try model not-target faces for review
         if not image_row:
@@ -1159,25 +1337,30 @@ def classify(project_id: int):
             if skipped_review_ids:
                 placeholders = ",".join(["%s"] * len(skipped_review_ids))
                 image_row = execute_query(
-                    "SELECT DISTINCT i.id AS image_id, i.file_title, i.commons_page_id "
+                    "SELECT DISTINCT i.id AS image_id, i.file_title, i.commons_page_id, "
+                    "i.detection_width, i.detection_height "
                     "FROM images i "
                     "JOIN faces f ON f.image_id = i.id "
                     f"WHERE i.project_id = %s AND f.is_target = 0 AND f.classified_by = 'model' "
-                    f"AND i.id NOT IN ({placeholders}) "
-                    "ORDER BY i.id ASC "
-                    "LIMIT 1",
+                    f"AND f.classified_by_user_id IS NULL AND i.id NOT IN ({placeholders}) "
+                    "LIMIT 200",
                     (project_id, *skipped_review_ids),
                 )
+                if image_row:
+                    image_row = [random.choice(image_row)]
             else:
                 image_row = execute_query(
-                    "SELECT DISTINCT i.id AS image_id, i.file_title, i.commons_page_id "
+                    "SELECT DISTINCT i.id AS image_id, i.file_title, i.commons_page_id, "
+                    "i.detection_width, i.detection_height "
                     "FROM images i "
                     "JOIN faces f ON f.image_id = i.id "
                     "WHERE i.project_id = %s AND f.is_target = 0 AND f.classified_by = 'model' "
-                    "ORDER BY i.id ASC "
-                    "LIMIT 1",
+                    "AND f.classified_by_user_id IS NULL "
+                    "LIMIT 200",
                     (project_id,),
                 )
+                if image_row:
+                    image_row = [random.choice(image_row)]
     except DatabaseError:
         logger.exception("Failed to load image for classification")
         image_row = []
@@ -1306,7 +1489,7 @@ def api_classify():
     # In review mode, we target model-classified not-target faces
     # In normal mode, we target unclassified faces
     if is_review_mode:
-        face_filter_sql = "is_target = 0 AND classified_by = 'model'"
+        face_filter_sql = "is_target = 0 AND classified_by = 'model' AND classified_by_user_id IS NULL"
     else:
         face_filter_sql = "is_target IS NULL"
 
@@ -1325,7 +1508,8 @@ def api_classify():
                     cursor.execute(
                         "UPDATE faces SET classified_by = 'human', "
                         "classified_by_user_id = %s "
-                        "WHERE image_id = %s AND is_target = 0 AND classified_by = 'model'",
+                        "WHERE image_id = %s AND is_target = 0 AND classified_by = 'model' "
+                        "AND classified_by_user_id IS NULL",
                         (g.user["id"], image_id),
                     )
                 else:
@@ -1373,7 +1557,8 @@ def api_classify():
                         "UPDATE faces SET classified_by = 'human', "
                         "classified_by_user_id = %s "
                         "WHERE image_id = %s AND id != %s "
-                        "AND is_target = 0 AND classified_by = 'model'",
+                        "AND is_target = 0 AND classified_by = 'model' "
+                        "AND classified_by_user_id IS NULL",
                         (g.user["id"], image_id, selected_face_id),
                     )
                 else:
@@ -1591,7 +1776,8 @@ def api_manual_face():
             if is_review_mode:
                 cursor.execute(
                     "SELECT id FROM faces "
-                    "WHERE image_id = %s AND is_target = 0 AND classified_by = 'model'",
+                    "WHERE image_id = %s AND is_target = 0 AND classified_by = 'model' "
+                    "AND classified_by_user_id IS NULL",
                     (image_id,),
                 )
                 rows = cursor.fetchall()
@@ -1617,7 +1803,8 @@ def api_manual_face():
                 cursor.execute(
                     "UPDATE faces SET classified_by = 'human', "
                     "classified_by_user_id = %s "
-                    "WHERE image_id = %s AND is_target = 0 AND classified_by = 'model'",
+                    "WHERE image_id = %s AND is_target = 0 AND classified_by = 'model' "
+                    "AND classified_by_user_id IS NULL",
                     (g.user["id"], image_id),
                 )
                 cursor.execute(
@@ -1787,6 +1974,7 @@ def api_reclassify():
     try:
         rows = execute_query(
             "SELECT f.id, f.is_target AS old_is_target, f.sdc_written, "
+            "  f.classified_by, "
             "  i.commons_page_id, p.id AS project_id, p.wikidata_qid "
             "FROM faces f "
             "JOIN images i ON f.image_id = i.id "
@@ -1829,9 +2017,9 @@ def api_reclassify():
 
         def _reclassify(conn, cursor):
             cursor.execute(
-                "UPDATE faces SET is_target = %s, classified_by = 'human', "
+                "UPDATE faces SET is_target = %s, "
                 "classified_by_user_id = %s, sdc_written = %s "
-                "WHERE id = %s",
+                "WHERE id = %s AND classified_by_user_id IS NULL",
                 (
                     is_target,
                     g.user["id"],
@@ -1839,6 +2027,8 @@ def api_reclassify():
                     face_id,
                 ),
             )
+            if cursor.rowcount == 0:
+                raise ValueError("already_reviewed")
 
             if is_target == 1 and old_is_target != 1:
                 cursor.execute(
@@ -1854,6 +2044,12 @@ def api_reclassify():
                 )
 
         execute_transaction(_reclassify)
+    except ValueError as e:
+        if str(e) == "already_reviewed":
+            return jsonify(
+                {"error": _("This face has already been reviewed by another user")}
+            ), 409
+        raise
     except DatabaseError:
         logger.exception("Failed to reclassify face")
         return jsonify({"error": _("Failed to save reclassification")}), 500
@@ -1863,7 +2059,7 @@ def api_reclassify():
             "status": "ok",
             "face_id": face_id,
             "is_target": is_target,
-            "classified_by": "human",
+            "classified_by": face_row["classified_by"],
             "sdc_removed": sdc_removed,
         }
     )
@@ -1917,7 +2113,7 @@ def api_update_face_bbox():
     try:
         rows = execute_query(
             "SELECT f.id, f.image_id, f.is_target, f.classified_by, f.confidence, "
-            "  i.file_title, p.id AS project_id "
+            "  f.classified_by_user_id, i.file_title, p.id AS project_id "
             "FROM faces f "
             "JOIN images i ON f.image_id = i.id "
             "JOIN projects p ON i.project_id = p.id "
@@ -1934,6 +2130,7 @@ def api_update_face_bbox():
     orig_is_target = face_row["is_target"]
     orig_classified_by = face_row["classified_by"]
     orig_confidence = face_row["confidence"]
+    orig_classified_by_user_id = face_row["classified_by_user_id"]
     file_title = face_row["file_title"]
     clean_title = file_title[5:] if file_title.startswith("File:") else file_title
     url = FILE_PATH_URL.format(file_title=clean_title)
@@ -1964,8 +2161,8 @@ def api_update_face_bbox():
             cursor.execute(
                 "INSERT INTO faces "
                 "(image_id, encoding, bbox_top, bbox_right, bbox_bottom, bbox_left, "
-                " is_target, classified_by, confidence) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, 'human', %s)",
+                " is_target, classified_by, confidence, classified_by_user_id) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, 'human', %s, %s)",
                 (
                     image_id,
                     encoding_bytes,
@@ -1975,12 +2172,14 @@ def api_update_face_bbox():
                     bbox_left,
                     orig_is_target,
                     orig_confidence,
+                    g.user["id"],
                 ),
             )
             new_face_id = cursor.lastrowid
             # Mark original face as superseded so it won't appear or get SDC-written
             cursor.execute(
-                "UPDATE faces SET is_target = 0, classified_by = 'human' WHERE id = %s",
+                "UPDATE faces SET is_target = 0, classified_by = 'human', "
+                "classified_by_user_id = NULL WHERE id = %s",
                 (face_id,),
             )
             return new_face_id
@@ -2118,6 +2317,74 @@ def api_sdc_status(project_id: int):
     )
 
 
+@app.route("/api/progress/<int:project_id>", methods=["GET"])
+@login_required
+@limiter.limit("30 per minute")
+def api_progress(project_id: int):
+    """Poll endpoint for image processing progress."""
+    try:
+        rows = execute_query(
+            "SELECT images_processed, images_total, status "
+            "FROM projects WHERE id = %s AND user_id = %s",
+            (project_id, g.user["id"]),
+        )
+        if not rows:
+            return jsonify({"error": _("Project not found or access denied")}), 404
+    except DatabaseError:
+        return jsonify({"error": _("Database error")}), 500
+
+    project = rows[0]
+    images_processed = project["images_processed"] or 0
+    images_total = project["images_total"] or 0
+
+    pending_images = 0
+    if project["status"] == "active" and images_total > 0:
+        try:
+            pending_row = execute_query(
+                "SELECT COUNT(*) AS cnt FROM images "
+                "WHERE project_id = %s AND status = 'pending'",
+                (project_id,),
+            )
+            pending_images = pending_row[0]["cnt"] if pending_row else 0
+        except DatabaseError:
+            pass
+
+    # Include face stats so the frontend can update stat cards live
+    face_stats = {}
+    try:
+        stat_rows = execute_query(
+            "SELECT "
+            "  COUNT(*) AS total_faces, "
+            "  SUM(CASE WHEN f.is_target = 1 THEN 1 ELSE 0 END) AS confirmed_matches, "
+            "  SUM(CASE WHEN f.is_target = 0 THEN 1 ELSE 0 END) AS confirmed_non_matches, "
+            "  SUM(CASE WHEN f.is_target IS NULL THEN 1 ELSE 0 END) AS unclassified, "
+            "  SUM(CASE WHEN f.sdc_written = 1 THEN 1 ELSE 0 END) AS sdc_written, "
+            "  SUM(CASE WHEN f.classified_by_user_id IS NOT NULL THEN 1 ELSE 0 END) AS by_human, "
+            "  SUM(CASE WHEN f.classified_by = 'model' AND f.classified_by_user_id IS NULL THEN 1 ELSE 0 END) AS by_model, "
+            "  SUM(CASE WHEN f.classified_by = 'bootstrap' AND f.classified_by_user_id IS NULL THEN 1 ELSE 0 END) AS by_bootstrap "
+            "FROM faces f "
+            "JOIN images i ON f.image_id = i.id "
+            "WHERE i.project_id = %s",
+            (project_id,),
+            fetch=True,
+        )
+        if stat_rows:
+            face_stats = {k: (v or 0) for k, v in stat_rows[0].items()}
+    except DatabaseError:
+        pass
+
+    return jsonify(
+        {
+            "status": "ok",
+            "images_processed": images_processed,
+            "images_total": images_total,
+            "pending_images": pending_images,
+            "complete": images_total > 0 and images_processed >= images_total,
+            "face_stats": face_stats,
+        }
+    )
+
+
 @app.route("/project/<int:project_id>/settings", methods=["GET", "POST"])
 @login_required
 def project_settings(project_id: int):
@@ -2231,16 +2498,15 @@ def leaderboard():
         rows = execute_query(
             "SELECT "
             "  u.wiki_username, "
-            "  COUNT(CASE WHEN f.classified_by = 'human' THEN 1 END) "
-            "    AS classifications, "
+            "  COUNT(*) AS classifications, "
             "  COUNT(CASE WHEN f.sdc_written = 1 THEN 1 END) "
             "    AS sdc_tags "
             "FROM users u "
             "INNER JOIN faces f ON f.classified_by_user_id = u.id "
             "GROUP BY u.id, u.wiki_username "
-            "ORDER BY (COUNT(CASE WHEN f.classified_by = 'human' THEN 1 END) "
+            "ORDER BY (COUNT(*) "
             "        + COUNT(CASE WHEN f.sdc_written = 1 THEN 1 END)) DESC, "
-            "         COUNT(CASE WHEN f.classified_by = 'human' THEN 1 END) DESC "
+            "         COUNT(*) DESC "
             "LIMIT 100",
         )
     except DatabaseError:
