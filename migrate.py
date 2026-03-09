@@ -170,12 +170,12 @@ _ALTER_MIGRATIONS = [
     ),
     (
         "Add detection_width to images",
-        "ALTER TABLE images ADD COLUMN detection_width SMALLINT UNSIGNED NULL "
+        "ALTER TABLE images ADD COLUMN detection_width MEDIUMINT UNSIGNED NULL "
         "COMMENT 'Image width in pixels at which face detection was run' AFTER face_count",
     ),
     (
         "Add detection_height to images",
-        "ALTER TABLE images ADD COLUMN detection_height SMALLINT UNSIGNED NULL "
+        "ALTER TABLE images ADD COLUMN detection_height MEDIUMINT UNSIGNED NULL "
         "COMMENT 'Image height in pixels at which face detection was run' AFTER detection_width",
     ),
     (
@@ -191,6 +191,16 @@ _ALTER_MIGRATIONS = [
     (
         "Add index for superseded_by",
         "ALTER TABLE faces ADD INDEX idx_faces_superseded (superseded_by)",
+    ),
+    (
+        "Widen detection_width from SMALLINT to MEDIUMINT",
+        "ALTER TABLE images MODIFY COLUMN detection_width MEDIUMINT UNSIGNED NULL "
+        "COMMENT 'Image width in pixels at which face detection was run'",
+    ),
+    (
+        "Widen detection_height from SMALLINT to MEDIUMINT",
+        "ALTER TABLE images MODIFY COLUMN detection_height MEDIUMINT UNSIGNED NULL "
+        "COMMENT 'Image height in pixels at which face detection was run'",
     ),
 ]
 
