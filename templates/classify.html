@@ -393,11 +393,22 @@
     const img = document.getElementById('classifyImg');
     const boxes = document.querySelectorAll('.face-box');
 
+    /* Detection dimensions: the image resolution at which bboxes were computed.
+       Falls back to the displayed thumbnail's natural size for legacy images
+       that pre-date the detection_width/detection_height columns. */
+    var detectionWidth = {{ (image.detection_width or 0)|tojson }};
+    var detectionHeight = {{ (image.detection_height or 0)|tojson }};
+
     function positionBoxes() {
         if (!img.naturalWidth || !img.naturalHeight) return;
 
-        var scaleX = img.clientWidth / img.naturalWidth;
-        var scaleY = img.clientHeight / img.naturalHeight;
+        /* Use detection dimensions when available, otherwise fall back to
+           the thumbnail's intrinsic size (legacy images without detection dims). */
+        var refW = detectionWidth || img.naturalWidth;
+        var refH = detectionHeight || img.naturalHeight;
+
+        var scaleX = img.clientWidth / refW;
+        var scaleY = img.clientHeight / refH;
 
         boxes.forEach(function(box) {
             var t = parseInt(box.dataset.bboxTop);
@@ -629,9 +640,13 @@
             return;
         }
 
-        /* Convert displayed pixel coordinates to original image coordinates */
-        var scaleX = img.naturalWidth / img.clientWidth;
-        var scaleY = img.naturalHeight / img.clientHeight;
+        /* Convert displayed pixel coordinates to detection-resolution coordinates.
+           The server downloads the same resolution image for encoding, so bbox
+           coords must be in detection-image space, not thumbnail space. */
+        var refW = detectionWidth || img.naturalWidth;
+        var refH = detectionHeight || img.naturalHeight;
+        var scaleX = refW / img.clientWidth;
+        var scaleY = refH / img.clientHeight;
 
         var bboxLeft   = Math.round(x1 * scaleX);
         var bboxTop    = Math.round(y1 * scaleY);

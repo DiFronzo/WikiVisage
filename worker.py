@@ -340,19 +340,20 @@ def _detect_faces_in_subprocess(
     """
     try:
         image_data = face_recognition.load_image_file(io.BytesIO(image_bytes))
+        img_height, img_width = image_data.shape[:2]
         face_locations = face_recognition.face_locations(image_data, model="hog")
         face_encodings = face_recognition.face_encodings(image_data, face_locations)
 
         encodings_as_bytes = [enc.tobytes() for enc in face_encodings]
-        conn.send(("ok", face_locations, encodings_as_bytes))
+        conn.send(("ok", face_locations, encodings_as_bytes, img_width, img_height))
     except Exception as e:
         conn.send(("error", str(e)))
     finally:
         conn.close()
 
 
-def _run_face_detection(image_bytes: bytes) -> Tuple[List, List[bytes]]:
-    """Run face detection in a subprocess with timeout. Returns (locations, encoding_bytes_list).
+def _run_face_detection(image_bytes: bytes) -> Tuple[List, List[bytes], int, int]:
+    """Run face detection in a subprocess with timeout. Returns (locations, encoding_bytes_list, width, height).
 
     Raises RuntimeError if subprocess crashes (segfault) or times out.
     """
@@ -384,7 +385,7 @@ def _run_face_detection(image_bytes: bytes) -> Tuple[List, List[bytes]]:
     if exitcode is not None and exitcode < 0:
         raise RuntimeError(f"Face detection subprocess crashed with signal {-exitcode}")
 
-    return result[1], result[2]
+    return result[1], result[2], result[3], result[4]
 
 
 def _process_single_image(img_id: int, title: str) -> bool:
@@ -397,13 +398,21 @@ def _process_single_image(img_id: int, title: str) -> bool:
         image_bytes = _download_image(url)
         _validate_image_dimensions(image_bytes)
 
-        face_locations, encodings_bytes = _run_face_detection(image_bytes)
+        face_locations, encodings_bytes, det_width, det_height = _run_face_detection(
+            image_bytes
+        )
         del image_bytes
 
         face_count = len(face_locations)
 
         for location, encoding_bytes in zip(face_locations, encodings_bytes):
             top, right, bottom, left = location
+
+            # All faces start unclassified (is_target=NULL). Classification
+            # happens only via human confirmation in the classify UI or
+            # autonomous inference after min_confirmed human confirmations.
+            # The bootstrapped flag on the image row is preserved as metadata
+            # but does NOT auto-classify faces.
             execute_query(
                 """
                 INSERT INTO faces (image_id, encoding, bbox_top, bbox_right, bbox_bottom, bbox_left)
@@ -414,8 +423,9 @@ def _process_single_image(img_id: int, title: str) -> bool:
             )
 
         execute_query(
-            "UPDATE images SET status = 'processed', face_count = %s WHERE id = %s",
-            (face_count, img_id),
+            "UPDATE images SET status = 'processed', face_count = %s, "
+            "detection_width = %s, detection_height = %s WHERE id = %s",
+            (face_count, det_width, det_height, img_id),
             fetch=False,
         )
 
@@ -483,6 +493,11 @@ def bootstrap_from_sparql(project: Dict[str, Any]) -> int:
     Uses the Wikibase haswbstatement search API on Commons instead of SPARQL,
     since commons-query.wikimedia.org requires OAuth cookie authentication
     that is impractical for automated tools.
+
+    Only inserts/flags image rows with bootstrapped=1. Face detection and
+    encoding storage are deferred to process_images / _process_single_image.
+    No faces are auto-classified — the user must confirm faces manually via
+    the classify UI before the model will run inference.
     """
     logger.info(
         f"Attempting bootstrap for project {project['id']} with QID {project['wikidata_qid']}"
@@ -493,7 +508,7 @@ def bootstrap_from_sparql(project: Dict[str, Any]) -> int:
     count_row = execute_query(
         "SELECT COUNT(*) AS cnt FROM faces f "
         "JOIN images i ON f.image_id = i.id "
-        "WHERE i.project_id = %s AND f.is_target = 1",
+        "WHERE i.project_id = %s AND f.is_target = 1 AND f.superseded_by IS NULL",
         (project["id"],),
     )
     if count_row and count_row[0]["cnt"] > 0:
@@ -510,7 +525,7 @@ def bootstrap_from_sparql(project: Dict[str, Any]) -> int:
     }
 
     try:
-        bootstrapped_count = 0
+        flagged_count = 0
 
         while True:
             if shutdown_requested:
@@ -536,79 +551,37 @@ def bootstrap_from_sparql(project: Dict[str, Any]) -> int:
                     fetch=True,
                 )
 
-                img_id = None
                 if exists:
-                    img_id = exists[0]["id"]
-                    if exists[0]["status"] != "pending":
-                        continue
+                    # Image already known — just flag it as bootstrapped if pending
+                    if exists[0]["status"] == "pending":
+                        affected = execute_query(
+                            "UPDATE images SET bootstrapped = 1 WHERE id = %s AND bootstrapped != 1",
+                            (exists[0]["id"],),
+                            fetch=False,
+                        )
+                        if affected:
+                            flagged_count += 1
                 else:
-                    execute_query(
+                    # New image not in category — insert as pending + bootstrapped
+                    affected = execute_query(
                         """
-                        INSERT IGNORE INTO images (project_id, commons_page_id, file_title, status)
-                        VALUES (%s, %s, %s, 'pending')
+                        INSERT IGNORE INTO images (project_id, commons_page_id, file_title, status, bootstrapped)
+                        VALUES (%s, %s, %s, 'pending', 1)
                         """,
                         (project["id"], page_id, title),
                         fetch=False,
                     )
-                    img_id_res = execute_query(
-                        "SELECT id FROM images WHERE project_id = %s AND commons_page_id = %s",
-                        (project["id"], page_id),
-                        fetch=True,
-                    )
-                    if img_id_res:
-                        img_id = img_id_res[0]["id"]
-
-                if not img_id:
-                    continue
-
-                clean_title = title[5:] if title.startswith("File:") else title
-                url = FILE_PATH_URL.format(file_title=clean_title)
-
-                try:
-                    image_bytes = _download_image(url)
-                    _validate_image_dimensions(image_bytes)
-                    face_locations, encodings_bytes = _run_face_detection(image_bytes)
-                    del image_bytes
-
-                    face_count = len(face_locations)
-
-                    if face_count == 1:
-                        top, right, bottom, left = face_locations[0]
-
+                    if affected:
+                        flagged_count += 1
+                    else:
+                        # Race: another process inserted this image between our
+                        # SELECT and INSERT.  Ensure it gets the bootstrap flag.
                         execute_query(
-                            """
-                            INSERT INTO faces (image_id, encoding, bbox_top, bbox_right, bbox_bottom, bbox_left, is_target, classified_by)
-                            VALUES (%s, %s, %s, %s, %s, %s, 1, 'bootstrap')
-                            """,
-                            (img_id, encodings_bytes[0], top, right, bottom, left),
+                            "UPDATE images SET bootstrapped = 1 "
+                            "WHERE project_id = %s AND commons_page_id = %s AND bootstrapped != 1",
+                            (project["id"], page_id),
                             fetch=False,
                         )
-                        bootstrapped_count += 1
-                    else:
-                        for location, enc_bytes in zip(face_locations, encodings_bytes):
-                            top, right, bottom, left = location
-                            execute_query(
-                                """
-                                INSERT INTO faces (image_id, encoding, bbox_top, bbox_right, bbox_bottom, bbox_left)
-                                VALUES (%s, %s, %s, %s, %s, %s)
-                                """,
-                                (img_id, enc_bytes, top, right, bottom, left),
-                                fetch=False,
-                            )
-
-                    execute_query(
-                        "UPDATE images SET status = 'processed', face_count = %s WHERE id = %s",
-                        (face_count, img_id),
-                        fetch=False,
-                    )
-
-                except Exception as e:
-                    logger.error(f"Bootstrap image processing error for {title}: {e}")
-                    execute_query(
-                        "UPDATE images SET status = 'error', error_message = %s WHERE id = %s",
-                        (str(e)[:1000], img_id),
-                        fetch=False,
-                    )
 
             # Paginate: check for continuation token
             continuation = data.get("continue", {})
@@ -618,13 +591,20 @@ def bootstrap_from_sparql(project: Dict[str, Any]) -> int:
             search_params["sroffset"] = sr_offset
             logger.info(f"Bootstrap pagination: fetching from offset {sr_offset}")
 
-        if bootstrapped_count > 0:
+        if flagged_count > 0:
+            # Update images_total to include any newly inserted bootstrap images
             execute_query(
-                "UPDATE projects SET faces_confirmed = faces_confirmed + %s, images_processed = (SELECT COUNT(*) FROM images WHERE project_id = %s AND status IN ('processed', 'error', 'enriched')) WHERE id = %s",
-                (bootstrapped_count, project["id"], project["id"]),
+                "UPDATE projects SET "
+                "images_total = (SELECT COUNT(*) FROM images WHERE project_id = %s) "
+                "WHERE id = %s",
+                (project["id"], project["id"]),
                 fetch=False,
             )
-            return bootstrapped_count
+            logger.info(
+                f"Bootstrap flagged {flagged_count} images for project {project['id']}"
+            )
+
+        return flagged_count
 
     except Exception as e:
         logger.error(f"SPARQL Bootstrap failed: {e}")
@@ -640,7 +620,7 @@ def run_autonomous_inference(project: Dict[str, Any]) -> int:
     count_row = execute_query(
         "SELECT COUNT(*) AS cnt FROM faces f "
         "JOIN images i ON f.image_id = i.id "
-        "WHERE i.project_id = %s AND f.is_target = 1",
+        "WHERE i.project_id = %s AND f.is_target = 1 AND f.superseded_by IS NULL",
         (project["id"],),
         fetch=True,
     )
@@ -661,7 +641,7 @@ def run_autonomous_inference(project: Dict[str, Any]) -> int:
         """
         SELECT f.encoding FROM faces f
         JOIN images i ON f.image_id = i.id
-        WHERE i.project_id = %s AND f.is_target = 1
+        WHERE i.project_id = %s AND f.is_target = 1 AND f.superseded_by IS NULL
         """,
         (project["id"],),
         fetch=True,
@@ -684,7 +664,7 @@ def run_autonomous_inference(project: Dict[str, Any]) -> int:
         """
         SELECT f.id, f.encoding FROM faces f
         JOIN images i ON f.image_id = i.id
-        WHERE i.project_id = %s AND f.is_target IS NULL
+        WHERE i.project_id = %s AND f.is_target IS NULL AND f.superseded_by IS NULL
         """,
         (project["id"],),
         fetch=True,
@@ -778,7 +758,7 @@ def write_sdc_claims(project: Dict[str, Any]) -> int:
             FROM faces f
             JOIN images i ON f.image_id = i.id
             WHERE i.project_id = %s AND f.is_target = 1 AND f.sdc_written = 0
-            AND f.classified_by != 'bootstrap'
+            AND f.classified_by != 'bootstrap' AND f.superseded_by IS NULL
             LIMIT %s
             """,
             (project_id, SDC_BATCH),
@@ -1024,11 +1004,11 @@ def main():
         diag = execute_query(
             "SELECT p.id, p.wikidata_qid, p.status, p.min_confirmed, p.faces_confirmed, "
             "  (SELECT COUNT(*) FROM faces f JOIN images i ON f.image_id = i.id "
-            "   WHERE i.project_id = p.id AND f.is_target = 1) AS actual_target_faces, "
+            "   WHERE i.project_id = p.id AND f.is_target = 1 AND f.superseded_by IS NULL) AS actual_target_faces, "
             "  (SELECT COUNT(*) FROM faces f JOIN images i ON f.image_id = i.id "
-            "   WHERE i.project_id = p.id AND f.is_target = 0) AS actual_non_target, "
+            "   WHERE i.project_id = p.id AND f.is_target = 0 AND f.superseded_by IS NULL) AS actual_non_target, "
             "  (SELECT COUNT(*) FROM faces f JOIN images i ON f.image_id = i.id "
-            "   WHERE i.project_id = p.id AND f.is_target IS NULL) AS unclassified_faces "
+            "   WHERE i.project_id = p.id AND f.is_target IS NULL AND f.superseded_by IS NULL) AS unclassified_faces "
             "FROM projects p",
             fetch=True,
         )
@@ -1067,12 +1047,12 @@ def main():
                     "AND ("
                     "  SELECT COUNT(*) FROM faces f "
                     "  JOIN images i ON f.image_id = i.id "
-                    "  WHERE i.project_id = p.id AND f.is_target = 1"
+                    "  WHERE i.project_id = p.id AND f.is_target = 1 AND f.superseded_by IS NULL"
                     ") >= p.min_confirmed "
                     "AND EXISTS ("
                     "  SELECT 1 FROM faces f "
                     "  JOIN images i ON f.image_id = i.id "
-                    "  WHERE i.project_id = p.id AND f.is_target IS NULL"
+                    "  WHERE i.project_id = p.id AND f.is_target IS NULL AND f.superseded_by IS NULL"
                     ")",
                     fetch=True,
                 )

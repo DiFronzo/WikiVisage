@@ -69,6 +69,9 @@ CREATE TABLE IF NOT EXISTS images (
     file_title      VARCHAR(512)    NOT NULL COMMENT 'Full file title including "File:" prefix',
     status          ENUM('pending', 'processed', 'enriched', 'error') NOT NULL DEFAULT 'pending',
     face_count      SMALLINT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'Number of faces detected',
+    detection_width MEDIUMINT UNSIGNED NULL COMMENT 'Image width in pixels at which face detection was run',
+    detection_height MEDIUMINT UNSIGNED NULL COMMENT 'Image height in pixels at which face detection was run',
+    bootstrapped    TINYINT(1)      NOT NULL DEFAULT 0 COMMENT '1=image found via P180 bootstrap',
     error_message   VARCHAR(1024)   NULL COMMENT 'Error details if status is error',
     created_at      DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at      DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -86,6 +89,7 @@ CREATE TABLE IF NOT EXISTS images (
 -- Faces table: stores each detected face encoding and its classification state.
 -- encoding: 128-dimensional float64 numpy array stored as raw bytes (1024 bytes).
 -- is_target: NULL = unclassified, TRUE = confirmed match, FALSE = confirmed non-match.
+-- superseded_by: FK to replacement face row (after bbox edit). NULL = active face.
 CREATE TABLE IF NOT EXISTS faces (
     id              BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
     image_id        BIGINT UNSIGNED NOT NULL,
@@ -99,6 +103,7 @@ CREATE TABLE IF NOT EXISTS faces (
     classified_by   ENUM('human', 'model', 'bootstrap') NULL COMMENT 'How this face was classified',
     classified_by_user_id BIGINT UNSIGNED NULL COMMENT 'User who classified this face (human classifications)',
     sdc_written     TINYINT(1)      NOT NULL DEFAULT 0 COMMENT 'Whether P180 claim was written to SDC',
+    superseded_by   BIGINT UNSIGNED NULL COMMENT 'FK to replacement face after bbox edit. NULL=active face',
     created_at      DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at      DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
 
@@ -107,11 +112,14 @@ CREATE TABLE IF NOT EXISTS faces (
     INDEX idx_faces_classification (image_id, is_target, classified_by),
     INDEX idx_faces_sdc (is_target, sdc_written),
     INDEX idx_faces_classified_by_user (classified_by_user_id),
+    INDEX idx_faces_superseded (superseded_by),
 
     CONSTRAINT fk_faces_image
         FOREIGN KEY (image_id) REFERENCES images (id) ON DELETE CASCADE,
     CONSTRAINT fk_faces_classified_by_user
-        FOREIGN KEY (classified_by_user_id) REFERENCES users (id) ON DELETE SET NULL
+        FOREIGN KEY (classified_by_user_id) REFERENCES users (id) ON DELETE SET NULL,
+    CONSTRAINT fk_faces_superseded_by
+        FOREIGN KEY (superseded_by) REFERENCES faces (id) ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 

@@ -19,6 +19,7 @@
     .result-card:hover { border-color: var(--primary); transform: translateY(-2px); }
     .result-card[data-result="match"] { border-left: 4px solid var(--success); }
     .result-card[data-result="non-match"] { border-left: 4px solid var(--danger); }
+    .result-card[data-result="rejected"] { border-left: 4px solid var(--warning, #f59e0b); opacity: 0.75; }
     .result-card.hidden { display: none; }
     .result-thumb {
         position: relative;
@@ -265,34 +266,34 @@
     </div>
 </div>
 
-<div class="card">
+<div class="card" id="progressCard">
     {% if project.images_total == 0 %}
         <h2>{{ _('Processing Progress') }}</h2>
-        <p style="color: var(--text-muted); margin-top: 1rem; margin-bottom: 0;">
+        <p id="progressMsg" style="color: var(--text-muted); margin-top: 1rem; margin-bottom: 0;">
             {{ _("The background worker hasn't discovered images in this category yet. This usually takes a minute or two after creating a project.") }}
         </p>
         <div class="progress-wrap" style="height: 2.5rem; margin-top: 1.5rem;">
-            <div class="progress-bar" style="width: 100%; opacity: 0.15; animation: pulse 2s ease-in-out infinite;"></div>
-            <div class="progress-text" style="font-size: 1rem;">{{ _('Waiting for worker') }}&hellip;</div>
+            <div class="progress-bar" id="progressBar" style="width: 100%; opacity: 0.15; animation: pulse 2s ease-in-out infinite;"></div>
+            <div class="progress-text" id="progressPct" style="font-size: 1rem;">{{ _('Waiting for worker') }}&hellip;</div>
         </div>
     {% elif project.images_processed == project.images_total %}
         <div style="display: flex; justify-content: space-between; align-items: flex-end; margin-bottom: 1rem;">
             <h2>{{ _('Processing Progress') }}</h2>
-            <span style="font-weight: bold; color: var(--success);">{{ _('Complete') }}</span>
+            <span id="progressCount" style="font-weight: bold; color: var(--success);">{{ _('Complete') }}</span>
         </div>
         <div class="progress-wrap" style="height: 2.5rem;">
-            <div class="progress-bar" style="width: 100%;"></div>
-            <div class="progress-text" style="font-size: 1rem;">{{ _('%(num)d images processed', num=project.images_total) }}</div>
+            <div class="progress-bar" id="progressBar" style="width: 100%;"></div>
+            <div class="progress-text" id="progressPct" style="font-size: 1rem;">{{ _('%(num)d images processed', num=project.images_total) }}</div>
         </div>
     {% else %}
         <div style="display: flex; justify-content: space-between; align-items: flex-end; margin-bottom: 1rem;">
             <h2>{{ _('Processing Progress') }}</h2>
-            <span style="font-weight: bold; color: var(--primary);">{{ _('%(done)d / %(total)d images', done=project.images_processed, total=project.images_total) }}</span>
+            <span id="progressCount" style="font-weight: bold; color: var(--primary);">{{ _('%(done)d / %(total)d images', done=project.images_processed, total=project.images_total) }}</span>
         </div>
         {% set pct = (project.images_processed / project.images_total * 100) %}
         <div class="progress-wrap" style="height: 2.5rem;">
-            <div class="progress-bar" style="width: {{ pct }}%;"></div>
-            <div class="progress-text" style="font-size: 1rem;">{{ "%.1f"|format(pct) }}%</div>
+            <div class="progress-bar" id="progressBar" style="width: {{ pct }}%; transition: width 0.3s ease;"></div>
+            <div class="progress-text" id="progressPct" style="font-size: 1rem;">{{ "%.1f"|format(pct) }}%</div>
         </div>
     {% endif %}
 </div>
@@ -301,23 +302,23 @@
 <h2>{{ _('Project Statistics') }}</h2>
 <div class="stats-grid">
     <div class="stat-box">
-        <div class="stat-value">{{ stats.total_faces or 0 }}</div>
+        <div class="stat-value" id="statTotalFaces">{{ stats.total_faces or 0 }}</div>
         <div class="stat-label">{{ _('Total Faces Found') }}</div>
     </div>
     <div class="stat-box" style="border-color: var(--success);">
-        <div class="stat-value" style="color: var(--success);">{{ stats.confirmed_matches or 0 }}</div>
+        <div class="stat-value" id="statMatches" style="color: var(--success);">{{ stats.confirmed_matches or 0 }}</div>
         <div class="stat-label">{{ _('Target Matches') }}</div>
     </div>
     <div class="stat-box" style="border-color: var(--danger);">
-        <div class="stat-value" style="color: var(--danger);">{{ stats.confirmed_non_matches or 0 }}</div>
+        <div class="stat-value" id="statNonMatches" style="color: var(--danger);">{{ stats.confirmed_non_matches or 0 }}</div>
         <div class="stat-label">{{ _('Not Target') }}</div>
     </div>
     <div class="stat-box" style="border-color: var(--warning);">
-        <div class="stat-value" style="color: var(--warning);">{{ stats.unclassified or 0 }}</div>
+        <div class="stat-value" id="statUnclassified" style="color: var(--warning);">{{ stats.unclassified or 0 }}</div>
         <div class="stat-label">{{ _('Unclassified') }}</div>
     </div>
     <div class="stat-box" data-stat="sdc_written" style="border-color: var(--info);">
-        <div class="stat-value" style="color: var(--info);">{{ stats.sdc_written or 0 }}</div>
+        <div class="stat-value" id="statSdcWritten" style="color: var(--info);">{{ stats.sdc_written or 0 }}</div>
         <div class="stat-label">{{ _('SDC Written') }}</div>
     </div>
 </div>
@@ -330,15 +331,15 @@
 <h2 style="margin-top: 3rem;">{{ _('Classification Breakdown') }}</h2>
 <div class="stats-grid">
     <div class="stat-box">
-        <div class="stat-value">{{ by_human }}</div>
+        <div class="stat-value" id="statByHuman">{{ by_human }}</div>
         <div class="stat-label">{{ _('By Human') }}</div>
     </div>
     <div class="stat-box" style="border-color: var(--primary);">
-        <div class="stat-value" style="color: var(--primary);">{{ by_model }}</div>
+        <div class="stat-value" id="statByModel" style="color: var(--primary);">{{ by_model }}</div>
         <div class="stat-label">{{ _('By Model') }}</div>
     </div>
     <div class="stat-box" style="border-color: var(--info);">
-        <div class="stat-value" style="color: var(--info);">{{ by_bootstrap }}</div>
+        <div class="stat-value" id="statByBootstrap" style="color: var(--info);">{{ by_bootstrap }}</div>
         <div class="stat-label">{{ _('By Bootstrap') }}</div>
     </div>
 </div>
@@ -346,15 +347,27 @@
 {% endif %}
 
 {% set unclassified = stats.unclassified or 0 %}
-{% if unclassified > 0 %}
-<div class="card" style="margin-top: 2rem; border-color: var(--info); background: rgba(59, 130, 246, 0.05);">
-    {% if project.faces_confirmed >= project.min_confirmed %}
+{% set confirmed = stats.confirmed_matches or 0 %}
+{% if unclassified > 0 or pending_images > 0 %}
+<div class="card" id="infoBanner" style="margin-top: 2rem; border-color: var(--info); background: rgba(59, 130, 246, 0.05);">
+    {% if confirmed >= project.min_confirmed %}
     <p style="color: var(--info); font-weight: 700; margin-bottom: 0;">
         {{ ngettext('%(num)d face waiting for model inference. The background worker will classify it automatically within the next minute.', '%(num)d faces waiting for model inference. The background worker will classify them automatically within the next minute.', unclassified, num=unclassified) }}
     </p>
+    {% elif pending_images > 0 %}
+    <p style="color: var(--info); font-weight: 700; margin-bottom: 0;">
+        {{ ngettext('The background worker is still processing images (%(pending)d image remaining). More faces will appear as processing continues.', 'The background worker is still processing images (%(pending)d images remaining). More faces will appear as processing continues.', pending_images, pending=pending_images) }}
+    </p>
+    {% elif confirmed + unclassified < project.min_confirmed %}
+    <p style="color: var(--danger); font-weight: 700; margin-bottom: 0.5rem;">
+        {{ _('Cannot reach autonomous inference: even if all %(unclassified)d unclassified faces are target matches, you would have %(potential)d/%(min)d confirmed — below the threshold.', unclassified=unclassified, potential=confirmed + unclassified, min=project.min_confirmed) }}
+    </p>
+    <p style="color: var(--text-muted); margin-bottom: 0;">
+        {{ _('Lower the min_confirmed setting in') }} <a href="{{ url_for('project_settings', project_id=project.id) }}" style="color: var(--primary);">{{ _('Project Settings') }}</a> {{ _('to proceed, or wait for the background worker to detect more faces.') }}
+    </p>
     {% else %}
     <p style="color: var(--warning); font-weight: 700; margin-bottom: 0;">
-        {{ _('%(count)d unclassified faces remaining. Classify at least %(needed)d more target faces to enable autonomous inference (%(confirmed)d/%(min)d confirmed).', count=unclassified, needed=project.min_confirmed - project.faces_confirmed, confirmed=project.faces_confirmed, min=project.min_confirmed) }}
+        {{ _('%(count)d unclassified faces remaining. Classify at least %(needed)d more target faces to enable autonomous inference (%(confirmed)d/%(min)d confirmed).', count=unclassified, needed=project.min_confirmed - confirmed, confirmed=confirmed, min=project.min_confirmed) }}
     </p>
     {% endif %}
 </div>
@@ -377,17 +390,18 @@
     <button class="btn btn-sm results-filter active" data-filter="all" data-filter-type="result" onclick="filterResults('all', 'result')">{{ _('All') }} ({{ model_faces | length }})</button>
     <button class="btn btn-sm results-filter" data-filter="match" data-filter-type="result" onclick="filterResults('match', 'result')">{{ _('Matches') }}</button>
     <button class="btn btn-sm results-filter" data-filter="non-match" data-filter-type="result" onclick="filterResults('non-match', 'result')">{{ _('Non-matches') }}</button>
+    <button class="btn btn-sm results-filter" data-filter="rejected" data-filter-type="result" onclick="filterResults('rejected', 'result')">{{ _('Rejected') }}</button>
     <span style="border-left: 2px solid var(--border); margin: 0 0.25rem;"></span>
     <button class="btn btn-sm results-filter" data-filter="model" data-filter-type="source" onclick="filterResults('model', 'source')">{{ _('Model') }}</button>
-    <button class="btn btn-sm results-filter" data-filter="bootstrap" data-filter-type="source" onclick="filterResults('bootstrap', 'source')">{{ _('Bootstrap') }}</button>
 </div>
 
 <div class="results-gallery" id="resultsGallery">
     {% for face in model_faces %}
-    <div class="result-card" data-result="{{ 'match' if face.is_target == 1 else 'non-match' }}" data-source="{{ face.classified_by }}" data-face-id="{{ face.id }}" data-image-id="{{ face.image_id }}" data-sdc-written="{{ face.sdc_written }}">
-        <div class="result-thumb" data-file-title="{{ face.file_title }}"
-             data-bbox-top="{{ face.bbox_top }}" data-bbox-right="{{ face.bbox_right }}"
-             data-bbox-bottom="{{ face.bbox_bottom }}" data-bbox-left="{{ face.bbox_left }}">
+    <div class="result-card" data-result="{{ 'rejected' if face.is_target == 0 and face.classified_by_user_id else ('match' if face.is_target == 1 else 'non-match') }}" data-source="{{ face.classified_by }}" data-face-id="{{ face.id }}" data-image-id="{{ face.image_id }}" data-sdc-written="{{ face.sdc_written }}">
+<div class="result-thumb" data-file-title="{{ face.file_title }}"
+data-bbox-top="{{ face.bbox_top }}" data-bbox-right="{{ face.bbox_right }}"
+data-bbox-bottom="{{ face.bbox_bottom }}" data-bbox-left="{{ face.bbox_left }}"
+data-detection-width="{{ face.detection_width or 0 }}" data-detection-height="{{ face.detection_height or 0 }}">
             <img src="{{ commons_thumb_url(face.file_title, 330) }}"
                  alt="{{ face.file_title }}" loading="lazy">
             <div class="result-actions">
@@ -399,7 +413,7 @@
         </div>
         <div class="result-info">
             <span class="badge {{ 'badge-active' if face.is_target == 1 else 'badge-paused' }}" style="font-size: 0.65rem;">
-                {{ _('Match') if face.is_target == 1 else _('Not target') }}
+                {% if face.is_target == 1 and face.classified_by_user_id %}{{ _('Verified') }} &#10003;{% elif face.is_target == 1 %}{{ _('Match') }}{% elif face.classified_by_user_id %}{{ _('Rejected') }}{% else %}{{ _('Not target') }}{% endif %}
             </span>
             <span class="result-distance" title="{{ _('Face distance from target centroid') }}">
                 {{ "%.3f"|format(face.confidence) if face.confidence is not none else '—' }}
@@ -419,6 +433,9 @@
     <h3 style="color: var(--primary); margin-bottom: 0.5rem;">{{ _('Send Edits to Wikimedia Commons') }}</h3>
     <p style="color: var(--text-muted); margin-bottom: 1.5rem;">
         {{ _('Write P180 depicts claims for all approved target faces that have not yet been written to Commons. Review the Model Results above to remove false positives before sending.') }}
+    </p>
+    <p style="color: var(--text-muted); font-size: 0.85rem; margin-bottom: 1.5rem;">
+        {{ _('All structured data edits will be published under the') }} <a rel="nofollow" href="https://creativecommons.org/publicdomain/zero/1.0/" style="color: var(--primary);">Creative Commons CC0 License</a>.
     </p>
     <div id="sdcStatus" style="margin-bottom: 1rem;">
         {% if sdc_pending > 0 %}
@@ -501,13 +518,11 @@
         }).then(function(data) {
             loading.classList.remove('active');
             if (data.status === 'ok') {
-                card.dataset.result = isTarget === 1 ? 'match' : 'non-match';
+                card.dataset.result = isTarget === 1 ? 'match' : 'rejected';
                 
                 var badge = card.querySelector('.badge');
                 badge.className = 'badge ' + (isTarget === 1 ? 'badge-active' : 'badge-paused');
                 badge.textContent = isTarget === 1 ? i18nReclassify.verified + ' \u2713' : i18nReclassify.rejected;
-                
-                card.querySelector('.result-method').textContent = i18nReclassify.human;
                 
                 if (data.sdc_removed) {
                     var sdcNote = card.querySelector('.sdc-note');
@@ -575,13 +590,19 @@
         img.onload = function() {
             var containerW = img.parentElement.clientWidth;
             var containerH = img.parentElement.clientHeight;
-            var natW = img.naturalWidth;
-            var natH = img.naturalHeight;
-            imgScale = Math.min(containerW / natW, containerH / natH);
-            var renderedW = natW * imgScale;
-            var renderedH = natH * imgScale;
+            /* Use detection dimensions for scaling — bbox coords are stored
+               at the resolution the worker used for face detection, not the
+               thumbnail resolution loaded in this modal. */
+            var detW = parseInt(thumb.dataset.detectionWidth) || img.naturalWidth;
+            var detH = parseInt(thumb.dataset.detectionHeight) || img.naturalHeight;
+            imgScale = Math.min(containerW / detW, containerH / detH);
+            var renderedW = detW * imgScale;
+            var renderedH = detH * imgScale;
             imgOffsetX = (containerW - renderedW) / 2;
             imgOffsetY = (containerH - renderedH) / 2;
+            /* Store detection dims for mousedown/mousemove boundary checks */
+            img._detW = detW;
+            img._detH = detH;
             
             var t = parseInt(thumb.dataset.bboxTop);
             var r = parseInt(thumb.dataset.bboxRight);
@@ -620,8 +641,10 @@
         var clickY = e.clientY - rect.top;
         
         var img = document.getElementById('modalImg');
-        var renderedW = img.naturalWidth * imgScale;
-        var renderedH = img.naturalHeight * imgScale;
+        var detW = img._detW || img.naturalWidth;
+        var detH = img._detH || img.naturalHeight;
+        var renderedW = detW * imgScale;
+        var renderedH = detH * imgScale;
         
         if (clickX < imgOffsetX || clickX > imgOffsetX + renderedW ||
             clickY < imgOffsetY || clickY > imgOffsetY + renderedH) {
@@ -647,8 +670,10 @@
         var currentY = e.clientY - rect.top;
         
         var img = document.getElementById('modalImg');
-        var renderedW = img.naturalWidth * imgScale;
-        var renderedH = img.naturalHeight * imgScale;
+        var detW = img._detW || img.naturalWidth;
+        var detH = img._detH || img.naturalHeight;
+        var renderedW = detW * imgScale;
+        var renderedH = detH * imgScale;
         
         currentX = Math.max(imgOffsetX, Math.min(currentX, imgOffsetX + renderedW));
         currentY = Math.max(imgOffsetY, Math.min(currentY, imgOffsetY + renderedH));
@@ -1032,6 +1057,123 @@
         progress.style.display = 'block';
         progressText.textContent = i18nSdc.writing;
         startSdcPolling();
+    })();
+    {% endif %}
+
+    // --- Processing progress live polling ---
+    {% if project.images_processed != project.images_total or project.images_total == 0 %}
+    (function() {
+        var apiProgressUrl = {{ url_for('api_progress', project_id=project.id)|tojson }};
+        var pollTimer = null;
+        var i18nProgress = {
+            complete: {{ _('Complete')|tojson }},
+            imagesCount: {{ _('{done} / {total} images')|tojson }},
+            imagesProcessed: {{ _('{num} images processed')|tojson }},
+            waiting: {{ _('Waiting for worker')|tojson }},
+            pendingOne: {{ _('The background worker is still processing images ({pending} image remaining). More faces will appear as processing continues.')|tojson }},
+            pendingMany: {{ _('The background worker is still processing images ({pending} images remaining). More faces will appear as processing continues.')|tojson }}
+        };
+
+        function updateStats(fs) {
+            if (!fs) return;
+            var map = {
+                'statTotalFaces': fs.total_faces,
+                'statMatches': fs.confirmed_matches,
+                'statNonMatches': fs.confirmed_non_matches,
+                'statUnclassified': fs.unclassified,
+                'statSdcWritten': fs.sdc_written,
+                'statByHuman': fs.by_human,
+                'statByModel': fs.by_model,
+                'statByBootstrap': fs.by_bootstrap
+            };
+            for (var id in map) {
+                var el = document.getElementById(id);
+                if (el) el.textContent = map[id] || 0;
+            }
+        }
+
+        function pollProgress() {
+            fetch(apiProgressUrl).then(function(r) {
+                if (!r.ok) throw new Error('HTTP ' + r.status);
+                return r.json();
+            }).then(function(data) {
+                var bar = document.getElementById('progressBar');
+                var pctEl = document.getElementById('progressPct');
+                var countEl = document.getElementById('progressCount');
+                var msgEl = document.getElementById('progressMsg');
+                if (!bar || !pctEl) return;
+
+                var done = data.images_processed || 0;
+                var total = data.images_total || 0;
+
+                if (total === 0) return;
+
+                if (msgEl) msgEl.style.display = 'none';
+
+                bar.style.opacity = '';
+                bar.style.animation = '';
+                bar.style.transition = 'width 0.3s ease';
+
+                updateStats(data.face_stats);
+
+                if (data.complete) {
+                    bar.style.width = '100%';
+                    pctEl.textContent = i18nProgress.imagesProcessed.replace('{num}', total);
+                    if (countEl) {
+                        countEl.textContent = i18nProgress.complete;
+                        countEl.style.color = 'var(--success)';
+                    }
+                    var banner = document.getElementById('infoBanner');
+                    if (banner && data.pending_images === 0) {
+                        banner.style.display = 'none';
+                    }
+                    clearInterval(pollTimer);
+                    pollTimer = null;
+                } else {
+                    var pct = (done / total * 100).toFixed(1);
+                    bar.style.width = pct + '%';
+                    pctEl.textContent = pct + '%';
+                    if (countEl) {
+                        countEl.textContent = i18nProgress.imagesCount
+                            .replace('{done}', done)
+                            .replace('{total}', total);
+                    } else {
+                        var card = document.getElementById('progressCard');
+                        var header = card ? card.querySelector('h2') : null;
+                        if (header && !header.nextElementSibling) {
+                            var wrap = document.createElement('div');
+                            wrap.style.cssText = 'display:flex;justify-content:space-between;align-items:flex-end;margin-bottom:1rem';
+                            var span = document.createElement('span');
+                            span.id = 'progressCount';
+                            span.style.cssText = 'font-weight:bold;color:var(--primary)';
+                            span.textContent = i18nProgress.imagesCount
+                                .replace('{done}', done)
+                                .replace('{total}', total);
+                            header.parentNode.insertBefore(wrap, header);
+                            wrap.appendChild(header);
+                            wrap.appendChild(span);
+                        }
+                    }
+
+                    var banner = document.getElementById('infoBanner');
+                    if (banner && data.pending_images > 0) {
+                        var p = banner.querySelector('p');
+                        if (p) {
+                            p.style.color = 'var(--info)';
+                            p.style.fontWeight = '700';
+                            p.textContent = data.pending_images === 1
+                                ? i18nProgress.pendingOne.replace('{pending}', '1')
+                                : i18nProgress.pendingMany.replace('{pending}', data.pending_images);
+                        }
+                    }
+                }
+            }).catch(function(e) {
+                console.error('Progress poll error:', e);
+            });
+        }
+
+        pollTimer = setInterval(pollProgress, 5000);
+        pollProgress();
     })();
     {% endif %}
 </script>
