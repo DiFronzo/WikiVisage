@@ -508,7 +508,7 @@ def bootstrap_from_sparql(project: Dict[str, Any]) -> int:
     count_row = execute_query(
         "SELECT COUNT(*) AS cnt FROM faces f "
         "JOIN images i ON f.image_id = i.id "
-        "WHERE i.project_id = %s AND f.is_target = 1",
+        "WHERE i.project_id = %s AND f.is_target = 1 AND f.superseded_by IS NULL",
         (project["id"],),
     )
     if count_row and count_row[0]["cnt"] > 0:
@@ -554,15 +554,16 @@ def bootstrap_from_sparql(project: Dict[str, Any]) -> int:
                 if exists:
                     # Image already known — just flag it as bootstrapped if pending
                     if exists[0]["status"] == "pending":
-                        execute_query(
-                            "UPDATE images SET bootstrapped = 1 WHERE id = %s",
+                        affected = execute_query(
+                            "UPDATE images SET bootstrapped = 1 WHERE id = %s AND bootstrapped != 1",
                             (exists[0]["id"],),
                             fetch=False,
                         )
-                        flagged_count += 1
+                        if affected:
+                            flagged_count += 1
                 else:
                     # New image not in category — insert as pending + bootstrapped
-                    execute_query(
+                    affected = execute_query(
                         """
                         INSERT IGNORE INTO images (project_id, commons_page_id, file_title, status, bootstrapped)
                         VALUES (%s, %s, %s, 'pending', 1)
@@ -570,7 +571,17 @@ def bootstrap_from_sparql(project: Dict[str, Any]) -> int:
                         (project["id"], page_id, title),
                         fetch=False,
                     )
-                    flagged_count += 1
+                    if affected:
+                        flagged_count += 1
+                    else:
+                        # Race: another process inserted this image between our
+                        # SELECT and INSERT.  Ensure it gets the bootstrap flag.
+                        execute_query(
+                            "UPDATE images SET bootstrapped = 1 "
+                            "WHERE project_id = %s AND commons_page_id = %s AND bootstrapped != 1",
+                            (project["id"], page_id),
+                            fetch=False,
+                        )
 
             # Paginate: check for continuation token
             continuation = data.get("continue", {})
@@ -609,7 +620,7 @@ def run_autonomous_inference(project: Dict[str, Any]) -> int:
     count_row = execute_query(
         "SELECT COUNT(*) AS cnt FROM faces f "
         "JOIN images i ON f.image_id = i.id "
-        "WHERE i.project_id = %s AND f.is_target = 1",
+        "WHERE i.project_id = %s AND f.is_target = 1 AND f.superseded_by IS NULL",
         (project["id"],),
         fetch=True,
     )
@@ -630,7 +641,7 @@ def run_autonomous_inference(project: Dict[str, Any]) -> int:
         """
         SELECT f.encoding FROM faces f
         JOIN images i ON f.image_id = i.id
-        WHERE i.project_id = %s AND f.is_target = 1
+        WHERE i.project_id = %s AND f.is_target = 1 AND f.superseded_by IS NULL
         """,
         (project["id"],),
         fetch=True,
@@ -653,7 +664,7 @@ def run_autonomous_inference(project: Dict[str, Any]) -> int:
         """
         SELECT f.id, f.encoding FROM faces f
         JOIN images i ON f.image_id = i.id
-        WHERE i.project_id = %s AND f.is_target IS NULL
+        WHERE i.project_id = %s AND f.is_target IS NULL AND f.superseded_by IS NULL
         """,
         (project["id"],),
         fetch=True,
@@ -747,7 +758,7 @@ def write_sdc_claims(project: Dict[str, Any]) -> int:
             FROM faces f
             JOIN images i ON f.image_id = i.id
             WHERE i.project_id = %s AND f.is_target = 1 AND f.sdc_written = 0
-            AND f.classified_by != 'bootstrap'
+            AND f.classified_by != 'bootstrap' AND f.superseded_by IS NULL
             LIMIT %s
             """,
             (project_id, SDC_BATCH),
@@ -993,11 +1004,11 @@ def main():
         diag = execute_query(
             "SELECT p.id, p.wikidata_qid, p.status, p.min_confirmed, p.faces_confirmed, "
             "  (SELECT COUNT(*) FROM faces f JOIN images i ON f.image_id = i.id "
-            "   WHERE i.project_id = p.id AND f.is_target = 1) AS actual_target_faces, "
+            "   WHERE i.project_id = p.id AND f.is_target = 1 AND f.superseded_by IS NULL) AS actual_target_faces, "
             "  (SELECT COUNT(*) FROM faces f JOIN images i ON f.image_id = i.id "
-            "   WHERE i.project_id = p.id AND f.is_target = 0) AS actual_non_target, "
+            "   WHERE i.project_id = p.id AND f.is_target = 0 AND f.superseded_by IS NULL) AS actual_non_target, "
             "  (SELECT COUNT(*) FROM faces f JOIN images i ON f.image_id = i.id "
-            "   WHERE i.project_id = p.id AND f.is_target IS NULL) AS unclassified_faces "
+            "   WHERE i.project_id = p.id AND f.is_target IS NULL AND f.superseded_by IS NULL) AS unclassified_faces "
             "FROM projects p",
             fetch=True,
         )
@@ -1036,12 +1047,12 @@ def main():
                     "AND ("
                     "  SELECT COUNT(*) FROM faces f "
                     "  JOIN images i ON f.image_id = i.id "
-                    "  WHERE i.project_id = p.id AND f.is_target = 1"
+                    "  WHERE i.project_id = p.id AND f.is_target = 1 AND f.superseded_by IS NULL"
                     ") >= p.min_confirmed "
                     "AND EXISTS ("
                     "  SELECT 1 FROM faces f "
                     "  JOIN images i ON f.image_id = i.id "
-                    "  WHERE i.project_id = p.id AND f.is_target IS NULL"
+                    "  WHERE i.project_id = p.id AND f.is_target IS NULL AND f.superseded_by IS NULL"
                     ")",
                     fetch=True,
                 )

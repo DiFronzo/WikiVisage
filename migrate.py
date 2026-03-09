@@ -178,6 +178,20 @@ _ALTER_MIGRATIONS = [
         "ALTER TABLE images ADD COLUMN detection_height SMALLINT UNSIGNED NULL "
         "COMMENT 'Image height in pixels at which face detection was run' AFTER detection_width",
     ),
+    (
+        "Add superseded_by to faces",
+        "ALTER TABLE faces ADD COLUMN superseded_by BIGINT UNSIGNED NULL "
+        "COMMENT 'FK to replacement face after bbox edit; NULL=active' AFTER sdc_written",
+    ),
+    (
+        "Add FK for superseded_by",
+        "ALTER TABLE faces ADD CONSTRAINT fk_faces_superseded_by "
+        "FOREIGN KEY (superseded_by) REFERENCES faces (id) ON DELETE SET NULL",
+    ),
+    (
+        "Add index for superseded_by",
+        "ALTER TABLE faces ADD INDEX idx_faces_superseded (superseded_by)",
+    ),
 ]
 
 

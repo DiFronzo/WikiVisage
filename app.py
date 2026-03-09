@@ -1186,7 +1186,7 @@ def project_detail(project_id: int):
             "  SUM(CASE WHEN f.classified_by = 'bootstrap' AND f.classified_by_user_id IS NULL THEN 1 ELSE 0 END) AS by_bootstrap "
             "FROM faces f "
             "JOIN images i ON f.image_id = i.id "
-            "WHERE i.project_id = %s",
+            "WHERE i.project_id = %s AND f.superseded_by IS NULL",
             (project_id,),
         )
         face_stats = stats[0] if stats else {}
@@ -1207,6 +1207,7 @@ def project_detail(project_id: int):
             "FROM faces f "
             "JOIN images i ON f.image_id = i.id "
             "WHERE i.project_id = %s "
+            "  AND f.superseded_by IS NULL "
             "  AND (f.classified_by IN ('model', 'bootstrap') "
             "       OR (f.is_target = 0 AND f.classified_by = 'human' AND f.classified_by_user_id IS NOT NULL)) "
             "  AND LOWER(i.file_title) NOT REGEXP '\\\\.(webm|ogv|ogg|mp3|wav|flac|opus|mid|oga)$' "
@@ -1290,6 +1291,7 @@ def classify(project_id: int):
                 "FROM images i "
                 "JOIN faces f ON f.image_id = i.id "
                 "WHERE i.project_id = %s AND i.id = %s "
+                "AND f.superseded_by IS NULL "
                 "AND (f.is_target IS NULL OR (f.is_target = 0 AND f.classified_by = 'model')) "
                 "LIMIT 1",
                 (project_id, forced_image_id),
@@ -1298,7 +1300,7 @@ def classify(project_id: int):
             if image_row:
                 unclassified_check = execute_query(
                     "SELECT COUNT(*) AS cnt FROM faces "
-                    "WHERE image_id = %s AND is_target IS NULL",
+                    "WHERE image_id = %s AND is_target IS NULL AND superseded_by IS NULL",
                     (forced_image_id,),
                 )
                 if not unclassified_check or unclassified_check[0]["cnt"] == 0:
@@ -1310,7 +1312,7 @@ def classify(project_id: int):
                 "i.detection_width, i.detection_height "
                 "FROM images i "
                 "JOIN faces f ON f.image_id = i.id "
-                f"WHERE i.project_id = %s AND f.is_target IS NULL AND i.id NOT IN ({placeholders}) "
+                f"WHERE i.project_id = %s AND f.is_target IS NULL AND f.superseded_by IS NULL AND i.id NOT IN ({placeholders}) "
                 "LIMIT 200",
                 (project_id, *skipped_ids),
             )
@@ -1322,7 +1324,7 @@ def classify(project_id: int):
                 "i.detection_width, i.detection_height "
                 "FROM images i "
                 "JOIN faces f ON f.image_id = i.id "
-                "WHERE i.project_id = %s AND f.is_target IS NULL "
+                "WHERE i.project_id = %s AND f.is_target IS NULL AND f.superseded_by IS NULL "
                 "LIMIT 200",
                 (project_id,),
             )
@@ -1342,7 +1344,7 @@ def classify(project_id: int):
                     "FROM images i "
                     "JOIN faces f ON f.image_id = i.id "
                     f"WHERE i.project_id = %s AND f.is_target = 0 AND f.classified_by = 'model' "
-                    f"AND f.classified_by_user_id IS NULL AND i.id NOT IN ({placeholders}) "
+                    f"AND f.classified_by_user_id IS NULL AND f.superseded_by IS NULL AND i.id NOT IN ({placeholders}) "
                     "LIMIT 200",
                     (project_id, *skipped_review_ids),
                 )
@@ -1355,7 +1357,7 @@ def classify(project_id: int):
                     "FROM images i "
                     "JOIN faces f ON f.image_id = i.id "
                     "WHERE i.project_id = %s AND f.is_target = 0 AND f.classified_by = 'model' "
-                    "AND f.classified_by_user_id IS NULL "
+                    "AND f.classified_by_user_id IS NULL AND f.superseded_by IS NULL "
                     "LIMIT 200",
                     (project_id,),
                 )
@@ -1377,6 +1379,7 @@ def classify(project_id: int):
                     "f.bbox_bottom, f.bbox_left, f.confidence "
                     "FROM faces f "
                     "WHERE f.image_id = %s AND f.is_target = 0 AND f.classified_by = 'model' "
+                    "AND f.superseded_by IS NULL "
                     "ORDER BY f.bbox_left ASC",
                     (image["image_id"],),
                 )
@@ -1390,7 +1393,7 @@ def classify(project_id: int):
                     "SELECT f.id AS face_id, f.bbox_top, f.bbox_right, "
                     "f.bbox_bottom, f.bbox_left, f.confidence "
                     "FROM faces f "
-                    "WHERE f.image_id = %s AND f.is_target IS NULL "
+                    "WHERE f.image_id = %s AND f.is_target IS NULL AND f.superseded_by IS NULL "
                     "ORDER BY f.bbox_left ASC",
                     (image["image_id"],),
                 )
@@ -1404,7 +1407,7 @@ def classify(project_id: int):
             "SELECT COUNT(DISTINCT i.id) AS cnt "
             "FROM images i "
             "JOIN faces f ON f.image_id = i.id "
-            "WHERE i.project_id = %s AND f.is_target IS NULL",
+            "WHERE i.project_id = %s AND f.is_target IS NULL AND f.superseded_by IS NULL",
             (project_id,),
         )
         remaining_count = remaining[0]["cnt"] if remaining else 0
@@ -1416,7 +1419,7 @@ def classify(project_id: int):
             "SELECT COUNT(DISTINCT i.id) AS cnt "
             "FROM images i "
             "JOIN faces f ON f.image_id = i.id "
-            "WHERE i.project_id = %s AND f.is_target = 0 AND f.classified_by = 'model'",
+            "WHERE i.project_id = %s AND f.is_target = 0 AND f.classified_by = 'model' AND f.superseded_by IS NULL",
             (project_id,),
         )
         model_review_count = model_remaining[0]["cnt"] if model_remaining else 0
@@ -1489,9 +1492,9 @@ def api_classify():
     # In review mode, we target model-classified not-target faces
     # In normal mode, we target unclassified faces
     if is_review_mode:
-        face_filter_sql = "is_target = 0 AND classified_by = 'model' AND classified_by_user_id IS NULL"
+        face_filter_sql = "is_target = 0 AND classified_by = 'model' AND classified_by_user_id IS NULL AND superseded_by IS NULL"
     else:
-        face_filter_sql = "is_target IS NULL"
+        face_filter_sql = "is_target IS NULL AND superseded_by IS NULL"
 
     try:
         if selected_face_id == "none":
@@ -1509,14 +1512,14 @@ def api_classify():
                         "UPDATE faces SET classified_by = 'human', "
                         "classified_by_user_id = %s "
                         "WHERE image_id = %s AND is_target = 0 AND classified_by = 'model' "
-                        "AND classified_by_user_id IS NULL",
+                        "AND classified_by_user_id IS NULL AND superseded_by IS NULL",
                         (g.user["id"], image_id),
                     )
                 else:
                     cursor.execute(
                         "UPDATE faces SET is_target = 0, classified_by = 'human', "
                         "classified_by_user_id = %s "
-                        "WHERE image_id = %s AND is_target IS NULL",
+                        "WHERE image_id = %s AND is_target IS NULL AND superseded_by IS NULL",
                         (g.user["id"], image_id),
                     )
                 return ids
@@ -1558,14 +1561,14 @@ def api_classify():
                         "classified_by_user_id = %s "
                         "WHERE image_id = %s AND id != %s "
                         "AND is_target = 0 AND classified_by = 'model' "
-                        "AND classified_by_user_id IS NULL",
+                        "AND classified_by_user_id IS NULL AND superseded_by IS NULL",
                         (g.user["id"], image_id, selected_face_id),
                     )
                 else:
                     cursor.execute(
                         "UPDATE faces SET is_target = 0, classified_by = 'human', "
                         "classified_by_user_id = %s "
-                        "WHERE image_id = %s AND id != %s AND is_target IS NULL",
+                        "WHERE image_id = %s AND id != %s AND is_target IS NULL AND superseded_by IS NULL",
                         (g.user["id"], image_id, selected_face_id),
                     )
 
@@ -1777,7 +1780,7 @@ def api_manual_face():
                 cursor.execute(
                     "SELECT id FROM faces "
                     "WHERE image_id = %s AND is_target = 0 AND classified_by = 'model' "
-                    "AND classified_by_user_id IS NULL",
+                    "AND classified_by_user_id IS NULL AND superseded_by IS NULL",
                     (image_id,),
                 )
                 rows = cursor.fetchall()
@@ -1804,7 +1807,7 @@ def api_manual_face():
                     "UPDATE faces SET classified_by = 'human', "
                     "classified_by_user_id = %s "
                     "WHERE image_id = %s AND is_target = 0 AND classified_by = 'model' "
-                    "AND classified_by_user_id IS NULL",
+                    "AND classified_by_user_id IS NULL AND superseded_by IS NULL",
                     (g.user["id"], image_id),
                 )
                 cursor.execute(
@@ -1979,7 +1982,7 @@ def api_reclassify():
             "FROM faces f "
             "JOIN images i ON f.image_id = i.id "
             "JOIN projects p ON i.project_id = p.id "
-            "WHERE f.id = %s AND p.user_id = %s",
+            "WHERE f.id = %s AND p.user_id = %s AND f.superseded_by IS NULL",
             (face_id, g.user["id"]),
         )
         if not rows:
@@ -2117,7 +2120,7 @@ def api_update_face_bbox():
             "FROM faces f "
             "JOIN images i ON f.image_id = i.id "
             "JOIN projects p ON i.project_id = p.id "
-            "WHERE f.id = %s AND p.user_id = %s",
+            "WHERE f.id = %s AND p.user_id = %s AND f.superseded_by IS NULL",
             (face_id, g.user["id"]),
         )
         if not rows:
@@ -2176,11 +2179,11 @@ def api_update_face_bbox():
                 ),
             )
             new_face_id = cursor.lastrowid
-            # Mark original face as superseded so it won't appear or get SDC-written
+            # Link original face to its replacement — superseded faces are
+            # excluded from all stats, inference, and SDC queries.
             cursor.execute(
-                "UPDATE faces SET is_target = 0, classified_by = 'human', "
-                "classified_by_user_id = NULL WHERE id = %s",
-                (face_id,),
+                "UPDATE faces SET superseded_by = %s WHERE id = %s",
+                (new_face_id, face_id),
             )
             return new_face_id
 
@@ -2236,7 +2239,7 @@ def api_write_sdc(project_id: int):
             "SELECT COUNT(*) AS cnt FROM faces f "
             "JOIN images i ON f.image_id = i.id "
             "WHERE i.project_id = %s AND f.is_target = 1 AND f.sdc_written = 0 "
-            "AND f.classified_by != 'bootstrap'",
+            "AND f.classified_by != 'bootstrap' AND f.superseded_by IS NULL",
             (project_id,),
             fetch=True,
         )
@@ -2297,7 +2300,7 @@ def api_sdc_status(project_id: int):
             "  SUM(CASE WHEN f.is_target = 1 AND f.sdc_written = 0 AND f.classified_by != 'bootstrap' THEN 1 ELSE 0 END) AS pending "
             "FROM faces f "
             "JOIN images i ON f.image_id = i.id "
-            "WHERE i.project_id = %s",
+            "WHERE i.project_id = %s AND f.superseded_by IS NULL",
             (project_id,),
             fetch=True,
         )
@@ -2364,7 +2367,7 @@ def api_progress(project_id: int):
             "  SUM(CASE WHEN f.classified_by = 'bootstrap' AND f.classified_by_user_id IS NULL THEN 1 ELSE 0 END) AS by_bootstrap "
             "FROM faces f "
             "JOIN images i ON f.image_id = i.id "
-            "WHERE i.project_id = %s",
+            "WHERE i.project_id = %s AND f.superseded_by IS NULL",
             (project_id,),
             fetch=True,
         )
@@ -2503,6 +2506,7 @@ def leaderboard():
             "    AS sdc_tags "
             "FROM users u "
             "INNER JOIN faces f ON f.classified_by_user_id = u.id "
+            "WHERE f.superseded_by IS NULL "
             "GROUP BY u.id, u.wiki_username "
             "ORDER BY (COUNT(*) "
             "        + COUNT(CASE WHEN f.sdc_written = 1 THEN 1 END)) DESC, "
