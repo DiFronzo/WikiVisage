@@ -355,9 +355,13 @@
 {% set eligible = inference_eligible or 0 %}
 {% if unclassified > 0 or pending_images > 0 %}
 <div class="card" id="infoBanner" style="margin-top: 2rem; border-color: var(--info); background: rgba(59, 130, 246, 0.05);">
-    {% if confirmed >= project.min_confirmed %}
+    {% if confirmed >= project.min_confirmed and eligible > 0 %}
     <p style="color: var(--info); font-weight: 700; margin-bottom: 0;">
         {{ ngettext('%(num)d face waiting for model inference. The background worker will classify it automatically within the next minute.', '%(num)d faces waiting for model inference. The background worker will classify them automatically within the next minute.', eligible, num=eligible) }}
+    </p>
+    {% elif confirmed >= project.min_confirmed %}
+    <p style="color: var(--info); font-weight: 700; margin-bottom: 0;">
+        {{ ngettext('%(num)d unclassified face remaining, but none are currently eligible for automatic model inference.', '%(num)d unclassified faces remaining, but none are currently eligible for automatic model inference.', unclassified, num=unclassified) }}
     </p>
     {% elif pending_images > 0 %}
     <p style="color: var(--info); font-weight: 700; margin-bottom: 0;">
