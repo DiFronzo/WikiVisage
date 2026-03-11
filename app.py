@@ -2354,27 +2354,6 @@ def api_write_sdc(project_id: int):
             }
         )
 
-    # Check there are faces to write or removals pending
-    try:
-        pending = execute_query(
-            "SELECT "
-            "  SUM(CASE WHEN f.is_target = 1 AND f.sdc_written = 0 "
-            "    AND f.classified_by != 'bootstrap' AND i.bootstrapped = 0 THEN 1 ELSE 0 END) AS write_cnt, "
-            "  COUNT(DISTINCT CASE WHEN f.sdc_removal_pending = 1 "
-            "    AND NOT EXISTS (SELECT 1 FROM faces f2 WHERE f2.image_id = f.image_id "
-            "    AND f2.is_target = 1 AND f2.superseded_by IS NULL AND f2.id != f.id) "
-            "    THEN f.image_id END) AS removal_cnt "
-            "FROM faces f "
-            "JOIN images i ON f.image_id = i.id "
-            "WHERE i.project_id = %s AND f.superseded_by IS NULL",
-            (project_id,),
-            fetch=True,
-        )
-        write_count = (pending[0]["write_cnt"] or 0) if pending else 0
-        removal_count = (pending[0]["removal_cnt"] or 0) if pending else 0
-    except DatabaseError:
-        return jsonify({"error": _("Database error")}), 500
-
     if write_count == 0 and removal_count == 0:
         return jsonify({"status": "ok", "pending": 0, "removal_pending": 0})
 
