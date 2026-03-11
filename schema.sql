@@ -54,6 +54,7 @@ CREATE TABLE IF NOT EXISTS projects (
 
     INDEX idx_projects_user_id (user_id),
     INDEX idx_projects_status (status),
+    INDEX idx_projects_sdc_write_requested (sdc_write_requested),
     UNIQUE INDEX idx_projects_user_qid_cat (user_id, wikidata_qid, commons_category),
 
     CONSTRAINT fk_projects_user
@@ -79,6 +80,7 @@ CREATE TABLE IF NOT EXISTS images (
     INDEX idx_images_project_id (project_id),
     INDEX idx_images_status (status),
     INDEX idx_images_project_status (project_id, status),
+    INDEX idx_images_project_bootstrapped (project_id, bootstrapped),
     UNIQUE INDEX idx_images_project_page (project_id, commons_page_id),
 
     CONSTRAINT fk_images_project
@@ -103,6 +105,7 @@ CREATE TABLE IF NOT EXISTS faces (
     classified_by   ENUM('human', 'model', 'bootstrap') NULL COMMENT 'How this face was classified',
     classified_by_user_id BIGINT UNSIGNED NULL COMMENT 'User who classified this face (human classifications)',
     sdc_written     TINYINT(1)      NOT NULL DEFAULT 0 COMMENT 'Whether P180 claim was written to SDC',
+    sdc_removal_pending TINYINT(1) NOT NULL DEFAULT 0 COMMENT '1=P180 claim removal queued (rejected bootstrap face)',
     superseded_by   BIGINT UNSIGNED NULL COMMENT 'FK to replacement face after bbox edit. NULL=active face',
     created_at      DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at      DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -111,6 +114,7 @@ CREATE TABLE IF NOT EXISTS faces (
     INDEX idx_faces_is_target (is_target),
     INDEX idx_faces_classification (image_id, is_target, classified_by),
     INDEX idx_faces_sdc (is_target, sdc_written),
+    INDEX idx_faces_sdc_removal (sdc_removal_pending),
     INDEX idx_faces_classified_by_user (classified_by_user_id),
     INDEX idx_faces_superseded (superseded_by),
 

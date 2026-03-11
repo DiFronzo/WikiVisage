@@ -34,6 +34,10 @@
         object-fit: contain;
         background: var(--bg);
     }
+    .result-thumb img.face-cropped {
+        /* JS sets position: absolute, width, height, top, left to zoom into face */
+        object-fit: unset;
+    }
     .result-actions {
         position: absolute;
         top: 0.5rem;
@@ -348,11 +352,12 @@
 
 {% set unclassified = stats.unclassified or 0 %}
 {% set confirmed = stats.confirmed_matches or 0 %}
+{% set eligible = inference_eligible or 0 %}
 {% if unclassified > 0 or pending_images > 0 %}
 <div class="card" id="infoBanner" style="margin-top: 2rem; border-color: var(--info); background: rgba(59, 130, 246, 0.05);">
     {% if confirmed >= project.min_confirmed %}
     <p style="color: var(--info); font-weight: 700; margin-bottom: 0;">
-        {{ ngettext('%(num)d face waiting for model inference. The background worker will classify it automatically within the next minute.', '%(num)d faces waiting for model inference. The background worker will classify them automatically within the next minute.', unclassified, num=unclassified) }}
+        {{ ngettext('%(num)d face waiting for model inference. The background worker will classify it automatically within the next minute.', '%(num)d faces waiting for model inference. The background worker will classify them automatically within the next minute.', eligible, num=eligible) }}
     </p>
     {% elif pending_images > 0 %}
     <p style="color: var(--info); font-weight: 700; margin-bottom: 0;">
@@ -393,6 +398,7 @@
     <button class="btn btn-sm results-filter" data-filter="rejected" data-filter-type="result" onclick="filterResults('rejected', 'result')">{{ _('Rejected') }}</button>
     <span style="border-left: 2px solid var(--border); margin: 0 0.25rem;"></span>
     <button class="btn btn-sm results-filter" data-filter="model" data-filter-type="source" onclick="filterResults('model', 'source')">{{ _('Model') }}</button>
+    <button class="btn btn-sm results-filter" data-filter="bootstrap" data-filter-type="source" onclick="filterResults('bootstrap', 'source')">{{ _('Bootstrap') }}</button>
 </div>
 
 <div class="results-gallery" id="resultsGallery">
@@ -429,6 +435,7 @@ data-detection-width="{{ face.detection_width or 0 }}" data-detection-height="{{
 
 {% if project.images_total > 0 %}
 {% set sdc_pending = stats.sdc_pending or 0 %}
+{% set sdc_removal = stats.sdc_removal_pending or 0 %}
 <div class="card" id="sdcWriteSection" style="border-color: var(--primary); background: rgba(59, 130, 246, 0.05); margin-top: 4rem;">
     <h3 style="color: var(--primary); margin-bottom: 0.5rem;">{{ _('Send Edits to Wikimedia Commons') }}</h3>
     <p style="color: var(--text-muted); margin-bottom: 1.5rem;">
@@ -438,9 +445,19 @@ data-detection-width="{{ face.detection_width or 0 }}" data-detection-height="{{
         {{ _('All structured data edits will be published under the') }} <a rel="nofollow" href="https://creativecommons.org/publicdomain/zero/1.0/" style="color: var(--primary);">Creative Commons CC0 License</a>.
     </p>
     <div id="sdcStatus" style="margin-bottom: 1rem;">
-        {% if sdc_pending > 0 %}
+        {% if sdc_pending > 0 and sdc_removal > 0 %}
+        <p style="font-weight: 700;">
+            {{ ngettext('%(num)d face ready to send', '%(num)d faces ready to send', sdc_pending, num=sdc_pending) }}
+            {{ _('and') }}
+            {{ ngettext('%(num)d ready to be removed.', '%(num)d ready to be removed.', sdc_removal, num=sdc_removal) }}
+        </p>
+        {% elif sdc_pending > 0 %}
         <p style="font-weight: 700;">
             {{ ngettext('%(num)d face ready to send.', '%(num)d faces ready to send.', sdc_pending, num=sdc_pending) }}
+        </p>
+        {% elif sdc_removal > 0 %}
+        <p style="font-weight: 700;">
+            {{ ngettext('%(num)d image ready to be removed.', '%(num)d images ready to be removed.', sdc_removal, num=sdc_removal) }}
         </p>
         {% else %}
         <p style="color: var(--text-muted);">{{ _('No pending faces to write. All approved faces have already been sent.') }}</p>
@@ -453,7 +470,7 @@ data-detection-width="{{ face.detection_width or 0 }}" data-detection-height="{{
         </div>
     </div>
     <div id="sdcResult" style="display: none; margin-bottom: 1rem;"></div>
-    <button class="btn btn-primary" id="sdcWriteBtn" onclick="startSdcWrite()" {{ 'disabled' if sdc_pending == 0 or project.sdc_write_requested }}>
+    <button class="btn btn-primary" id="sdcWriteBtn" onclick="startSdcWrite()" {{ 'disabled' if (sdc_pending == 0 and sdc_removal == 0) or project.sdc_write_requested }}>
         {{ _('Send Edits to Wikimedia Commons') }}
     </button>
 </div>
@@ -494,6 +511,7 @@ data-detection-width="{{ face.detection_width or 0 }}" data-detection-height="{{
         rejected: {{ _('Rejected')|tojson }},
         human: {{ _('human')|tojson }},
         sdcRemoved: {{ _('SDC claim was removed.')|tojson }},
+        sdcRemovalQueued: {{ _('SDC claim removal queued.')|tojson }},
         saveError: {{ _('Error saving classification')|tojson }},
         bboxError: {{ _('Error saving new bounding box')|tojson }}
     };
@@ -527,6 +545,10 @@ data-detection-width="{{ face.detection_width or 0 }}" data-detection-height="{{
                 if (data.sdc_removed) {
                     var sdcNote = card.querySelector('.sdc-note');
                     sdcNote.textContent = i18nReclassify.sdcRemoved;
+                    sdcNote.style.display = 'block';
+                } else if (data.sdc_removal_queued) {
+                    var sdcNote = card.querySelector('.sdc-note');
+                    sdcNote.textContent = i18nReclassify.sdcRemovalQueued;
                     sdcNote.style.display = 'block';
                 }
             } else {
@@ -569,6 +591,94 @@ data-detection-width="{{ face.detection_width or 0 }}" data-detection-height="{{
         }
         return 'https://commons.wikimedia.org/wiki/Special:FilePath/' + encodeURIComponent(clean) + '?width=' + width;
     }
+
+    /**
+     * Crop a gallery thumbnail to show just the face bounding box region.
+     * Positions the img absolutely inside the overflow-hidden .result-thumb
+     * container, scaling it so the face region (with padding) fills the view.
+     * Skips legacy images where detection_width/detection_height are 0.
+     */
+    function cropToFace(img) {
+        var thumb = img.parentElement;
+        if (!thumb || !thumb.classList.contains('result-thumb')) return;
+
+        var detW = parseInt(thumb.dataset.detectionWidth) || 0;
+        var detH = parseInt(thumb.dataset.detectionHeight) || 0;
+        if (detW === 0 || detH === 0) return;  // Legacy image — no crop
+
+        var bboxTop = parseInt(thumb.dataset.bboxTop) || 0;
+        var bboxRight = parseInt(thumb.dataset.bboxRight) || 0;
+        var bboxBottom = parseInt(thumb.dataset.bboxBottom) || 0;
+        var bboxLeft = parseInt(thumb.dataset.bboxLeft) || 0;
+
+        var faceW = bboxRight - bboxLeft;
+        var faceH = bboxBottom - bboxTop;
+        if (faceW <= 0 || faceH <= 0) return;  // Invalid bbox
+
+        // Add 30% padding around the face (clamped to image bounds in detection space)
+        var padX = faceW * 0.3;
+        var padY = faceH * 0.3;
+        var cropLeft = Math.max(0, bboxLeft - padX);
+        var cropTop = Math.max(0, bboxTop - padY);
+        var cropRight = Math.min(detW, bboxRight + padX);
+        var cropBottom = Math.min(detH, bboxBottom + padY);
+        var cropW = cropRight - cropLeft;
+        var cropH = cropBottom - cropTop;
+        if (cropW <= 0 || cropH <= 0) return;
+
+        // Container dimensions
+        var containerW = thumb.clientWidth;
+        var containerH = thumb.clientHeight;
+        if (containerW === 0 || containerH === 0) return;
+
+        var natW = img.naturalWidth;
+        var natH = img.naturalHeight;
+        if (natW === 0 || natH === 0) return;
+
+        // Convert crop region from detection space to natural image pixel space
+        var scaleX = natW / detW;
+        var scaleY = natH / detH;
+        var srcLeft = cropLeft * scaleX;
+        var srcTop = cropTop * scaleY;
+        var srcW = cropW * scaleX;
+        var srcH = cropH * scaleY;
+
+        // Scale image so crop region fills the container (cover — no empty space)
+        var displayScale = Math.max(containerW / srcW, containerH / srcH);
+
+        // Skip if the face already fills most of the image (zoom < 1.1x)
+        var fullImgScale = Math.max(containerW / natW, containerH / natH);
+        if (displayScale / fullImgScale < 1.1) return;
+
+        // Rendered full-image dimensions at this scale
+        var renderedW = natW * displayScale;
+        var renderedH = natH * displayScale;
+
+        // Position: offset so the crop center aligns with container center
+        var cropCenterX = (srcLeft + srcW / 2) * displayScale;
+        var cropCenterY = (srcTop + srcH / 2) * displayScale;
+        var offsetX = containerW / 2 - cropCenterX;
+        var offsetY = containerH / 2 - cropCenterY;
+
+        img.classList.add('face-cropped');
+        img.style.position = 'absolute';
+        img.style.width = renderedW + 'px';
+        img.style.height = renderedH + 'px';
+        img.style.left = offsetX + 'px';
+        img.style.top = offsetY + 'px';
+    }
+
+    // Apply face cropping to all gallery thumbnails
+    (function() {
+        var thumbs = document.querySelectorAll('.results-gallery .result-thumb img');
+        thumbs.forEach(function(img) {
+            if (img.complete && img.naturalWidth > 0) {
+                cropToFace(img);
+            } else {
+                img.addEventListener('load', function() { cropToFace(img); });
+            }
+        });
+    })();
 
     function openBboxModal(btn) {
         var card = btn.closest('.result-card');
@@ -866,6 +976,7 @@ data-detection-width="{{ face.detection_width or 0 }}" data-detection-height="{{
     var i18nSdc = {
         queued: {{ _('Queued — waiting for background worker...')|tojson }},
         writing: {{ _('Worker is writing claims...')|tojson }},
+        removing: {{ _('Worker is removing claims...')|tojson }},
         written: {{ _('{written} of {total} written...')|tojson }},
         done: {{ _('Done!')|tojson }},
         allSent: {{ _('All {num} claims written successfully!')|tojson }},
@@ -873,10 +984,13 @@ data-detection-width="{{ face.detection_width or 0 }}" data-detection-height="{{
         sendError: {{ _('Failed to queue edits. Please try again.')|tojson }},
         workerError: {{ _('Worker error: {error}')|tojson }},
         btnLabel: {{ _('Send Edits to Wikimedia Commons')|tojson }},
-        btnInProgress: {{ _('Writing in progress...')|tojson }}
+        btnInProgress: {{ _('Writing in progress...')|tojson }},
+        removalPending: {{ _('{num} images ready to be removed')|tojson }},
+        allDone: {{ _('All edits completed successfully!')|tojson }}
     };
 
     var sdcInitialPending = {{ (stats.sdc_pending or 0)|tojson }};
+    var sdcInitialRemoval = {{ (stats.sdc_removal_pending or 0)|tojson }};
     var sdcPollTimer = null;
     var sdcInitialWritten = {{ (stats.sdc_written or 0)|tojson }};
 
@@ -920,8 +1034,8 @@ data-detection-width="{{ face.detection_width or 0 }}" data-detection-height="{{
                 return;
             }
 
-            if (data.pending === 0) {
-                // Nothing to write
+            if (data.pending === 0 && (!data.removal_pending || data.removal_pending === 0)) {
+                // Nothing to write or remove
                 status.style.display = 'block';
                 sdcShowMessage(status, i18nSdc.noFaces, 'var(--text-muted)');
                 btn.disabled = true;
@@ -929,7 +1043,8 @@ data-detection-width="{{ face.detection_width or 0 }}" data-detection-height="{{
             }
 
             // Flag set — show queued state and start polling
-            sdcInitialPending = data.pending;
+            sdcInitialPending = data.pending || 0;
+            sdcInitialRemoval = data.removal_pending || 0;
             progress.style.display = 'block';
             progressBar.style.width = '0%';
             progressText.textContent = i18nSdc.queued;
@@ -983,12 +1098,16 @@ data-detection-width="{{ face.detection_width or 0 }}" data-detection-height="{{
 
             var written = data.written || 0;
             var pending = data.pending || 0;
+            var removalPending = data.removal_pending || 0;
             var total = written + pending;
             // Use the larger of initial pending or current total for progress calculation
             var progressTotal = Math.max(sdcInitialPending, total) || 1;
             var newlyWritten = written - sdcInitialWritten;
             if (newlyWritten < 0) newlyWritten = 0;
-            var pct = Math.min(100, Math.round(newlyWritten / (sdcInitialPending || 1) * 100));
+            var totalInitialWork = (sdcInitialPending || 0) + (sdcInitialRemoval || 0);
+            var totalDone = newlyWritten + (sdcInitialRemoval - removalPending);
+            if (totalDone < 0) totalDone = 0;
+            var pct = Math.min(100, Math.round(totalDone / (totalInitialWork || 1) * 100));
 
             if (data.in_progress) {
                 // Worker is actively writing
@@ -998,8 +1117,11 @@ data-detection-width="{{ face.detection_width or 0 }}" data-detection-height="{{
                     progressText.textContent = i18nSdc.written
                         .replace('{written}', newlyWritten)
                         .replace('{total}', sdcInitialPending);
+                } else if (sdcInitialPending === 0 && sdcInitialRemoval > 0) {
+                    progressText.textContent = i18nSdc.removing;
                 } else {
-                    progressText.textContent = i18nSdc.writing;
+        progressText.textContent = (sdcInitialPending === 0 && sdcInitialRemoval > 0)
+            ? i18nSdc.removing : i18nSdc.writing;
                 }
                 btn.disabled = true;
                 btn.textContent = i18nSdc.btnInProgress;
@@ -1016,10 +1138,10 @@ data-detection-width="{{ face.detection_width or 0 }}" data-detection-height="{{
                     sdcShowMessage(result, i18nSdc.workerError.replace('{error}', data.error), 'var(--danger)');
                     btn.disabled = false;
                     btn.textContent = i18nSdc.btnLabel;
-                } else if (pending === 0) {
+                } else if (pending === 0 && removalPending === 0) {
                     // All done successfully
                     result.style.display = 'block';
-                    sdcShowMessage(result, i18nSdc.allSent.replace('{num}', newlyWritten || written), 'var(--success)');
+                    sdcShowMessage(result, i18nSdc.allDone, 'var(--success)');
                     status.style.display = 'block';
                     sdcShowMessage(status, i18nSdc.noFaces, 'var(--text-muted)');
                     btn.disabled = true;
@@ -1027,10 +1149,12 @@ data-detection-width="{{ face.detection_width or 0 }}" data-detection-height="{{
                 } else {
                     // Finished but some faces still pending (partial success)
                     result.style.display = 'block';
-                    sdcShowMessage(result, i18nSdc.allSent.replace('{num}', newlyWritten), 'var(--success)');
+                    var doneMsg = i18nSdc.allDone;
+                    sdcShowMessage(result, doneMsg, 'var(--success)');
                     btn.disabled = false;
                     btn.textContent = i18nSdc.btnLabel;
                     sdcInitialPending = pending;
+                    sdcInitialRemoval = removalPending;
                     sdcInitialWritten = written;
                 }
 
