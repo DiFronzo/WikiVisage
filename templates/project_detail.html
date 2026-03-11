@@ -1100,8 +1100,6 @@ data-detection-width="{{ face.detection_width or 0 }}" data-detection-height="{{
             var pending = data.pending || 0;
             var removalPending = data.removal_pending || 0;
             var total = written + pending;
-            // Use the larger of initial pending or current total for progress calculation
-            var progressTotal = Math.max(sdcInitialPending, total) || 1;
             var newlyWritten = written - sdcInitialWritten;
             if (newlyWritten < 0) newlyWritten = 0;
             var totalInitialWork = (sdcInitialPending || 0) + (sdcInitialRemoval || 0);
