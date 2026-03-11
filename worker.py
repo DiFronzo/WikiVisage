@@ -3,8 +3,10 @@ import json
 import logging
 import multiprocessing
 import os
+import queue
 import signal
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
@@ -43,7 +45,7 @@ FILE_PATH_URL = (
 USER_AGENT = "WikiVisage/1.0 (Wikimedia Toolforge; https://toolsadmin.wikimedia.org)"
 
 POLL_INTERVAL = int(os.environ.get("WIKIVISAGE_WORKER_POLL_INTERVAL", 60))
-BATCH_SIZE = 10
+BATCH_SIZE = int(os.environ.get("WIKIVISAGE_WORKER_BATCH_SIZE", 50))
 WAKE_UP_FILE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), ".worker-wake-up"
 )
@@ -63,8 +65,8 @@ MAX_IMAGES_PER_PROJECT = 9000
 shutdown_requested = False
 
 
-def _get_session() -> requests.Session:
-    """Create a requests session with exponential backoff retries."""
+def _create_session() -> requests.Session:
+    """Create a requests session with exponential backoff retries and connection pooling."""
     session = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT})
     retries = Retry(
@@ -73,10 +75,23 @@ def _get_session() -> requests.Session:
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=["HEAD", "GET", "OPTIONS", "POST"],
     )
-    adapter = HTTPAdapter(max_retries=retries)
+    adapter = HTTPAdapter(max_retries=retries, pool_connections=10, pool_maxsize=20)
     session.mount("http://", adapter)
     session.mount("https://", adapter)
     return session
+
+
+# Module-level singleton session — reuses TCP connections and TLS state across all
+# HTTP requests, avoiding the ~100ms+ overhead of per-request Session creation.
+_http_session: Optional[requests.Session] = None
+
+
+def _get_session() -> requests.Session:
+    """Return the singleton HTTP session, creating it on first use."""
+    global _http_session
+    if _http_session is None:
+        _http_session = _create_session()
+    return _http_session
 
 
 def _api_request(
@@ -165,6 +180,7 @@ def _download_image(url: str, max_bytes: int = MAX_IMAGE_DOWNLOAD_BYTES) -> byte
             resp.close()
             raise ValueError(f"Image download exceeded {max_bytes} bytes limit")
         chunks.append(chunk)
+    resp.close()
 
     return b"".join(chunks)
 
@@ -328,6 +344,266 @@ def traverse_category(project: Dict[str, Any]) -> int:
 FACE_DETECT_TIMEOUT = 120  # seconds — kill subprocess if face detection hangs
 
 
+# ---------------------------------------------------------------------------
+# Persistent Subprocess Pool for Face Detection
+# ---------------------------------------------------------------------------
+# Instead of spawning a new multiprocessing.Process per image (which re-imports
+# dlib/numpy/face_recognition each time — 2-5s overhead on Toolforge), we
+# maintain a pool of long-lived subprocesses. Each subprocess imports the heavy
+# libraries once at startup and processes images received via a Queue.
+# If a subprocess crashes (e.g. dlib segfault), it is automatically respawned.
+
+
+def _face_detect_worker_loop(
+    task_queue: multiprocessing.Queue,
+    result_queue: multiprocessing.Queue,
+    worker_id: int,
+) -> None:
+    """Long-lived subprocess loop: receive image bytes, detect faces, send results.
+
+    Runs until it receives a None sentinel on task_queue. Each task is
+    (request_id, image_bytes). Results are (request_id, "ok", locations,
+    encodings_bytes, width, height) or (request_id, "error", error_string).
+    """
+    # Heavy imports happen once per subprocess lifetime — this is the whole point
+    import face_recognition as fr
+    import numpy  # noqa: F401 — imported to ensure numpy is initialized
+
+    while True:
+        try:
+            task = task_queue.get()
+            if task is None:
+                break  # Sentinel: clean shutdown
+
+            request_id, image_bytes = task
+
+            try:
+                image_data = fr.load_image_file(io.BytesIO(image_bytes))
+                img_height, img_width = image_data.shape[:2]
+                face_locations = fr.face_locations(image_data, model="hog")
+                face_encodings = fr.face_encodings(image_data, face_locations)
+
+                encodings_as_bytes = [enc.tobytes() for enc in face_encodings]
+                result_queue.put(
+                    (
+                        request_id,
+                        "ok",
+                        face_locations,
+                        encodings_as_bytes,
+                        img_width,
+                        img_height,
+                    )
+                )
+            except Exception as e:
+                result_queue.put((request_id, "error", str(e)))
+
+        except Exception:
+            # Queue error or other fatal issue — subprocess exits, will be respawned
+            break
+
+
+class PoolUnavailableError(RuntimeError):
+    """Raised when the persistent face detection pool is not functional."""
+
+    pass
+
+
+class FaceDetectPool:
+    """Pool of persistent subprocesses for face detection.
+
+    Eliminates the 2-5 second per-image overhead of spawning a new Process
+    (which re-imports dlib/face_recognition) by keeping N subprocesses alive.
+    Each subprocess imports the heavy libraries once at startup.
+
+    Thread-safe: multiple IMAGE_THREADS can call detect_faces() concurrently.
+    A background dispatch thread routes results from the shared subprocess
+    result queue to per-request queues, avoiding stash/requeue races.
+
+    Provides crash isolation: if a subprocess segfaults on a bad image,
+    it is automatically respawned for the next request.
+    """
+
+    def __init__(self, pool_size: int = IMAGE_THREADS):
+        self._pool_size = pool_size
+        self._task_queue: multiprocessing.Queue = multiprocessing.Queue()
+        self._result_queue: multiprocessing.Queue = multiprocessing.Queue()
+        self._workers: List[multiprocessing.Process] = []
+        self._request_counter = 0
+        self._counter_lock = threading.Lock()
+        # Per-request result routing: request_id -> queue.Queue holding the result
+        self._pending: Dict[int, queue.Queue] = {}
+        self._pending_lock = threading.Lock()
+        self._dispatcher_thread: Optional[threading.Thread] = None
+        self._shutdown_event = threading.Event()
+        self._started = False
+
+    def start(self) -> None:
+        """Start the subprocess pool and result dispatcher. Idempotent."""
+        if self._started:
+            return
+        logger.info(f"Starting face detection subprocess pool (size={self._pool_size})")
+        self._shutdown_event.clear()
+        for i in range(self._pool_size):
+            self._spawn_worker(i)
+        # Start background thread that routes results to per-request queues
+        self._dispatcher_thread = threading.Thread(
+            target=self._dispatch_results, daemon=True, name="face-pool-dispatch"
+        )
+        self._dispatcher_thread.start()
+        self._started = True
+
+    def _spawn_worker(self, worker_id: int) -> None:
+        """Spawn a single worker subprocess."""
+        proc = multiprocessing.Process(
+            target=_face_detect_worker_loop,
+            args=(self._task_queue, self._result_queue, worker_id),
+            daemon=True,
+        )
+        proc.start()
+        if worker_id < len(self._workers):
+            self._workers[worker_id] = proc
+        else:
+            self._workers.append(proc)
+        logger.debug(f"Spawned face detection subprocess {worker_id} (pid={proc.pid})")
+
+    def _ensure_workers_alive(self) -> None:
+        """Check all workers and respawn any that have died."""
+        for i, proc in enumerate(self._workers):
+            if not proc.is_alive():
+                exitcode = proc.exitcode
+                logger.warning(
+                    f"Face detection subprocess {i} died (exitcode={exitcode}), respawning"
+                )
+                self._spawn_worker(i)
+
+    def _dispatch_results(self) -> None:
+        """Background thread: drain _result_queue and route to per-request queues.
+
+        Each result tuple starts with request_id. We look up the corresponding
+        per-request queue in self._pending and deliver the result. If no pending
+        request matches (e.g. caller timed out and unregistered), the result is
+        discarded with a warning.
+        """
+        while not self._shutdown_event.is_set():
+            try:
+                # Short timeout so we can check shutdown_event periodically
+                result = self._result_queue.get(timeout=1.0)
+            except Exception:
+                # queue.Empty on timeout — loop back and check shutdown
+                continue
+
+            request_id = result[0]
+            with self._pending_lock:
+                result_q = self._pending.get(request_id)
+
+            if result_q is not None:
+                result_q.put(result)
+            else:
+                logger.warning(
+                    f"Face detection result for unknown request_id={request_id} (caller may have timed out)"
+                )
+
+    def is_healthy(self) -> bool:
+        """Check if the pool is started and the dispatcher thread is alive."""
+        return (
+            self._started
+            and self._dispatcher_thread is not None
+            and self._dispatcher_thread.is_alive()
+        )
+
+    def detect_faces(self, image_bytes: bytes) -> Tuple[List, List[bytes], int, int]:
+        """Submit image for face detection and wait for result.
+
+        Thread-safe: each caller gets a unique request_id and a private result
+        queue. The dispatch thread routes the subprocess result to the correct
+        caller without stashing or requeuing.
+
+        Returns (locations, encoding_bytes_list, width, height).
+        Raises PoolUnavailableError if the pool is not started or dispatcher is dead.
+        Raises RuntimeError on timeout, subprocess crash, or detection error.
+        """
+        if not self.is_healthy():
+            raise PoolUnavailableError(
+                "Face detection pool is not running"
+                + (" (dispatcher thread died)" if self._started else " (not started)")
+            )
+        self._ensure_workers_alive()
+
+        # Allocate unique request_id under lock
+        with self._counter_lock:
+            self._request_counter += 1
+            request_id = self._request_counter
+
+        # Register a private result queue for this request
+        result_q: queue.Queue = queue.Queue()
+        with self._pending_lock:
+            self._pending[request_id] = result_q
+
+        try:
+            # Submit task to subprocess pool
+            self._task_queue.put((request_id, image_bytes))
+
+            # Wait for our result — the dispatch thread will deliver it
+            try:
+                result = result_q.get(timeout=FACE_DETECT_TIMEOUT)
+            except queue.Empty:
+                raise RuntimeError(
+                    f"Face detection timed out after {FACE_DETECT_TIMEOUT}s"
+                )
+
+            if result[1] == "error":
+                raise RuntimeError(f"Face detection failed: {result[2]}")
+            if result[1] != "ok":
+                raise RuntimeError(f"Unexpected subprocess result: {result[1]}")
+            return result[2], result[3], result[4], result[5]
+        finally:
+            # Unregister so dispatch thread doesn't hold a stale reference
+            with self._pending_lock:
+                self._pending.pop(request_id, None)
+
+    def shutdown(self) -> None:
+        """Gracefully shut down all worker subprocesses and the dispatch thread.
+
+        Ordering: mark not-started (reject new work) → send sentinels to
+        workers → join workers → stop dispatcher → cleanup.  The dispatcher
+        must stay alive while workers drain so in-flight results are still
+        routed to their callers.
+        """
+        if not self._started:
+            return
+        logger.info("Shutting down face detection subprocess pool")
+
+        # 1. Reject new work immediately
+        self._started = False
+
+        # 2. Send sentinel to each worker subprocess so they exit cleanly
+        for _ in self._workers:
+            try:
+                self._task_queue.put(None)
+            except Exception:
+                pass
+
+        # 3. Wait for workers to exit (dispatcher still routing results)
+        for i, proc in enumerate(self._workers):
+            proc.join(timeout=5)
+            if proc.is_alive():
+                logger.warning(f"Force-killing face detection subprocess {i}")
+                proc.kill()
+                proc.join(timeout=2)
+
+        # 4. Now stop the dispatcher — all workers are gone, no more results
+        self._shutdown_event.set()
+        if self._dispatcher_thread is not None:
+            self._dispatcher_thread.join(timeout=5)
+
+        self._workers.clear()
+        logger.info("Face detection subprocess pool shut down")
+
+
+# Module-level pool instance — initialized in main() before processing starts
+_face_pool: Optional[FaceDetectPool] = None
+
+
 def _detect_faces_in_subprocess(
     image_bytes: bytes,
     conn: Any,
@@ -337,6 +613,9 @@ def _detect_faces_in_subprocess(
     This isolates dlib's C++ code so a segfault kills only this subprocess,
     not the parent worker. Results are sent as (locations, encodings_bytes) or
     an error string.
+
+    NOTE: This is the FALLBACK path used only when the persistent pool is not
+    available (e.g. during single-image retries after pool crash).
     """
     try:
         image_data = face_recognition.load_image_file(io.BytesIO(image_bytes))
@@ -352,10 +631,12 @@ def _detect_faces_in_subprocess(
         conn.close()
 
 
-def _run_face_detection(image_bytes: bytes) -> Tuple[List, List[bytes], int, int]:
-    """Run face detection in a subprocess with timeout. Returns (locations, encoding_bytes_list, width, height).
+def _run_face_detection_fallback(
+    image_bytes: bytes,
+) -> Tuple[List, List[bytes], int, int]:
+    """Fallback: run face detection in a one-shot subprocess (old behavior).
 
-    Raises RuntimeError if subprocess crashes (segfault) or times out.
+    Used only when the persistent pool is unavailable.
     """
     parent_conn, child_conn = multiprocessing.Pipe(duplex=False)
     proc = multiprocessing.Process(
@@ -388,39 +669,68 @@ def _run_face_detection(image_bytes: bytes) -> Tuple[List, List[bytes], int, int
     return result[1], result[2], result[3], result[4]
 
 
+def _run_face_detection(image_bytes: bytes) -> Tuple[List, List[bytes], int, int]:
+    """Run face detection — uses persistent pool if available, falls back to one-shot subprocess.
+
+    Returns (locations, encoding_bytes_list, width, height).
+    Raises RuntimeError if subprocess crashes (segfault) or times out.
+    """
+    if _face_pool is not None:
+        try:
+            return _face_pool.detect_faces(image_bytes)
+        except PoolUnavailableError as e:
+            logger.warning(
+                f"Pool unavailable, falling back to one-shot subprocess: {e}"
+            )
+    return _run_face_detection_fallback(image_bytes)
+
+
 def _process_single_image(img_id: int, title: str) -> bool:
     """Download one image, detect faces in subprocess, store encodings. Returns True on success."""
     clean_title = title[5:] if title.startswith("File:") else title
     url = FILE_PATH_URL.format(file_title=clean_title)
 
     try:
+        t_start = time.monotonic()
+
         logger.debug(f"Downloading image {title}")
         image_bytes = _download_image(url)
         _validate_image_dimensions(image_bytes)
+        t_download = time.monotonic()
 
         face_locations, encodings_bytes, det_width, det_height = _run_face_detection(
             image_bytes
         )
         del image_bytes
+        t_detect = time.monotonic()
 
         face_count = len(face_locations)
 
-        for location, encoding_bytes in zip(face_locations, encodings_bytes):
-            top, right, bottom, left = location
+        # Batch-insert detected faces in chunks to stay within max_allowed_packet.
+        # All faces start unclassified (is_target=NULL). Classification
+        # happens via human confirmation or autonomous inference.
+        if face_locations:
+            FACE_INSERT_CHUNK = 100  # ~100KB per chunk (1024-byte encoding + ints)
+            for chunk_start in range(0, face_count, FACE_INSERT_CHUNK):
+                chunk_locs = face_locations[
+                    chunk_start : chunk_start + FACE_INSERT_CHUNK
+                ]
+                chunk_encs = encodings_bytes[
+                    chunk_start : chunk_start + FACE_INSERT_CHUNK
+                ]
+                chunk_size = len(chunk_locs)
+                placeholders = ", ".join(["(%s, %s, %s, %s, %s, %s)"] * chunk_size)
+                flat_params: list = []
+                for location, enc_bytes in zip(chunk_locs, chunk_encs):
+                    top, right, bottom, left = location
+                    flat_params.extend([img_id, enc_bytes, top, right, bottom, left])
 
-            # All faces start unclassified (is_target=NULL). Classification
-            # happens only via human confirmation in the classify UI or
-            # autonomous inference after min_confirmed human confirmations.
-            # The bootstrapped flag on the image row is preserved as metadata
-            # but does NOT auto-classify faces.
-            execute_query(
-                """
-                INSERT INTO faces (image_id, encoding, bbox_top, bbox_right, bbox_bottom, bbox_left)
-                VALUES (%s, %s, %s, %s, %s, %s)
-                """,
-                (img_id, encoding_bytes, top, right, bottom, left),
-                fetch=False,
-            )
+                execute_query(
+                    f"INSERT INTO faces (image_id, encoding, bbox_top, bbox_right, bbox_bottom, bbox_left) "
+                    f"VALUES {placeholders}",
+                    tuple(flat_params),
+                    fetch=False,
+                )
 
         execute_query(
             "UPDATE images SET status = 'processed', face_count = %s, "
@@ -428,7 +738,15 @@ def _process_single_image(img_id: int, title: str) -> bool:
             (face_count, det_width, det_height, img_id),
             fetch=False,
         )
+        t_db = time.monotonic()
 
+        logger.debug(
+            f"Image {img_id} ({face_count} faces): "
+            f"download={t_download - t_start:.2f}s, "
+            f"detect={t_detect - t_download:.2f}s, "
+            f"db={t_db - t_detect:.2f}s, "
+            f"total={t_db - t_start:.2f}s"
+        )
         return True
 
     except Exception as e:
@@ -455,6 +773,7 @@ def process_images(project: Dict[str, Any]) -> int:
     if not pending_images:
         return 0
 
+    batch_start = time.monotonic()
     processed_count = 0
 
     with ThreadPoolExecutor(max_workers=IMAGE_THREADS) as executor:
@@ -476,6 +795,14 @@ def process_images(project: Dict[str, Any]) -> int:
                     processed_count += 1
             except Exception as e:
                 logger.error(f"Thread error processing {futures[future]}: {e}")
+
+    batch_elapsed = time.monotonic() - batch_start
+    batch_size = len(pending_images) if isinstance(pending_images, list) else 0
+    per_image = batch_elapsed / batch_size if batch_size > 0 else 0
+    logger.info(
+        f"Batch complete: {processed_count}/{batch_size} images in {batch_elapsed:.1f}s "
+        f"({per_image:.2f}s/image avg, {IMAGE_THREADS} threads)"
+    )
 
     # Update project stats
     execute_query(
@@ -607,13 +934,14 @@ def bootstrap_from_sparql(project: Dict[str, Any]) -> int:
         return flagged_count
 
     except Exception as e:
-        logger.error(f"SPARQL Bootstrap failed: {e}")
+        logger.error(f"Bootstrap search failed: {e}")
 
     return 0
 
 
 def run_autonomous_inference(project: Dict[str, Any]) -> int:
     """Run model inference on unclassified faces based on confirmed faces."""
+    t_start = time.monotonic()
     min_confirmed = project.get("min_confirmed", 5)
 
     # Count actual is_target=1 faces instead of trusting faces_confirmed counter
@@ -650,6 +978,8 @@ def run_autonomous_inference(project: Dict[str, Any]) -> int:
     if not confirmed_rows:
         return 0
 
+    t_query = time.monotonic()
+
     # Load all confirmed encodings to compute centroid. Each encoding is 128 float64
     # values (1024 bytes). Even 10K confirmed faces = ~10 MB — well within Toolforge
     # memory limits. Batching would add complexity with no practical benefit.
@@ -657,37 +987,118 @@ def run_autonomous_inference(project: Dict[str, Any]) -> int:
         np.frombuffer(row["encoding"], dtype=np.float64) for row in confirmed_rows
     ]
     centroid = np.mean(confirmed_encodings, axis=0)
+    t_centroid = time.monotonic()
 
-    # Process all unclassified faces (inference is fast numpy math — single distance
-    # computation per face). Same memory analysis applies: 10K faces ≈ 10 MB.
+    # Select candidate faces for model classification. A face is eligible only if:
+    #   (a) unclassified (is_target IS NULL) and not superseded
+    #   (b) no human has interacted with it (classified_by_user_id IS NULL)
+    #   (c) its image is not bootstrap-sourced (already has P180 depicts)
+    # Each face encoding is compared independently against the target centroid,
+    # so multi-face images are handled correctly.
     unclassified_rows = execute_query(
         """
-        SELECT f.id, f.encoding FROM faces f
+        SELECT f.id, f.image_id, f.encoding FROM faces f
         JOIN images i ON f.image_id = i.id
-        WHERE i.project_id = %s AND f.is_target IS NULL AND f.superseded_by IS NULL
+        WHERE i.project_id = %s
+          AND f.is_target IS NULL
+          AND f.superseded_by IS NULL
+          AND f.classified_by_user_id IS NULL
+          AND i.bootstrapped = 0
         """,
         (project["id"],),
         fetch=True,
     )
 
+    candidate_count = (
+        len(unclassified_rows) if isinstance(unclassified_rows, list) else 0
+    )
+    logger.info(
+        f"Project {project['id']}: {candidate_count} candidate faces for inference "
+        f"(non-bootstrap, no human edits)"
+    )
+
     classified_count = 0
     threshold = project.get("distance_threshold", 0.6)
 
+    # Compute all classifications in memory first (pure numpy, very fast),
+    # then batch-UPDATE in chunks to minimize DB round-trips.
+    UPDATE_BATCH_SIZE = 500
+    pending_updates: List[Tuple[int, int, float]] = []  # (face_id, is_target, distance)
+
+    t_distance_start = time.monotonic()
+
+    # Phase 1: compute distances for all candidates
+    face_distances: List[Tuple[int, int, float]] = []  # (face_id, image_id, distance)
     for row in unclassified_rows:
         if shutdown_requested:
             break
 
         encoding = np.frombuffer(row["encoding"], dtype=np.float64)
         distance = face_recognition.face_distance([centroid], encoding)[0]
+        face_distances.append((row["id"], row["image_id"], float(distance)))
 
-        is_target = 1 if distance < threshold else 0
+    # Phase 2: per-image dedup — only the closest face below threshold is a match;
+    # all other faces on the same image are rejected (a person appears once per image)
+    best_per_image: Dict[int, Tuple[int, float]] = {}  # image_id -> (face_id, distance)
+    for face_id, image_id, distance in face_distances:
+        if distance < threshold:
+            if image_id not in best_per_image or distance < best_per_image[image_id][1]:
+                best_per_image[image_id] = (face_id, distance)
+
+    best_face_ids = {face_id for face_id, _ in best_per_image.values()}
+
+    for face_id, image_id, distance in face_distances:
+        if face_id in best_face_ids:
+            pending_updates.append((face_id, 1, distance))
+        else:
+            pending_updates.append((face_id, 0, distance))
+
+    t_distance = time.monotonic()
+
+    # Flush batch UPDATEs using CASE/WHEN for single round-trip per batch
+    t_db_start = time.monotonic()
+    for i in range(0, len(pending_updates), UPDATE_BATCH_SIZE):
+        if shutdown_requested:
+            break
+        batch = pending_updates[i : i + UPDATE_BATCH_SIZE]
+        if not batch:
+            break
+
+        face_ids = [item[0] for item in batch]
+        id_placeholders = ",".join(["%s"] * len(face_ids))
+
+        # Build CASE expressions for is_target and confidence
+        target_cases = " ".join([f"WHEN %s THEN %s" for _ in batch])
+        conf_cases = " ".join([f"WHEN %s THEN %s" for _ in batch])
+
+        # Flatten params: target CASE pairs, confidence CASE pairs, then IN list
+        params: list = []
+        for face_id, is_target_val, _ in batch:
+            params.extend([face_id, is_target_val])
+        for face_id, _, dist in batch:
+            params.extend([face_id, dist])
+        params.extend(face_ids)
 
         execute_query(
-            "UPDATE faces SET is_target = %s, confidence = %s, classified_by = 'model' WHERE id = %s",
-            (is_target, float(distance), row["id"]),
+            f"UPDATE faces SET "
+            f"is_target = CASE id {target_cases} END, "
+            f"confidence = CASE id {conf_cases} END, "
+            f"classified_by = 'model' "
+            f"WHERE id IN ({id_placeholders})",
+            tuple(params),
             fetch=False,
         )
-        classified_count += 1
+        classified_count += len(batch)
+    t_db = time.monotonic()
+
+    matches = sum(1 for _, t, _ in pending_updates if t == 1)
+    logger.info(
+        f"Inference complete for project {project['id']}: "
+        f"{classified_count} classified ({matches} matches, {classified_count - matches} non-matches) | "
+        f"query={t_query - t_start:.2f}s, centroid={t_centroid - t_query:.2f}s, "
+        f"distances={t_distance - t_distance_start:.2f}s, "
+        f"db_update={t_db - t_db_start:.2f}s, total={t_db - t_start:.2f}s"
+    )
 
     return classified_count
 
@@ -758,7 +1169,8 @@ def write_sdc_claims(project: Dict[str, Any]) -> int:
             FROM faces f
             JOIN images i ON f.image_id = i.id
             WHERE i.project_id = %s AND f.is_target = 1 AND f.sdc_written = 0
-            AND f.classified_by != 'bootstrap' AND f.superseded_by IS NULL
+            AND f.classified_by != 'bootstrap' AND i.bootstrapped = 0
+            AND f.superseded_by IS NULL
             LIMIT %s
             """,
             (project_id, SDC_BATCH),
@@ -904,6 +1316,174 @@ def write_sdc_claims(project: Dict[str, Any]) -> int:
                 )
                 return total_written
 
+    # --- P180 Removal Phase ---
+    # Process faces with sdc_removal_pending=1 (rejected bootstrap faces)
+    total_removed = 0
+    REMOVAL_BATCH = 50
+
+    while not shutdown_requested:
+        faces_to_remove = execute_query(
+            """
+            SELECT DISTINCT i.commons_page_id
+            FROM faces f
+            JOIN images i ON f.image_id = i.id
+            WHERE i.project_id = %s AND f.sdc_removal_pending = 1
+            AND f.superseded_by IS NULL
+            AND NOT EXISTS (
+                SELECT 1 FROM faces f2
+                WHERE f2.image_id = f.image_id AND f2.is_target = 1
+                AND f2.superseded_by IS NULL AND f2.id != f.id
+            )
+            LIMIT %s
+            """,
+            (project_id, REMOVAL_BATCH),
+            fetch=True,
+        )
+
+        if (
+            not faces_to_remove
+            or not isinstance(faces_to_remove, list)
+            or len(faces_to_remove) == 0
+        ):
+            break
+
+        for row in faces_to_remove:
+            if shutdown_requested:
+                break
+
+            page_id = row["commons_page_id"]
+            mid = f"M{page_id}"
+
+            try:
+                still_pending = execute_query(
+                    """
+                    SELECT 1 FROM faces f
+                    JOIN images i ON f.image_id = i.id
+                    WHERE i.commons_page_id = %s AND i.project_id = %s
+                    AND f.sdc_removal_pending = 1 AND f.superseded_by IS NULL
+                    AND NOT EXISTS (
+                        SELECT 1 FROM faces f2
+                        WHERE f2.image_id = f.image_id AND f2.is_target = 1
+                        AND f2.superseded_by IS NULL AND f2.id != f.id
+                    )
+                    LIMIT 1
+                    """,
+                    (page_id, project_id),
+                    fetch=True,
+                )
+                if not still_pending or not isinstance(still_pending, list):
+                    logger.info(
+                        f"Skipping removal for M{page_id}: "
+                        f"sibling approved since selection"
+                    )
+                    continue
+
+                claim_params = {
+                    "action": "wbgetclaims",
+                    "entity": mid,
+                    "property": "P180",
+                    "format": "json",
+                }
+                claim_headers = {"Authorization": f"Bearer {access_token}"}
+
+                claim_resp = _api_request(
+                    COMMONS_API_URL, params=claim_params, headers=claim_headers
+                )
+                claim_data = claim_resp.json()
+
+                claims = claim_data.get("claims", {}).get("P180", [])
+                target_guid = None
+                for claim in claims:
+                    snak = claim.get("mainsnak", {})
+                    if snak.get("datavalue", {}).get("value", {}).get("id") == qid:
+                        target_guid = claim.get("id")
+                        break
+
+                if not target_guid:
+                    execute_query(
+                        "UPDATE faces f JOIN images i ON f.image_id = i.id "
+                        "SET f.sdc_removal_pending = 0 "
+                        "WHERE i.commons_page_id = %s AND i.project_id = %s "
+                        "AND f.sdc_removal_pending = 1",
+                        (page_id, project_id),
+                        fetch=False,
+                    )
+                    total_removed += 1
+                    continue
+
+                remove_data = {
+                    "action": "wbremoveclaims",
+                    "claim": target_guid,
+                    "token": csrf_token,
+                    "summary": f"WikiVisage: Removing depicts (P180) claim for "
+                    f"{qid} (human review)",
+                    "format": "json",
+                    "bot": "1",
+                    "maxlag": "5",
+                }
+
+                remove_resp = _api_request(
+                    COMMONS_API_URL,
+                    data=remove_data,
+                    headers=claim_headers,
+                    method="post",
+                )
+                remove_json = remove_resp.json()
+
+                if "error" in remove_json:
+                    error_code = remove_json["error"].get("code")
+                    error_info = remove_json["error"].get("info", "Unknown error")
+                    if error_code == "badtoken":
+                        try:
+                            csrf_token = _get_csrf_token(access_token)
+                        except Exception:
+                            logger.error(
+                                f"Failed to refresh CSRF token for project {project_id}"
+                            )
+                            break
+                        continue
+                    else:
+                        logger.error(
+                            f"SDC removal error for {mid}: {remove_json['error']}"
+                        )
+                        execute_query(
+                            "UPDATE projects SET sdc_write_requested = 0, "
+                            "sdc_write_error = %s WHERE id = %s",
+                            (f"Removal {error_code}: {error_info}", project_id),
+                            fetch=False,
+                        )
+                        logger.info(
+                            f"SDC removals aborted for project {project_id}: "
+                            f"{total_removed} removed before error"
+                        )
+                        return total_written
+
+                execute_query(
+                    "UPDATE faces f JOIN images i ON f.image_id = i.id "
+                    "SET f.sdc_removal_pending = 0 "
+                    "WHERE i.commons_page_id = %s AND i.project_id = %s "
+                    "AND f.sdc_removal_pending = 1",
+                    (page_id, project_id),
+                    fetch=False,
+                )
+                total_removed += 1
+
+                time.sleep(1)
+
+            except Exception as e:
+                logger.error(f"Error removing SDC for {mid}: {e}")
+                execute_query(
+                    "UPDATE projects SET sdc_write_requested = 0, "
+                    "sdc_write_error = %s WHERE id = %s",
+                    (str(e)[:1024], project_id),
+                    fetch=False,
+                )
+                logger.info(
+                    f"SDC removals aborted for project {project_id}: "
+                    f"{total_removed} removed before error"
+                )
+                return total_written
+
     # Clear the flag — all done successfully (or shutdown requested)
     error_msg = None
     if shutdown_requested:
@@ -915,25 +1495,33 @@ def write_sdc_claims(project: Dict[str, Any]) -> int:
         fetch=False,
     )
 
-    logger.info(f"SDC writes for project {project_id}: {total_written} written")
+    logger.info(
+        f"SDC for project {project_id}: {total_written} written, {total_removed} removed"
+    )
     return total_written
 
 
 def process_project(project: Dict[str, Any]) -> None:
     """Orchestrate all phases for a single project."""
+    t_project_start = time.monotonic()
     logger.info(
         f"--- Processing project {project['id']} ({project['wikidata_qid']}) ---"
     )
 
     try:
         # 1. Traversal
+        t0 = time.monotonic()
         traverse_category(project)
+        t_traversal = time.monotonic() - t0
 
         # 2. Bootstrap (if needed)
+        t0 = time.monotonic()
         bootstrap_from_sparql(project)
+        t_bootstrap = time.monotonic() - t0
 
         # 3. Image Download & Face Detection — process all pending images
         #    Interleave inference every 5 batches so results appear progressively
+        t0 = time.monotonic()
         total_processed = 0
         batches_since_inference = 0
         while not shutdown_requested:
@@ -960,8 +1548,10 @@ def process_project(project: Dict[str, Any]) -> None:
                     logger.info(
                         f"Mid-processing inference classified {classified} faces"
                     )
+        t_images = time.monotonic() - t0
 
         # 4. Final Autonomous Inference (catch any remaining unclassified faces)
+        t0 = time.monotonic()
         fresh = execute_query(
             "SELECT * FROM projects WHERE id = %s", (project["id"],), fetch=True
         )
@@ -969,9 +1559,18 @@ def process_project(project: Dict[str, Any]) -> None:
             run_autonomous_inference(fresh[0])
         else:
             run_autonomous_inference(project)
+        t_inference = time.monotonic() - t0
 
-        # 5. SDC writes are handled separately — triggered via web UI,
+        # 6. SDC writes are handled separately — triggered via web UI,
         #    processed in the main loop when sdc_write_requested=1.
+
+        t_total = time.monotonic() - t_project_start
+        logger.info(
+            f"--- Project {project['id']} complete: "
+            f"traversal={t_traversal:.1f}s, bootstrap={t_bootstrap:.1f}s, "
+            f"images={t_images:.1f}s ({total_processed} processed), "
+            f"inference={t_inference:.1f}s, total={t_total:.1f}s ---"
+        )
 
     except Exception as e:
         logger.error(f"Failed to process project {project['id']}: {e}")
@@ -995,10 +1594,16 @@ def main():
     signal.signal(signal.SIGTERM, signal_handler)
 
     try:
-        init_db(pool_size=6)
+        init_db(pool_size=max(15, MAX_CONCURRENT_PROJECTS * IMAGE_THREADS + 3))
     except Exception as e:
         logger.error(f"Database initialization failed: {e}")
         sys.exit(1)
+
+    # Start persistent face detection subprocess pool — each subprocess imports
+    # dlib/face_recognition once, eliminating 2-5s per-image spawn overhead.
+    global _face_pool
+    _face_pool = FaceDetectPool(pool_size=IMAGE_THREADS)
+    _face_pool.start()
 
     try:
         diag = execute_query(
@@ -1248,7 +1853,9 @@ def main():
                 time.sleep(10)
 
     finally:
-        logger.info("Worker shutting down, closing database pool.")
+        logger.info("Worker shutting down, closing resources.")
+        if _face_pool is not None:
+            _face_pool.shutdown()
         close_pool()
 
 

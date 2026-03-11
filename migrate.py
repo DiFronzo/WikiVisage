@@ -202,11 +202,33 @@ _ALTER_MIGRATIONS = [
         "ALTER TABLE images MODIFY COLUMN detection_height MEDIUMINT UNSIGNED NULL "
         "COMMENT 'Image height in pixels at which face detection was run'",
     ),
+    (
+        "Add index on projects.sdc_write_requested",
+        "ALTER TABLE projects ADD INDEX idx_projects_sdc_write_requested (sdc_write_requested)",
+    ),
+    (
+        "Add composite index on images(project_id, bootstrapped)",
+        "ALTER TABLE images ADD INDEX idx_images_project_bootstrapped (project_id, bootstrapped)",
+    ),
+    (
+        "Add sdc_removal_pending to faces",
+        "ALTER TABLE faces ADD COLUMN sdc_removal_pending TINYINT(1) NOT NULL DEFAULT 0 "
+        "COMMENT '1=P180 claim removal queued (rejected bootstrap face)' AFTER sdc_written",
+    ),
+    (
+        "Add index on faces(sdc_removal_pending)",
+        "ALTER TABLE faces ADD INDEX idx_faces_sdc_removal (sdc_removal_pending)",
+    ),
 ]
 
 
 def _apply_alter_migrations() -> None:
     """Apply ALTER TABLE migrations, skipping those already applied."""
+    IDEMPOTENT_ERROR_CODES = {
+        1060,  # ER_DUP_FIELDNAME — column already exists
+        1061,  # ER_DUP_KEYNAME — index/key already exists
+        1826,  # ER_DUP_CONSTRAINT_NAME — FK constraint already exists
+    }
     logger.info(f"Applying {len(_ALTER_MIGRATIONS)} incremental migrations")
     with get_connection() as conn:
         with conn.cursor() as cursor:
@@ -217,7 +239,13 @@ def _apply_alter_migrations() -> None:
                     logger.info(f"Applied migration: {desc}")
                 except Exception as e:
                     conn.rollback()
-                    logger.info(f"Skipped migration (already applied): {desc}")
+                    errno = (
+                        getattr(e, "args", (None,))[0] if hasattr(e, "args") else None
+                    )
+                    if isinstance(errno, int) and errno in IDEMPOTENT_ERROR_CODES:
+                        logger.info(f"Skipped migration (already applied): {desc}")
+                    else:
+                        raise DatabaseError(f"Migration failed: {desc} — {e}") from e
 
 
 def verify_tables() -> None:

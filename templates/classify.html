@@ -204,6 +204,28 @@
         color: var(--text-muted);
         font-size: 0.85rem;
     }
+    .hotkey-hints {
+        display: flex;
+        justify-content: center;
+        gap: 1.5rem;
+        margin-top: 1rem;
+        flex-wrap: wrap;
+        color: var(--text-muted);
+        font-size: 0.85rem;
+    }
+    .hotkey-hints kbd {
+        display: inline-block;
+        padding: 0.15em 0.45em;
+        font-family: inherit;
+        font-size: 0.85em;
+        border: 1px solid var(--border);
+        border-radius: 4px;
+        background: var(--surface);
+        color: var(--text);
+        margin-right: 0.25em;
+        min-width: 1.5em;
+        text-align: center;
+    }
     .single-face-controls {
         display: grid;
         grid-template-columns: 1fr 1fr;
@@ -358,10 +380,22 @@
                     {% endif %}
                     <button class="btn btn-skip" onclick="skipImage()">{{ _('Skip') }}</button>
                 </div>
+                <div class="hotkey-hints">
+                    <span><kbd>Y</kbd> {{ _('Yes') }}</span>
+                    <span><kbd>N</kbd> {{ _('No') }}</span>
+                    <span><kbd>S</kbd> {{ _('Skip') }}</span>
+                    {% if has_undo %}<span><kbd>Z</kbd> {{ _('Undo') }}</span>{% endif %}
+                </div>
             {% else %}
                 <div class="single-face-controls">
                     <button class="btn btn-none" onclick="selectFace('none')">{{ _('None of These') }}</button>
                     <button class="btn btn-skip" onclick="skipImage()">{{ _('Skip') }}</button>
+                </div>
+                <div class="hotkey-hints">
+                    {% for face in faces %}<span><kbd>{{ loop.index }}</kbd> {{ _('Face %(num)d', num=loop.index) }}</span>{% endfor %}
+                    <span><kbd>N</kbd> {{ _('None') }}</span>
+                    <span><kbd>S</kbd> {{ _('Skip') }}</span>
+                    {% if has_undo %}<span><kbd>Z</kbd> {{ _('Undo') }}</span>{% endif %}
                 </div>
             {% endif %}
         </div>

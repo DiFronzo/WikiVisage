@@ -6,7 +6,7 @@ Provides OAuth 2.0 authentication, project management, and an active
 learning interface for classifying detected faces.
 """
 
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.2.1"
 
 import hashlib
 import io
@@ -1180,7 +1180,15 @@ def project_detail(project_id: int):
             "  SUM(CASE WHEN f.is_target = 0 THEN 1 ELSE 0 END) AS confirmed_non_matches, "
             "  SUM(CASE WHEN f.is_target IS NULL THEN 1 ELSE 0 END) AS unclassified, "
             "  SUM(CASE WHEN f.sdc_written = 1 THEN 1 ELSE 0 END) AS sdc_written, "
-            "  SUM(CASE WHEN f.is_target = 1 AND f.sdc_written = 0 AND f.classified_by != 'bootstrap' THEN 1 ELSE 0 END) AS sdc_pending, "
+            "  SUM(CASE WHEN f.is_target = 1 AND f.sdc_written = 0 AND f.classified_by != 'bootstrap' AND i.bootstrapped = 0 THEN 1 ELSE 0 END) AS sdc_pending, "
+            "  SUM(CASE WHEN f.sdc_removal_pending = 1 "
+            "    AND NOT EXISTS (SELECT 1 FROM faces f2 WHERE f2.image_id = f.image_id "
+            "    AND f2.is_target = 1 AND f2.superseded_by IS NULL AND f2.id != f.id) "
+            "    THEN 1 ELSE 0 END) AS sdc_removal_pending_faces, "
+            "  COUNT(DISTINCT CASE WHEN f.sdc_removal_pending = 1 "
+            "    AND NOT EXISTS (SELECT 1 FROM faces f2 WHERE f2.image_id = f.image_id "
+            "    AND f2.is_target = 1 AND f2.superseded_by IS NULL AND f2.id != f.id) "
+            "    THEN f.image_id END) AS sdc_removal_pending, "
             "  SUM(CASE WHEN f.classified_by_user_id IS NOT NULL THEN 1 ELSE 0 END) AS by_human, "
             "  SUM(CASE WHEN f.classified_by = 'model' AND f.classified_by_user_id IS NULL THEN 1 ELSE 0 END) AS by_model, "
             "  SUM(CASE WHEN f.classified_by = 'bootstrap' AND f.classified_by_user_id IS NULL THEN 1 ELSE 0 END) AS by_bootstrap "
@@ -1232,12 +1240,30 @@ def project_detail(project_id: int):
         except DatabaseError:
             pass
 
+    # Count faces eligible for model inference (mirrors worker's filter)
+    inference_eligible = 0
+    try:
+        eligible_row = execute_query(
+            "SELECT COUNT(*) AS cnt FROM faces f "
+            "JOIN images i ON f.image_id = i.id "
+            "WHERE i.project_id = %s "
+            "  AND f.is_target IS NULL "
+            "  AND f.superseded_by IS NULL "
+            "  AND f.classified_by_user_id IS NULL "
+            "  AND i.bootstrapped = 0",
+            (project_id,),
+        )
+        inference_eligible = eligible_row[0]["cnt"] if eligible_row else 0
+    except DatabaseError:
+        pass
+
     return render_template(
         "project_detail.html",
         project=project,
         stats=face_stats,
         model_faces=model_faces,
         pending_images=pending_images,
+        inference_eligible=inference_eligible,
     )
 
 
@@ -1522,6 +1548,32 @@ def api_classify():
                         "WHERE image_id = %s AND is_target IS NULL AND superseded_by IS NULL",
                         (g.user["id"], image_id),
                     )
+
+                # Queue P180 removal for rejected faces on bootstrapped images
+                if ids:
+                    cursor.execute(
+                        "SELECT i.bootstrapped, "
+                        "EXISTS(SELECT 1 FROM faces f2 WHERE f2.image_id = %s "
+                        "AND f2.is_target = 1 AND f2.superseded_by IS NULL "
+                        "AND f2.id NOT IN ({placeholders})) AS has_sibling_match "
+                        "FROM images i WHERE i.id = %s".format(
+                            placeholders=",".join(["%s"] * len(ids))
+                        ),
+                        (image_id, *ids, image_id),
+                    )
+                    img_row = cursor.fetchone()
+                    if (
+                        img_row
+                        and img_row["bootstrapped"]
+                        and not img_row["has_sibling_match"]
+                    ):
+                        id_placeholders = ",".join(["%s"] * len(ids))
+                        cursor.execute(
+                            f"UPDATE faces SET sdc_removal_pending = 1 "
+                            f"WHERE id IN ({id_placeholders}) AND is_target = 0",
+                            tuple(ids),
+                        )
+
                 return ids
 
             affected_ids = execute_transaction(_classify_none)
@@ -1577,6 +1629,10 @@ def api_classify():
                     "WHERE id = %s",
                     (project_id,),
                 )
+
+                # Do NOT queue P180 removal here — the selected face confirms
+                # the person IS depicted, so the P180 claim must stay.
+
                 return ids
 
             affected_ids = execute_transaction(_classify_target)
@@ -1651,14 +1707,14 @@ def api_undo_classify():
                 if was_review:
                     cursor.execute(
                         f"UPDATE faces SET is_target = 0, classified_by = 'model', "
-                        f"classified_by_user_id = NULL "
+                        f"classified_by_user_id = NULL, sdc_removal_pending = 0 "
                         f"WHERE id IN ({placeholders}) AND image_id = %s",
                         (*original_ids, image_id),
                     )
                 else:
                     cursor.execute(
                         f"UPDATE faces SET is_target = NULL, classified_by = NULL, "
-                        f"classified_by_user_id = NULL "
+                        f"classified_by_user_id = NULL, sdc_removal_pending = 0 "
                         f"WHERE id IN ({placeholders}) AND image_id = %s",
                         (*original_ids, image_id),
                     )
@@ -1954,8 +2010,9 @@ def _remove_sdc_claim(
 @limiter.limit("60 per minute")
 def api_reclassify():
     """Reclassify a model/bootstrap-classified face as human-verified.
-    If rejecting a face with sdc_written=1, also removes the P180 claim
-    from Commons."""
+    If rejecting a bootstrap face, queues P180 removal for the background worker.
+    If rejecting a non-bootstrap face with sdc_written=1, removes the P180 claim
+    from Commons immediately."""
     if not _validate_csrf():
         return jsonify({"error": _("Invalid CSRF token")}), 400
 
@@ -1976,9 +2033,10 @@ def api_reclassify():
     # Verify ownership: face → image → project → user
     try:
         rows = execute_query(
-            "SELECT f.id, f.is_target AS old_is_target, f.sdc_written, "
+            "SELECT f.id, f.image_id, f.is_target AS old_is_target, f.sdc_written, "
             "  f.classified_by, "
-            "  i.commons_page_id, p.id AS project_id, p.wikidata_qid "
+            "  i.commons_page_id, i.bootstrapped, "
+            "  p.id AS project_id, p.wikidata_qid "
             "FROM faces f "
             "JOIN images i ON f.image_id = i.id "
             "JOIN projects p ON i.project_id = p.id "
@@ -1995,10 +2053,35 @@ def api_reclassify():
     sdc_written = face_row["sdc_written"]
     commons_page_id = face_row["commons_page_id"]
     wikidata_qid = face_row["wikidata_qid"]
+    is_bootstrapped = face_row["bootstrapped"]
 
-    # If rejecting (is_target=0) a face that had SDC written, remove the claim
+    # If rejecting (is_target=0): for bootstrap images, queue removal via
+    # sdc_removal_pending (worker handles actual API call) — but ONLY if no
+    # other face on the same image confirms the target (sibling guard).
+    # For non-bootstrap faces with sdc_written=1, remove the claim immediately.
     sdc_removed = False
-    if is_target == 0 and sdc_written == 1:
+    sdc_removal_queued = False
+    if is_target == 0 and is_bootstrapped:
+        # Check if another face on the same image is confirmed as target.
+        # If so, the P180 claim must stay — don't queue removal.
+        try:
+            sibling_rows = execute_query(
+                "SELECT EXISTS("
+                "  SELECT 1 FROM faces f2 "
+                "  WHERE f2.image_id = %s AND f2.is_target = 1 "
+                "  AND f2.superseded_by IS NULL AND f2.id != %s"
+                ") AS has_sibling_match",
+                (face_row["image_id"], face_id),
+            )
+            has_sibling = (
+                sibling_rows[0]["has_sibling_match"] if sibling_rows else False
+            )
+        except DatabaseError:
+            return jsonify({"error": _("Database error")}), 500
+
+        if not has_sibling:
+            sdc_removal_queued = True
+    elif is_target == 0 and sdc_written == 1:
         access_token = _get_valid_token()
         if not access_token:
             return jsonify(
@@ -2021,12 +2104,14 @@ def api_reclassify():
         def _reclassify(conn, cursor):
             cursor.execute(
                 "UPDATE faces SET is_target = %s, "
-                "classified_by_user_id = %s, sdc_written = %s "
+                "classified_by_user_id = %s, sdc_written = %s, "
+                "sdc_removal_pending = %s "
                 "WHERE id = %s AND classified_by_user_id IS NULL",
                 (
                     is_target,
                     g.user["id"],
                     0 if is_target == 0 else sdc_written,
+                    1 if sdc_removal_queued else 0,
                     face_id,
                 ),
             )
@@ -2038,6 +2123,12 @@ def api_reclassify():
                     "UPDATE projects SET faces_confirmed = faces_confirmed + 1 "
                     "WHERE id = %s",
                     (face_row["project_id"],),
+                )
+                cursor.execute(
+                    "UPDATE faces SET sdc_removal_pending = 0 "
+                    "WHERE image_id = %s AND sdc_removal_pending = 1 "
+                    "AND superseded_by IS NULL AND id != %s",
+                    (face_row["image_id"], face_id),
                 )
             elif is_target == 0 and old_is_target == 1:
                 cursor.execute(
@@ -2064,6 +2155,7 @@ def api_reclassify():
             "is_target": is_target,
             "classified_by": face_row["classified_by"],
             "sdc_removed": sdc_removed,
+            "sdc_removal_queued": sdc_removal_queued,
         }
     )
 
@@ -2230,25 +2322,40 @@ def api_write_sdc(project_id: int):
         return jsonify({"error": _("Database error")}), 500
 
     project = rows[0]
-    if project["sdc_write_requested"] == 1:
-        return jsonify({"status": "ok", "message": "already_requested"})
 
-    # Check there are faces to write
+    # Query current counts (needed for both already_requested and normal paths)
     try:
         pending = execute_query(
-            "SELECT COUNT(*) AS cnt FROM faces f "
+            "SELECT "
+            "  SUM(CASE WHEN f.is_target = 1 AND f.sdc_written = 0 "
+            "    AND f.classified_by != 'bootstrap' AND i.bootstrapped = 0 THEN 1 ELSE 0 END) AS write_cnt, "
+            "  COUNT(DISTINCT CASE WHEN f.sdc_removal_pending = 1 "
+            "    AND NOT EXISTS (SELECT 1 FROM faces f2 WHERE f2.image_id = f.image_id "
+            "    AND f2.is_target = 1 AND f2.superseded_by IS NULL AND f2.id != f.id) "
+            "    THEN f.image_id END) AS removal_cnt "
+            "FROM faces f "
             "JOIN images i ON f.image_id = i.id "
-            "WHERE i.project_id = %s AND f.is_target = 1 AND f.sdc_written = 0 "
-            "AND f.classified_by != 'bootstrap' AND f.superseded_by IS NULL",
+            "WHERE i.project_id = %s AND f.superseded_by IS NULL",
             (project_id,),
             fetch=True,
         )
-        pending_count = pending[0]["cnt"] if pending else 0
+        write_count = (pending[0]["write_cnt"] or 0) if pending else 0
+        removal_count = (pending[0]["removal_cnt"] or 0) if pending else 0
     except DatabaseError:
         return jsonify({"error": _("Database error")}), 500
 
-    if pending_count == 0:
-        return jsonify({"status": "ok", "pending": 0})
+    if project["sdc_write_requested"] == 1:
+        return jsonify(
+            {
+                "status": "ok",
+                "message": "already_requested",
+                "pending": write_count,
+                "removal_pending": removal_count,
+            }
+        )
+
+    if write_count == 0 and removal_count == 0:
+        return jsonify({"status": "ok", "pending": 0, "removal_pending": 0})
 
     # Set the flag for the worker to pick up
     try:
@@ -2271,7 +2378,9 @@ def api_write_sdc(project_id: int):
     except OSError:
         pass
 
-    return jsonify({"status": "ok", "pending": pending_count})
+    return jsonify(
+        {"status": "ok", "pending": write_count, "removal_pending": removal_count}
+    )
 
 
 @app.route("/api/sdc-status/<int:project_id>", methods=["GET"])
@@ -2297,7 +2406,11 @@ def api_sdc_status(project_id: int):
         counts = execute_query(
             "SELECT "
             "  SUM(CASE WHEN f.is_target = 1 AND f.sdc_written = 1 THEN 1 ELSE 0 END) AS written, "
-            "  SUM(CASE WHEN f.is_target = 1 AND f.sdc_written = 0 AND f.classified_by != 'bootstrap' THEN 1 ELSE 0 END) AS pending "
+            "  SUM(CASE WHEN f.is_target = 1 AND f.sdc_written = 0 AND f.classified_by != 'bootstrap' AND i.bootstrapped = 0 THEN 1 ELSE 0 END) AS pending, "
+            "  COUNT(DISTINCT CASE WHEN f.sdc_removal_pending = 1 "
+            "    AND NOT EXISTS (SELECT 1 FROM faces f2 WHERE f2.image_id = f.image_id "
+            "    AND f2.is_target = 1 AND f2.superseded_by IS NULL AND f2.id != f.id) "
+            "    THEN f.image_id END) AS removal_pending "
             "FROM faces f "
             "JOIN images i ON f.image_id = i.id "
             "WHERE i.project_id = %s AND f.superseded_by IS NULL",
@@ -2306,6 +2419,7 @@ def api_sdc_status(project_id: int):
         )
         written = counts[0]["written"] or 0 if counts else 0
         pending = counts[0]["pending"] or 0 if counts else 0
+        removal_pending = counts[0]["removal_pending"] or 0 if counts else 0
     except DatabaseError:
         return jsonify({"error": _("Database error")}), 500
 
@@ -2314,6 +2428,7 @@ def api_sdc_status(project_id: int):
             "status": "ok",
             "written": written,
             "pending": pending,
+            "removal_pending": removal_pending,
             "in_progress": bool(project["sdc_write_requested"]),
             "error": project["sdc_write_error"],
         }
@@ -2352,7 +2467,6 @@ def api_progress(project_id: int):
         except DatabaseError:
             pass
 
-    # Include face stats so the frontend can update stat cards live
     face_stats = {}
     try:
         stat_rows = execute_query(
@@ -2376,6 +2490,22 @@ def api_progress(project_id: int):
     except DatabaseError:
         pass
 
+    inference_eligible = 0
+    try:
+        eligible_row = execute_query(
+            "SELECT COUNT(*) AS cnt FROM faces f "
+            "JOIN images i ON f.image_id = i.id "
+            "WHERE i.project_id = %s "
+            "  AND f.is_target IS NULL "
+            "  AND f.superseded_by IS NULL "
+            "  AND f.classified_by_user_id IS NULL "
+            "  AND i.bootstrapped = 0",
+            (project_id,),
+        )
+        inference_eligible = eligible_row[0]["cnt"] if eligible_row else 0
+    except DatabaseError:
+        pass
+
     return jsonify(
         {
             "status": "ok",
@@ -2384,6 +2514,7 @@ def api_progress(project_id: int):
             "pending_images": pending_images,
             "complete": images_total > 0 and images_processed >= images_total,
             "face_stats": face_stats,
+            "inference_eligible": inference_eligible,
         }
     )
 
