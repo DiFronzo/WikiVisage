@@ -349,7 +349,7 @@ test_db (session) → creates/drops wikiface_test DB
 │   └── integration_client (function) → logged-in test client with session
 ├── seed_user → inserts test user, depends on db_conn
 ├── seed_project → inserts test project, depends on db_conn + seed_user
-├── seed_images → inserts 3 test images, depends on db_conn + seed_project
+├── seed_images → inserts 5 test images, depends on db_conn + seed_project
 ├── seed_faces → inserts target + non-target faces, depends on db_conn + seed_images + seed_user
 ├── seed_unclassified_faces → inserts unclassified faces, depends on db_conn + seed_images
 └── seed_bootstrap_image → inserts bootstrapped image + face, depends on db_conn + seed_project
