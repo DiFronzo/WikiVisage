@@ -7,7 +7,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: PROJECT VERSION\n"
 "Report-Msgid-Bugs-To: EMAIL@ADDRESS\n"
-"POT-Creation-Date: 2026-03-11 23:50+0000\n"
+"POT-Creation-Date: 2026-03-12 21:38+0100\n"
 "PO-Revision-Date: 2026-03-07 16:49+0100\n"
 "Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
 "Language: es\n"
@@ -16,7 +16,7 @@ msgstr ""
 "MIME-Version: 1.0\n"
 "Content-Type: text/plain; charset=utf-8\n"
 "Content-Transfer-Encoding: 8bit\n"
-"Generated-By: Babel 2.10.3\n"
+"Generated-By: Babel 2.18.0\n"
 
 #: app.py:332
 msgid "Please log in to continue."
@@ -55,7 +55,7 @@ msgid "Failed to load projects."
 msgstr "Error al cargar los proyectos."
 
 #: app.py:1012 app.py:1489 app.py:1662 app.py:1746 app.py:2017 app.py:2170
-#: app.py:2311 app.py:2564 app.py:2630
+#: app.py:2311 app.py:2543 app.py:2609
 msgid "Invalid CSRF token"
 msgstr "Token CSRF no válido"
 
@@ -67,23 +67,23 @@ msgstr "El Q-ID de Wikidata debe comenzar con 'Q' (ej. Q42)."
 msgid "Commons category is required."
 msgstr "Se requiere una categoría de Commons."
 
-#: app.py:1030 app.py:2577
+#: app.py:1030 app.py:2556
 msgid "Distance threshold must be between 0.1 and 1.0."
 msgstr "El umbral de distancia debe estar entre 0.1 y 1.0."
 
-#: app.py:1032 app.py:2579
+#: app.py:1032 app.py:2558
 msgid "Distance threshold must be a number."
 msgstr "El umbral de distancia debe ser un número."
 
-#: app.py:1038 app.py:2585
+#: app.py:1038 app.py:2564
 msgid "Minimum confirmed must be at least 1."
 msgstr "El mínimo confirmado debe ser al menos 1."
 
-#: app.py:1040 app.py:2587
+#: app.py:1040 app.py:2566
 msgid "Minimum confirmed must be a whole number."
 msgstr "El mínimo confirmado debe ser un número entero."
 
-#: app.py:1047
+#: app.py:1048
 #, python-format
 msgid ""
 "The Wikidata entity %(qid)s is not an instance of human (Q5). Only human "
@@ -92,7 +92,7 @@ msgstr ""
 "La entidad de Wikidata %(qid)s no es una instancia de humano (Q5). Solo "
 "se admiten entidades humanas."
 
-#: app.py:1058
+#: app.py:1059
 #, python-format
 msgid "The Commons category \"%(category)s\" does not exist."
 msgstr "La categoría de Commons \"%(category)s\" no existe."
@@ -122,8 +122,7 @@ msgid "Image not found or access denied"
 msgstr "Imagen no encontrada o acceso denegado"
 
 #: app.py:1516 app.py:1688 app.py:1805 app.py:2049 app.py:2080 app.py:2221
-#: app.py:2322 app.py:2345 app.py:2376 app.py:2390 app.py:2422 app.py:2445
-#: app.py:2473
+#: app.py:2322 app.py:2345 app.py:2369 app.py:2401 app.py:2424 app.py:2452
 msgid "Database error"
 msgstr "Error de base de datos"
 
@@ -151,7 +150,7 @@ msgstr "Dimensiones del cuadro delimitador no válidas"
 msgid "Bounding box out of allowed range"
 msgstr "El cuadro delimitador está fuera del rango permitido"
 
-#: app.py:1824 app.py:2245
+#: app.py:1825 app.py:2246
 msgid ""
 "Could not compute face encoding for the selected region. Try drawing a "
 "slightly larger box."
@@ -179,7 +178,7 @@ msgstr "Rostro no encontrado o acceso denegado"
 msgid "OAuth token expired. Please log in again."
 msgstr "El token de OAuth ha caducado. Por favor, inicia sesión de nuevo."
 
-#: app.py:2095
+#: app.py:2096
 msgid "Failed to remove SDC claim from Commons. The face was not reclassified."
 msgstr ""
 "Error al eliminar la declaración SDC de Commons. El rostro no fue "
@@ -194,47 +193,47 @@ msgstr "Este rostro ya ha sido revisado por otro usuario"
 msgid "Failed to save reclassification"
 msgstr "Error al guardar la reclasificación"
 
-#: app.py:2320 app.py:2420 app.py:2471
+#: app.py:2320 app.py:2399 app.py:2450
 msgid "Project not found or access denied"
 msgstr "Proyecto no encontrado o acceso denegado"
 
-#: app.py:2591
+#: app.py:2570
 msgid "Invalid status."
 msgstr "Estado no válido."
 
-#: app.py:2617
+#: app.py:2596
 msgid "Settings updated."
 msgstr "Configuración actualizada."
 
-#: app.py:2621
+#: app.py:2600
 msgid "Failed to update settings."
 msgstr "Error al actualizar la configuración."
 
-#: app.py:2639
+#: app.py:2618
 msgid "Project deleted."
 msgstr "Proyecto eliminado."
 
-#: app.py:2641
+#: app.py:2620
 msgid "Project not found."
 msgstr "Proyecto no encontrado."
 
-#: app.py:2644
+#: app.py:2623
 msgid "Failed to delete project."
 msgstr "Error al eliminar el proyecto."
 
-#: app.py:2671
+#: app.py:2650
 msgid "Failed to load leaderboard."
 msgstr "Error al cargar la tabla de clasificación."
 
-#: app.py:2730
+#: app.py:2709
 msgid "Page not found"
 msgstr "Página no encontrada"
 
-#: app.py:2740
+#: app.py:2719
 msgid "Rate limit exceeded. Please try again later."
 msgstr "Límite de velocidad excedido. Por favor, inténtalo de nuevo más tarde."
 
-#: app.py:2751
+#: app.py:2730
 msgid "Internal server error"
 msgstr "Error interno del servidor"
 
@@ -515,12 +514,12 @@ msgid "Category:"
 msgstr "Categoría:"
 
 #: templates/dashboard.html:170 templates/project_detail.html:281
-#: templates/project_detail.html:1200
+#: templates/project_detail.html:1198
 msgid "Waiting for worker"
 msgstr "Esperando al trabajador"
 
 #: templates/dashboard.html:176 templates/project_detail.html:286
-#: templates/project_detail.html:1197
+#: templates/project_detail.html:1195
 msgid "Complete"
 msgstr "Completado"
 
@@ -617,9 +616,11 @@ msgid "1. Create a Project"
 msgstr "1. Crea un proyecto"
 
 #: templates/index.html:81
+#, fuzzy
 msgid ""
-"Enter a Wikidata Q-ID and a Wikimedia Commons category. The system will "
-"scan all images for faces."
+"Enter a Wikidata Q-ID and Commons category. The system scans all images, "
+"detects faces with bounding boxes, and bootstraps from existing P180 "
+"depicts claims."
 msgstr ""
 "Ingresa un Q-ID de Wikidata y una categoría de Wikimedia Commons. El "
 "sistema escaneará todas las imágenes en busca de rostros."
@@ -629,22 +630,27 @@ msgid "2. Classify Faces"
 msgstr "2. Clasifica rostros"
 
 #: templates/index.html:85
+#, fuzzy
 msgid ""
-"Review detected faces one by one with simple Yes/No buttons. After enough"
-" examples, the model classifies remaining faces automatically."
+"Review detected faces one by one with Yes/No buttons. After enough "
+"examples, the model classifies remaining faces automatically using face "
+"encodings."
 msgstr ""
 "Revisa los rostros detectados uno por uno con botones simples de Sí/No. "
 "Después de suficientes ejemplos, el modelo clasifica los rostros "
 "restantes automáticamente."
 
 #: templates/index.html:88
-msgid "3. Review Results"
+#, fuzzy
+msgid "3. Review & Edit"
 msgstr "3. Revisa los resultados"
 
 #: templates/index.html:89
+#, fuzzy
 msgid ""
-"Check the model's classifications. Approve correct matches, reject false "
-"positives, and redraw bounding boxes if needed."
+"Check model classifications. Approve matches, reject false positives, "
+"redraw bounding boxes, or manually add missed faces. Each face is "
+"compared independently."
 msgstr ""
 "Comprueba las clasificaciones del modelo. Aprueba las coincidencias "
 "correctas, rechaza los falsos positivos y vuelve a dibujar los cuadros "
@@ -656,12 +662,9 @@ msgstr "4. Envía a Commons"
 
 #: templates/index.html:93
 msgid ""
-"When you're satisfied, send the results to Wikimedia Commons. P180 "
-"(depicts) Structured Data claims are written for all approved faces."
+"Send approved matches to Commons as P180 depicts claims. Rejected "
+"bootstrap faces queue P180 removal, fixing incorrect existing data."
 msgstr ""
-"Cuando estés satisfecho, envía los resultados a Wikimedia Commons. Se "
-"escriben las declaraciones de Datos Estructurados P180 (representa) para "
-"todos los rostros aprobados."
 
 #: templates/leaderboard.html:76
 msgid "Classified"
@@ -1071,17 +1074,17 @@ msgstr "{num} imágenes listas para ser eliminadas"
 msgid "All edits completed successfully!"
 msgstr "¡Todas las ediciones se completaron con éxito!"
 
-#: templates/project_detail.html:1198
+#: templates/project_detail.html:1196
 #, python-brace-format
 msgid "{done} / {total} images"
 msgstr "{done} / {total} imágenes"
 
-#: templates/project_detail.html:1199
+#: templates/project_detail.html:1197
 #, python-brace-format
 msgid "{num} images processed"
 msgstr "{num} imágenes procesadas"
 
-#: templates/project_detail.html:1201
+#: templates/project_detail.html:1199
 #, python-brace-format
 msgid ""
 "The background worker is still processing images ({pending} image "
@@ -1091,7 +1094,7 @@ msgstr ""
 "imagen restante). Aparecerán más rostros a medida que continúe el "
 "procesamiento."
 
-#: templates/project_detail.html:1202
+#: templates/project_detail.html:1200
 #, python-brace-format
 msgid ""
 "The background worker is still processing images ({pending} images "
@@ -1275,4 +1278,16 @@ msgstr ""
 #~ "%(num)d rostros adicionales en imágenes "
 #~ "con múltiples rostros requieren clasificación"
 #~ " manual."
+
+#~ msgid ""
+#~ "When you're satisfied, send the results"
+#~ " to Wikimedia Commons. P180 (depicts) "
+#~ "Structured Data claims are written for"
+#~ " all approved faces."
+#~ msgstr ""
+#~ "Cuando estés satisfecho, envía los "
+#~ "resultados a Wikimedia Commons. Se "
+#~ "escriben las declaraciones de Datos "
+#~ "Estructurados P180 (representa) para todos "
+#~ "los rostros aprobados."
 
