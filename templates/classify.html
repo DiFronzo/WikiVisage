@@ -499,7 +499,8 @@
                 overlay.style.display = 'none';
                 inFlight = false;
             } else {
-                window.location.href = '{{ url_for("classify", project_id=project.id) }}';
+                // Reload the current page to preserve query parameters (e.g., reviewing_model)
+                window.location.reload();
             }
         })
         .catch(function(error) {
