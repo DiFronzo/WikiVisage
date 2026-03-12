@@ -300,7 +300,7 @@ def execute_query(
             cursor.execute(sql, params)
 
             if fetch:
-                results = cursor.fetchall()
+                results = list(cursor.fetchall())
                 logger.debug(f"Query returned {len(results)} rows")
                 return results
             else:
