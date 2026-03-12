@@ -244,6 +244,14 @@ def _apply_alter_migrations() -> None:
                     )
                     if isinstance(errno, int) and errno in IDEMPOTENT_ERROR_CODES:
                         logger.info(f"Skipped migration (already applied): {desc}")
+                    elif (
+                        isinstance(errno, int)
+                        and errno == 1005
+                        and "errno: 121" in str(e)
+                    ):
+                        # MariaDB reports duplicate FK constraint names as
+                        # error 1005 with inner errno 121, not 1826 like MySQL.
+                        logger.info(f"Skipped migration (already applied): {desc}")
                     else:
                         raise DatabaseError(f"Migration failed: {desc} — {e}") from e
 
