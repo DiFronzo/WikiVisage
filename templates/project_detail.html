@@ -996,6 +996,9 @@ data-detection-width="{{ face.detection_width or 0 }}" data-detection-height="{{
     var sdcInitialPending = {{ (stats.sdc_pending or 0)|tojson }};
     var sdcInitialRemoval = {{ (stats.sdc_removal_pending or 0)|tojson }};
     var sdcPollTimer = null;
+    var sdcPollErrors = 0;
+    var SDC_POLL_BASE_INTERVAL = 5000;
+    var SDC_POLL_MAX_INTERVAL = 60000;
     var sdcInitialWritten = {{ (stats.sdc_written or 0)|tojson }};
 
     // Helper: safely set message text without innerHTML
@@ -1064,17 +1067,26 @@ data-detection-width="{{ face.detection_width or 0 }}" data-detection-height="{{
     }
 
     function startSdcPolling() {
-        if (sdcPollTimer) return;  // Already polling
-        sdcPollTimer = setInterval(pollSdcStatus, 5000);
-        // First poll immediately
+        if (sdcPollTimer) return;
+        sdcPollErrors = 0;
+        scheduleSdcPoll(SDC_POLL_BASE_INTERVAL);
         pollSdcStatus();
+    }
+
+    function scheduleSdcPoll(interval) {
+        if (sdcPollTimer) clearTimeout(sdcPollTimer);
+        sdcPollTimer = setTimeout(function() {
+            sdcPollTimer = null;
+            pollSdcStatus();
+        }, interval);
     }
 
     function stopSdcPolling() {
         if (sdcPollTimer) {
-            clearInterval(sdcPollTimer);
+            clearTimeout(sdcPollTimer);
             sdcPollTimer = null;
         }
+        sdcPollErrors = 0;
     }
 
     function pollSdcStatus() {
@@ -1127,6 +1139,7 @@ data-detection-width="{{ face.detection_width or 0 }}" data-detection-height="{{
                 }
                 btn.disabled = true;
                 btn.textContent = i18nSdc.btnInProgress;
+                scheduleSdcPoll(SDC_POLL_BASE_INTERVAL);
             } else {
                 // Worker finished (flag cleared)
                 stopSdcPolling();
@@ -1167,8 +1180,10 @@ data-detection-width="{{ face.detection_width or 0 }}" data-detection-height="{{
                 }
             }
         }).catch(function(e) {
-            // Network error during poll — don't stop polling, just log
-            console.error('SDC status poll error:', e);
+            sdcPollErrors++;
+            var backoff = Math.min(SDC_POLL_BASE_INTERVAL * Math.pow(2, sdcPollErrors), SDC_POLL_MAX_INTERVAL);
+            console.error('SDC status poll error (retry in ' + backoff + 'ms):', e);
+            scheduleSdcPoll(backoff);
         });
     }
 
@@ -1222,7 +1237,8 @@ data-detection-width="{{ face.detection_width or 0 }}" data-detection-height="{{
             fetch(apiProgressUrl).then(function(r) {
                 if (!r.ok) throw new Error('HTTP ' + r.status);
                 return r.json();
-            }).then(function(data) {
+        }).then(function(data) {
+            sdcPollErrors = 0;
                 var bar = document.getElementById('progressBar');
                 var pctEl = document.getElementById('progressPct');
                 var countEl = document.getElementById('progressCount');

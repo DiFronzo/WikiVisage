@@ -12,7 +12,7 @@ import logging
 import os
 import sys
 
-from database import init_db, get_connection, close_pool, DatabaseError
+from database import DatabaseError, close_pool, get_connection, init_db
 
 logging.basicConfig(
     level=logging.INFO,
@@ -39,7 +39,7 @@ def load_schema(path: str) -> list[str]:
     if not os.path.exists(path):
         raise FileNotFoundError(f"Schema file not found: {path}")
 
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, encoding="utf-8") as f:
         content = f.read()
 
     # Split on semicolons, strip whitespace, filter empty/comment-only chunks
@@ -55,11 +55,7 @@ def load_schema(path: str) -> list[str]:
             continue
 
         # Skip chunks that are only comments
-        lines = [
-            line.strip()
-            for line in stmt.splitlines()
-            if line.strip() and not line.strip().startswith("--")
-        ]
+        lines = [line.strip() for line in stmt.splitlines() if line.strip() and not line.strip().startswith("--")]
         if not lines:
             continue
 
@@ -96,12 +92,8 @@ def run_migration() -> None:
             with conn.cursor() as cursor:
                 for i, stmt in enumerate(statements, 1):
                     # Log first line of each statement for context
-                    first_line = (
-                        stmt.splitlines()[0].strip() if stmt.splitlines() else stmt[:80]
-                    )
-                    logger.info(
-                        f"Executing statement {i}/{len(statements)}: {first_line}"
-                    )
+                    first_line = stmt.splitlines()[0].strip() if stmt.splitlines() else stmt[:80]
+                    logger.info(f"Executing statement {i}/{len(statements)}: {first_line}")
 
                     try:
                         cursor.execute(stmt)
@@ -109,9 +101,7 @@ def run_migration() -> None:
                         logger.error(f"Failed on statement {i}: {e}")
                         logger.error(f"Statement: {stmt[:200]}")
                         conn.rollback()
-                        raise DatabaseError(
-                            f"Migration failed on statement {i}: {e}"
-                        ) from e
+                        raise DatabaseError(f"Migration failed on statement {i}: {e}") from e
 
             conn.commit()
             logger.info("Schema migration completed successfully")
@@ -230,30 +220,23 @@ def _apply_alter_migrations() -> None:
         1826,  # ER_DUP_CONSTRAINT_NAME — FK constraint already exists
     }
     logger.info(f"Applying {len(_ALTER_MIGRATIONS)} incremental migrations")
-    with get_connection() as conn:
-        with conn.cursor() as cursor:
-            for desc, sql in _ALTER_MIGRATIONS:
-                try:
-                    cursor.execute(sql)
-                    conn.commit()
-                    logger.info(f"Applied migration: {desc}")
-                except Exception as e:
-                    conn.rollback()
-                    errno = (
-                        getattr(e, "args", (None,))[0] if hasattr(e, "args") else None
-                    )
-                    if isinstance(errno, int) and errno in IDEMPOTENT_ERROR_CODES:
-                        logger.info(f"Skipped migration (already applied): {desc}")
-                    elif (
-                        isinstance(errno, int)
-                        and errno == 1005
-                        and "errno: 121" in str(e)
-                    ):
-                        # MariaDB reports duplicate FK constraint names as
-                        # error 1005 with inner errno 121, not 1826 like MySQL.
-                        logger.info(f"Skipped migration (already applied): {desc}")
-                    else:
-                        raise DatabaseError(f"Migration failed: {desc} — {e}") from e
+    with get_connection() as conn, conn.cursor() as cursor:
+        for desc, sql in _ALTER_MIGRATIONS:
+            try:
+                cursor.execute(sql)
+                conn.commit()
+                logger.info(f"Applied migration: {desc}")
+            except Exception as e:
+                conn.rollback()
+                errno = getattr(e, "args", (None,))[0] if hasattr(e, "args") else None
+                if isinstance(errno, int) and errno in IDEMPOTENT_ERROR_CODES:
+                    logger.info(f"Skipped migration (already applied): {desc}")
+                elif isinstance(errno, int) and errno == 1005 and "errno: 121" in str(e):
+                    # MariaDB reports duplicate FK constraint names as
+                    # error 1005 with inner errno 121, not 1826 like MySQL.
+                    logger.info(f"Skipped migration (already applied): {desc}")
+                else:
+                    raise DatabaseError(f"Migration failed: {desc} — {e}") from e
 
 
 def verify_tables() -> None:
@@ -272,25 +255,24 @@ def verify_tables() -> None:
     init_db(pool_size=1)
 
     try:
-        with get_connection() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute("SHOW TABLES")
-                rows = cursor.fetchall()
+        with get_connection() as conn, conn.cursor() as cursor:
+            cursor.execute("SHOW TABLES")
+            rows = cursor.fetchall()
 
-                # DictCursor returns rows like {"Tables_in_dbname": "tablename"}
-                existing = set()
-                for row in rows:
-                    # Column name varies based on database name, grab first value
-                    existing.add(list(row.values())[0])
+            # DictCursor returns rows like {"Tables_in_dbname": "tablename"}
+            existing = set()
+            for row in rows:
+                # Column name varies based on database name, grab first value
+                existing.add(list(row.values())[0])
 
-                logger.info(f"Tables in database: {sorted(existing)}")
+            logger.info(f"Tables in database: {sorted(existing)}")
 
-                missing = [t for t in expected_tables if t not in existing]
-                if missing:
-                    logger.error(f"Missing tables after migration: {missing}")
-                    sys.exit(1)
+            missing = [t for t in expected_tables if t not in existing]
+            if missing:
+                logger.error(f"Missing tables after migration: {missing}")
+                sys.exit(1)
 
-                logger.info(f"All {len(expected_tables)} expected tables verified")
+            logger.info(f"All {len(expected_tables)} expected tables verified")
 
     finally:
         close_pool()

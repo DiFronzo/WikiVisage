@@ -6,19 +6,18 @@ Provides OAuth 2.0 authentication, project management, and an active
 learning interface for classifying detected faces.
 """
 
-APP_VERSION = "0.2.1"
+APP_VERSION = "0.2.2"
 
 import hashlib
 import io
-import json
 import logging
 import os
 import random
 import secrets
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from functools import wraps
-from typing import Any, Optional
+from typing import Any
 from urllib.parse import urlparse
 
 from dotenv import load_dotenv
@@ -38,18 +37,16 @@ from flask import (
     session,
     url_for,
 )
-from flask_babel import Babel, gettext as _, ngettext
+from flask_babel import Babel
+from flask_babel import gettext as _
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from requests_oauthlib import OAuth2Session
 
 from database import (
     DatabaseError,
-    close_pool,
-    execute_insert,
     execute_query,
     execute_transaction,
-    get_connection,
     init_db,
 )
 
@@ -83,12 +80,8 @@ OAUTH_PROFILE_URL = "https://meta.wikimedia.org/w/rest.php/oauth2/resource/profi
 OAUTH_REDIRECT_URI = os.environ.get("OAUTH_REDIRECT_URI", "")
 
 # Beta whitelist — fetched from GitHub every 5 minutes, falls back to local file
-_WHITELIST_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "whitelist.txt"
-)
-_WHITELIST_URL = (
-    "https://raw.githubusercontent.com/DiFronzo/WikiVisage/main/whitelist.txt"
-)
+_WHITELIST_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "whitelist.txt")
+_WHITELIST_URL = "https://raw.githubusercontent.com/DiFronzo/WikiVisage/main/whitelist.txt"
 _WHITELIST_CACHE_TTL = 300  # seconds
 _whitelist_cache: set[str] = set()
 _whitelist_cache_time: float = 0.0
@@ -96,11 +89,7 @@ _whitelist_cache_time: float = 0.0
 
 def _parse_whitelist(text: str) -> set[str]:
     """Parse whitelist text into a set of usernames."""
-    return {
-        line.strip()
-        for line in text.splitlines()
-        if line.strip() and not line.startswith("#")
-    }
+    return {line.strip() for line in text.splitlines() if line.strip() and not line.startswith("#")}
 
 
 def _load_whitelist() -> set[str]:
@@ -128,7 +117,7 @@ def _load_whitelist() -> set[str]:
 
     # Fall back to local file
     try:
-        with open(_WHITELIST_PATH, "r", encoding="utf-8") as f:
+        with open(_WHITELIST_PATH, encoding="utf-8") as f:
             fresh = _parse_whitelist(f.read())
             if fresh:
                 _whitelist_cache = fresh
@@ -138,6 +127,8 @@ def _load_whitelist() -> set[str]:
         pass
 
     # Return last-known-good (may be empty on first boot if both fail)
+    if not _whitelist_cache:
+        logger.warning("Whitelist is empty — all authenticated access will be denied (fail-closed)")
     return _whitelist_cache
 
 
@@ -197,9 +188,7 @@ def set_language(lang: str):
         referrer = url_for("index")
     resp = redirect(referrer)
     if not request.args.get("nocookie"):
-        resp.set_cookie(
-            "locale", lang, max_age=60 * 60 * 24 * 365, httponly=True, samesite="Lax"
-        )
+        resp.set_cookie("locale", lang, max_age=60 * 60 * 24 * 365, httponly=True, samesite="Lax")
     else:
         # Delete any existing locale cookie when consent is withdrawn
         resp.delete_cookie("locale")
@@ -222,9 +211,7 @@ def inject_i18n_helpers() -> dict[str, Any]:
 TOKEN_REFRESH_BUFFER = 300  # seconds
 
 # Wikimedia Commons file URL pattern (used for manual face detection)
-FILE_PATH_URL = (
-    "https://commons.wikimedia.org/wiki/Special:FilePath/{file_title}?width=1024"
-)
+FILE_PATH_URL = "https://commons.wikimedia.org/wiki/Special:FilePath/{file_title}?width=1024"
 USER_AGENT = "WikiVisage/1.0 (https://github.com/DiFronzo/WikiVisage)"
 COMMONS_API_URL = "https://commons.wikimedia.org/w/api.php"
 WIKIDATA_API_URL = "https://www.wikidata.org/w/api.php"
@@ -256,13 +243,11 @@ def before_request() -> None:
                 for _tk in ("access_token", "refresh_token"):
                     if isinstance(g.user.get(_tk), bytes):
                         g.user[_tk] = g.user[_tk].decode("utf-8")
-                # Enforce whitelist on every request (not just login)
+                # Enforce whitelist on every request (not just login).
+                # Fail-closed: empty whitelist = deny all (prevents bypass if both sources fail).
                 allowed = _load_whitelist()
-                if allowed and g.user["wiki_username"] not in allowed:
-                    logger.warning(
-                        f"Session revoked for user not on whitelist: "
-                        f"{g.user['wiki_username']}"
-                    )
+                if not allowed or g.user["wiki_username"] not in allowed:
+                    logger.warning(f"Session revoked for user not on whitelist: {g.user['wiki_username']}")
                     session.clear()
                     g.user = None
         except DatabaseError:
@@ -271,7 +256,7 @@ def before_request() -> None:
 
 
 @app.teardown_appcontext
-def teardown_appcontext(exception: Optional[BaseException] = None) -> None:
+def teardown_appcontext(exception: BaseException | None = None) -> None:
     """Clean up per-request resources."""
     pass  # Connection pool handles cleanup via context managers
 
@@ -301,9 +286,7 @@ def _download_image(url: str, max_bytes: int = MAX_IMAGE_DOWNLOAD_BYTES) -> byte
     content_length = resp.headers.get("Content-Length")
     if content_length and int(content_length) > max_bytes:
         resp.close()
-        raise ValueError(
-            f"Image too large: {int(content_length)} bytes (limit {max_bytes})"
-        )
+        raise ValueError(f"Image too large: {int(content_length)} bytes (limit {max_bytes})")
 
     # Stream with enforced cap
     chunks: list[bytes] = []
@@ -336,20 +319,18 @@ def login_required(f):
     return decorated_function
 
 
-def _make_oauth_session(state: Optional[str] = None) -> OAuth2Session:
+def _make_oauth_session(state: str | None = None) -> OAuth2Session:
     """Create an OAuth2Session with the configured client."""
     sess = OAuth2Session(
         client_id=OAUTH_CLIENT_ID,
         redirect_uri=OAUTH_REDIRECT_URI,
         state=state,
     )
-    sess.headers["User-Agent"] = (
-        "WikiVisage/1.0 (https://github.com/DiFronzo/WikiVisage)"
-    )
+    sess.headers["User-Agent"] = "WikiVisage/1.0 (https://github.com/DiFronzo/WikiVisage)"
     return sess
 
 
-def _refresh_access_token(user: dict[str, Any]) -> Optional[dict[str, Any]]:
+def _refresh_access_token(user: dict[str, Any]) -> dict[str, Any] | None:
     """
     Refresh the user's access token if it is expired or about to expire.
 
@@ -359,9 +340,9 @@ def _refresh_access_token(user: dict[str, Any]) -> Optional[dict[str, Any]]:
     if isinstance(expires_at, str):
         expires_at = datetime.fromisoformat(expires_at)
     if expires_at.tzinfo is None:
-        expires_at = expires_at.replace(tzinfo=timezone.utc)
+        expires_at = expires_at.replace(tzinfo=UTC)
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     if (expires_at - now).total_seconds() > TOKEN_REFRESH_BUFFER:
         return user  # Still valid
 
@@ -376,13 +357,10 @@ def _refresh_access_token(user: dict[str, Any]) -> Optional[dict[str, Any]]:
             client_secret=OAUTH_CLIENT_SECRET,
         )
 
-        new_expires_at = datetime.now(timezone.utc) + timedelta(
-            seconds=new_token.get("expires_in", 14400)
-        )
+        new_expires_at = datetime.now(UTC) + timedelta(seconds=new_token.get("expires_in", 14400))
 
         execute_query(
-            "UPDATE users SET access_token = %s, refresh_token = %s, "
-            "token_expires_at = %s WHERE id = %s",
+            "UPDATE users SET access_token = %s, refresh_token = %s, token_expires_at = %s WHERE id = %s",
             (
                 new_token["access_token"],
                 new_token.get("refresh_token", user["refresh_token"]),
@@ -402,7 +380,7 @@ def _refresh_access_token(user: dict[str, Any]) -> Optional[dict[str, Any]]:
         return None
 
 
-def _get_valid_token() -> Optional[str]:
+def _get_valid_token() -> str | None:
     """Get a valid access token for the current user, refreshing if needed."""
     if g.user is None:
         return None
@@ -443,8 +421,7 @@ def inject_worker_status() -> dict[str, Any]:
     """Check worker heartbeat and inject worker_down flag into all templates."""
     try:
         rows = execute_query(
-            "SELECT last_seen < NOW() - INTERVAL 5 MINUTE AS is_stale "
-            "FROM worker_heartbeat WHERE id = 1",
+            "SELECT last_seen < NOW() - INTERVAL 5 MINUTE AS is_stale FROM worker_heartbeat WHERE id = 1",
         )
         if rows and isinstance(rows, list):
             worker_down = bool(rows[0]["is_stale"])
@@ -496,12 +473,7 @@ def _is_human_entity(qid: str) -> bool:
 
         claims = data.get("claims", {}).get("P31", [])
         for claim in claims:
-            value = (
-                claim.get("mainsnak", {})
-                .get("datavalue", {})
-                .get("value", {})
-                .get("id")
-            )
+            value = claim.get("mainsnak", {}).get("datavalue", {}).get("value", {}).get("id")
             if value == "Q5":
                 return True
         return False
@@ -536,7 +508,7 @@ def _commons_category_exists(category: str) -> bool:
         return False
 
 
-def _fetch_p18_thumb_url(qid: str, width: int = 250) -> Optional[str]:
+def _fetch_p18_thumb_url(qid: str, width: int = 250) -> str | None:
     """
     Fetch P18 (image) property from Wikidata and return a Commons thumbnail URL.
 
@@ -613,10 +585,7 @@ def commons_thumb_url(file_title: str, width: int = 330) -> str:
     md5 = hashlib.md5(clean.encode("utf-8")).hexdigest()
     ext = os.path.splitext(clean)[1].lower()
 
-    base = (
-        f"https://upload.wikimedia.org/wikipedia/commons/thumb/"
-        f"{md5[0]}/{md5[0:2]}/{clean}"
-    )
+    base = f"https://upload.wikimedia.org/wikipedia/commons/thumb/{md5[0]}/{md5[0:2]}/{clean}"
 
     if ext in _VIDEO_EXTENSIONS:
         return f"{base}/{width}px--{clean}.jpg"
@@ -694,23 +663,19 @@ def oauth_callback():
         flash(_("Invalid profile data received."), "error")
         return redirect(url_for("index"))
 
-    # Beta whitelist check (re-read file so edits take effect without restart)
+    # Beta whitelist check — fail-closed: empty whitelist = deny all
     allowed = _load_whitelist()
-    if allowed and wiki_username not in allowed:
+    if not allowed or wiki_username not in allowed:
         logger.warning(f"Login denied for user not on whitelist: {wiki_username}")
         flash(_("Access is currently restricted to approved testers."), "warning")
         return redirect(url_for("index"))
 
-    expires_at = datetime.now(timezone.utc) + timedelta(
-        seconds=token.get("expires_in", 14400)
-    )
+    expires_at = datetime.now(UTC) + timedelta(seconds=token.get("expires_in", 14400))
     expires_at_str = expires_at.strftime("%Y-%m-%d %H:%M:%S")
 
     # Upsert user
     try:
-        existing = execute_query(
-            "SELECT id FROM users WHERE wiki_user_id = %s", (wiki_user_id,)
-        )
+        existing = execute_query("SELECT id FROM users WHERE wiki_user_id = %s", (wiki_user_id,))
 
         if existing:
             execute_query(
@@ -739,9 +704,7 @@ def oauth_callback():
                 ),
                 fetch=False,
             )
-            rows = execute_query(
-                "SELECT id FROM users WHERE wiki_user_id = %s", (wiki_user_id,)
-            )
+            rows = execute_query("SELECT id FROM users WHERE wiki_user_id = %s", (wiki_user_id,))
             user_id = rows[0]["id"]
 
     except DatabaseError:
@@ -810,8 +773,7 @@ def dashboard():
 
     try:
         projects = execute_query(
-            "SELECT * FROM projects WHERE user_id = %s "
-            "ORDER BY updated_at DESC LIMIT %s OFFSET %s",
+            "SELECT * FROM projects WHERE user_id = %s ORDER BY updated_at DESC LIMIT %s OFFSET %s",
             (g.user["id"], PROJECTS_PER_PAGE, offset),
         )
     except DatabaseError:
@@ -922,9 +884,7 @@ def api_category_info():
         while cat_queue and len(visited) < MAX_CATS and time.monotonic() < deadline:
             # Batch up to 50 titles for categoryinfo
             batch = []
-            while (
-                cat_queue and len(batch) < 50 and len(visited) + len(batch) < MAX_CATS
-            ):
+            while cat_queue and len(batch) < 50 and len(visited) + len(batch) < MAX_CATS:
                 title = cat_queue.pop(0)
                 if title not in visited:
                     batch.append(title)
@@ -981,11 +941,7 @@ def api_category_info():
                 if "continue" in sub_data:
                     approximate = True
 
-        approximate = (
-            approximate
-            or len(visited) >= MAX_CATS
-            or (cat_queue and time.monotonic() >= deadline)
-        )
+        approximate = approximate or len(visited) >= MAX_CATS or (cat_queue and time.monotonic() >= deadline)
 
         return jsonify(
             {
@@ -1045,8 +1001,7 @@ def project_new():
         if not _is_human_entity(wikidata_qid):
             errors.append(
                 _(
-                    "The Wikidata entity %(qid)s is not an instance of human (Q5). "
-                    "Only human entities are supported.",
+                    "The Wikidata entity %(qid)s is not an instance of human (Q5). Only human entities are supported.",
                     qid=wikidata_qid,
                 )
             )
@@ -1076,8 +1031,7 @@ def project_new():
     # Check for duplicate
     try:
         existing = execute_query(
-            "SELECT id FROM projects WHERE user_id = %s AND wikidata_qid = %s "
-            "AND commons_category = %s",
+            "SELECT id FROM projects WHERE user_id = %s AND wikidata_qid = %s AND commons_category = %s",
             (g.user["id"], wikidata_qid, commons_category),
         )
         if existing:
@@ -1117,9 +1071,7 @@ def project_new():
 
         # Signal the worker to wake up and process the new project immediately
         try:
-            wake_file = os.path.join(
-                os.path.dirname(os.path.abspath(__file__)), ".worker_wake"
-            )
+            wake_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".worker_wake")
             with open(wake_file, "w") as f:
                 f.write("")
         except OSError:
@@ -1232,8 +1184,7 @@ def project_detail(project_id: int):
     if project.get("status") == "active":
         try:
             pending_row = execute_query(
-                "SELECT COUNT(*) AS cnt FROM images "
-                "WHERE project_id = %s AND status = 'pending'",
+                "SELECT COUNT(*) AS cnt FROM images WHERE project_id = %s AND status = 'pending'",
                 (project_id,),
             )
             pending_images = pending_row[0]["cnt"] if pending_row else 0
@@ -1518,7 +1469,9 @@ def api_classify():
     # In review mode, we target model-classified not-target faces
     # In normal mode, we target unclassified faces
     if is_review_mode:
-        face_filter_sql = "is_target = 0 AND classified_by = 'model' AND classified_by_user_id IS NULL AND superseded_by IS NULL"
+        face_filter_sql = (
+            "is_target = 0 AND classified_by = 'model' AND classified_by_user_id IS NULL AND superseded_by IS NULL"
+        )
     else:
         face_filter_sql = "is_target IS NULL AND superseded_by IS NULL"
 
@@ -1556,17 +1509,11 @@ def api_classify():
                         "EXISTS(SELECT 1 FROM faces f2 WHERE f2.image_id = %s "
                         "AND f2.is_target = 1 AND f2.superseded_by IS NULL "
                         "AND f2.id NOT IN ({placeholders})) AS has_sibling_match "
-                        "FROM images i WHERE i.id = %s".format(
-                            placeholders=",".join(["%s"] * len(ids))
-                        ),
+                        "FROM images i WHERE i.id = %s".format(placeholders=",".join(["%s"] * len(ids))),
                         (image_id, *ids, image_id),
                     )
                     img_row = cursor.fetchone()
-                    if (
-                        img_row
-                        and img_row["bootstrapped"]
-                        and not img_row["has_sibling_match"]
-                    ):
+                    if img_row and img_row["bootstrapped"] and not img_row["has_sibling_match"]:
                         id_placeholders = ",".join(["%s"] * len(ids))
                         cursor.execute(
                             f"UPDATE faces SET sdc_removal_pending = 1 "
@@ -1625,8 +1572,7 @@ def api_classify():
                     )
 
                 cursor.execute(
-                    "UPDATE projects SET faces_confirmed = faces_confirmed + 1 "
-                    "WHERE id = %s",
+                    "UPDATE projects SET faces_confirmed = faces_confirmed + 1 WHERE id = %s",
                     (project_id,),
                 )
 
@@ -1721,8 +1667,7 @@ def api_undo_classify():
 
             if decrement_counter:
                 cursor.execute(
-                    "UPDATE projects SET faces_confirmed = GREATEST(faces_confirmed - 1, 0) "
-                    "WHERE id = %s",
+                    "UPDATE projects SET faces_confirmed = GREATEST(faces_confirmed - 1, 0) WHERE id = %s",
                     (project_id,),
                 )
 
@@ -1822,8 +1767,7 @@ def api_manual_face():
             return jsonify(
                 {
                     "error": _(
-                        "Could not compute face encoding for the selected region. "
-                        "Try drawing a slightly larger box."
+                        "Could not compute face encoding for the selected region. Try drawing a slightly larger box."
                     )
                 }
             ), 422
@@ -1867,8 +1811,7 @@ def api_manual_face():
                     (g.user["id"], image_id),
                 )
                 cursor.execute(
-                    "UPDATE projects SET faces_confirmed = faces_confirmed + 1 "
-                    "WHERE id = %s",
+                    "UPDATE projects SET faces_confirmed = faces_confirmed + 1 WHERE id = %s",
                     (project_id,),
                 )
             else:
@@ -1914,14 +1857,12 @@ def api_manual_face():
     except DatabaseError:
         logger.exception("Failed to insert manual face")
         return jsonify({"error": _("Failed to save face")}), 500
-    except Exception as e:
+    except Exception:
         logger.exception("Unexpected error in manual face detection")
         return jsonify({"error": _("Failed to process face region")}), 500
 
 
-def _remove_sdc_claim(
-    commons_page_id: int, wikidata_qid: str, access_token: str
-) -> bool:
+def _remove_sdc_claim(commons_page_id: int, wikidata_qid: str, access_token: str) -> bool:
     """Remove a P180 depicts claim for a specific QID from a Commons file.
     Returns True if claim was removed or didn't exist, False on error."""
     mid = f"M{commons_page_id}"
@@ -1980,8 +1921,7 @@ def _remove_sdc_claim(
                 "action": "wbremoveclaims",
                 "claim": target_guid,
                 "token": csrf_token,
-                "summary": f"WikiVisage: Removing depicts (P180) claim for "
-                f"{wikidata_qid} (human review)",
+                "summary": f"WikiVisage: Removing depicts (P180) claim for {wikidata_qid} (human review)",
                 "format": "json",
                 "bot": "1",
                 "maxlag": "5",
@@ -1993,9 +1933,7 @@ def _remove_sdc_claim(
         result = remove_resp.json()
 
         if "error" in result:
-            logger.error(
-                f"SDC removal error for {mid}/{wikidata_qid}: {result['error']}"
-            )
+            logger.error(f"SDC removal error for {mid}/{wikidata_qid}: {result['error']}")
             return False
 
         return True
@@ -2073,9 +2011,7 @@ def api_reclassify():
                 ") AS has_sibling_match",
                 (face_row["image_id"], face_id),
             )
-            has_sibling = (
-                sibling_rows[0]["has_sibling_match"] if sibling_rows else False
-            )
+            has_sibling = sibling_rows[0]["has_sibling_match"] if sibling_rows else False
         except DatabaseError:
             return jsonify({"error": _("Database error")}), 500
 
@@ -2084,20 +2020,11 @@ def api_reclassify():
     elif is_target == 0 and sdc_written == 1:
         access_token = _get_valid_token()
         if not access_token:
-            return jsonify(
-                {"error": _("OAuth token expired. Please log in again.")}
-            ), 401
+            return jsonify({"error": _("OAuth token expired. Please log in again.")}), 401
 
         sdc_removed = _remove_sdc_claim(commons_page_id, wikidata_qid, access_token)
         if not sdc_removed:
-            return jsonify(
-                {
-                    "error": _(
-                        "Failed to remove SDC claim from Commons. "
-                        "The face was not reclassified."
-                    )
-                }
-            ), 502
+            return jsonify({"error": _("Failed to remove SDC claim from Commons. The face was not reclassified.")}), 502
 
     try:
 
@@ -2120,8 +2047,7 @@ def api_reclassify():
 
             if is_target == 1 and old_is_target != 1:
                 cursor.execute(
-                    "UPDATE projects SET faces_confirmed = faces_confirmed + 1 "
-                    "WHERE id = %s",
+                    "UPDATE projects SET faces_confirmed = faces_confirmed + 1 WHERE id = %s",
                     (face_row["project_id"],),
                 )
                 cursor.execute(
@@ -2140,9 +2066,7 @@ def api_reclassify():
         execute_transaction(_reclassify)
     except ValueError as e:
         if str(e) == "already_reviewed":
-            return jsonify(
-                {"error": _("This face has already been reviewed by another user")}
-            ), 409
+            return jsonify({"error": _("This face has already been reviewed by another user")}), 409
         raise
     except DatabaseError:
         logger.exception("Failed to reclassify face")
@@ -2175,9 +2099,7 @@ def api_update_face_bbox():
     bbox_bottom_str = request.form.get("bbox_bottom")
     bbox_left_str = request.form.get("bbox_left")
 
-    if not all(
-        [face_id_str, bbox_top_str, bbox_right_str, bbox_bottom_str, bbox_left_str]
-    ):
+    if not all([face_id_str, bbox_top_str, bbox_right_str, bbox_bottom_str, bbox_left_str]):
         return jsonify({"error": _("Missing required fields")}), 400
 
     try:
@@ -2223,9 +2145,7 @@ def api_update_face_bbox():
     face_row = rows[0]
     image_id = face_row["image_id"]
     orig_is_target = face_row["is_target"]
-    orig_classified_by = face_row["classified_by"]
     orig_confidence = face_row["confidence"]
-    orig_classified_by_user_id = face_row["classified_by_user_id"]
     file_title = face_row["file_title"]
     clean_title = file_title[5:] if file_title.startswith("File:") else file_title
     url = FILE_PATH_URL.format(file_title=clean_title)
@@ -2243,8 +2163,7 @@ def api_update_face_bbox():
             return jsonify(
                 {
                     "error": _(
-                        "Could not compute face encoding for the selected region. "
-                        "Try drawing a slightly larger box."
+                        "Could not compute face encoding for the selected region. Try drawing a slightly larger box."
                     )
                 }
             ), 422
@@ -2360,8 +2279,7 @@ def api_write_sdc(project_id: int):
     # Set the flag for the worker to pick up
     try:
         execute_query(
-            "UPDATE projects SET sdc_write_requested = 1, sdc_write_error = NULL "
-            "WHERE id = %s",
+            "UPDATE projects SET sdc_write_requested = 1, sdc_write_error = NULL WHERE id = %s",
             (project_id,),
             fetch=False,
         )
@@ -2370,17 +2288,13 @@ def api_write_sdc(project_id: int):
 
     # Touch wake-up file to reduce latency (worker checks every 60s)
     try:
-        wake_up_path = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), ".worker-wake-up"
-        )
+        wake_up_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".worker-wake-up")
         with open(wake_up_path, "w") as f:
             f.write("sdc")
     except OSError:
         pass
 
-    return jsonify(
-        {"status": "ok", "pending": write_count, "removal_pending": removal_count}
-    )
+    return jsonify({"status": "ok", "pending": write_count, "removal_pending": removal_count})
 
 
 @app.route("/api/sdc-status/<int:project_id>", methods=["GET"])
@@ -2391,8 +2305,7 @@ def api_sdc_status(project_id: int):
     pending, and whether the worker is actively writing."""
     try:
         rows = execute_query(
-            "SELECT id, sdc_write_requested, sdc_write_error "
-            "FROM projects WHERE id = %s AND user_id = %s",
+            "SELECT id, sdc_write_requested, sdc_write_error FROM projects WHERE id = %s AND user_id = %s",
             (project_id, g.user["id"]),
         )
         if not rows:
@@ -2442,8 +2355,7 @@ def api_progress(project_id: int):
     """Poll endpoint for image processing progress."""
     try:
         rows = execute_query(
-            "SELECT images_processed, images_total, status "
-            "FROM projects WHERE id = %s AND user_id = %s",
+            "SELECT images_processed, images_total, status FROM projects WHERE id = %s AND user_id = %s",
             (project_id, g.user["id"]),
         )
         if not rows:
@@ -2459,8 +2371,7 @@ def api_progress(project_id: int):
     if project["status"] == "active" and images_total > 0:
         try:
             pending_row = execute_query(
-                "SELECT COUNT(*) AS cnt FROM images "
-                "WHERE project_id = %s AND status = 'pending'",
+                "SELECT COUNT(*) AS cnt FROM images WHERE project_id = %s AND status = 'pending'",
                 (project_id,),
             )
             pending_images = pending_row[0]["cnt"] if pending_row else 0
@@ -2542,9 +2453,7 @@ def project_settings(project_id: int):
     if not _validate_csrf():
         abort(400, _("Invalid CSRF token"))
 
-    distance_threshold = request.form.get(
-        "distance_threshold", str(project["distance_threshold"])
-    )
+    distance_threshold = request.form.get("distance_threshold", str(project["distance_threshold"]))
     min_confirmed = request.form.get("min_confirmed", str(project["min_confirmed"]))
     status = request.form.get("status", project["status"])
     label = request.form.get("label", project["label"])

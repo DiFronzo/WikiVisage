@@ -78,7 +78,7 @@ The landing page and `/health` endpoint work without OAuth. See [test-local.md](
 - Use type hints and f-strings.
 - All database queries use `%s` parameterized placeholders (PyMySQL). Never interpolate **values** into SQL via f-strings. F-strings are acceptable for structural SQL (e.g., building `IN (%s, %s, %s)` placeholder lists from `",".join(["%s"] * len(ids))`).
 - Use `execute_query()` for reads and simple writes, `execute_insert()` for INSERTs needing `lastrowid`, and `execute_transaction()` for atomic multi-statement mutations.
-- No linter or formatter is configured in the repo. Keep your changes consistent with the surrounding code.
+- Ruff is configured in `pyproject.toml` for linting and formatting (line-length 120, target py311). Run `ruff check .` and `ruff format --check .` before submitting.
 
 ### Templates
 
