@@ -615,45 +615,42 @@ msgid "1. Create a Project"
 msgstr "1. Créer un projet"
 
 #: templates/index.html:81
-#, fuzzy
 msgid ""
 "Enter a Wikidata Q-ID and Commons category. The system scans all images, "
 "detects faces with bounding boxes, and bootstraps from existing P180 "
 "depicts claims."
 msgstr ""
-"Saisissez un Q-ID Wikidata et une catégorie Wikimedia Commons. Le système"
-" analysera toutes les images pour trouver des visages."
+"Saisissez un Q-ID Wikidata et une catégorie Commons. Le système scanne "
+"toutes les images, détecte les visages avec des boîtes englobantes et "
+"amorce depuis les affirmations P180 depicts existantes."
 
 #: templates/index.html:84
 msgid "2. Classify Faces"
 msgstr "2. Classer les visages"
 
 #: templates/index.html:85
-#, fuzzy
 msgid ""
 "Review detected faces one by one with Yes/No buttons. After enough "
 "examples, the model classifies remaining faces automatically using face "
 "encodings."
 msgstr ""
-"Examinez les visages détectés un par un avec de simples boutons Oui/Non. "
-"Après suffisamment d'exemples, le modèle classe automatiquement les "
-"visages restants."
+"Examinez les visages détectés un par un avec des boutons Oui/Non. Après "
+"suffisamment d'exemples, le modèle classe automatiquement les visages "
+"restants en utilisant les encodages faciaux."
 
 #: templates/index.html:88
-#, fuzzy
 msgid "3. Review & Edit"
-msgstr "3. Examiner les résultats"
+msgstr "3. Réviser et modifier"
 
 #: templates/index.html:89
-#, fuzzy
 msgid ""
 "Check model classifications. Approve matches, reject false positives, "
 "redraw bounding boxes, or manually add missed faces. Each face is "
 "compared independently."
 msgstr ""
-"Vérifiez les classifications du modèle. Approuvez les correspondances "
-"correctes, rejetez les faux positifs et redessinez les boîtes englobantes"
-" si nécessaire."
+"Vérifiez les classifications du modèle. Approuvez les correspondances, "
+"rejetez les faux positifs, redessinez les boîtes englobantes ou ajoutez "
+"manuellement les visages manqués. Chaque visage est comparé indépendamment."
 
 #: templates/index.html:92
 msgid "4. Send to Commons"
@@ -664,6 +661,9 @@ msgid ""
 "Send approved matches to Commons as P180 depicts claims. Rejected "
 "bootstrap faces queue P180 removal, fixing incorrect existing data."
 msgstr ""
+"Envoyez les correspondances approuvées vers Commons en tant qu'affirmations "
+"P180 depicts. Les visages bootstrap rejetés sont mis en file d'attente pour "
+"la suppression P180, corrigeant les données existantes incorrectes."
 
 #: templates/leaderboard.html:76
 msgid "Classified"
