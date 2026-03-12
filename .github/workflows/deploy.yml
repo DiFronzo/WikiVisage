@@ -1,0 +1,37 @@
+name: Deploy
+on:
+  release:
+    types: [published]
+concurrency:
+  group: deploy-production
+  cancel-in-progress: true
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: toolforge
+    steps:
+      - uses: actions/checkout@v6
+      - name: Deploy to server
+        uses: appleboy/ssh-action@v1.2.4
+        with:
+          host: ${{ secrets.HOST }}
+          username: ${{ secrets.USERNAME }}
+          port: 22
+          request_pty: true
+          script_stop: true
+          key: ${{ secrets.KEY }}
+          script: |
+            # Become the tool account
+            become wikivisage
+
+            # 1. Rebuild
+            toolforge build start https://github.com/DiFronzo/WikiVisage.git
+
+            # 2. run migration (recreates all tables from schema.sql)
+            toolforge jobs run migrate --command "python migrate.py" --image tool-wikivisage/tool-wikivisage:latest --wait
+
+            # 3. Restart web service
+            toolforge webservice buildservice restart
+            
+            # 4. Restart worker
+            toolforge jobs restart ml-worker

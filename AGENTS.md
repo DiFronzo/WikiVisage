@@ -8,19 +8,30 @@ Active-learning Flask app for Wikimedia Commons. Users classify faces via yes/no
 
 ```
 WikiVisage/
-├── app.py              # Flask web app: OAuth, routes, classification API (2397 lines)
-├── worker.py           # Background ML pipeline: crawl, detect, infer (1164 lines)
-├── database.py         # MariaDB connection pool with retry logic (500 lines)
+├── app.py              # Flask web app: OAuth, routes, classification API (~2660 lines)
+├── worker.py           # Background ML pipeline: crawl, detect, infer (~1730 lines)
+├── database.py         # MariaDB connection pool with retry logic (~480 lines)
 ├── schema.sql          # DDL for 6 tables: users, sessions, projects, images, faces, worker_heartbeat
 ├── migrate.py          # Idempotent schema migration (reads schema.sql, executes statements)
 ├── whitelist.txt       # Allowed usernames (one per line, checked on every request)
+├── pyproject.toml      # Project config: Ruff linter/formatter rules, pytest config, markers
+├── requirements.txt    # Python 3.11+, dlib-bin fork (no source compilation)
+├── requirements-dev.txt # Dev/test deps: pytest, pytest-cov, ruff (includes requirements.txt)
 ├── babel.cfg           # pybabel extraction config (explicit file list, excludes venv)
 ├── messages.pot        # Extracted translatable strings template
+├── CONTRIBUTING.md     # Contributor guide: setup, conventions, i18n, schema changes
 ├── translations/       # i18n translation files (Flask-Babel / gettext)
 │   ├── en/LC_MESSAGES/ # English (identity: msgstr = msgid)
 │   ├── nb/LC_MESSAGES/ # Norwegian Bokmål
 │   ├── es/LC_MESSAGES/ # Spanish
 │   └── fr/LC_MESSAGES/ # French
+├── tests/              # Hybrid test suite: 56 unit + 33 integration tests
+│   ├── __init__.py
+│   ├── conftest.py     # Integration fixture infrastructure (~450 lines)
+│   ├── test_app.py     # 29 unit + 11 integration tests (~476 lines)
+│   ├── test_database.py # 9 unit + 9 integration tests (~235 lines)
+│   ├── test_migrate.py # 13 unit + 8 integration tests (~408 lines)
+│   └── test_worker.py  # 5 unit + 5 integration tests (~393 lines)
 ├── templates/          # Jinja2 templates (9 files, all extend base.html)
 │   ├── base.html       # Layout: nav, flash messages, CSS variables. Blocks: title, extra_head, content
 │   ├── classify.html   # Active learning UI: face image, yes/no/skip/none buttons, keyboard shortcuts, undo
@@ -29,9 +40,12 @@ WikiVisage/
 ├── static/             # Static assets
 │   ├── wikivisage-logo.svg        # Full logo with text
 │   └── wikivisage-logo-notext.svg # Logo icon only
+├── .github/
+│   └── workflows/
+│       ├── ci.yml      # CI: Ruff lint + pytest on Python 3.11/3.13 (integration tests skipped)
+│       └── deploy.yml  # CD: Release-triggered Toolforge deploy via SSH
 ├── Procfile            # web: gunicorn (4 workers, app factory), worker: python -u worker.py
 ├── Aptfile             # System deps: libopenblas0, liblapack3 (dlib runtime)
-├── requirements.txt    # Python 3.11+, dlib-bin fork (no source compilation)
 ├── jobs.yaml           # Toolforge jobs definition (ml-worker continuous job)
 ├── how-to-run-it.md    # Toolforge deployment guide
 ├── test-local.md       # Local development setup guide
@@ -134,6 +148,11 @@ users 1──N projects 1──N images 1──N faces
                                        +-- encoding: 128D float64 numpy array (1024 bytes BLOB)
                                        +-- confidence: face distance from target centroid
                                        +-- sdc_written: whether P180 claim was written
+                                       +-- sdc_removal_pending: 1=P180 removal queued (rejected face)
+                                       +-- superseded_by: FK to replacement face (after bbox edit)
+
+                                images:
+                                       +-- bootstrapped: 1=image found via P180 bootstrap
 
 worker_heartbeat (single-row: id=1, last_seen DATETIME)
 ```
@@ -145,7 +164,7 @@ worker_heartbeat (single-row: id=1, last_seen DATETIME)
 ### app.py
 | Constant | Value | Purpose |
 |----------|-------|---------|
-| `APP_VERSION` | `"0.1.0"` | Displayed in footer |
+| `APP_VERSION` | `"0.2.2"` | Displayed in footer |
 | `LANGUAGES` | `en, nb, es, fr` | Supported locales |
 | `RTL_LANGUAGES` | `ar, he, fa, ur` | RTL layout support |
 | `MAX_IMAGE_DOWNLOAD_BYTES` | 50 MB | Image download size cap (shared with worker) |
@@ -189,11 +208,13 @@ worker_heartbeat (single-row: id=1, last_seen DATETIME)
 ## Conventions
 
 ### Python
-- No linter/formatter config in repo (no pyproject.toml, no .flake8). Code uses type hints, f-strings, DictCursor everywhere.
-- No test files or test framework configured.
+- **Linter/formatter**: Ruff configured in `pyproject.toml` (line-length 120, target py311). Selects E/W/F/I/UP/B/SIM/S rule sets with project-specific ignores. Run: `ruff check .` and `ruff format --check .`.
+- **Test framework**: pytest configured in `pyproject.toml` (`testpaths = ["tests"]`, `pythonpath = ["."]`). Integration tests marked with `@pytest.mark.integration`, skipped unless `WIKIVISAGE_TEST_DB=1` env var is set. See **Testing** section below.
+- Code uses type hints, f-strings, DictCursor everywhere.
 - `execute_query()` is the universal DB read/write interface. `execute_insert()` for INSERTs needing lastrowid. `execute_transaction()` for atomic multi-step mutations.
-- All DB queries use `%s` parameterized placeholders (PyMySQL). Never f-string SQL.
+- All DB queries use `%s` parameterized placeholders (PyMySQL). Never interpolate **values** into SQL via f-strings. F-strings are acceptable for structural SQL (e.g., building `IN (%s, %s, %s)` placeholder lists).
 - All mutation endpoints (classify, reclassify, manual-face, update-face-bbox, write-sdc) use `execute_transaction` for atomicity.
+- `execute_query()` returns empty **tuple** `()` not `[]` when no rows found (PyMySQL DictCursor behavior).
 
 ### Templates
 - All templates extend `base.html`. Three blocks: `title`, `extra_head` (CSS/JS), `content`.
@@ -281,6 +302,91 @@ Only 2 cookies: `session` (strictly necessary, server-side via Flask-Session) an
 ### Inference RAM
 Each face encoding is 1024 bytes (128 float64). Even 10K faces ~ 10MB. No RAM concern for inference.
 
+## Testing
+
+Hybrid test suite: **56 unit tests** (run in CI) + **33 integration tests** (require local Docker MariaDB).
+
+### Architecture
+
+- **Unit tests**: Pure mocks, no DB. Run everywhere (CI, local). Cover thumb snapping, URL safety, CSRF validation, error classes, migration parsing, route logic.
+- **Integration tests**: Hit a real MariaDB via Docker. Marked with `@pytest.mark.integration`. Skipped in CI (GitHub Actions) — only run locally when `WIKIVISAGE_TEST_DB=1` is set.
+- **Test DB**: `wikiface_test` — created fresh per pytest session, dropped on teardown. Never touches `wikiface_dev`.
+- **Config**: `pyproject.toml` has `testpaths = ["tests"]`, `pythonpath = ["."]`, and integration marker.
+
+### Test Counts
+
+| File | Unit | Integration | Total |
+|------|------|-------------|-------|
+| `test_app.py` | 29 | 11 | 40 |
+| `test_database.py` | 9 | 9 | 18 |
+| `test_migrate.py` | 13 | 8 | 21 |
+| `test_worker.py` | 5 | 5 | 10 |
+| **Total** | **56** | **33** | **89** |
+
+### Commands
+
+```bash
+# Full suite (unit + integration) — requires Docker MariaDB running
+WIKIVISAGE_TEST_DB=1 pytest tests/ -v
+
+# CI mode (unit only — integration tests auto-skipped)
+pytest tests/ -v
+
+# Single test file
+pytest tests/test_app.py -v
+
+# With coverage
+WIKIVISAGE_TEST_DB=1 pytest tests/ --cov=. --cov-report=term-missing
+```
+
+### Fixture Hierarchy (`tests/conftest.py`)
+
+```
+test_db (session) → creates/drops wikiface_test DB
+├── db_conn (function) → raw pymysql connection, truncates all tables after test
+├── db_pool (function) → initializes database.py pool for test DB
+├── integration_app (function) → Flask app connected to test DB
+│   └── integration_client (function) → logged-in test client with session
+├── seed_user → inserts test user, depends on db_conn
+├── seed_project → inserts test project, depends on db_conn + seed_user
+├── seed_images → inserts 5 test images, depends on db_conn + seed_project
+├── seed_faces → inserts target + non-target faces, depends on db_conn + seed_images + seed_user
+├── seed_unclassified_faces → inserts unclassified faces, depends on db_conn + seed_images
+└── seed_bootstrap_image → inserts bootstrapped image + face, depends on db_conn + seed_project
+```
+
+### Conventions
+
+- **Encoding helper**: `_make_encoding(seed)` generates deterministic 128D float64 numpy arrays for face encodings.
+- **Import pattern**: `conftest.py` helpers use try/except: `try: from conftest import X` / `except: from tests.conftest import X` for compatibility.
+- **DB connection**: `host=127.0.0.1, user=root, password=devpass, port=3306`.
+- **Assertion gotcha**: `execute_query()` returns empty **tuple** `()` not `[]` — use `len(result) == 0` not `result == []`.
+- **Integration test isolation**: Each `db_conn` fixture truncates all tables after the test via `SET FOREIGN_KEY_CHECKS=0`.
+- **App auth simulation**: Set `session["user_id"]`, patch `_load_whitelist` to return `{"TestUser"}`.
+
+## CI/CD
+
+### CI (`.github/workflows/ci.yml`)
+
+Runs on push/PR to `main`. Two jobs:
+
+1. **Lint**: Ruff check + format check (Python 3.11).
+2. **Test**: `pytest --tb=short -q` on Python 3.11 and 3.13 matrix. Integration tests auto-skipped (no `WIKIVISAGE_TEST_DB` env var in CI). Installs system deps (`libopenblas0`, `liblapack3`) for dlib. Caches pip dependencies.
+
+Concurrency: `ci-${{ github.ref }}` with cancel-in-progress.
+
+### CD (`.github/workflows/deploy.yml`)
+
+Triggered on GitHub release publish. Steps:
+1. SSH into Toolforge via `appleboy/ssh-action`.
+2. `become wikivisage` (tool account).
+3. `toolforge build start` — rebuild container image from repo.
+4. `toolforge jobs run migrate` — run schema migration.
+5. `toolforge webservice buildservice restart` — restart web.
+6. `toolforge jobs restart ml-worker` — restart background worker.
+
+Concurrency: `deploy-production` with cancel-in-progress.
+
 ## Internationalization (i18n)
 
 Uses Flask-Babel with gettext `.po`/`.mo` files. 4 supported locales.
@@ -367,6 +473,16 @@ The English `.po` file uses identity translations (`msgstr` = `msgid`). This ens
 python app.py                    # Web app on http://localhost:8000
 python worker.py                 # Background worker (separate terminal)
 python migrate.py                # Run schema migrations (idempotent)
+
+# Linting
+ruff check .                     # Lint (errors, warnings, security)
+ruff format --check .            # Format check (dry-run)
+ruff format .                    # Auto-format
+
+# Testing
+pytest tests/ -v                                          # Unit tests only (CI mode)
+WIKIVISAGE_TEST_DB=1 pytest tests/ -v                     # Full suite (unit + integration)
+WIKIVISAGE_TEST_DB=1 pytest tests/ --cov=. --cov-report=term-missing  # With coverage
 
 # i18n
 source venv/bin/activate

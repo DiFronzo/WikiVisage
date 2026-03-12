@@ -1,0 +1,49 @@
+[project]
+name = "wikivisage"
+version = "0.2.2"
+requires-python = ">=3.11"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "UP",   # pyupgrade
+    "B",    # flake8-bugbear
+    "SIM",  # flake8-simplify
+    "S",    # flake8-bandit (security)
+]
+ignore = [
+    "E501",   # line too long (handled by formatter)
+    "E402",   # module level import not at top — intentional (load_dotenv, APP_VERSION before imports)
+    "S101",   # assert used (needed in tests)
+    "S105",   # possible hardcoded password — false positives on URL constants and test fixtures
+    "S110",   # try-except-pass — intentional for connection cleanup and non-critical ops
+    "S112",   # try-except-continue — intentional in worker queue polling
+    "S201",   # debug=True in Flask — only in __main__ dev block
+    "S311",   # random.choice — not crypto, just shuffling images for classification
+    "S324",   # md5 — required by Commons thumbnail URL scheme
+    "S603",   # subprocess call without shell=True check — worker uses subprocess intentionally
+    "S607",   # starting process with partial path
+    "S608",   # SQL injection — false positives, we build placeholder lists not values
+    "S104",   # binding to all interfaces — only in __main__ dev block
+    "B904",   # raise from — would be noisy to fix across pool/worker error handling
+    "B905",   # zip without strict=
+    "SIM102", # nested if — sometimes more readable as separate conditions
+    "SIM105", # contextlib.suppress — try/except/pass is clearer for our patterns
+    "SIM108", # ternary operator — multi-line if/else is clearer in test fixtures
+    "SIM117", # multiple with statements — nested with is clearer for our DB patterns
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101", "S105", "S106"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+markers = ["integration: tests requiring a local MariaDB (Docker)"]

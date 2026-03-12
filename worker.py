@@ -9,7 +9,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 from dotenv import load_dotenv
 
@@ -27,28 +27,22 @@ from PIL import Image
 from requests.adapters import HTTPAdapter
 from requests.packages.urllib3.util.retry import Retry
 
-from database import close_pool, execute_query, init_db, DatabaseError
+from database import DatabaseError, close_pool, execute_query, init_db
 
 # Configure Logging
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("worker")
 
 # Constants
 COMMONS_API_URL = "https://commons.wikimedia.org/w/api.php"
 SPARQL_URL = "https://commons-query.wikimedia.org/sparql"  # Requires OAuth; unused, kept for reference
-FILE_PATH_URL = (
-    "https://commons.wikimedia.org/wiki/Special:FilePath/{file_title}?width=1024"
-)
+FILE_PATH_URL = "https://commons.wikimedia.org/wiki/Special:FilePath/{file_title}?width=1024"
 
 USER_AGENT = "WikiVisage/1.0 (Wikimedia Toolforge; https://toolsadmin.wikimedia.org)"
 
 POLL_INTERVAL = int(os.environ.get("WIKIVISAGE_WORKER_POLL_INTERVAL", 60))
 BATCH_SIZE = int(os.environ.get("WIKIVISAGE_WORKER_BATCH_SIZE", 50))
-WAKE_UP_FILE = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), ".worker-wake-up"
-)
+WAKE_UP_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".worker-wake-up")
 MAX_CONCURRENT_PROJECTS = int(os.environ.get("WIKIVISAGE_WORKER_MAX_PROJECTS", 3))
 IMAGE_THREADS = int(os.environ.get("WIKIVISAGE_WORKER_IMAGE_THREADS", 4))
 
@@ -83,7 +77,7 @@ def _create_session() -> requests.Session:
 
 # Module-level singleton session — reuses TCP connections and TLS state across all
 # HTTP requests, avoiding the ~100ms+ overhead of per-request Session creation.
-_http_session: Optional[requests.Session] = None
+_http_session: requests.Session | None = None
 
 
 def _get_session() -> requests.Session:
@@ -96,10 +90,10 @@ def _get_session() -> requests.Session:
 
 def _api_request(
     url: str,
-    params: Optional[Dict[str, Any]] = None,
-    headers: Optional[Dict[str, str]] = None,
+    params: dict[str, Any] | None = None,
+    headers: dict[str, str] | None = None,
     method: str = "get",
-    data: Optional[Dict[str, Any]] = None,
+    data: dict[str, Any] | None = None,
     timeout: int = 30,
 ) -> requests.Response:
     """Central HTTP request function with maxlag handling."""
@@ -117,9 +111,7 @@ def _api_request(
             if method.lower() == "get":
                 resp = session.get(url, params=params, headers=headers, timeout=timeout)
             else:
-                resp = session.post(
-                    url, data=data, params=params, headers=headers, timeout=timeout
-                )
+                resp = session.post(url, data=data, params=params, headers=headers, timeout=timeout)
 
             resp.raise_for_status()
 
@@ -127,14 +119,9 @@ def _api_request(
             if "Retry-After" in resp.headers and resp.status_code == 200:
                 try:
                     data_json = resp.json()
-                    if (
-                        "error" in data_json
-                        and data_json["error"].get("code") == "maxlag"
-                    ):
+                    if "error" in data_json and data_json["error"].get("code") == "maxlag":
                         retry_after = int(resp.headers.get("Retry-After", 5))
-                        logger.warning(
-                            f"Maxlag encountered. Sleeping for {retry_after} seconds."
-                        )
+                        logger.warning(f"Maxlag encountered. Sleeping for {retry_after} seconds.")
                         time.sleep(retry_after)
                         continue
                 except ValueError:
@@ -167,9 +154,7 @@ def _download_image(url: str, max_bytes: int = MAX_IMAGE_DOWNLOAD_BYTES) -> byte
     content_length = resp.headers.get("Content-Length")
     if content_length and int(content_length) > max_bytes:
         resp.close()
-        raise ValueError(
-            f"Image too large: {int(content_length)} bytes (limit {max_bytes})"
-        )
+        raise ValueError(f"Image too large: {int(content_length)} bytes (limit {max_bytes})")
 
     # Stream with enforced cap
     chunks: list[bytes] = []
@@ -190,10 +175,7 @@ def _validate_image_dimensions(image_bytes: bytes) -> None:
     img = Image.open(io.BytesIO(image_bytes))
     w, h = img.size
     if w * h > MAX_IMAGE_PIXELS:
-        raise ValueError(
-            f"Image too large for face detection: {w}x{h} "
-            f"({w * h:,} pixels, limit {MAX_IMAGE_PIXELS:,})"
-        )
+        raise ValueError(f"Image too large for face detection: {w}x{h} ({w * h:,} pixels, limit {MAX_IMAGE_PIXELS:,})")
 
 
 def _get_csrf_token(access_token: str) -> str:
@@ -210,7 +192,7 @@ def _get_csrf_token(access_token: str) -> str:
         raise
 
 
-def traverse_category(project: Dict[str, Any]) -> int:
+def traverse_category(project: dict[str, Any]) -> int:
     """Fetch all files in the project's Commons category (including subcategories) and insert them as pending."""
     logger.info(f"Traversing category for project {project['id']}")
 
@@ -242,8 +224,7 @@ def traverse_category(project: Dict[str, Any]) -> int:
     while cat_queue and not shutdown_requested:
         if added_count >= remaining:
             logger.info(
-                f"Reached image limit ({MAX_IMAGES_PER_PROJECT}) for project "
-                f"{project['id']}, stopping traversal."
+                f"Reached image limit ({MAX_IMAGES_PER_PROJECT}) for project {project['id']}, stopping traversal."
             )
             break
         if len(visited_cats) >= max_categories:
@@ -290,9 +271,7 @@ def traverse_category(project: Dict[str, Any]) -> int:
                             cat_queue.append(subcat_title)
                     elif ns == 6:
                         # File — collect for batch insert
-                        new_files.append(
-                            (project["id"], member["pageid"], member["title"])
-                        )
+                        new_files.append((project["id"], member["pageid"], member["title"]))
 
                 # Trim batch to stay within per-project image limit
                 space_left = remaining - added_count
@@ -301,9 +280,7 @@ def traverse_category(project: Dict[str, Any]) -> int:
 
                 # Batch insert all files from this API page (UNIQUE index handles duplicates)
                 if new_files:
-                    placeholders = ", ".join(
-                        ["(%s, %s, %s, 'pending')"] * len(new_files)
-                    )
+                    placeholders = ", ".join(["(%s, %s, %s, 'pending')"] * len(new_files))
                     flat_params = [val for tup in new_files for val in tup]
                     result = execute_query(
                         f"INSERT IGNORE INTO images (project_id, commons_page_id, file_title, status) "
@@ -427,13 +404,13 @@ class FaceDetectPool:
         self._pool_size = pool_size
         self._task_queue: multiprocessing.Queue = multiprocessing.Queue()
         self._result_queue: multiprocessing.Queue = multiprocessing.Queue()
-        self._workers: List[multiprocessing.Process] = []
+        self._workers: list[multiprocessing.Process] = []
         self._request_counter = 0
         self._counter_lock = threading.Lock()
         # Per-request result routing: request_id -> queue.Queue holding the result
-        self._pending: Dict[int, queue.Queue] = {}
+        self._pending: dict[int, queue.Queue] = {}
         self._pending_lock = threading.Lock()
-        self._dispatcher_thread: Optional[threading.Thread] = None
+        self._dispatcher_thread: threading.Thread | None = None
         self._shutdown_event = threading.Event()
         self._started = False
 
@@ -471,9 +448,7 @@ class FaceDetectPool:
         for i, proc in enumerate(self._workers):
             if not proc.is_alive():
                 exitcode = proc.exitcode
-                logger.warning(
-                    f"Face detection subprocess {i} died (exitcode={exitcode}), respawning"
-                )
+                logger.warning(f"Face detection subprocess {i} died (exitcode={exitcode}), respawning")
                 self._spawn_worker(i)
 
     def _dispatch_results(self) -> None:
@@ -499,19 +474,13 @@ class FaceDetectPool:
             if result_q is not None:
                 result_q.put(result)
             else:
-                logger.warning(
-                    f"Face detection result for unknown request_id={request_id} (caller may have timed out)"
-                )
+                logger.warning(f"Face detection result for unknown request_id={request_id} (caller may have timed out)")
 
     def is_healthy(self) -> bool:
         """Check if the pool is started and the dispatcher thread is alive."""
-        return (
-            self._started
-            and self._dispatcher_thread is not None
-            and self._dispatcher_thread.is_alive()
-        )
+        return self._started and self._dispatcher_thread is not None and self._dispatcher_thread.is_alive()
 
-    def detect_faces(self, image_bytes: bytes) -> Tuple[List, List[bytes], int, int]:
+    def detect_faces(self, image_bytes: bytes) -> tuple[list, list[bytes], int, int]:
         """Submit image for face detection and wait for result.
 
         Thread-safe: each caller gets a unique request_id and a private result
@@ -547,9 +516,7 @@ class FaceDetectPool:
             try:
                 result = result_q.get(timeout=FACE_DETECT_TIMEOUT)
             except queue.Empty:
-                raise RuntimeError(
-                    f"Face detection timed out after {FACE_DETECT_TIMEOUT}s"
-                )
+                raise RuntimeError(f"Face detection timed out after {FACE_DETECT_TIMEOUT}s")
 
             if result[1] == "error":
                 raise RuntimeError(f"Face detection failed: {result[2]}")
@@ -601,7 +568,7 @@ class FaceDetectPool:
 
 
 # Module-level pool instance — initialized in main() before processing starts
-_face_pool: Optional[FaceDetectPool] = None
+_face_pool: FaceDetectPool | None = None
 
 
 def _detect_faces_in_subprocess(
@@ -633,7 +600,7 @@ def _detect_faces_in_subprocess(
 
 def _run_face_detection_fallback(
     image_bytes: bytes,
-) -> Tuple[List, List[bytes], int, int]:
+) -> tuple[list, list[bytes], int, int]:
     """Fallback: run face detection in a one-shot subprocess (old behavior).
 
     Used only when the persistent pool is unavailable.
@@ -669,7 +636,7 @@ def _run_face_detection_fallback(
     return result[1], result[2], result[3], result[4]
 
 
-def _run_face_detection(image_bytes: bytes) -> Tuple[List, List[bytes], int, int]:
+def _run_face_detection(image_bytes: bytes) -> tuple[list, list[bytes], int, int]:
     """Run face detection — uses persistent pool if available, falls back to one-shot subprocess.
 
     Returns (locations, encoding_bytes_list, width, height).
@@ -679,9 +646,7 @@ def _run_face_detection(image_bytes: bytes) -> Tuple[List, List[bytes], int, int
         try:
             return _face_pool.detect_faces(image_bytes)
         except PoolUnavailableError as e:
-            logger.warning(
-                f"Pool unavailable, falling back to one-shot subprocess: {e}"
-            )
+            logger.warning(f"Pool unavailable, falling back to one-shot subprocess: {e}")
     return _run_face_detection_fallback(image_bytes)
 
 
@@ -698,9 +663,7 @@ def _process_single_image(img_id: int, title: str) -> bool:
         _validate_image_dimensions(image_bytes)
         t_download = time.monotonic()
 
-        face_locations, encodings_bytes, det_width, det_height = _run_face_detection(
-            image_bytes
-        )
+        face_locations, encodings_bytes, det_width, det_height = _run_face_detection(image_bytes)
         del image_bytes
         t_detect = time.monotonic()
 
@@ -712,12 +675,8 @@ def _process_single_image(img_id: int, title: str) -> bool:
         if face_locations:
             FACE_INSERT_CHUNK = 100  # ~100KB per chunk (1024-byte encoding + ints)
             for chunk_start in range(0, face_count, FACE_INSERT_CHUNK):
-                chunk_locs = face_locations[
-                    chunk_start : chunk_start + FACE_INSERT_CHUNK
-                ]
-                chunk_encs = encodings_bytes[
-                    chunk_start : chunk_start + FACE_INSERT_CHUNK
-                ]
+                chunk_locs = face_locations[chunk_start : chunk_start + FACE_INSERT_CHUNK]
+                chunk_encs = encodings_bytes[chunk_start : chunk_start + FACE_INSERT_CHUNK]
                 chunk_size = len(chunk_locs)
                 placeholders = ", ".join(["(%s, %s, %s, %s, %s, %s)"] * chunk_size)
                 flat_params: list = []
@@ -760,7 +719,7 @@ def _process_single_image(img_id: int, title: str) -> bool:
         return False
 
 
-def process_images(project: Dict[str, Any]) -> int:
+def process_images(project: dict[str, Any]) -> int:
     """Download images, detect faces, and extract embeddings using parallel threads."""
     logger.info(f"Processing images for project {project['id']}")
 
@@ -781,9 +740,7 @@ def process_images(project: Dict[str, Any]) -> int:
         for img_row in pending_images:
             if shutdown_requested:
                 break
-            future = executor.submit(
-                _process_single_image, img_row["id"], img_row["file_title"]
-            )
+            future = executor.submit(_process_single_image, img_row["id"], img_row["file_title"])
             futures[future] = img_row["file_title"]
 
         for future in as_completed(futures):
@@ -814,7 +771,7 @@ def process_images(project: Dict[str, Any]) -> int:
     return processed_count
 
 
-def bootstrap_from_sparql(project: Dict[str, Any]) -> int:
+def bootstrap_from_sparql(project: dict[str, Any]) -> int:
     """Bootstrap a project using images already linked to the QID via P180.
 
     Uses the Wikibase haswbstatement search API on Commons instead of SPARQL,
@@ -826,9 +783,7 @@ def bootstrap_from_sparql(project: Dict[str, Any]) -> int:
     No faces are auto-classified — the user must confirm faces manually via
     the classify UI before the model will run inference.
     """
-    logger.info(
-        f"Attempting bootstrap for project {project['id']} with QID {project['wikidata_qid']}"
-    )
+    logger.info(f"Attempting bootstrap for project {project['id']} with QID {project['wikidata_qid']}")
 
     # Check if project already has confirmed target faces (use actual count, not
     # the unreliable faces_confirmed counter)
@@ -842,7 +797,7 @@ def bootstrap_from_sparql(project: Dict[str, Any]) -> int:
         return 0
 
     qid = project["wikidata_qid"]
-    search_params: Dict[str, Any] = {
+    search_params: dict[str, Any] = {
         "action": "query",
         "list": "search",
         "srsearch": f"haswbstatement:P180={qid}",
@@ -921,15 +876,11 @@ def bootstrap_from_sparql(project: Dict[str, Any]) -> int:
         if flagged_count > 0:
             # Update images_total to include any newly inserted bootstrap images
             execute_query(
-                "UPDATE projects SET "
-                "images_total = (SELECT COUNT(*) FROM images WHERE project_id = %s) "
-                "WHERE id = %s",
+                "UPDATE projects SET images_total = (SELECT COUNT(*) FROM images WHERE project_id = %s) WHERE id = %s",
                 (project["id"], project["id"]),
                 fetch=False,
             )
-            logger.info(
-                f"Bootstrap flagged {flagged_count} images for project {project['id']}"
-            )
+            logger.info(f"Bootstrap flagged {flagged_count} images for project {project['id']}")
 
         return flagged_count
 
@@ -939,7 +890,7 @@ def bootstrap_from_sparql(project: Dict[str, Any]) -> int:
     return 0
 
 
-def run_autonomous_inference(project: Dict[str, Any]) -> int:
+def run_autonomous_inference(project: dict[str, Any]) -> int:
     """Run model inference on unclassified faces based on confirmed faces."""
     t_start = time.monotonic()
     min_confirmed = project.get("min_confirmed", 5)
@@ -960,9 +911,7 @@ def run_autonomous_inference(project: Dict[str, Any]) -> int:
         )
         return 0
 
-    logger.info(
-        f"Running autonomous inference for project {project['id']} ({actual_confirmed} confirmed faces)"
-    )
+    logger.info(f"Running autonomous inference for project {project['id']} ({actual_confirmed} confirmed faces)")
 
     # Get confirmed faces
     confirmed_rows = execute_query(
@@ -983,9 +932,7 @@ def run_autonomous_inference(project: Dict[str, Any]) -> int:
     # Load all confirmed encodings to compute centroid. Each encoding is 128 float64
     # values (1024 bytes). Even 10K confirmed faces = ~10 MB — well within Toolforge
     # memory limits. Batching would add complexity with no practical benefit.
-    confirmed_encodings = [
-        np.frombuffer(row["encoding"], dtype=np.float64) for row in confirmed_rows
-    ]
+    confirmed_encodings = [np.frombuffer(row["encoding"], dtype=np.float64) for row in confirmed_rows]
     centroid = np.mean(confirmed_encodings, axis=0)
     t_centroid = time.monotonic()
 
@@ -1009,12 +956,9 @@ def run_autonomous_inference(project: Dict[str, Any]) -> int:
         fetch=True,
     )
 
-    candidate_count = (
-        len(unclassified_rows) if isinstance(unclassified_rows, list) else 0
-    )
+    candidate_count = len(unclassified_rows) if isinstance(unclassified_rows, list) else 0
     logger.info(
-        f"Project {project['id']}: {candidate_count} candidate faces for inference "
-        f"(non-bootstrap, no human edits)"
+        f"Project {project['id']}: {candidate_count} candidate faces for inference (non-bootstrap, no human edits)"
     )
 
     classified_count = 0
@@ -1023,12 +967,12 @@ def run_autonomous_inference(project: Dict[str, Any]) -> int:
     # Compute all classifications in memory first (pure numpy, very fast),
     # then batch-UPDATE in chunks to minimize DB round-trips.
     UPDATE_BATCH_SIZE = 500
-    pending_updates: List[Tuple[int, int, float]] = []  # (face_id, is_target, distance)
+    pending_updates: list[tuple[int, int, float]] = []  # (face_id, is_target, distance)
 
     t_distance_start = time.monotonic()
 
     # Phase 1: compute distances for all candidates
-    face_distances: List[Tuple[int, int, float]] = []  # (face_id, image_id, distance)
+    face_distances: list[tuple[int, int, float]] = []  # (face_id, image_id, distance)
     for row in unclassified_rows:
         if shutdown_requested:
             break
@@ -1039,7 +983,7 @@ def run_autonomous_inference(project: Dict[str, Any]) -> int:
 
     # Phase 2: per-image dedup — only the closest face below threshold is a match;
     # all other faces on the same image are rejected (a person appears once per image)
-    best_per_image: Dict[int, Tuple[int, float]] = {}  # image_id -> (face_id, distance)
+    best_per_image: dict[int, tuple[int, float]] = {}  # image_id -> (face_id, distance)
     for face_id, image_id, distance in face_distances:
         if distance < threshold:
             if image_id not in best_per_image or distance < best_per_image[image_id][1]:
@@ -1047,7 +991,7 @@ def run_autonomous_inference(project: Dict[str, Any]) -> int:
 
     best_face_ids = {face_id for face_id, _ in best_per_image.values()}
 
-    for face_id, image_id, distance in face_distances:
+    for face_id, _image_id, distance in face_distances:
         if face_id in best_face_ids:
             pending_updates.append((face_id, 1, distance))
         else:
@@ -1068,8 +1012,8 @@ def run_autonomous_inference(project: Dict[str, Any]) -> int:
         id_placeholders = ",".join(["%s"] * len(face_ids))
 
         # Build CASE expressions for is_target and confidence
-        target_cases = " ".join([f"WHEN %s THEN %s" for _ in batch])
-        conf_cases = " ".join([f"WHEN %s THEN %s" for _ in batch])
+        target_cases = " ".join(["WHEN %s THEN %s" for _ in batch])
+        conf_cases = " ".join(["WHEN %s THEN %s" for _ in batch])
 
         # Flatten params: target CASE pairs, confidence CASE pairs, then IN list
         params: list = []
@@ -1103,7 +1047,7 @@ def run_autonomous_inference(project: Dict[str, Any]) -> int:
     return classified_count
 
 
-def write_sdc_claims(project: Dict[str, Any]) -> int:
+def write_sdc_claims(project: dict[str, Any]) -> int:
     """Write SDC P180 claims for all faces marked as target.
 
     Called when sdc_write_requested=1. Processes all pending faces in batches,
@@ -1122,8 +1066,7 @@ def write_sdc_claims(project: Dict[str, Any]) -> int:
     if not user_row:
         logger.error(f"User {project['user_id']} not found for SDC writes")
         execute_query(
-            "UPDATE projects SET sdc_write_requested = 0, "
-            "sdc_write_error = 'User not found' WHERE id = %s",
+            "UPDATE projects SET sdc_write_requested = 0, sdc_write_error = 'User not found' WHERE id = %s",
             (project_id,),
             fetch=False,
         )
@@ -1138,8 +1081,7 @@ def write_sdc_claims(project: Dict[str, Any]) -> int:
     except Exception as e:
         logger.error(f"Failed to get CSRF token for project {project_id}: {e}")
         execute_query(
-            "UPDATE projects SET sdc_write_requested = 0, "
-            "sdc_write_error = 'Failed to get CSRF token' WHERE id = %s",
+            "UPDATE projects SET sdc_write_requested = 0, sdc_write_error = 'Failed to get CSRF token' WHERE id = %s",
             (project_id,),
             fetch=False,
         )
@@ -1151,8 +1093,7 @@ def write_sdc_claims(project: Dict[str, Any]) -> int:
     except ValueError:
         logger.error(f"Invalid QID format: {qid}")
         execute_query(
-            "UPDATE projects SET sdc_write_requested = 0, "
-            "sdc_write_error = 'Invalid QID format' WHERE id = %s",
+            "UPDATE projects SET sdc_write_requested = 0, sdc_write_error = 'Invalid QID format' WHERE id = %s",
             (project_id,),
             fetch=False,
         )
@@ -1177,11 +1118,7 @@ def write_sdc_claims(project: Dict[str, Any]) -> int:
             fetch=True,
         )
 
-        if (
-            not faces_to_write
-            or not isinstance(faces_to_write, list)
-            or len(faces_to_write) == 0
-        ):
+        if not faces_to_write or not isinstance(faces_to_write, list) or len(faces_to_write) == 0:
             break
 
         for row in faces_to_write:
@@ -1202,9 +1139,7 @@ def write_sdc_claims(project: Dict[str, Any]) -> int:
                 }
                 claim_headers = {"Authorization": f"Bearer {access_token}"}
 
-                claim_resp = _api_request(
-                    COMMONS_API_URL, params=claim_params, headers=claim_headers
-                )
+                claim_resp = _api_request(COMMONS_API_URL, params=claim_params, headers=claim_headers)
                 claim_data = claim_resp.json()
 
                 already_exists = False
@@ -1272,23 +1207,19 @@ def write_sdc_claims(project: Dict[str, Any]) -> int:
                         try:
                             csrf_token = _get_csrf_token(access_token)
                         except Exception:
-                            logger.error(
-                                f"Failed to refresh CSRF token for project {project_id}"
-                            )
+                            logger.error(f"Failed to refresh CSRF token for project {project_id}")
                             break
                         continue
                     else:
                         # Any other API error — abort entire write
                         logger.error(f"SDC Write error for {mid}: {edit_json['error']}")
                         execute_query(
-                            "UPDATE projects SET sdc_write_requested = 0, "
-                            "sdc_write_error = %s WHERE id = %s",
+                            "UPDATE projects SET sdc_write_requested = 0, sdc_write_error = %s WHERE id = %s",
                             (f"{error_code}: {error_info}", project_id),
                             fetch=False,
                         )
                         logger.info(
-                            f"SDC writes aborted for project {project_id}: "
-                            f"{total_written} written before error"
+                            f"SDC writes aborted for project {project_id}: {total_written} written before error"
                         )
                         return total_written
 
@@ -1305,15 +1236,11 @@ def write_sdc_claims(project: Dict[str, Any]) -> int:
             except Exception as e:
                 logger.error(f"Error writing SDC for face {face_id} on {mid}: {e}")
                 execute_query(
-                    "UPDATE projects SET sdc_write_requested = 0, "
-                    "sdc_write_error = %s WHERE id = %s",
+                    "UPDATE projects SET sdc_write_requested = 0, sdc_write_error = %s WHERE id = %s",
                     (str(e)[:1024], project_id),
                     fetch=False,
                 )
-                logger.info(
-                    f"SDC writes aborted for project {project_id}: "
-                    f"{total_written} written before error"
-                )
+                logger.info(f"SDC writes aborted for project {project_id}: {total_written} written before error")
                 return total_written
 
     # --- P180 Removal Phase ---
@@ -1340,11 +1267,7 @@ def write_sdc_claims(project: Dict[str, Any]) -> int:
             fetch=True,
         )
 
-        if (
-            not faces_to_remove
-            or not isinstance(faces_to_remove, list)
-            or len(faces_to_remove) == 0
-        ):
+        if not faces_to_remove or not isinstance(faces_to_remove, list) or len(faces_to_remove) == 0:
             break
 
         for row in faces_to_remove:
@@ -1372,10 +1295,7 @@ def write_sdc_claims(project: Dict[str, Any]) -> int:
                     fetch=True,
                 )
                 if not still_pending or not isinstance(still_pending, list):
-                    logger.info(
-                        f"Skipping removal for M{page_id}: "
-                        f"sibling approved since selection"
-                    )
+                    logger.info(f"Skipping removal for M{page_id}: sibling approved since selection")
                     continue
 
                 claim_params = {
@@ -1386,9 +1306,7 @@ def write_sdc_claims(project: Dict[str, Any]) -> int:
                 }
                 claim_headers = {"Authorization": f"Bearer {access_token}"}
 
-                claim_resp = _api_request(
-                    COMMONS_API_URL, params=claim_params, headers=claim_headers
-                )
+                claim_resp = _api_request(COMMONS_API_URL, params=claim_params, headers=claim_headers)
                 claim_data = claim_resp.json()
 
                 claims = claim_data.get("claims", {}).get("P180", [])
@@ -1415,8 +1333,7 @@ def write_sdc_claims(project: Dict[str, Any]) -> int:
                     "action": "wbremoveclaims",
                     "claim": target_guid,
                     "token": csrf_token,
-                    "summary": f"WikiVisage: Removing depicts (P180) claim for "
-                    f"{qid} (human review)",
+                    "summary": f"WikiVisage: Removing depicts (P180) claim for {qid} (human review)",
                     "format": "json",
                     "bot": "1",
                     "maxlag": "5",
@@ -1437,24 +1354,18 @@ def write_sdc_claims(project: Dict[str, Any]) -> int:
                         try:
                             csrf_token = _get_csrf_token(access_token)
                         except Exception:
-                            logger.error(
-                                f"Failed to refresh CSRF token for project {project_id}"
-                            )
+                            logger.error(f"Failed to refresh CSRF token for project {project_id}")
                             break
                         continue
                     else:
-                        logger.error(
-                            f"SDC removal error for {mid}: {remove_json['error']}"
-                        )
+                        logger.error(f"SDC removal error for {mid}: {remove_json['error']}")
                         execute_query(
-                            "UPDATE projects SET sdc_write_requested = 0, "
-                            "sdc_write_error = %s WHERE id = %s",
+                            "UPDATE projects SET sdc_write_requested = 0, sdc_write_error = %s WHERE id = %s",
                             (f"Removal {error_code}: {error_info}", project_id),
                             fetch=False,
                         )
                         logger.info(
-                            f"SDC removals aborted for project {project_id}: "
-                            f"{total_removed} removed before error"
+                            f"SDC removals aborted for project {project_id}: {total_removed} removed before error"
                         )
                         return total_written
 
@@ -1473,15 +1384,11 @@ def write_sdc_claims(project: Dict[str, Any]) -> int:
             except Exception as e:
                 logger.error(f"Error removing SDC for {mid}: {e}")
                 execute_query(
-                    "UPDATE projects SET sdc_write_requested = 0, "
-                    "sdc_write_error = %s WHERE id = %s",
+                    "UPDATE projects SET sdc_write_requested = 0, sdc_write_error = %s WHERE id = %s",
                     (str(e)[:1024], project_id),
                     fetch=False,
                 )
-                logger.info(
-                    f"SDC removals aborted for project {project_id}: "
-                    f"{total_removed} removed before error"
-                )
+                logger.info(f"SDC removals aborted for project {project_id}: {total_removed} removed before error")
                 return total_written
 
     # Clear the flag — all done successfully (or shutdown requested)
@@ -1495,18 +1402,14 @@ def write_sdc_claims(project: Dict[str, Any]) -> int:
         fetch=False,
     )
 
-    logger.info(
-        f"SDC for project {project_id}: {total_written} written, {total_removed} removed"
-    )
+    logger.info(f"SDC for project {project_id}: {total_written} written, {total_removed} removed")
     return total_written
 
 
-def process_project(project: Dict[str, Any]) -> None:
+def process_project(project: dict[str, Any]) -> None:
     """Orchestrate all phases for a single project."""
     t_project_start = time.monotonic()
-    logger.info(
-        f"--- Processing project {project['id']} ({project['wikidata_qid']}) ---"
-    )
+    logger.info(f"--- Processing project {project['id']} ({project['wikidata_qid']}) ---")
 
     try:
         # 1. Traversal
@@ -1530,9 +1433,7 @@ def process_project(project: Dict[str, Any]) -> None:
                 break
             total_processed += batch_count
             batches_since_inference += 1
-            logger.info(
-                f"Processed batch of {batch_count} images ({total_processed} total so far)"
-            )
+            logger.info(f"Processed batch of {batch_count} images ({total_processed} total so far)")
 
             # Run inference periodically during image processing
             if batches_since_inference >= 5:
@@ -1545,16 +1446,12 @@ def process_project(project: Dict[str, Any]) -> None:
                 proj = fresh[0] if fresh and isinstance(fresh, list) else project
                 classified = run_autonomous_inference(proj)
                 if classified:
-                    logger.info(
-                        f"Mid-processing inference classified {classified} faces"
-                    )
+                    logger.info(f"Mid-processing inference classified {classified} faces")
         t_images = time.monotonic() - t0
 
         # 4. Final Autonomous Inference (catch any remaining unclassified faces)
         t0 = time.monotonic()
-        fresh = execute_query(
-            "SELECT * FROM projects WHERE id = %s", (project["id"],), fetch=True
-        )
+        fresh = execute_query("SELECT * FROM projects WHERE id = %s", (project["id"],), fetch=True)
         if fresh and isinstance(fresh, list):
             run_autonomous_inference(fresh[0])
         else:
@@ -1585,10 +1482,7 @@ def signal_handler(signum, frame):
 
 def main():
     """Main worker loop with concurrent project processing."""
-    logger.info(
-        f"Starting WikiVisage Worker "
-        f"(max_projects={MAX_CONCURRENT_PROJECTS}, image_threads={IMAGE_THREADS})"
-    )
+    logger.info(f"Starting WikiVisage Worker (max_projects={MAX_CONCURRENT_PROJECTS}, image_threads={IMAGE_THREADS})")
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
@@ -1662,14 +1556,8 @@ def main():
                     fetch=True,
                 )
 
-                active_count = (
-                    len(active_projects) if isinstance(active_projects, list) else 0
-                )
-                inference_count = (
-                    len(inference_projects)
-                    if isinstance(inference_projects, list)
-                    else 0
-                )
+                active_count = len(active_projects) if isinstance(active_projects, list) else 0
+                inference_count = len(inference_projects) if isinstance(inference_projects, list) else 0
 
                 # Check for SDC write requests
                 sdc_projects = execute_query(
@@ -1687,9 +1575,7 @@ def main():
                 # Process active projects concurrently
                 seen_ids = set()
                 if active_projects and isinstance(active_projects, list):
-                    with ThreadPoolExecutor(
-                        max_workers=MAX_CONCURRENT_PROJECTS
-                    ) as executor:
+                    with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_PROJECTS) as executor:
                         futures = {}
                         for project in active_projects:
                             if shutdown_requested:
@@ -1720,9 +1606,7 @@ def main():
                                     os.remove(WAKE_UP_FILE)
                                 except OSError:
                                     pass
-                                logger.info(
-                                    "Wake-up signal received mid-cycle, checking for new projects"
-                                )
+                                logger.info("Wake-up signal received mid-cycle, checking for new projects")
                                 new_projects = execute_query(
                                     "SELECT p.*, "
                                     "  (SELECT COUNT(*) FROM images i WHERE i.project_id = p.id) AS image_count "
@@ -1734,12 +1618,8 @@ def main():
                                     for project in new_projects:
                                         if project["id"] not in seen_ids:
                                             seen_ids.add(project["id"])
-                                            logger.info(
-                                                f"Adding new project {project['id']} to current cycle"
-                                            )
-                                            future = executor.submit(
-                                                process_project, project
-                                            )
+                                            logger.info(f"Adding new project {project['id']} to current cycle")
+                                            future = executor.submit(process_project, project)
                                             futures[future] = project["id"]
 
                             done = {f for f in futures if f.done()}
@@ -1752,19 +1632,13 @@ def main():
                                 try:
                                     future.result()
                                 except Exception as e:
-                                    logger.error(
-                                        f"Project {project_id} processing failed: {e}"
-                                    )
+                                    logger.error(f"Project {project_id} processing failed: {e}")
 
                 # Run inference for eligible projects not already processed
                 if inference_projects and isinstance(inference_projects, list):
-                    inference_only = [
-                        p for p in inference_projects if p["id"] not in seen_ids
-                    ]
+                    inference_only = [p for p in inference_projects if p["id"] not in seen_ids]
                     if inference_only:
-                        with ThreadPoolExecutor(
-                            max_workers=MAX_CONCURRENT_PROJECTS
-                        ) as executor:
+                        with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_PROJECTS) as executor:
                             futures = {}
                             for project in inference_only:
                                 if shutdown_requested:
@@ -1773,9 +1647,7 @@ def main():
                                     f"Running inference-only for project {project['id']} "
                                     f"(status={project.get('status')})"
                                 )
-                                future = executor.submit(
-                                    run_autonomous_inference, project
-                                )
+                                future = executor.submit(run_autonomous_inference, project)
                                 futures[future] = project["id"]
 
                             last_heartbeat_inf = time.time()
@@ -1795,38 +1667,25 @@ def main():
                                 project_id = futures[future]
                                 try:
                                     classified = future.result()
-                                    logger.info(
-                                        f"Inference classified {classified} faces "
-                                        f"for project {project_id}"
-                                    )
+                                    logger.info(f"Inference classified {classified} faces for project {project_id}")
                                 except Exception as e:
-                                    logger.error(
-                                        f"Inference failed for project {project_id}: {e}"
-                                    )
+                                    logger.error(f"Inference failed for project {project_id}: {e}")
 
                 # Process SDC write requests (sequential — one project at a time)
                 if sdc_projects and isinstance(sdc_projects, list):
                     for sdc_project in sdc_projects:
                         if shutdown_requested:
                             break
-                        logger.info(
-                            f"Processing SDC write request for project {sdc_project['id']}"
-                        )
+                        logger.info(f"Processing SDC write request for project {sdc_project['id']}")
                         try:
                             written = write_sdc_claims(sdc_project)
-                            logger.info(
-                                f"SDC write complete for project {sdc_project['id']}: "
-                                f"{written} claims written"
-                            )
+                            logger.info(f"SDC write complete for project {sdc_project['id']}: {written} claims written")
                         except Exception as e:
-                            logger.error(
-                                f"SDC write failed for project {sdc_project['id']}: {e}"
-                            )
+                            logger.error(f"SDC write failed for project {sdc_project['id']}: {e}")
                             # Clear the flag so it doesn't retry endlessly
                             try:
                                 execute_query(
-                                    "UPDATE projects SET sdc_write_requested = 0, "
-                                    "sdc_write_error = %s WHERE id = %s",
+                                    "UPDATE projects SET sdc_write_requested = 0, sdc_write_error = %s WHERE id = %s",
                                     (str(e)[:1000], sdc_project["id"]),
                                     fetch=False,
                                 )

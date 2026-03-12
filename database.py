@@ -10,20 +10,19 @@ import os
 import time
 from collections.abc import Callable
 from contextlib import contextmanager
-from queue import Queue, Empty, Full
-from typing import Any, Dict, List, Optional, Tuple, Union
+from queue import Empty, Full, Queue
+from typing import Any
 
 import pymysql
-from pymysql import OperationalError, InterfaceError
+from pymysql import InterfaceError, OperationalError
 from pymysql.cursors import DictCursor
 
 logger = logging.getLogger(__name__)
 
 # Connection pool configuration
-_pool: Optional[Queue] = None
+_pool: Queue | None = None
 _pool_size: int = int(os.environ.get("WIKIVISAGE_DB_POOL_SIZE", 5))
-_db_config: Dict[str, Any] = {}
-_pool_initialized: bool = False
+_db_config: dict[str, Any] = {}
 
 # Retry configuration
 MAX_RETRIES = 3
@@ -48,7 +47,7 @@ class ConfigurationError(DatabaseError):
     pass
 
 
-def _get_db_config() -> Dict[str, Any]:
+def _get_db_config() -> dict[str, Any]:
     """
     Retrieve database configuration from environment variables.
 
@@ -63,17 +62,11 @@ def _get_db_config() -> Dict[str, Any]:
     database = os.environ.get("WIKIVISAGE_DB_NAME")
 
     if not user:
-        raise ConfigurationError(
-            "Missing required environment variable: TOOL_TOOLSDB_USER"
-        )
+        raise ConfigurationError("Missing required environment variable: TOOL_TOOLSDB_USER")
     if not password:
-        raise ConfigurationError(
-            "Missing required environment variable: TOOL_TOOLSDB_PASSWORD"
-        )
+        raise ConfigurationError("Missing required environment variable: TOOL_TOOLSDB_PASSWORD")
     if not database:
-        raise ConfigurationError(
-            "Missing required environment variable: WIKIVISAGE_DB_NAME"
-        )
+        raise ConfigurationError("Missing required environment variable: WIKIVISAGE_DB_NAME")
 
     host = os.environ.get("TOOL_TOOLSDB_HOST", "tools.db.svc.wikimedia.cloud")
 
@@ -160,8 +153,7 @@ def _get_connection_from_pool(timeout: float = 30.0) -> pymysql.Connection:
 
     except Empty:
         raise PoolExhaustedError(
-            f"Connection pool exhausted after {timeout}s timeout. "
-            f"Consider increasing pool size or reducing query time."
+            f"Connection pool exhausted after {timeout}s timeout. Consider increasing pool size or reducing query time."
         )
 
 
@@ -181,21 +173,23 @@ def _return_connection_to_pool(conn: pymysql.Connection) -> None:
         return
 
     try:
-        # Rollback any uncommitted transactions
         if conn.open:
             try:
                 conn.rollback()
             except Exception as e:
                 logger.debug(f"Rollback failed when returning connection: {e}")
-
-        _pool.put_nowait(conn)
-    except Full:
-        # Pool is full, close the connection
-        logger.debug("Pool full, closing connection instead of returning")
-        try:
-            conn.close()
-        except Exception:
-            pass
+            try:
+                _pool.put_nowait(conn)
+            except Full:
+                logger.debug("Pool full, closing connection instead of returning")
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        else:
+            logger.debug("Connection already closed, not returning to pool")
+    except Exception:
+        pass
 
 
 def _execute_with_retry(func: Callable[..., Any], *args, **kwargs) -> Any:
@@ -213,7 +207,7 @@ def _execute_with_retry(func: Callable[..., Any], *args, **kwargs) -> Any:
     Raises:
         DatabaseError: If all retries fail.
     """
-    last_exception: Optional[Exception] = None
+    last_exception: Exception | None = None
 
     for attempt in range(MAX_RETRIES):
         try:
@@ -223,14 +217,11 @@ def _execute_with_retry(func: Callable[..., Any], *args, **kwargs) -> Any:
             if attempt < MAX_RETRIES - 1:
                 backoff = INITIAL_BACKOFF * (2**attempt)
                 logger.warning(
-                    f"Database operation failed (attempt {attempt + 1}/{MAX_RETRIES}): {e}. "
-                    f"Retrying in {backoff}s..."
+                    f"Database operation failed (attempt {attempt + 1}/{MAX_RETRIES}): {e}. Retrying in {backoff}s..."
                 )
                 time.sleep(backoff)
             else:
-                logger.error(
-                    f"Database operation failed after {MAX_RETRIES} attempts: {e}"
-                )
+                logger.error(f"Database operation failed after {MAX_RETRIES} attempts: {e}")
 
     if last_exception is not None:
         raise last_exception
@@ -262,7 +253,7 @@ def get_connection(timeout: float = 30.0):
     try:
         conn = _execute_with_retry(_get_connection_from_pool, timeout)
         yield conn
-    except Exception as e:
+    except Exception:
         if conn and conn.open:
             try:
                 conn.rollback()
@@ -275,8 +266,8 @@ def get_connection(timeout: float = 30.0):
 
 
 def execute_query(
-    sql: str, params: Optional[Union[Tuple, Dict]] = None, fetch: bool = True
-) -> Optional[Union[List[Dict[str, Any]], int]]:
+    sql: str, params: tuple | dict | None = None, fetch: bool = True
+) -> list[dict[str, Any]] | int | None:
     """
     Execute a SQL query with automatic connection and cursor management.
 
@@ -304,20 +295,19 @@ def execute_query(
         )
     """
 
-    def _execute() -> Optional[Union[List[Dict[str, Any]], int]]:
-        with get_connection() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(sql, params)
+    def _execute() -> list[dict[str, Any]] | int | None:
+        with get_connection() as conn, conn.cursor() as cursor:
+            cursor.execute(sql, params)
 
-                if fetch:
-                    results = cursor.fetchall()
-                    logger.debug(f"Query returned {len(results)} rows")
-                    return results
-                else:
-                    conn.commit()
-                    affected = cursor.rowcount
-                    logger.debug(f"Query affected {affected} rows")
-                    return affected
+            if fetch:
+                results = list(cursor.fetchall())
+                logger.debug(f"Query returned {len(results)} rows")
+                return results
+            else:
+                conn.commit()
+                affected = cursor.rowcount
+                logger.debug(f"Query affected {affected} rows")
+                return affected
 
     try:
         return _execute_with_retry(_execute)
@@ -326,7 +316,7 @@ def execute_query(
         raise DatabaseError(f"Query execution failed: {e}") from e
 
 
-def execute_insert(sql: str, params: Optional[Union[Tuple, Dict]] = None) -> int:
+def execute_insert(sql: str, params: tuple | dict | None = None) -> int:
     """
     Execute an INSERT query and return the auto-generated row ID.
 
@@ -345,11 +335,10 @@ def execute_insert(sql: str, params: Optional[Union[Tuple, Dict]] = None) -> int
     """
 
     def _execute() -> int:
-        with get_connection() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(sql, params)
-                conn.commit()
-                return cursor.lastrowid
+        with get_connection() as conn, conn.cursor() as cursor:
+            cursor.execute(sql, params)
+            conn.commit()
+            return cursor.lastrowid
 
     try:
         return _execute_with_retry(_execute)
@@ -388,11 +377,10 @@ def execute_transaction(
     """
 
     def _execute() -> Any:
-        with get_connection() as conn:
-            with conn.cursor() as cursor:
-                result = operations(conn, cursor)
-                conn.commit()
-                return result
+        with get_connection() as conn, conn.cursor() as cursor:
+            result = operations(conn, cursor)
+            conn.commit()
+            return result
 
     try:
         return _execute_with_retry(_execute)
@@ -401,7 +389,7 @@ def execute_transaction(
         raise DatabaseError(f"Transaction execution failed: {e}") from e
 
 
-def init_db(pool_size: Optional[int] = None) -> None:
+def init_db(pool_size: int | None = None) -> None:
     """
     Initialize the database connection pool and verify connectivity.
 
@@ -409,7 +397,7 @@ def init_db(pool_size: Optional[int] = None) -> None:
 
     Args:
         pool_size: Number of connections to maintain in the pool.
-                   Defaults to WIKIVISAGE_DB_POOL_SIZE env var or 15.
+                   Defaults to WIKIVISAGE_DB_POOL_SIZE env var or 5.
 
     Raises:
         ConfigurationError: If database configuration is invalid.
@@ -438,26 +426,23 @@ def init_db(pool_size: Optional[int] = None) -> None:
             _pool.put_nowait(conn)
             logger.debug(f"Created connection {i + 1}/{_pool_size}")
         except Exception as e:
-            logger.error(
-                f"Failed to create initial connection {i + 1}/{_pool_size}: {e}"
-            )
+            logger.error(f"Failed to create initial connection {i + 1}/{_pool_size}: {e}")
             # Clean up any connections created so far
             close_pool()
             raise DatabaseError(f"Failed to initialize connection pool: {e}") from e
 
     # Test connectivity
     try:
-        with get_connection() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute("SELECT 1")
-                result = cursor.fetchone()
-                if result:
-                    logger.info(
-                        f"Database connection pool initialized successfully. "
-                        f"Pool size: {_pool_size}, Database: {_db_config['database']}"
-                    )
-                else:
-                    raise DatabaseError("Connectivity test failed: No result returned")
+        with get_connection() as conn, conn.cursor() as cursor:
+            cursor.execute("SELECT 1")
+            result = cursor.fetchone()
+            if result:
+                logger.info(
+                    f"Database connection pool initialized successfully. "
+                    f"Pool size: {_pool_size}, Database: {_db_config['database']}"
+                )
+            else:
+                raise DatabaseError("Connectivity test failed: No result returned")
     except Exception as e:
         logger.error(f"Database connectivity test failed: {e}")
         close_pool()

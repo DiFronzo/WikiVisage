@@ -468,7 +468,11 @@
         });
     });
 
+    var inFlight = false;
+
     function selectFace(faceId) {
+        if (inFlight) return;
+        inFlight = true;
         var overlay = document.getElementById('loadingOverlay');
         overlay.style.display = 'flex';
 
@@ -493,7 +497,9 @@
             if (data.error) {
                 alert(i18n.errorPrefix.replace('{message}', data.error));
                 overlay.style.display = 'none';
+                inFlight = false;
             } else {
+                // Reload the current page to preserve query parameters (e.g., reviewing_model)
                 window.location.reload();
             }
         })
@@ -501,6 +507,7 @@
             console.error('Error:', error);
             alert(i18n.errorSaving);
             overlay.style.display = 'none';
+            inFlight = false;
         });
     }
 
@@ -513,6 +520,8 @@
     }
 
     function undoClassify() {
+        if (inFlight) return;
+        inFlight = true;
         var overlay = document.getElementById('loadingOverlay');
         overlay.style.display = 'flex';
         overlay.textContent = i18n.undoing;
@@ -533,6 +542,7 @@
                 alert(data.error);
                 overlay.style.display = 'none';
                 overlay.textContent = i18n.saving;
+                inFlight = false;
             } else {
                 // Redirect to the undone image so the user sees it again
                 var url = '{{ url_for("classify", project_id=project.id) }}';
@@ -547,6 +557,7 @@
             alert(i18n.errorUndo);
             overlay.style.display = 'none';
             overlay.textContent = i18n.saving;
+            inFlight = false;
         });
     }
 
@@ -618,14 +629,26 @@
 
     function getRelativePos(e) {
         var rect = wrapper.getBoundingClientRect();
+        var clientX, clientY;
+        if (e.touches && e.touches.length > 0) {
+            clientX = e.touches[0].clientX;
+            clientY = e.touches[0].clientY;
+        } else if (e.changedTouches && e.changedTouches.length > 0) {
+            clientX = e.changedTouches[0].clientX;
+            clientY = e.changedTouches[0].clientY;
+        } else {
+            clientX = e.clientX;
+            clientY = e.clientY;
+        }
         return {
-            x: Math.max(0, Math.min(e.clientX - rect.left, rect.width)),
-            y: Math.max(0, Math.min(e.clientY - rect.top, rect.height))
+            x: Math.max(0, Math.min(clientX - rect.left, rect.width)),
+            y: Math.max(0, Math.min(clientY - rect.top, rect.height))
         };
     }
 
-    wrapper.addEventListener('mousedown', function(e) {
-        if (!drawMode || e.button !== 0) return;
+    function onDrawStart(e) {
+        if (!drawMode) return;
+        if (e.type === 'mousedown' && e.button !== 0) return;
         e.preventDefault();
         isDrawing = true;
         var pos = getRelativePos(e);
@@ -640,9 +663,9 @@
         drawRect.style.width = '0px';
         drawRect.style.height = '0px';
         wrapper.appendChild(drawRect);
-    });
+    }
 
-    wrapper.addEventListener('mousemove', function(e) {
+    function onDrawMove(e) {
         if (!isDrawing || !drawRect) return;
         e.preventDefault();
         var pos = getRelativePos(e);
@@ -654,9 +677,9 @@
         drawRect.style.top = y + 'px';
         drawRect.style.width = w + 'px';
         drawRect.style.height = h + 'px';
-    });
+    }
 
-    wrapper.addEventListener('mouseup', function(e) {
+    function onDrawEnd(e) {
         if (!isDrawing || !drawRect) return;
         isDrawing = false;
         var pos = getRelativePos(e);
@@ -668,15 +691,11 @@
         var w = x2 - x1;
         var h = y2 - y1;
 
-        /* Ignore tiny accidental clicks (less than 20px in either dimension) */
         if (w < 20 || h < 20) {
             removeDrawRect();
             return;
         }
 
-        /* Convert displayed pixel coordinates to detection-resolution coordinates.
-           The server downloads the same resolution image for encoding, so bbox
-           coords must be in detection-image space, not thumbnail space. */
         var refW = detectionWidth || img.naturalWidth;
         var refH = detectionHeight || img.naturalHeight;
         var scaleX = refW / img.clientWidth;
@@ -688,9 +707,15 @@
         var bboxBottom = Math.round(y2 * scaleY);
 
         submitManualFace(bboxTop, bboxRight, bboxBottom, bboxLeft);
-    });
+    }
 
-    /* Prevent drag from continuing outside wrapper */
+    wrapper.addEventListener('mousedown', onDrawStart);
+    wrapper.addEventListener('mousemove', onDrawMove);
+    wrapper.addEventListener('mouseup', onDrawEnd);
+    wrapper.addEventListener('touchstart', onDrawStart, { passive: false });
+    wrapper.addEventListener('touchmove', onDrawMove, { passive: false });
+    wrapper.addEventListener('touchend', onDrawEnd, { passive: false });
+
     document.addEventListener('mouseup', function() {
         if (isDrawing) isDrawing = false;
     });

@@ -78,19 +78,19 @@
 <div class="features">
     <div class="feature-card">
         <h3>{{ _('1. Create a Project') }}</h3>
-        <p>{{ _('Enter a Wikidata Q-ID and a Wikimedia Commons category. The system will scan all images for faces.') }}</p>
+        <p>{{ _('Enter a Wikidata Q-ID and Commons category. The system scans all images, detects faces with bounding boxes, and bootstraps from existing P180 depicts claims.') }}</p>
     </div>
     <div class="feature-card">
         <h3>{{ _('2. Classify Faces') }}</h3>
-        <p>{{ _('Review detected faces one by one with simple Yes/No buttons. After enough examples, the model classifies remaining faces automatically.') }}</p>
+        <p>{{ _('Review detected faces one by one with Yes/No buttons. After enough examples, the model classifies remaining faces automatically using face encodings.') }}</p>
     </div>
     <div class="feature-card">
-        <h3>{{ _('3. Review Results') }}</h3>
-        <p>{{ _('Check the model\'s classifications. Approve correct matches, reject false positives, and redraw bounding boxes if needed.') }}</p>
+        <h3>{{ _('3. Review & Edit') }}</h3>
+        <p>{{ _('Check model classifications. Approve matches, reject false positives, redraw bounding boxes, or manually add missed faces. Each face is compared independently.') }}</p>
     </div>
     <div class="feature-card">
         <h3>{{ _('4. Send to Commons') }}</h3>
-        <p>{{ _('When you\'re satisfied, send the results to Wikimedia Commons. P180 (depicts) Structured Data claims are written for all approved faces.') }}</p>
+        <p>{{ _('Send approved matches to Commons as P180 depicts claims. Rejected bootstrap faces queue P180 removal, fixing incorrect existing data.') }}</p>
     </div>
 </div>
 {% endblock %}
