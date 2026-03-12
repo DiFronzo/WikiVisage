@@ -614,43 +614,42 @@ msgid "1. Create a Project"
 msgstr "1. Opprett et prosjekt"
 
 #: templates/index.html:81
-#, fuzzy
 msgid ""
 "Enter a Wikidata Q-ID and Commons category. The system scans all images, "
 "detects faces with bounding boxes, and bootstraps from existing P180 "
 "depicts claims."
 msgstr ""
-"Oppgi en Wikidata Q-ID og en kategori på Wikimedia Commons. Systemet vil "
-"skanne alle bildene for ansikter."
+"Oppgi en Wikidata Q-ID og en Commons-kategori. Systemet skanner alle "
+"bildene, oppdager ansikter med markeringsrammer, og bootstrapper fra "
+"eksisterende P180 depicts-påstander."
 
 #: templates/index.html:84
 msgid "2. Classify Faces"
 msgstr "2. Klassifiser ansikter"
 
 #: templates/index.html:85
-#, fuzzy
 msgid ""
 "Review detected faces one by one with Yes/No buttons. After enough "
 "examples, the model classifies remaining faces automatically using face "
 "encodings."
 msgstr ""
-"Gå gjennom oppdagede ansikter én etter én med enkle Ja/Nei-knapper. Etter"
-" nok eksempler klassifiserer modellen resten av ansiktene automatisk."
+"Gå gjennom oppdagede ansikter én etter én med Ja/Nei-knapper. Etter nok "
+"eksempler klassifiserer modellen resten av ansiktene automatisk ved hjelp "
+"av ansiktskoderinger."
 
 #: templates/index.html:88
-#, fuzzy
 msgid "3. Review & Edit"
-msgstr "3. Gjennomgå resultater"
+msgstr "3. Gjennomgå og rediger"
 
 #: templates/index.html:89
-#, fuzzy
 msgid ""
 "Check model classifications. Approve matches, reject false positives, "
 "redraw bounding boxes, or manually add missed faces. Each face is "
 "compared independently."
 msgstr ""
-"Kontroller modellens klassifiseringer. Godkjenn riktige treff, avvis "
-"falske positive, og tegn om markeringsrammer ved behov."
+"Kontroller modellens klassifiseringer. Godkjenn treff, avvis falske "
+"positive, tegn om markeringsrammer, eller legg til manglende ansikter "
+"manuelt. Hvert ansikt sammenlignes uavhengig."
 
 #: templates/index.html:92
 msgid "4. Send to Commons"
@@ -661,6 +660,9 @@ msgid ""
 "Send approved matches to Commons as P180 depicts claims. Rejected "
 "bootstrap faces queue P180 removal, fixing incorrect existing data."
 msgstr ""
+"Send godkjente treff til Commons som P180 depicts-påstander. Avviste "
+"bootstrap-ansikter settes i kø for fjerning av P180, og retter opp feil "
+"i eksisterende data."
 
 #: templates/leaderboard.html:76
 msgid "Classified"
