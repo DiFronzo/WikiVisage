@@ -269,7 +269,7 @@
 
 {% block content %}
 <div class="header-actions">
-    <h1><a href="{{ url_for('project_detail', project_id=project.id) }}" style="color: var(--text-muted); text-decoration: none; margin-right: 0.5rem;" title="{{ _('Back to Project') }}">&larr;</a><a href="{{ url_for('project_detail', project_id=project.id) }}" style="color: var(--text-main); text-decoration: none;">{{ project.label or project.wikidata_qid }}</a></h1>
+    <h1><a href="{{ url_for('project_detail', project_id=project.id) }}" style="color: var(--text-muted); text-decoration: none; margin-right: 0.5rem;" title="{{ _('Back to Project') }}" aria-label="{{ _('Back to Project') }}">&larr;</a><a href="{{ url_for('project_detail', project_id=project.id) }}" style="color: var(--text-main); text-decoration: none;">{{ project.label or project.wikidata_qid }}</a></h1>
     {% if reviewing_model %}
     <span class="badge" style="font-size: 1.1rem; padding: 0.6rem 0.9rem; background-color: var(--warning); color: var(--bg);">
         {{ ngettext('%(num)d model rejection to review', '%(num)d model rejections to review', model_review_count, num=model_review_count) }}
