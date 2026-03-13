@@ -6,4 +6,9 @@
   command: python -u worker.py
   image: tool-wikivisage/tool-wikivisage:latest
   continuous: true
-  mem: 2G
+  mem: 3G
+  env:
+    - name: WIKIVISAGE_WORKER_IMAGE_THREADS
+      value: "6"
+    - name: WIKIVISAGE_WORKER_BATCH_SIZE
+      value: "100"

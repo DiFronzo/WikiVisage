@@ -18,20 +18,14 @@ jobs:
           username: ${{ secrets.USERNAME }}
           port: 22
           request_pty: true
-          script_stop: true
+          command_timeout: 20m
           key: ${{ secrets.KEY }}
           script: |
-            # Become the tool account
-            become wikivisage
-
-            # 1. Rebuild
-            toolforge build start https://github.com/DiFronzo/WikiVisage.git
-
-            # 2. run migration (recreates all tables from schema.sql)
-            toolforge jobs run migrate --command "python migrate.py" --image tool-wikivisage/tool-wikivisage:latest --wait
-
-            # 3. Restart web service
-            toolforge webservice buildservice restart
-            
-            # 4. Restart worker
-            toolforge jobs restart ml-worker
+            become wikivisage bash -c "
+              set -e
+              toolforge build start https://github.com/DiFronzo/WikiVisage.git
+              toolforge jobs run migrate --command 'python migrate.py' --image tool-wikivisage/tool-wikivisage:latest --wait
+              curl -fsSL https://raw.githubusercontent.com/DiFronzo/WikiVisage/${{ github.event.release.tag_name }}/jobs.yaml -o /tmp/jobs.yaml
+              toolforge jobs load /tmp/jobs.yaml
+              toolforge webservice buildservice restart
+            "

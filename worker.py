@@ -4,6 +4,7 @@ import logging
 import multiprocessing
 import os
 import queue
+import re
 import signal
 import sys
 import threading
@@ -36,7 +37,7 @@ logger = logging.getLogger("worker")
 # Constants
 COMMONS_API_URL = "https://commons.wikimedia.org/w/api.php"
 SPARQL_URL = "https://commons-query.wikimedia.org/sparql"  # Requires OAuth; unused, kept for reference
-FILE_PATH_URL = "https://commons.wikimedia.org/wiki/Special:FilePath/{file_title}?width=1024"
+FILE_PATH_URL = "https://commons.wikimedia.org/wiki/Special:FilePath/{file_title}?width=500"
 
 USER_AGENT = "WikiVisage/1.0 (Wikimedia Toolforge; https://toolsadmin.wikimedia.org)"
 
@@ -54,6 +55,28 @@ MAX_IMAGE_PIXELS = 100_000_000
 
 # Maximum images per project — stops category traversal once this limit is reached
 MAX_IMAGES_PER_PROJECT = 9000
+
+# Non-image file extensions to skip during category traversal (video, audio)
+_SKIP_EXTENSIONS = {".webm", ".ogv", ".ogg", ".mp3", ".wav", ".flac", ".opus", ".mid", ".oga"}
+
+
+def _build_skip_extensions_regex(extensions: set[str]) -> str:
+    """
+    Build a regex that matches file titles ending with any of the non-image extensions.
+
+    The generated pattern has the form: r"\\.(ext1|ext2|ext3)$"
+    where the extensions come from the `_SKIP_EXTENSIONS` set.
+    """
+    # Normalize by removing leading dots and escaping for regex safety
+    escaped_exts = [re.escape(ext.lstrip(".")) for ext in sorted(extensions)]
+    if not escaped_exts:
+        # Fallback that matches nothing if the set is ever empty
+        return r"(?!)"
+    return r"\.(" + "|".join(escaped_exts) + r")$"
+
+
+# Regex derived from `_SKIP_EXTENSIONS` for consistent non-image filtering (e.g. in SQL REGEXP)
+SKIP_EXTENSIONS_REGEX = _build_skip_extensions_regex(_SKIP_EXTENSIONS)
 
 # Global Shutdown Flag
 shutdown_requested = False
@@ -270,8 +293,12 @@ def traverse_category(project: dict[str, Any]) -> int:
                         if subcat_title not in visited_cats:
                             cat_queue.append(subcat_title)
                     elif ns == 6:
-                        # File — collect for batch insert
-                        new_files.append((project["id"], member["pageid"], member["title"]))
+                        # File — collect for batch insert (skip video/audio)
+                        file_title = member["title"]
+                        ext = os.path.splitext(file_title)[1].lower()
+                        if ext in _SKIP_EXTENSIONS:
+                            continue
+                        new_files.append((project["id"], member["pageid"], file_title))
 
                 # Trim batch to stay within per-project image limit
                 space_left = remaining - added_count
@@ -650,8 +677,17 @@ def _run_face_detection(image_bytes: bytes) -> tuple[list, list[bytes], int, int
     return _run_face_detection_fallback(image_bytes)
 
 
-def _process_single_image(img_id: int, title: str) -> bool:
-    """Download one image, detect faces in subprocess, store encodings. Returns True on success."""
+def _process_single_image(
+    img_id: int, title: str, *, bootstrapped: bool = False, project_id: int | None = None
+) -> bool:
+    """Download one image, detect faces in subprocess, store encodings.
+
+    If the image is bootstrapped (already has a P180 depicts claim on Commons)
+    and exactly one face is detected, auto-classify it as a target match.
+    Multi-face bootstrapped images are left for manual classification.
+
+    Returns True on success.
+    """
     clean_title = title[5:] if title.startswith("File:") else title
     url = FILE_PATH_URL.format(file_title=clean_title)
 
@@ -697,6 +733,26 @@ def _process_single_image(img_id: int, title: str) -> bool:
             (face_count, det_width, det_height, img_id),
             fetch=False,
         )
+
+        # Auto-classify single-face bootstrapped images as target matches.
+        # These images already have a P180 depicts claim on Commons, so the
+        # single detected face is overwhelmingly likely to be the target person.
+        # Multi-face bootstrapped images are left for manual classification.
+        if bootstrapped and face_count == 1 and project_id is not None:
+            auto_classified = execute_query(
+                "UPDATE faces SET is_target = 1, classified_by = 'bootstrap' "
+                "WHERE image_id = %s AND is_target IS NULL AND superseded_by IS NULL",
+                (img_id,),
+                fetch=False,
+            )
+            if auto_classified:
+                execute_query(
+                    "UPDATE projects SET faces_confirmed = faces_confirmed + %s WHERE id = %s",
+                    (auto_classified, project_id),
+                    fetch=False,
+                )
+                logger.info(f"Auto-classified {auto_classified} face(s) on bootstrapped image {img_id} as target")
+
         t_db = time.monotonic()
 
         logger.debug(
@@ -724,7 +780,7 @@ def process_images(project: dict[str, Any]) -> int:
     logger.info(f"Processing images for project {project['id']}")
 
     pending_images = execute_query(
-        "SELECT id, file_title FROM images WHERE project_id = %s AND status = 'pending' LIMIT %s",
+        "SELECT id, file_title, bootstrapped FROM images WHERE project_id = %s AND status = 'pending' LIMIT %s",
         (project["id"], BATCH_SIZE),
         fetch=True,
     )
@@ -740,7 +796,13 @@ def process_images(project: dict[str, Any]) -> int:
         for img_row in pending_images:
             if shutdown_requested:
                 break
-            future = executor.submit(_process_single_image, img_row["id"], img_row["file_title"])
+            future = executor.submit(
+                _process_single_image,
+                img_row["id"],
+                img_row["file_title"],
+                bootstrapped=bool(img_row.get("bootstrapped")),
+                project_id=project["id"],
+            )
             futures[future] = img_row["file_title"]
 
         for future in as_completed(futures):
@@ -780,8 +842,9 @@ def bootstrap_from_sparql(project: dict[str, Any]) -> int:
 
     Only inserts/flags image rows with bootstrapped=1. Face detection and
     encoding storage are deferred to process_images / _process_single_image.
-    No faces are auto-classified — the user must confirm faces manually via
-    the classify UI before the model will run inference.
+    Single-face bootstrapped images are auto-classified as target matches
+    during face detection (see _process_single_image). Multi-face bootstrapped
+    images require manual classification via the classify UI.
     """
     logger.info(f"Attempting bootstrap for project {project['id']} with QID {project['wikidata_qid']}")
 
@@ -825,6 +888,11 @@ def bootstrap_from_sparql(project: dict[str, Any]) -> int:
                 title = result.get("title")
 
                 if not page_id or not title:
+                    continue
+
+                # Skip non-image files (video, audio) — same filter as traverse_category
+                ext = os.path.splitext(title)[1].lower()
+                if ext in _SKIP_EXTENSIONS:
                     continue
 
                 exists = execute_query(
@@ -1409,7 +1477,31 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
 def process_project(project: dict[str, Any]) -> None:
     """Orchestrate all phases for a single project."""
     t_project_start = time.monotonic()
-    logger.info(f"--- Processing project {project['id']} ({project['wikidata_qid']}) ---")
+    project_id = project["id"]
+    logger.info(f"--- Processing project {project_id} ({project['wikidata_qid']}) ---")
+
+    def _is_still_active() -> bool:
+        """Re-check project status from DB; return False if no longer active."""
+        try:
+            row = execute_query(
+                "SELECT status FROM projects WHERE id = %s",
+                (project_id,),
+                fetch=True,
+            )
+            if row and isinstance(row, list) and row[0]["status"] == "active":
+                return True
+            logger.info(
+                f"Project {project_id} is no longer active (status={row[0]['status'] if row and isinstance(row, list) else 'unknown'}), stopping processing"
+            )
+            return False
+        except DatabaseError as exc:
+            logger.warning(
+                "DatabaseError while checking if project %s is still active; "
+                "assuming it is still active to avoid dropping work: %s",
+                project_id,
+                exc,
+            )
+            return True  # On DB error, keep going rather than silently dropping work
 
     try:
         # 1. Traversal
@@ -1417,10 +1509,16 @@ def process_project(project: dict[str, Any]) -> None:
         traverse_category(project)
         t_traversal = time.monotonic() - t0
 
+        if shutdown_requested or not _is_still_active():
+            return
+
         # 2. Bootstrap (if needed)
         t0 = time.monotonic()
         bootstrap_from_sparql(project)
         t_bootstrap = time.monotonic() - t0
+
+        if shutdown_requested or not _is_still_active():
+            return
 
         # 3. Image Download & Face Detection — process all pending images
         #    Interleave inference every 5 batches so results appear progressively
@@ -1434,6 +1532,10 @@ def process_project(project: dict[str, Any]) -> None:
             total_processed += batch_count
             batches_since_inference += 1
             logger.info(f"Processed batch of {batch_count} images ({total_processed} total so far)")
+
+            # Check if project was paused/completed between batches
+            if not _is_still_active():
+                break
 
             # Run inference periodically during image processing
             if batches_since_inference >= 5:
@@ -1451,11 +1553,12 @@ def process_project(project: dict[str, Any]) -> None:
 
         # 4. Final Autonomous Inference (catch any remaining unclassified faces)
         t0 = time.monotonic()
-        fresh = execute_query("SELECT * FROM projects WHERE id = %s", (project["id"],), fetch=True)
-        if fresh and isinstance(fresh, list):
-            run_autonomous_inference(fresh[0])
-        else:
-            run_autonomous_inference(project)
+        if not shutdown_requested and _is_still_active():
+            fresh = execute_query("SELECT * FROM projects WHERE id = %s", (project_id,), fetch=True)
+            if fresh and isinstance(fresh, list):
+                run_autonomous_inference(fresh[0])
+            else:
+                run_autonomous_inference(project)
         t_inference = time.monotonic() - t0
 
         # 6. SDC writes are handled separately — triggered via web UI,
