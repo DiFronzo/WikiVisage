@@ -1591,7 +1591,15 @@ def main():
     signal.signal(signal.SIGTERM, signal_handler)
 
     try:
-        init_db(pool_size=max(15, MAX_CONCURRENT_PROJECTS * IMAGE_THREADS + 3))
+        # Respect WIKIVISAGE_DB_POOL_SIZE env var if set; otherwise compute from concurrency settings.
+        # Toolforge shared MariaDB has a low max_user_connections limit (~10), so keep this modest.
+        # The web process (gunicorn) also uses connections from the same user account.
+        db_pool_env = os.environ.get("WIKIVISAGE_DB_POOL_SIZE")
+        if db_pool_env:
+            worker_pool_size = int(db_pool_env)
+        else:
+            worker_pool_size = MAX_CONCURRENT_PROJECTS * IMAGE_THREADS + 3
+        init_db(pool_size=worker_pool_size)
     except Exception as e:
         logger.error(f"Database initialization failed: {e}")
         sys.exit(1)
