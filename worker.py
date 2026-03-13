@@ -890,6 +890,11 @@ def bootstrap_from_sparql(project: dict[str, Any]) -> int:
                 if not page_id or not title:
                     continue
 
+                # Skip non-image files (video, audio) — same filter as traverse_category
+                ext = os.path.splitext(title)[1].lower()
+                if ext in _SKIP_EXTENSIONS:
+                    continue
+
                 exists = execute_query(
                     "SELECT id, status FROM images WHERE project_id = %s AND commons_page_id = %s",
                     (project["id"], page_id),
