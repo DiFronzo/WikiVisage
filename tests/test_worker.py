@@ -10,7 +10,7 @@ from unittest.mock import patch
 import numpy as np
 
 with patch("database.init_db"):
-    from worker import run_autonomous_inference
+    from worker import _process_single_image, run_autonomous_inference
 
 
 def _make_encoding(seed: int) -> bytes:
@@ -224,6 +224,86 @@ def test_inference_returns_classified_count():
         classified = run_autonomous_inference(project)
 
     assert classified == 4
+
+
+def test_process_single_image_bootstrapped_single_face_auto_classifies():
+    """Single-face bootstrapped image should auto-classify as target and increment faces_confirmed."""
+    fake_location = (10, 110, 110, 10)
+    fake_encoding = _make_encoding(1)
+
+    query_calls: list[tuple] = []
+
+    def mock_execute_query(sql, params=None, fetch=True):
+        query_calls.append((sql, params))
+        if "UPDATE faces SET is_target" in sql:
+            return 1  # one face auto-classified
+        return None
+
+    with (
+        patch("worker.execute_query", side_effect=mock_execute_query),
+        patch("worker._download_image", return_value=b"fake"),
+        patch("worker._validate_image_dimensions"),
+        patch("worker._run_face_detection", return_value=([fake_location], [fake_encoding], 800, 600)),
+    ):
+        result = _process_single_image(42, "File:Test.jpg", bootstrapped=True, project_id=5)
+
+    assert result is True
+
+    auto_classify_calls = [c for c in query_calls if "UPDATE faces SET is_target" in c[0]]
+    assert len(auto_classify_calls) == 1
+    assert auto_classify_calls[0][1] == (42,)
+
+    project_update_calls = [c for c in query_calls if "UPDATE projects SET faces_confirmed" in c[0]]
+    assert len(project_update_calls) == 1
+    assert project_update_calls[0][1] == (1, 5)
+
+
+def test_process_single_image_bootstrapped_multi_face_no_auto_classify():
+    """Multi-face bootstrapped image should NOT trigger auto-classify or faces_confirmed update."""
+    fake_locations = [(10, 110, 110, 10), (200, 310, 310, 200)]
+    fake_encodings = [_make_encoding(2), _make_encoding(3)]
+
+    query_calls: list[tuple] = []
+
+    def mock_execute_query(sql, params=None, fetch=True):
+        query_calls.append((sql, params))
+        return None
+
+    with (
+        patch("worker.execute_query", side_effect=mock_execute_query),
+        patch("worker._download_image", return_value=b"fake"),
+        patch("worker._validate_image_dimensions"),
+        patch("worker._run_face_detection", return_value=(fake_locations, fake_encodings, 800, 600)),
+    ):
+        result = _process_single_image(43, "File:Multi.jpg", bootstrapped=True, project_id=5)
+
+    assert result is True
+    assert not any("UPDATE faces SET is_target" in c[0] for c in query_calls)
+    assert not any("UPDATE projects SET faces_confirmed" in c[0] for c in query_calls)
+
+
+def test_process_single_image_non_bootstrapped_no_auto_classify():
+    """Non-bootstrapped single-face image should NOT trigger auto-classify or faces_confirmed update."""
+    fake_location = (10, 110, 110, 10)
+    fake_encoding = _make_encoding(4)
+
+    query_calls: list[tuple] = []
+
+    def mock_execute_query(sql, params=None, fetch=True):
+        query_calls.append((sql, params))
+        return None
+
+    with (
+        patch("worker.execute_query", side_effect=mock_execute_query),
+        patch("worker._download_image", return_value=b"fake"),
+        patch("worker._validate_image_dimensions"),
+        patch("worker._run_face_detection", return_value=([fake_location], [fake_encoding], 800, 600)),
+    ):
+        result = _process_single_image(44, "File:NonBoot.jpg", bootstrapped=False, project_id=5)
+
+    assert result is True
+    assert not any("UPDATE faces SET is_target" in c[0] for c in query_calls)
+    assert not any("UPDATE projects SET faces_confirmed" in c[0] for c in query_calls)
 
 
 import pytest
