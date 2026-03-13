@@ -8,6 +8,7 @@ import signal
 import sys
 import threading
 import time
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
@@ -57,6 +58,25 @@ MAX_IMAGES_PER_PROJECT = 9000
 
 # Non-image file extensions to skip during category traversal (video, audio)
 _SKIP_EXTENSIONS = {".webm", ".ogv", ".ogg", ".mp3", ".wav", ".flac", ".opus", ".mid", ".oga"}
+
+
+def _build_skip_extensions_regex(extensions: set[str]) -> str:
+    """
+    Build a regex that matches file titles ending with any of the non-image extensions.
+
+    The generated pattern has the form: r"\.(ext1|ext2|ext3)$"
+    where the extensions come from the `_SKIP_EXTENSIONS` set.
+    """
+    # Normalize by removing leading dots and escaping for regex safety
+    escaped_exts = [re.escape(ext.lstrip(".")) for ext in sorted(extensions)]
+    if not escaped_exts:
+        # Fallback that matches nothing if the set is ever empty
+        return r"(?!)"
+    return r"\.(" + "|".join(escaped_exts) + r")$"
+
+
+# Regex derived from `_SKIP_EXTENSIONS` for consistent non-image filtering (e.g. in SQL REGEXP)
+SKIP_EXTENSIONS_REGEX = _build_skip_extensions_regex(_SKIP_EXTENSIONS)
 
 # Global Shutdown Flag
 shutdown_requested = False
