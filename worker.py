@@ -1489,7 +1489,13 @@ def process_project(project: dict[str, Any]) -> None:
                 f"Project {project_id} is no longer active (status={row[0]['status'] if row and isinstance(row, list) else 'unknown'}), stopping processing"
             )
             return False
-        except DatabaseError:
+        except DatabaseError as exc:
+            logger.warning(
+                "DatabaseError while checking if project %s is still active; "
+                "assuming it is still active to avoid dropping work: %s",
+                project_id,
+                exc,
+            )
             return True  # On DB error, keep going rather than silently dropping work
 
     try:
