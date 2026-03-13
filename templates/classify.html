@@ -269,7 +269,7 @@
 
 {% block content %}
 <div class="header-actions">
-    <h1><a href="{{ url_for('project_detail', project_id=project.id) }}" style="color: var(--text-main); text-decoration: none;">{{ project.label or project.wikidata_qid }}</a></h1>
+    <h1><a href="{{ url_for('project_detail', project_id=project.id) }}" style="color: var(--text-muted); text-decoration: none; margin-right: 0.5rem;" title="{{ _('Back to Project') }}">&larr;</a><a href="{{ url_for('project_detail', project_id=project.id) }}" style="color: var(--text-main); text-decoration: none;">{{ project.label or project.wikidata_qid }}</a></h1>
     {% if reviewing_model %}
     <span class="badge" style="font-size: 1.1rem; padding: 0.6rem 0.9rem; background-color: var(--warning); color: var(--bg);">
         {{ ngettext('%(num)d model rejection to review', '%(num)d model rejections to review', model_review_count, num=model_review_count) }}
@@ -392,7 +392,7 @@
                     <button class="btn btn-skip" onclick="skipImage()">{{ _('Skip') }}</button>
                 </div>
                 <div class="hotkey-hints">
-                    {% for face in faces %}<span><kbd>{{ loop.index }}</kbd> {{ _('Face %(num)d', num=loop.index) }}</span>{% endfor %}
+                    {% for face in faces %}{% if loop.index <= 9 %}<span><kbd>{{ loop.index }}</kbd> {{ _('Face %(num)d', num=loop.index) }}</span>{% endif %}{% endfor %}
                     <span><kbd>N</kbd> {{ _('None') }}</span>
                     <span><kbd>S</kbd> {{ _('Skip') }}</span>
                     {% if has_undo %}<span><kbd>Z</kbd> {{ _('Undo') }}</span>{% endif %}
@@ -499,8 +499,9 @@
                 overlay.style.display = 'none';
                 inFlight = false;
             } else {
-                // Reload the current page to preserve query parameters (e.g., reviewing_model)
-                window.location.reload();
+                // Navigate to the base classify URL (strip any ?image_id= param
+                // left over from undo redirects to avoid re-forcing a finished image)
+                window.location.href = '{{ url_for("classify", project_id=project.id) }}';
             }
         })
         .catch(function(error) {
@@ -588,7 +589,7 @@
             undoClassify();
         }
         var idx = parseInt(e.key);
-        if (idx >= 1 && idx <= {{ faces | length }}) {
+        if (idx >= 1 && idx <= 9 && idx <= {{ faces | length }}) {
             var faceIds = [{% for face in faces %}{{ face.face_id }}{% if not loop.last %},{% endif %}{% endfor %}];
             selectFace(faceIds[idx - 1]);
         }
