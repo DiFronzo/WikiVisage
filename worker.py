@@ -4,11 +4,11 @@ import logging
 import multiprocessing
 import os
 import queue
+import re
 import signal
 import sys
 import threading
 import time
-import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
@@ -64,7 +64,7 @@ def _build_skip_extensions_regex(extensions: set[str]) -> str:
     """
     Build a regex that matches file titles ending with any of the non-image extensions.
 
-    The generated pattern has the form: r"\.(ext1|ext2|ext3)$"
+    The generated pattern has the form: r"\\.(ext1|ext2|ext3)$"
     where the extensions come from the `_SKIP_EXTENSIONS` set.
     """
     # Normalize by removing leading dots and escaping for regex safety
