@@ -77,11 +77,13 @@ def reset_database() -> None:
 
     try:
         with get_connection() as conn, conn.cursor() as cursor:
-            cursor.execute("SET FOREIGN_KEY_CHECKS=0")
-            for table in _ALL_TABLES:
-                logger.info(f"Dropping table: {table}")
-                cursor.execute(f"DROP TABLE IF EXISTS {table}")
-            cursor.execute("SET FOREIGN_KEY_CHECKS=1")
+            try:
+                cursor.execute("SET FOREIGN_KEY_CHECKS=0")
+                for table in _ALL_TABLES:
+                    logger.info(f"Dropping table: {table}")
+                    cursor.execute(f"DROP TABLE IF EXISTS {table}")
+            finally:
+                cursor.execute("SET FOREIGN_KEY_CHECKS=1")
             conn.commit()
             logger.info("All tables dropped")
     finally:
