@@ -6,7 +6,7 @@ Provides OAuth 2.0 authentication, project management, and an active
 learning interface for classifying detected faces.
 """
 
-APP_VERSION = "0.2.4"
+APP_VERSION = "0.2.5"
 
 import hashlib
 import io
@@ -550,6 +550,51 @@ def _fetch_p18_thumb_url(qid: str, width: int = 250) -> str | None:
         return None
 
 
+def _fetch_wikidata_label(qid: str) -> str | None:
+    """
+    Fetch the label for a Wikidata entity.
+
+    Tries the user's current locale first, falls back to English.
+
+    Args:
+        qid: Wikidata entity ID (e.g., "Q42").
+
+    Returns:
+        Entity label string, or None if unavailable or API call fails.
+    """
+    try:
+        locale = get_locale()
+        lang = str(locale) if locale else "en"
+        languages = f"{lang}|en" if lang != "en" else "en"
+
+        resp = requests.get(
+            WIKIDATA_API_URL,
+            params={
+                "action": "wbgetentities",
+                "ids": qid,
+                "props": "labels",
+                "languages": languages,
+                "format": "json",
+            },
+            headers={"User-Agent": USER_AGENT},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        entity = data.get("entities", {}).get(qid, {})
+        labels = entity.get("labels", {})
+
+        # Prefer user's locale, fall back to English
+        label_obj = labels.get(lang) or labels.get("en")
+        if label_obj:
+            return label_obj.get("value")
+        return None
+    except Exception:
+        logger.debug(f"Failed to fetch label for {qid}", exc_info=True)
+        return None
+
+
 # Wikimedia Commons enforces standard thumbnail step sizes ($wgThumbnailSteps).
 # Requests for non-standard widths return 429. Snap to the nearest allowed step.
 # https://www.mediawiki.org/wiki/Common_thumbnail_sizes
@@ -1058,8 +1103,10 @@ def project_new():
 
     # Create project
     try:
-        # Fetch P18 thumbnail from Wikidata (non-blocking on failure)
         p18_thumb_url = _fetch_p18_thumb_url(wikidata_qid)
+
+        if not label:
+            label = _fetch_wikidata_label(wikidata_qid) or ""
 
         execute_query(
             "INSERT INTO projects (user_id, wikidata_qid, commons_category, label, "
@@ -1140,6 +1187,7 @@ def project_detail(project_id: int):
             "  SUM(CASE WHEN f.is_target = 1 THEN 1 ELSE 0 END) AS confirmed_matches, "
             "  SUM(CASE WHEN f.is_target = 0 THEN 1 ELSE 0 END) AS confirmed_non_matches, "
             "  SUM(CASE WHEN f.is_target IS NULL THEN 1 ELSE 0 END) AS unclassified, "
+            "  SUM(CASE WHEN f.is_target = 1 AND f.classified_by_user_id IS NOT NULL THEN 1 ELSE 0 END) AS human_confirmed, "
             "  SUM(CASE WHEN f.sdc_written = 1 THEN 1 ELSE 0 END) AS sdc_written, "
             "  SUM(CASE WHEN f.is_target = 1 AND f.sdc_written = 0 AND f.classified_by != 'bootstrap' AND i.bootstrapped = 0 THEN 1 ELSE 0 END) AS sdc_pending, "
             "  SUM(CASE WHEN f.sdc_removal_pending = 1 "

@@ -963,23 +963,27 @@ def run_autonomous_inference(project: dict[str, Any]) -> int:
     t_start = time.monotonic()
     min_confirmed = project.get("min_confirmed", 5)
 
-    # Count actual is_target=1 faces instead of trusting faces_confirmed counter
+    # Count human-confirmed target faces only.  Bootstrap auto-classifications
+    # do NOT count toward the gate — a human must review at least min_confirmed
+    # faces before the model is allowed to classify autonomously.  This prevents
+    # the model from running before the user has seen any results.
     count_row = execute_query(
         "SELECT COUNT(*) AS cnt FROM faces f "
         "JOIN images i ON f.image_id = i.id "
-        "WHERE i.project_id = %s AND f.is_target = 1 AND f.superseded_by IS NULL",
+        "WHERE i.project_id = %s AND f.is_target = 1 AND f.superseded_by IS NULL "
+        "AND f.classified_by_user_id IS NOT NULL",
         (project["id"],),
         fetch=True,
     )
-    actual_confirmed = count_row[0]["cnt"] if count_row else 0
+    human_confirmed = count_row[0]["cnt"] if count_row else 0
 
-    if actual_confirmed < min_confirmed:
+    if human_confirmed < min_confirmed:
         logger.info(
-            f"Project {project['id']}: {actual_confirmed} confirmed target faces < {min_confirmed} required, skipping inference"
+            f"Project {project['id']}: {human_confirmed} human-confirmed target faces < {min_confirmed} required, skipping inference"
         )
         return 0
 
-    logger.info(f"Running autonomous inference for project {project['id']} ({actual_confirmed} confirmed faces)")
+    logger.info(f"Running autonomous inference for project {project['id']} ({human_confirmed} human-confirmed faces)")
 
     # Get confirmed faces
     confirmed_rows = execute_query(
@@ -1665,6 +1669,7 @@ def main():
                     "  SELECT COUNT(*) FROM faces f "
                     "  JOIN images i ON f.image_id = i.id "
                     "  WHERE i.project_id = p.id AND f.is_target = 1 AND f.superseded_by IS NULL"
+                    "  AND f.classified_by_user_id IS NOT NULL"
                     ") >= p.min_confirmed "
                     "AND EXISTS ("
                     "  SELECT 1 FROM faces f "
