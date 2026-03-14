@@ -7,7 +7,7 @@ import pytest
 
 import database
 from database import DatabaseError
-from migrate import _ALTER_MIGRATIONS, _apply_alter_migrations, load_schema
+from migrate import _ALL_TABLES, _ALTER_MIGRATIONS, _apply_alter_migrations, load_schema, reset_database
 
 
 def test_load_schema_basic(tmp_path: Path) -> None:
@@ -222,6 +222,69 @@ def test_alter_migration_raises_on_1005_without_errno_121() -> None:
         _apply_alter_migrations()
 
     assert conn.rollback.call_count == 1
+
+
+def _make_mock_connection():
+    """Return (conn_cm, conn, cursor) triple with a working cursor mock."""
+    cursor = MagicMock()
+    cursor_cm = MagicMock()
+    cursor_cm.__enter__.return_value = cursor
+    cursor_cm.__exit__.return_value = False
+
+    conn = MagicMock()
+    conn.cursor.return_value = cursor_cm
+
+    conn_cm = MagicMock()
+    conn_cm.__enter__.return_value = conn
+    conn_cm.__exit__.return_value = False
+
+    return conn_cm, conn, cursor
+
+
+def test_reset_database_drops_all_tables(caplog: pytest.LogCaptureFixture) -> None:
+    conn_cm, conn, cursor = _make_mock_connection()
+
+    with (
+        patch("migrate.init_db") as mock_init_db,
+        patch("migrate.close_pool") as mock_close_pool,
+        patch("migrate.get_connection", return_value=conn_cm),
+        patch("migrate.run_migration") as mock_run_migration,
+        caplog.at_level(logging.WARNING),
+    ):
+        reset_database()
+
+    mock_init_db.assert_called_once_with(pool_size=1)
+    mock_close_pool.assert_called_once()
+    mock_run_migration.assert_called_once()
+    conn.commit.assert_called_once()
+
+    executed_sql = [call.args[0] for call in cursor.execute.call_args_list]
+    assert executed_sql[0] == "SET FOREIGN_KEY_CHECKS=0"
+    for table in _ALL_TABLES:
+        assert f"DROP TABLE IF EXISTS {table}" in executed_sql
+    assert "SET FOREIGN_KEY_CHECKS=1" in executed_sql
+
+
+def test_reset_database_restores_fk_checks_on_error() -> None:
+    conn_cm, conn, cursor = _make_mock_connection()
+
+    def _fail_on_drop(sql, *args):
+        if sql.startswith("DROP TABLE"):
+            raise Exception("Table drop failed")
+
+    cursor.execute.side_effect = _fail_on_drop
+
+    with (
+        patch("migrate.init_db"),
+        patch("migrate.close_pool"),
+        patch("migrate.get_connection", return_value=conn_cm),
+        patch("migrate.run_migration"),
+        pytest.raises(Exception, match="Table drop failed"),
+    ):
+        reset_database()
+
+    executed_sql = [call.args[0] for call in cursor.execute.call_args_list]
+    assert "SET FOREIGN_KEY_CHECKS=1" in executed_sql
 
 
 @pytest.mark.integration
