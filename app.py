@@ -6,7 +6,7 @@ Provides OAuth 2.0 authentication, project management, and an active
 learning interface for classifying detected faces.
 """
 
-APP_VERSION = "0.2.5"
+APP_VERSION = "0.2.6"
 
 import hashlib
 import io
