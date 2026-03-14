@@ -181,9 +181,8 @@ msgstr "El token de OAuth ha caducado. Por favor, inicia sesión de nuevo."
 #: app.py:2026
 msgid "Failed to remove SDC claim from Commons. The face was not reclassified."
 msgstr ""
-"Error al eliminar la declaración SDC de Commons. El rostro no fue "
-"reclasificado.Error al eliminar la declaración SDC de Commons. El rostro "
-"no fue reclasificado."
+"Error al eliminar la declaración SDC de Commons. "
+"El rostro no fue reclasificado."
 
 #: app.py:2068
 msgid "This face has already been reviewed by another user"
