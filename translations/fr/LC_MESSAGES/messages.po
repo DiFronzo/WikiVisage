@@ -181,8 +181,7 @@ msgstr "Le jeton OAuth a expiré. Veuillez vous reconnecter."
 msgid "Failed to remove SDC claim from Commons. The face was not reclassified."
 msgstr ""
 "Échec de la suppression de la déclaration SDC de Commons. Le visage n'a "
-"pas été reclassifié.Échec de la suppression de l'allégation SDC de "
-"Commons. Le visage n'a pas été reclassé."
+"pas été reclassifié."
 
 #: app.py:2068
 msgid "This face has already been reviewed by another user"
