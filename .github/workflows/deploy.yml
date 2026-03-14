@@ -32,7 +32,7 @@ jobs:
         run: |
           ssh -i ~/.ssh/id_ed25519 "${{ secrets.USERNAME }}@${{ secrets.HOST }}" \
             "become wikivisage bash -c '
-              set -e
+              set -euo pipefail
               echo \"==> Building image from ref ${TAG}\"
               toolforge build start --ref ${TAG} https://github.com/DiFronzo/WikiVisage.git 2>&1 | tail -5
               echo \"==> Waiting for build to complete...\"
