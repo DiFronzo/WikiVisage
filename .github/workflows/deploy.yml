@@ -2,6 +2,11 @@ name: Deploy
 on:
   release:
     types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Git tag to deploy (e.g. v0.2.5)"
+        required: true
 concurrency:
   group: deploy-production
   cancel-in-progress: true
@@ -28,46 +33,61 @@ jobs:
       - name: Deploy to Toolforge
         timeout-minutes: 20
         env:
-          TAG: ${{ github.event.release.tag_name }}
+          TAG: ${{ github.event.release.tag_name || github.event.inputs.tag }}
         run: |
-          ssh -i ~/.ssh/id_ed25519 "${{ secrets.USERNAME }}@${{ secrets.HOST }}" \
-            "become wikivisage bash -c '
-              set -euo pipefail
-              echo \"==> Building image from ref ${TAG}\"
-              toolforge build start --ref ${TAG} https://github.com/DiFronzo/WikiVisage.git 2>&1 | tail -5
-              echo \"==> Waiting for build to complete...\"
-              ELAPSED=0
-              while [ \$ELAPSED -lt 600 ]; do
-                sleep 10
-                ELAPSED=\$((ELAPSED + 10))
-                STATUS=\$(toolforge build show 2>&1 | head -1)
-                case \"\$STATUS\" in
-                  *ok*|*Succeeded*|*succeeded*)
-                    echo \"Build succeeded after \${ELAPSED}s\"
-                    break
-                    ;;
-                  *Failed*|*failed*|*error*)
-                    echo \"Build failed: \$STATUS\"
-                    toolforge build logs 2>&1 | tail -20
-                    exit 1
-                    ;;
-                esac
-                echo \"Waiting... (\${ELAPSED}s) status: \$STATUS\"
-              done
-              if [ \$ELAPSED -ge 600 ]; then
-                echo \"Build timed out after 600s\"
-                toolforge build show
-                exit 1
-              fi
-              echo \"==> Running migration\"
-              toolforge jobs run migrate --command \"python migrate.py\" --image tool-wikivisage/tool-wikivisage:latest --wait
-              echo \"==> Loading jobs.yaml\"
-              curl -fsSL \"https://raw.githubusercontent.com/DiFronzo/WikiVisage/${TAG}/jobs.yaml\" -o /tmp/jobs.yaml
-              toolforge jobs load /tmp/jobs.yaml
-              echo \"==> Restarting webservice\"
-              toolforge webservice buildservice restart
-              echo \"==> Deploy complete\"
-            '"
+          set -euo pipefail
+
+          # Validate TAG to prevent command injection via workflow_dispatch input.
+          if [ -z "${TAG:-}" ]; then
+            echo "::error::TAG is empty. Provide a valid tag (e.g. v0.2.5)."
+            exit 1
+          fi
+
+          # Allow only safe characters in TAG: letters, digits, dot, underscore, hyphen.
+          if ! [[ "$TAG" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "::error::Invalid tag '$TAG'. Allowed characters: A-Z, a-z, 0-9, '.', '_', '-'."
+            exit 1
+          fi
+
+          ssh -i ~/.ssh/id_ed25519 "${{ secrets.USERNAME }}@${{ secrets.HOST }}" <<REMOTE
+become wikivisage bash -c '
+  set -euo pipefail;
+  echo "==> Building image from ref ${TAG}";
+  toolforge build start --ref "${TAG}" https://github.com/DiFronzo/WikiVisage.git 2>&1 | tail -5;
+  echo "==> Waiting for build to complete...";
+  ELAPSED=0;
+  while [ \$ELAPSED -lt 600 ]; do
+    sleep 10;
+    ELAPSED=\$((ELAPSED + 10));
+    STATUS=\$(toolforge build show 2>&1 | head -1);
+    case "\$STATUS" in
+      *ok*|*Succeeded*|*succeeded*)
+        echo "Build succeeded after \${ELAPSED}s";
+        break;
+        ;;
+      *Failed*|*failed*|*error*)
+        echo "Build failed: \$STATUS";
+        toolforge build logs 2>&1 | tail -20;
+        exit 1;
+        ;;
+    esac;
+    echo "Waiting... (\${ELAPSED}s) status: \$STATUS";
+  done;
+  if [ \$ELAPSED -ge 600 ]; then
+    echo "Build timed out after 600s";
+    toolforge build show;
+    exit 1;
+  fi;
+  echo "==> Running migration";
+  toolforge jobs run migrate --command "python migrate.py" --image tool-wikivisage/tool-wikivisage:latest --wait;
+  echo "==> Loading jobs.yaml";
+  curl -fsSL "https://raw.githubusercontent.com/DiFronzo/WikiVisage/${TAG}/jobs.yaml" -o /tmp/jobs.yaml;
+  toolforge jobs load /tmp/jobs.yaml;
+  echo "==> Restarting webservice";
+  toolforge webservice buildservice restart;
+  echo "==> Deploy complete";
+'
+REMOTE
       - name: Cleanup SSH
         if: always()
         run: rm -f ~/.ssh/id_ed25519
