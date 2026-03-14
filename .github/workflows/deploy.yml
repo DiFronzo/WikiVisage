@@ -29,8 +29,8 @@ jobs:
         timeout-minutes: 20
         run: |
           ssh -i ~/.ssh/id_ed25519 "${{ secrets.USERNAME }}@${{ secrets.HOST }}" <<'EOF'
-            become wikivisage
             set -e
+            become wikivisage
             toolforge build start --ref ${{ github.event.release.tag_name }} https://github.com/DiFronzo/WikiVisage.git
             ELAPSED=0
             while [ $ELAPSED -lt 600 ]; do
