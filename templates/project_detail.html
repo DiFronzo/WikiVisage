@@ -355,14 +355,15 @@
 
 {% set unclassified = stats.unclassified or 0 %}
 {% set confirmed = stats.confirmed_matches or 0 %}
+{% set human_confirmed = stats.human_confirmed or 0 %}
 {% set eligible = inference_eligible or 0 %}
 {% if unclassified > 0 or pending_images > 0 %}
 <div class="card" id="infoBanner" style="margin-top: 2rem; border-color: var(--info); background: rgba(59, 130, 246, 0.05);">
-    {% if confirmed >= project.min_confirmed and eligible > 0 %}
+    {% if human_confirmed >= project.min_confirmed and eligible > 0 %}
     <p style="color: var(--info); font-weight: 700; margin-bottom: 0;">
         {{ ngettext('%(num)d face waiting for model inference. The background worker will classify it automatically within the next minute.', '%(num)d faces waiting for model inference. The background worker will classify them automatically within the next minute.', eligible, num=eligible) }}
     </p>
-    {% elif confirmed >= project.min_confirmed %}
+    {% elif human_confirmed >= project.min_confirmed %}
     <p style="color: var(--info); font-weight: 700; margin-bottom: 0;">
         {{ ngettext('%(num)d unclassified face remaining, but none are currently eligible for automatic model inference.', '%(num)d unclassified faces remaining, but none are currently eligible for automatic model inference.', unclassified, num=unclassified) }}
     </p>
@@ -370,17 +371,22 @@
     <p style="color: var(--info); font-weight: 700; margin-bottom: 0;">
         {{ ngettext('The background worker is still processing images (%(pending)d image remaining). More faces will appear as processing continues.', 'The background worker is still processing images (%(pending)d images remaining). More faces will appear as processing continues.', pending_images, pending=pending_images) }}
     </p>
-    {% elif confirmed + unclassified < project.min_confirmed %}
+    {% elif human_confirmed + unclassified < project.min_confirmed %}
     <p style="color: var(--danger); font-weight: 700; margin-bottom: 0.5rem;">
-        {{ _('Cannot reach autonomous inference: even if all %(unclassified)d unclassified faces are target matches, you would have %(potential)d/%(min)d confirmed — below the threshold.', unclassified=unclassified, potential=confirmed + unclassified, min=project.min_confirmed) }}
+        {{ _('Cannot reach autonomous inference: even if all %(unclassified)d unclassified faces are target matches, you would have %(potential)d/%(min)d human-confirmed — below the threshold.', unclassified=unclassified, potential=human_confirmed + unclassified, min=project.min_confirmed) }}
     </p>
     <p style="color: var(--text-muted); margin-bottom: 0;">
         {{ _('Lower the min_confirmed setting in') }} <a href="{{ url_for('project_settings', project_id=project.id) }}" style="color: var(--primary);">{{ _('Project Settings') }}</a> {{ _('to proceed, or wait for the background worker to detect more faces.') }}
     </p>
     {% else %}
     <p style="color: var(--warning); font-weight: 700; margin-bottom: 0;">
-        {{ _('%(count)d unclassified faces remaining. Classify at least %(needed)d more target faces to enable autonomous inference (%(confirmed)d/%(min)d confirmed).', count=unclassified, needed=project.min_confirmed - confirmed, confirmed=confirmed, min=project.min_confirmed) }}
+        {{ _('%(count)d unclassified faces remaining. Classify at least %(needed)d more target faces to enable autonomous inference (%(confirmed)d/%(min)d human-confirmed).', count=unclassified, needed=project.min_confirmed - human_confirmed, confirmed=human_confirmed, min=project.min_confirmed) }}
     </p>
+    {% if by_bootstrap > 0 %}
+    <p style="color: var(--text-muted); margin-top: 0.5rem; margin-bottom: 0;">
+        {{ _('Tip: You have %(count)d bootstrapped matches from existing Commons depicts claims. These were auto-classified and may be incorrect — verify them in Model Results below to count them as human-confirmed.', count=by_bootstrap) }}
+    </p>
+    {% endif %}
     {% endif %}
 </div>
 {% endif %}
@@ -574,14 +580,15 @@ data-detection-width="{{ face.detection_width or 0 }}" data-detection-height="{{
                     sdcBadge.remove();
                 }
 
+                var sdcNote = card.querySelector('.sdc-note');
                 if (data.sdc_removed) {
-                    var sdcNote = card.querySelector('.sdc-note');
                     sdcNote.textContent = i18nReclassify.sdcRemoved;
                     sdcNote.style.display = 'block';
                 } else if (data.sdc_removal_queued) {
-                    var sdcNote = card.querySelector('.sdc-note');
                     sdcNote.textContent = i18nReclassify.sdcRemovalQueued;
                     sdcNote.style.display = 'block';
+                } else if (sdcNote) {
+                    sdcNote.style.display = 'none';
                 }
             } else {
                 alert(data.error || i18nReclassify.saveError);

@@ -27,37 +27,47 @@ jobs:
           SSH_USER: ${{ secrets.USERNAME }}
       - name: Deploy to Toolforge
         timeout-minutes: 20
+        env:
+          TAG: ${{ github.event.release.tag_name }}
         run: |
-          ssh -i ~/.ssh/id_ed25519 "${{ secrets.USERNAME }}@${{ secrets.HOST }}" <<'EOF'
-            set -e
-            become wikivisage
-            toolforge build start --ref ${{ github.event.release.tag_name }} https://github.com/DiFronzo/WikiVisage.git
-            ELAPSED=0
-            while [ $ELAPSED -lt 600 ]; do
-              sleep 15
-              ELAPSED=$((ELAPSED + 15))
-              STATUS=$(toolforge build show)
-              if echo "$STATUS" | grep -q 'Succeeded'; then
-                echo "Build succeeded after ${ELAPSED}s"
-                break
-              elif echo "$STATUS" | grep -q 'Failed'; then
-                echo "Build failed"
-                toolforge build logs
+          ssh -i ~/.ssh/id_ed25519 "${{ secrets.USERNAME }}@${{ secrets.HOST }}" \
+            "become wikivisage bash -c '
+              set -euo pipefail
+              echo \"==> Building image from ref ${TAG}\"
+              toolforge build start --ref ${TAG} https://github.com/DiFronzo/WikiVisage.git 2>&1 | tail -5
+              echo \"==> Waiting for build to complete...\"
+              ELAPSED=0
+              while [ \$ELAPSED -lt 600 ]; do
+                sleep 10
+                ELAPSED=\$((ELAPSED + 10))
+                STATUS=\$(toolforge build show 2>&1 | head -1)
+                case \"\$STATUS\" in
+                  *ok*|*Succeeded*|*succeeded*)
+                    echo \"Build succeeded after \${ELAPSED}s\"
+                    break
+                    ;;
+                  *Failed*|*failed*|*error*)
+                    echo \"Build failed: \$STATUS\"
+                    toolforge build logs 2>&1 | tail -20
+                    exit 1
+                    ;;
+                esac
+                echo \"Waiting... (\${ELAPSED}s) status: \$STATUS\"
+              done
+              if [ \$ELAPSED -ge 600 ]; then
+                echo \"Build timed out after 600s\"
+                toolforge build show
                 exit 1
               fi
-              echo "Waiting for build... (${ELAPSED}s)"
-            done
-            if [ $ELAPSED -ge 600 ]; then
-              echo "Build timed out after 600s"
-              toolforge build logs
-              exit 1
-            fi
-            toolforge jobs run migrate --command 'python migrate.py' --image tool-wikivisage/tool-wikivisage:latest --wait
-            curl -fsSL https://raw.githubusercontent.com/DiFronzo/WikiVisage/${{ github.event.release.tag_name }}/jobs.yaml -o /tmp/jobs.yaml
-            toolforge jobs load /tmp/jobs.yaml
-            toolforge webservice buildservice restart
-            exit
-          EOF
+              echo \"==> Running migration\"
+              toolforge jobs run migrate --command \"python migrate.py\" --image tool-wikivisage/tool-wikivisage:latest --wait
+              echo \"==> Loading jobs.yaml\"
+              curl -fsSL \"https://raw.githubusercontent.com/DiFronzo/WikiVisage/${TAG}/jobs.yaml\" -o /tmp/jobs.yaml
+              toolforge jobs load /tmp/jobs.yaml
+              echo \"==> Restarting webservice\"
+              toolforge webservice buildservice restart
+              echo \"==> Deploy complete\"
+            '"
       - name: Cleanup SSH
         if: always()
         run: rm -f ~/.ssh/id_ed25519

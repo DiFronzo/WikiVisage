@@ -959,27 +959,61 @@ def bootstrap_from_sparql(project: dict[str, Any]) -> int:
 
 
 def run_autonomous_inference(project: dict[str, Any]) -> int:
-    """Run model inference on unclassified faces based on confirmed faces."""
+    """
+    Run model inference on unclassified faces based on confirmed faces.
+
+    The inference gate counts only faces with ``classified_by_user_id IS NOT NULL``
+    (i.e., human-confirmed faces). Projects that have enough bootstrap/model
+    ``is_target = 1`` faces but *zero* human-confirmed faces must still skip
+    autonomous inference, even if encodings exist.
+
+    The following doctest exercises this behavior by simulating a project where
+    the COUNT query for human-confirmed faces returns 0 while the confirmed-
+    encodings query returns rows. In this case, inference must be skipped and
+    the function should return 0.
+
+    >>> project = {"id": 1, "min_confirmed": 5}
+    >>> # Save the real execute_query so we can restore it after the test.
+    >>> _real_execute_query = execute_query
+    >>> def _fake_execute_query(sql, params, fetch=False):
+    ...     # Simulate 0 human-confirmed faces for the COUNT(*) query.
+    ...     if "COUNT(*) AS cnt" in sql:
+    ...         return [{"cnt": 0}]
+    ...     # Simulate existing confirmed encodings for the second query.
+    ...     if "SELECT f.encoding FROM faces f" in sql:
+    ...         return [{"encoding": b"fake-encoding"}]
+    ...     return []
+    >>> try:
+    ...     execute_query = _fake_execute_query
+    ...     run_autonomous_inference(project)
+    ... finally:
+    ...     execute_query = _real_execute_query
+    0
+    """
     t_start = time.monotonic()
     min_confirmed = project.get("min_confirmed", 5)
 
-    # Count actual is_target=1 faces instead of trusting faces_confirmed counter
+    # Count human-confirmed target faces only.  Bootstrap auto-classifications
+    # do NOT count toward the gate — a human must review at least min_confirmed
+    # faces before the model is allowed to classify autonomously.  This prevents
+    # the model from running before the user has seen any results.
     count_row = execute_query(
         "SELECT COUNT(*) AS cnt FROM faces f "
         "JOIN images i ON f.image_id = i.id "
-        "WHERE i.project_id = %s AND f.is_target = 1 AND f.superseded_by IS NULL",
+        "WHERE i.project_id = %s AND f.is_target = 1 AND f.superseded_by IS NULL "
+        "AND f.classified_by_user_id IS NOT NULL",
         (project["id"],),
         fetch=True,
     )
-    actual_confirmed = count_row[0]["cnt"] if count_row else 0
+    human_confirmed = count_row[0]["cnt"] if count_row else 0
 
-    if actual_confirmed < min_confirmed:
+    if human_confirmed < min_confirmed:
         logger.info(
-            f"Project {project['id']}: {actual_confirmed} confirmed target faces < {min_confirmed} required, skipping inference"
+            f"Project {project['id']}: {human_confirmed} human-confirmed target faces < {min_confirmed} required, skipping inference"
         )
         return 0
 
-    logger.info(f"Running autonomous inference for project {project['id']} ({actual_confirmed} confirmed faces)")
+    logger.info(f"Running autonomous inference for project {project['id']} ({human_confirmed} human-confirmed faces)")
 
     # Get confirmed faces
     confirmed_rows = execute_query(
@@ -1665,6 +1699,7 @@ def main():
                     "  SELECT COUNT(*) FROM faces f "
                     "  JOIN images i ON f.image_id = i.id "
                     "  WHERE i.project_id = p.id AND f.is_target = 1 AND f.superseded_by IS NULL"
+                    "  AND f.classified_by_user_id IS NOT NULL"
                     ") >= p.min_confirmed "
                     "AND EXISTS ("
                     "  SELECT 1 FROM faces f "
