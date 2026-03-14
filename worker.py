@@ -1007,9 +1007,9 @@ def run_autonomous_inference(project: dict[str, Any]) -> int:
     # Select candidate faces for model classification. A face is eligible only if:
     #   (a) unclassified (is_target IS NULL) and not superseded
     #   (b) no human has interacted with it (classified_by_user_id IS NULL)
-    #   (c) its image is not bootstrap-sourced (already has P180 depicts)
-    # Each face encoding is compared independently against the target centroid,
-    # so multi-face images are handled correctly.
+    # Bootstrapped images are included: bootstrap auto-classifies the single best face,
+    # but multi-face images have additional unclassified faces that need inference.
+    # The per-image dedup below ensures only the closest face per image is matched.
     unclassified_rows = execute_query(
         """
         SELECT f.id, f.image_id, f.encoding FROM faces f
@@ -1018,7 +1018,6 @@ def run_autonomous_inference(project: dict[str, Any]) -> int:
           AND f.is_target IS NULL
           AND f.superseded_by IS NULL
           AND f.classified_by_user_id IS NULL
-          AND i.bootstrapped = 0
         """,
         (project["id"],),
         fetch=True,
@@ -1096,7 +1095,9 @@ def run_autonomous_inference(project: dict[str, Any]) -> int:
             f"is_target = CASE id {target_cases} END, "
             f"confidence = CASE id {conf_cases} END, "
             f"classified_by = 'model' "
-            f"WHERE id IN ({id_placeholders})",
+            f"WHERE id IN ({id_placeholders}) "
+            f"AND classified_by_user_id IS NULL "
+            f"AND superseded_by IS NULL",
             tuple(params),
             fetch=False,
         )
@@ -1599,6 +1600,12 @@ def main():
             worker_pool_size = int(db_pool_env)
         else:
             worker_pool_size = MAX_CONCURRENT_PROJECTS * IMAGE_THREADS + 3
+        if worker_pool_size > 10:
+            logger.warning(
+                "DB pool size %d may exceed Toolforge max_user_connections. "
+                "Set WIKIVISAGE_DB_POOL_SIZE <= 10 if you see 'Too many connections' errors.",
+                worker_pool_size,
+            )
         init_db(pool_size=worker_pool_size)
     except Exception as e:
         logger.error(f"Database initialization failed: {e}")

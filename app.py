@@ -6,7 +6,7 @@ Provides OAuth 2.0 authentication, project management, and an active
 learning interface for classifying detected faces.
 """
 
-APP_VERSION = "0.2.3"
+APP_VERSION = "0.2.4"
 
 import hashlib
 import io
@@ -141,8 +141,9 @@ app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(hours=8)
 
 # Rate limiter — memory:// is per-process (not shared across gunicorn workers).
-# Acceptable on Toolforge where we run a single gunicorn worker process.
-# For multi-worker deployments, switch to Redis or memcached storage.
+# With 2 gunicorn workers, effective limits are doubled (e.g., 200/hr becomes ~400/hr).
+# Acceptable for a whitelisted beta tool on Toolforge with limited user count.
+# For broader deployments, switch to Redis or memcached storage.
 limiter = Limiter(
     get_remote_address,
     app=app,
@@ -313,7 +314,7 @@ def login_required(f):
     def decorated_function(*args, **kwargs):
         if g.user is None:
             flash(_("Please log in to continue."), "warning")
-            return redirect(url_for("login", next=request.url))
+            return redirect(url_for("login", next=request.full_path))
         return f(*args, **kwargs)
 
     return decorated_function
@@ -402,8 +403,8 @@ def _csrf_token() -> str:
 
 
 def _validate_csrf() -> bool:
-    """Validate CSRF token from form submission."""
-    token = request.form.get("csrf_token", "")
+    """Validate CSRF token from form submission or X-CSRFToken header."""
+    token = request.form.get("csrf_token", "") or request.headers.get("X-CSRFToken", "")
     expected = session.get("csrf_token", "")
     if not expected or not token:
         return False
@@ -435,6 +436,7 @@ def inject_worker_status() -> dict[str, Any]:
             )
             worker_down = bool(table_check and isinstance(table_check, list))
     except Exception:
+        app.logger.exception("Worker heartbeat check failed")
         worker_down = False
     return {"worker_down": worker_down}
 
@@ -712,10 +714,17 @@ def oauth_callback():
         flash(_("Database error. Please try again."), "error")
         return redirect(url_for("index"))
 
+    # Prevent session fixation: clear old session data before establishing
+    # the authenticated session. Preserve CSRF token for continuity.
+    csrf = session.get("csrf_token")
+    login_next = session.pop("login_next", "")
+    session.clear()
+    if csrf:
+        session["csrf_token"] = csrf
     session.permanent = True
     session["user_id"] = user_id
 
-    next_url = session.pop("login_next", "")
+    next_url = login_next
     if not _is_safe_url(next_url):
         next_url = url_for("dashboard")
     return redirect(next_url)
@@ -1071,7 +1080,7 @@ def project_new():
 
         # Signal the worker to wake up and process the new project immediately
         try:
-            wake_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".worker_wake")
+            wake_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".worker-wake-up")
             with open(wake_file, "w") as f:
                 f.write("")
         except OSError:
@@ -1163,7 +1172,7 @@ def project_detail(project_id: int):
             "  f.bbox_top, f.bbox_right, f.bbox_bottom, f.bbox_left, "
             "  f.sdc_written, f.classified_by_user_id, "
             "  i.file_title, i.commons_page_id, "
-            "  i.detection_width, i.detection_height "
+            "  i.detection_width, i.detection_height, i.bootstrapped "
             "FROM faces f "
             "JOIN images i ON f.image_id = i.id "
             "WHERE i.project_id = %s "
@@ -1171,7 +1180,7 @@ def project_detail(project_id: int):
             "  AND (f.classified_by IN ('model', 'bootstrap') "
             "       OR (f.is_target = 0 AND f.classified_by = 'human' AND f.classified_by_user_id IS NOT NULL)) "
             "  AND LOWER(i.file_title) NOT REGEXP '\\\\.(webm|ogv|ogg|mp3|wav|flac|opus|mid|oga)$' "
-            "ORDER BY f.is_target DESC, f.confidence ASC "
+            "ORDER BY f.is_target DESC, COALESCE(f.confidence, 999) ASC "
             "LIMIT 200",
             (project_id,),
         )
@@ -1200,8 +1209,7 @@ def project_detail(project_id: int):
             "WHERE i.project_id = %s "
             "  AND f.is_target IS NULL "
             "  AND f.superseded_by IS NULL "
-            "  AND f.classified_by_user_id IS NULL "
-            "  AND i.bootstrapped = 0",
+            "  AND f.classified_by_user_id IS NULL",
             (project_id,),
         )
         inference_eligible = eligible_row[0]["cnt"] if eligible_row else 0
@@ -2018,13 +2026,31 @@ def api_reclassify():
         if not has_sibling:
             sdc_removal_queued = True
     elif is_target == 0 and sdc_written == 1:
-        access_token = _get_valid_token()
-        if not access_token:
-            return jsonify({"error": _("OAuth token expired. Please log in again.")}), 401
+        # Check if another face on the same image is confirmed as target.
+        # If so, the P180 claim must stay — only clear sdc_written on this face.
+        try:
+            sibling_rows = execute_query(
+                "SELECT EXISTS("
+                "  SELECT 1 FROM faces f2 "
+                "  WHERE f2.image_id = %s AND f2.is_target = 1 "
+                "  AND f2.superseded_by IS NULL AND f2.id != %s"
+                ") AS has_sibling_match",
+                (face_row["image_id"], face_id),
+            )
+            has_sibling = sibling_rows[0]["has_sibling_match"] if sibling_rows else False
+        except DatabaseError:
+            return jsonify({"error": _("Database error")}), 500
 
-        sdc_removed = _remove_sdc_claim(commons_page_id, wikidata_qid, access_token)
-        if not sdc_removed:
-            return jsonify({"error": _("Failed to remove SDC claim from Commons. The face was not reclassified.")}), 502
+        if not has_sibling:
+            access_token = _get_valid_token()
+            if not access_token:
+                return jsonify({"error": _("OAuth token expired. Please log in again.")}), 401
+
+            sdc_removed = _remove_sdc_claim(commons_page_id, wikidata_qid, access_token)
+            if not sdc_removed:
+                return jsonify(
+                    {"error": _("Failed to remove SDC claim from Commons. The face was not reclassified.")}
+                ), 502
 
     try:
 
@@ -2033,17 +2059,30 @@ def api_reclassify():
                 "UPDATE faces SET is_target = %s, "
                 "classified_by_user_id = %s, sdc_written = %s, "
                 "sdc_removal_pending = %s "
-                "WHERE id = %s AND classified_by_user_id IS NULL",
+                "WHERE id = %s AND (classified_by_user_id IS NULL OR classified_by_user_id = %s)",
                 (
                     is_target,
                     g.user["id"],
                     0 if is_target == 0 else sdc_written,
                     1 if sdc_removal_queued else 0,
                     face_id,
+                    g.user["id"],
                 ),
             )
             if cursor.rowcount == 0:
-                raise ValueError("already_reviewed")
+                # rowcount=0 means either another user owns this face, or the
+                # same user clicked the same action again (no columns changed).
+                # Re-check to distinguish the two cases.
+                cursor.execute(
+                    "SELECT classified_by_user_id FROM faces WHERE id = %s",
+                    (face_id,),
+                )
+                check = cursor.fetchone()
+                if check and check["classified_by_user_id"] == g.user["id"]:
+                    # Same user, same value — treat as no-op success
+                    pass
+                else:
+                    raise ValueError("already_reviewed")
 
             if is_target == 1 and old_is_target != 1:
                 cursor.execute(
@@ -2409,8 +2448,7 @@ def api_progress(project_id: int):
             "WHERE i.project_id = %s "
             "  AND f.is_target IS NULL "
             "  AND f.superseded_by IS NULL "
-            "  AND f.classified_by_user_id IS NULL "
-            "  AND i.bootstrapped = 0",
+            "  AND f.classified_by_user_id IS NULL",
             (project_id,),
         )
         inference_eligible = eligible_row[0]["cnt"] if eligible_row else 0

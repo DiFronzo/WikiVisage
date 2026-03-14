@@ -474,3 +474,142 @@ def test_api_classify_wrong_project(integration_client, seed_images):
     )
 
     assert response.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for CSRF header validation (MEDIUM #6)
+# ---------------------------------------------------------------------------
+
+
+def test_csrf_via_header():
+    """CSRF token sent via X-CSRFToken header should be accepted."""
+    with app.test_request_context(
+        "/submit",
+        method="POST",
+        data={},
+        headers={"X-CSRFToken": "headertoken"},
+    ):
+        from flask import session
+
+        session["csrf_token"] = "headertoken"
+        assert _validate_csrf() is True
+
+
+def test_csrf_header_wrong():
+    """Wrong X-CSRFToken header should be rejected."""
+    with app.test_request_context(
+        "/submit",
+        method="POST",
+        data={},
+        headers={"X-CSRFToken": "wrong"},
+    ):
+        from flask import session
+
+        session["csrf_token"] = "correct"
+        assert _validate_csrf() is False
+
+
+def test_csrf_form_takes_precedence_over_header():
+    """When both form token and header token are present, form token is checked first."""
+    with app.test_request_context(
+        "/submit",
+        method="POST",
+        data={"csrf_token": "formtoken"},
+        headers={"X-CSRFToken": "headertoken"},
+    ):
+        from flask import session
+
+        session["csrf_token"] = "formtoken"
+        assert _validate_csrf() is True
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for session fixation prevention (MEDIUM #9)
+# ---------------------------------------------------------------------------
+
+
+def test_session_cleared_on_login_callback(monkeypatch):
+    """OAuth callback should clear session before setting user_id (session fixation prevention)."""
+    client = app.test_client()
+
+    fake_token = {"access_token": "tok", "refresh_token": "ref", "expires_at": 9999999999, "expires_in": 14400}
+    fake_userinfo = {"sub": 42, "username": "TestUser"}
+    fake_user_row = [
+        {
+            "id": 1,
+            "wiki_user_id": 42,
+            "wiki_username": "TestUser",
+            "access_token": "tok",
+            "refresh_token": "ref",
+            "token_expires_at": datetime.now(UTC),
+        }
+    ]
+
+    monkeypatch.setattr(app_module, "execute_query", lambda *a, **kw: fake_user_row)
+    monkeypatch.setattr(app_module, "_load_whitelist", lambda: {"TestUser"})
+
+    class FakeResp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return fake_userinfo
+
+    monkeypatch.setattr(app_module.requests, "get", lambda *a, **kw: FakeResp())
+
+    class FakeOAuth:
+        def fetch_token(self, *a, **kw):
+            return fake_token
+
+    monkeypatch.setattr(app_module, "_make_oauth_session", lambda state=None: FakeOAuth())
+
+    with client.session_transaction() as sess:
+        sess["oauth_state"] = "fakestate"
+        sess["login_next"] = "/dashboard"
+        sess["attacker_data"] = "should_be_removed"
+
+    client.get("/auth/callback?state=fakestate&code=fakecode")
+
+    with client.session_transaction() as sess:
+        assert sess.get("user_id") == 1
+        assert "attacker_data" not in sess
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for login_required next= parameter (LOW #14)
+# ---------------------------------------------------------------------------
+
+
+def test_login_required_uses_relative_path():
+    """login_required should redirect to login with a relative path, not absolute URL."""
+    client = app.test_client()
+
+    response = client.get("/dashboard")
+
+    assert response.status_code == 302
+    location = response.headers["Location"]
+    assert "/login" in location
+    if "next=" in location:
+        from urllib.parse import parse_qs, urlparse
+
+        parsed = urlparse(location)
+        qs = parse_qs(parsed.query)
+        next_val = qs.get("next", [""])[0]
+        assert _is_safe_url(next_val), f"next= value '{next_val}' is not safe (would be rejected)"
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for wake file (LOW #15)
+# ---------------------------------------------------------------------------
+
+
+def test_wake_file_path_consistent():
+    """Both project creation and SDC write should use the same wake file name."""
+    import inspect
+
+    source = inspect.getsource(app_module)
+    wake_refs = [line.strip() for line in source.splitlines() if "worker-wake" in line or "worker_wake" in line]
+    for ref in wake_refs:
+        if ref.lstrip().startswith("#"):
+            continue
+        assert ".worker-wake-up" in ref, f"Inconsistent wake file name in: {ref}"

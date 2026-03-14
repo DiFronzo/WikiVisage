@@ -100,6 +100,9 @@
         gap: 0.5rem;
         flex-wrap: wrap;
     }
+    .badge-sdc-pending {
+        color: var(--info, #3b82f6);
+    }
     .result-distance {
         font-family: monospace;
         font-size: 0.8rem;
@@ -403,11 +406,14 @@
     <span style="border-left: 2px solid var(--border); margin: 0 0.25rem;"></span>
     <button class="btn btn-sm results-filter" data-filter="model" data-filter-type="source" onclick="filterResults('model', 'source')">{{ _('Model') }}</button>
     <button class="btn btn-sm results-filter" data-filter="bootstrap" data-filter-type="source" onclick="filterResults('bootstrap', 'source')">{{ _('Bootstrap') }}</button>
+    <span style="border-left: 2px solid var(--border); margin: 0 0.25rem;"></span>
+    <button class="btn btn-sm results-filter" data-filter="sdc-pending" data-filter-type="sdc" onclick="filterResults('sdc-pending', 'sdc')">{{ _('SDC Pending') }}</button>
 </div>
 
 <div class="results-gallery" id="resultsGallery">
     {% for face in model_faces %}
-    <div class="result-card" data-result="{{ 'rejected' if face.is_target == 0 and face.classified_by_user_id else ('match' if face.is_target == 1 else 'non-match') }}" data-source="{{ face.classified_by }}" data-face-id="{{ face.id }}" data-image-id="{{ face.image_id }}" data-sdc-written="{{ face.sdc_written }}">
+    {% set is_sdc_pending = face.is_target == 1 and face.sdc_written == 0 and face.classified_by != 'bootstrap' and face.bootstrapped == 0 %}
+    <div class="result-card" data-result="{{ 'rejected' if face.is_target == 0 and face.classified_by_user_id else ('match' if face.is_target == 1 else 'non-match') }}" data-source="{{ face.classified_by }}" data-face-id="{{ face.id }}" data-image-id="{{ face.image_id }}" data-sdc-written="{{ face.sdc_written }}" data-sdc-pending="{{ '1' if is_sdc_pending else '0' }}" data-bootstrapped="{{ face.bootstrapped }}">
 <div class="result-thumb" data-file-title="{{ face.file_title }}"
 data-bbox-top="{{ face.bbox_top }}" data-bbox-right="{{ face.bbox_right }}"
 data-bbox-bottom="{{ face.bbox_bottom }}" data-bbox-left="{{ face.bbox_left }}"
@@ -425,6 +431,9 @@ data-detection-width="{{ face.detection_width or 0 }}" data-detection-height="{{
             <span class="badge {{ 'badge-active' if face.is_target == 1 else 'badge-paused' }}" style="font-size: 0.65rem;">
                 {% if face.is_target == 1 and face.classified_by_user_id %}{{ _('Verified') }} &#10003;{% elif face.is_target == 1 %}{{ _('Match') }}{% elif face.classified_by_user_id %}{{ _('Rejected') }}{% else %}{{ _('Not target') }}{% endif %}
             </span>
+            {% if is_sdc_pending %}
+            <span class="badge badge-sdc-pending" style="font-size: 0.65rem;" data-sdc-badge>{{ _('SDC pending') }}</span>
+            {% endif %}
             <span class="result-distance" title="{{ _('Face distance from target centroid') }}">
                 {{ "%.3f"|format(face.confidence) if face.confidence is not none else '—' }}
             </span>
@@ -514,6 +523,7 @@ data-detection-width="{{ face.detection_width or 0 }}" data-detection-height="{{
         verified: {{ _('Verified')|tojson }},
         rejected: {{ _('Rejected')|tojson }},
         human: {{ _('human')|tojson }},
+        sdcPending: {{ _('SDC pending')|tojson }},
         sdcRemoved: {{ _('SDC claim was removed.')|tojson }},
         sdcRemovalQueued: {{ _('SDC claim removal queued.')|tojson }},
         saveError: {{ _('Error saving classification')|tojson }},
@@ -546,6 +556,24 @@ data-detection-width="{{ face.detection_width or 0 }}" data-detection-height="{{
                 badge.className = 'badge ' + (isTarget === 1 ? 'badge-active' : 'badge-paused');
                 badge.textContent = isTarget === 1 ? i18nReclassify.verified + ' \u2713' : i18nReclassify.rejected;
                 
+                // Update SDC pending state
+                var isBootstrapped = card.dataset.bootstrapped === '1';
+                var sdcWritten = card.dataset.sdcWritten === '1';
+                var source = card.dataset.source;
+                var nowSdcPending = (isTarget === 1 && !sdcWritten && source !== 'bootstrap' && !isBootstrapped);
+                card.dataset.sdcPending = nowSdcPending ? '1' : '0';
+                var sdcBadge = card.querySelector('[data-sdc-badge]');
+                if (nowSdcPending && !sdcBadge) {
+                    sdcBadge = document.createElement('span');
+                    sdcBadge.className = 'badge badge-sdc-pending';
+                    sdcBadge.style.fontSize = '0.65rem';
+                    sdcBadge.setAttribute('data-sdc-badge', '');
+                    sdcBadge.textContent = i18nReclassify.sdcPending;
+                    card.querySelector('.result-info').insertBefore(sdcBadge, badge.nextSibling);
+                } else if (!nowSdcPending && sdcBadge) {
+                    sdcBadge.remove();
+                }
+
                 if (data.sdc_removed) {
                     var sdcNote = card.querySelector('.sdc-note');
                     sdcNote.textContent = i18nReclassify.sdcRemoved;
@@ -865,6 +893,7 @@ data-detection-width="{{ face.detection_width or 0 }}" data-detection-height="{{
 
     var activeResultFilter = 'all';
     var activeSourceFilter = 'all';
+    var activeSdcFilter = 'all';
     var currentPage = 1;
     var perPage = 27;
     var i18nPagination = {
@@ -878,7 +907,8 @@ data-detection-width="{{ face.detection_width or 0 }}" data-detection-height="{{
         return cards.filter(function(card) {
             var matchResult = (activeResultFilter === 'all' || card.dataset.result === activeResultFilter);
             var matchSource = (activeSourceFilter === 'all' || card.dataset.source === activeSourceFilter);
-            return matchResult && matchSource;
+            var matchSdc = (activeSdcFilter === 'all' || card.dataset.sdcPending === '1');
+            return matchResult && matchSource && matchSdc;
         });
     }
 
@@ -950,9 +980,12 @@ data-detection-width="{{ face.detection_width or 0 }}" data-detection-height="{{
     function filterResults(filter, type) {
         if (type === 'result') {
             activeResultFilter = filter;
-        } else {
+        } else if (type === 'source') {
             // Clicking same source filter again toggles it off
             activeSourceFilter = (activeSourceFilter === filter) ? 'all' : filter;
+        } else if (type === 'sdc') {
+            // Clicking same SDC filter again toggles it off
+            activeSdcFilter = (activeSdcFilter === filter) ? 'all' : filter;
         }
 
         // Update button states
@@ -961,6 +994,9 @@ data-detection-width="{{ face.detection_width or 0 }}" data-detection-height="{{
         });
         document.querySelectorAll('.results-filter[data-filter-type="source"]').forEach(function(btn) {
             btn.classList.toggle('active', btn.dataset.filter === activeSourceFilter);
+        });
+        document.querySelectorAll('.results-filter[data-filter-type="sdc"]').forEach(function(btn) {
+            btn.classList.toggle('active', activeSdcFilter === btn.dataset.filter);
         });
 
         // Reset to page 1 when filter changes

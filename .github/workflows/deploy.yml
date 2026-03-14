@@ -10,22 +10,54 @@ jobs:
     runs-on: ubuntu-latest
     environment: toolforge
     steps:
-      - uses: actions/checkout@v6
-      - name: Deploy to server
-        uses: appleboy/ssh-action@v1.2.4
-        with:
-          host: ${{ secrets.HOST }}
-          username: ${{ secrets.USERNAME }}
-          port: 22
-          request_pty: true
-          command_timeout: 20m
-          key: ${{ secrets.KEY }}
-          script: |
-            become wikivisage bash -c "
-              set -e
-              toolforge build start https://github.com/DiFronzo/WikiVisage.git
-              toolforge jobs run migrate --command 'python migrate.py' --image tool-wikivisage/tool-wikivisage:latest --wait
-              curl -fsSL https://raw.githubusercontent.com/DiFronzo/WikiVisage/${{ github.event.release.tag_name }}/jobs.yaml -o /tmp/jobs.yaml
-              toolforge jobs load /tmp/jobs.yaml
-              toolforge webservice buildservice restart
-            "
+      - uses: actions/checkout@v4
+      - name: Setup SSH
+        run: |
+          if [ -z "$SSH_HOST" ] || [ -z "$SSH_KEY" ] || [ -z "$SSH_USER" ]; then
+            echo "::error::Missing required secrets (HOST, KEY, USERNAME). Configure them in the 'toolforge' environment."
+            exit 1
+          fi
+          mkdir -p ~/.ssh
+          ssh-keyscan "$SSH_HOST" >> ~/.ssh/known_hosts
+          echo "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+        env:
+          SSH_HOST: ${{ secrets.HOST }}
+          SSH_KEY: ${{ secrets.KEY }}
+          SSH_USER: ${{ secrets.USERNAME }}
+      - name: Deploy to Toolforge
+        timeout-minutes: 20
+        run: |
+          ssh -i ~/.ssh/id_ed25519 "${{ secrets.USERNAME }}@${{ secrets.HOST }}" <<'EOF'
+            set -e
+            become wikivisage
+            toolforge build start --ref ${{ github.event.release.tag_name }} https://github.com/DiFronzo/WikiVisage.git
+            ELAPSED=0
+            while [ $ELAPSED -lt 600 ]; do
+              sleep 15
+              ELAPSED=$((ELAPSED + 15))
+              STATUS=$(toolforge build show)
+              if echo "$STATUS" | grep -q 'Succeeded'; then
+                echo "Build succeeded after ${ELAPSED}s"
+                break
+              elif echo "$STATUS" | grep -q 'Failed'; then
+                echo "Build failed"
+                toolforge build logs
+                exit 1
+              fi
+              echo "Waiting for build... (${ELAPSED}s)"
+            done
+            if [ $ELAPSED -ge 600 ]; then
+              echo "Build timed out after 600s"
+              toolforge build logs
+              exit 1
+            fi
+            toolforge jobs run migrate --command 'python migrate.py' --image tool-wikivisage/tool-wikivisage:latest --wait
+            curl -fsSL https://raw.githubusercontent.com/DiFronzo/WikiVisage/${{ github.event.release.tag_name }}/jobs.yaml -o /tmp/jobs.yaml
+            toolforge jobs load /tmp/jobs.yaml
+            toolforge webservice buildservice restart
+            exit
+          EOF
+      - name: Cleanup SSH
+        if: always()
+        run: rm -f ~/.ssh/id_ed25519
