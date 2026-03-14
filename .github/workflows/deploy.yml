@@ -57,7 +57,7 @@ jobs:
           while [ $ELAPSED -lt 600 ]; do
             sleep 15
             ELAPSED=$((ELAPSED + 15))
-            STATUS=$(toolforge build show --json 2>/dev/null | jq -r '.build.status // empty')
+            STATUS=$(toolforge build show --json 2>/dev/null | jq -r '.build.status // empty' 2>/dev/null || true)
             if [ -z "$STATUS" ]; then
               echo "Waiting... (${ELAPSED}s) no status yet"
               continue
