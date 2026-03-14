@@ -17,7 +17,8 @@ CREATE TABLE IF NOT EXISTS users (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 
--- Sessions table: server-side session storage for Flask-Session.
+-- Sessions table: reserved for future server-side session storage (Flask-Session).
+-- Currently unused — the app uses signed cookie sessions. Kept for forward compatibility.
 CREATE TABLE IF NOT EXISTS sessions (
     id              VARCHAR(255)    PRIMARY KEY,
     user_id         BIGINT UNSIGNED NULL,

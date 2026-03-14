@@ -1,14 +1,16 @@
 # WikiVisage — Toolforge Jobs
 # Load with: toolforge jobs load jobs.yaml
 # Docs: https://wikitech.wikimedia.org/wiki/Help:Toolforge/Running_jobs
+
+#  env:
+#    - name: WIKIVISAGE_WORKER_IMAGE_THREADS
+#      value: "6"
+#    - name: WIKIVISAGE_WORKER_BATCH_SIZE
+#      value: "100"
 ---
 - name: ml-worker
   command: python -u worker.py
   image: tool-wikivisage/tool-wikivisage:latest
   continuous: true
-  mem: 3G
-  env:
-    - name: WIKIVISAGE_WORKER_IMAGE_THREADS
-      value: "6"
-    - name: WIKIVISAGE_WORKER_BATCH_SIZE
-      value: "100"
+  mem: 3Gi
+
