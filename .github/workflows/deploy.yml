@@ -47,9 +47,9 @@ jobs:
             exit 1
           fi
 
-          cat > /tmp/deploy.sh << 'SCRIPT'
+          ssh -i ~/.ssh/id_ed25519 "${{ secrets.USERNAME }}@${{ secrets.HOST }}" \
+            "become wikivisage TAG='${TAG}' bash -s" << 'SCRIPT'
           set -euo pipefail
-          TAG="$1"
           echo "==> Building image from ref $TAG"
           toolforge build start --ref "$TAG" https://github.com/DiFronzo/WikiVisage.git 2>&1 | tail -5
           echo "==> Waiting for build to complete..."
@@ -79,16 +79,16 @@ jobs:
           echo "==> Running migration"
           toolforge jobs run migrate --command "python migrate.py" --image tool-wikivisage/tool-wikivisage:latest --wait
           echo "==> Loading jobs.yaml"
-          curl -fsSL "https://raw.githubusercontent.com/DiFronzo/WikiVisage/${TAG}/jobs.yaml" -o /tmp/jobs.yaml
+          curl -fsSL "https://raw.githubusercontent.com/DiFronzo/WikiVisage/$TAG/jobs.yaml" -o /tmp/jobs.yaml
           toolforge jobs load /tmp/jobs.yaml
           echo "==> Restarting webservice"
           toolforge webservice buildservice restart
           echo "==> Deploy complete"
           SCRIPT
 
-          scp -i ~/.ssh/id_ed25519 /tmp/deploy.sh "${{ secrets.USERNAME }}@${{ secrets.HOST }}":/tmp/deploy.sh
-          ssh -i ~/.ssh/id_ed25519 "${{ secrets.USERNAME }}@${{ secrets.HOST }}" \
-            "become wikivisage bash /tmp/deploy.sh '${TAG}'"
+
+
+
       - name: Cleanup SSH
         if: always()
         run: rm -f ~/.ssh/id_ed25519
