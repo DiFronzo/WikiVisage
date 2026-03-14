@@ -959,7 +959,37 @@ def bootstrap_from_sparql(project: dict[str, Any]) -> int:
 
 
 def run_autonomous_inference(project: dict[str, Any]) -> int:
-    """Run model inference on unclassified faces based on confirmed faces."""
+    """
+    Run model inference on unclassified faces based on confirmed faces.
+
+    The inference gate counts only faces with ``classified_by_user_id IS NOT NULL``
+    (i.e., human-confirmed faces). Projects that have enough bootstrap/model
+    ``is_target = 1`` faces but *zero* human-confirmed faces must still skip
+    autonomous inference, even if encodings exist.
+
+    The following doctest exercises this behavior by simulating a project where
+    the COUNT query for human-confirmed faces returns 0 while the confirmed-
+    encodings query returns rows. In this case, inference must be skipped and
+    the function should return 0.
+
+    >>> project = {"id": 1, "min_confirmed": 5}
+    >>> # Save the real execute_query so we can restore it after the test.
+    >>> _real_execute_query = execute_query
+    >>> def _fake_execute_query(sql, params, fetch=False):
+    ...     # Simulate 0 human-confirmed faces for the COUNT(*) query.
+    ...     if "COUNT(*) AS cnt" in sql:
+    ...         return [{"cnt": 0}]
+    ...     # Simulate existing confirmed encodings for the second query.
+    ...     if "SELECT f.encoding FROM faces f" in sql:
+    ...         return [{"encoding": b"fake-encoding"}]
+    ...     return []
+    >>> try:
+    ...     execute_query = _fake_execute_query
+    ...     run_autonomous_inference(project)
+    ... finally:
+    ...     execute_query = _real_execute_query
+    0
+    """
     t_start = time.monotonic()
     min_confirmed = project.get("min_confirmed", 5)
 
