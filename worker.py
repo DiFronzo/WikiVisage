@@ -1096,7 +1096,8 @@ def run_autonomous_inference(project: dict[str, Any]) -> int:
             f"confidence = CASE id {conf_cases} END, "
             f"classified_by = 'model' "
             f"WHERE id IN ({id_placeholders}) "
-            f"AND classified_by_user_id IS NULL",
+            f"AND classified_by_user_id IS NULL "
+            f"AND superseded_by IS NULL",
             tuple(params),
             fetch=False,
         )
