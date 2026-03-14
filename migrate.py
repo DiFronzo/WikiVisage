@@ -5,9 +5,11 @@ Reads schema.sql and executes it against the configured MariaDB database.
 Safe to run multiple times — all CREATE TABLE statements use IF NOT EXISTS.
 
 Usage:
-    python migrate.py
+    python migrate.py            # Apply migrations
+    python migrate.py --reset    # Drop all tables and recreate from scratch
 """
 
+import argparse
 import logging
 import os
 import sys
@@ -21,6 +23,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 SCHEMA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "schema.sql")
+
+# Drop order respects foreign key dependencies (children first).
+_ALL_TABLES = ["faces", "images", "projects", "sessions", "worker_heartbeat", "users"]
 
 
 def load_schema(path: str) -> list[str]:
@@ -62,6 +67,29 @@ def load_schema(path: str) -> list[str]:
         statements.append(stmt)
 
     return statements
+
+
+def reset_database() -> None:
+    """Drop all tables and recreate the schema from scratch."""
+    logger.warning("Resetting database — dropping all tables")
+
+    init_db(pool_size=1)
+
+    try:
+        with get_connection() as conn, conn.cursor() as cursor:
+            try:
+                cursor.execute("SET FOREIGN_KEY_CHECKS=0")
+                for table in _ALL_TABLES:
+                    logger.info(f"Dropping table: {table}")
+                    cursor.execute(f"DROP TABLE IF EXISTS {table}")
+            finally:
+                cursor.execute("SET FOREIGN_KEY_CHECKS=1")
+            conn.commit()
+            logger.info("All tables dropped")
+    finally:
+        close_pool()
+
+    run_migration()
 
 
 def run_migration() -> None:
@@ -280,8 +308,15 @@ def verify_tables() -> None:
 
 def main() -> None:
     """Entry point for the migration script."""
+    parser = argparse.ArgumentParser(description="WikiVisage database migration")
+    parser.add_argument("--reset", action="store_true", help="Drop all tables and recreate from scratch")
+    args = parser.parse_args()
+
     try:
-        run_migration()
+        if args.reset:
+            reset_database()
+        else:
+            run_migration()
         verify_tables()
     except FileNotFoundError as e:
         logger.error(str(e))
