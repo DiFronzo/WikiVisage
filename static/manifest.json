@@ -1,0 +1,26 @@
+{
+  "name": "WikiVisage",
+  "short_name": "WikiVisage",
+  "description": "Active learning facial recognition for Wikimedia Commons",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#090e17",
+  "theme_color": "#090e17",
+  "icons": [
+    {
+      "src": "/static/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "/static/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    },
+    {
+      "src": "/static/wikivisage-logo-notext.svg",
+      "sizes": "any",
+      "type": "image/svg+xml"
+    }
+  ]
+}

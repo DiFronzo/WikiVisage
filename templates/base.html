@@ -5,6 +5,11 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{% block title %}WikiVisage BETA{% endblock %}</title>
     <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='wikivisage-logo.svg') }}">
+    <link rel="manifest" href="{{ url_for('static', filename='manifest.json') }}">
+    <meta name="theme-color" content="#090e17">
+    <link rel="apple-touch-icon" href="{{ url_for('static', filename='icon-192.png') }}">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <style>
         :root {
             --bg: #090e17;
@@ -228,7 +233,7 @@
 
         .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(350px, 1fr)); gap: 2rem; }
         .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 2rem; }
-        @media (max-width: 600px) { .grid-2 { grid-template-columns: 1fr; } }
+        @media (max-width: 600px) { .grid-2 { grid-template-columns: 1fr; } .grid { grid-template-columns: 1fr; } .container { padding: 0 1rem; } }
 
         .badge {
             display: inline-block;
@@ -361,6 +366,84 @@
             flex-shrink: 0;
         }
     </style>
+    <div id="pwa-install" class="pwa-banner" style="display:none;">
+        <button class="pwa-close" onclick="localStorage.setItem('pwa_dismissed',new Date().toDateString());document.getElementById('pwa-install').style.display='none'" aria-label="{{ _('Close') }}">&times;</button>
+        <div class="pwa-banner-inner">
+            <img src="{{ url_for('static', filename='icon-192.png') }}" alt="" class="pwa-icon">
+            <div class="pwa-content">
+                <p class="pwa-title">WikiVisage</p>
+                <p class="pwa-text" id="pwa-install-text"></p>
+            </div>
+            <button id="pwa-install-btn" class="btn btn-primary">{{ _('Install') }}</button>
+        </div>
+    </div>
+    <style>
+        .pwa-banner {
+            position: fixed;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            z-index: 10000;
+            background: linear-gradient(135deg, #0d3b34 0%, #141f33 50%, #1a1040 100%);
+            border-top: 3px solid var(--primary);
+            padding: 1.25rem 1.5rem;
+            box-shadow: 0 -8px 32px rgba(20, 184, 166, 0.25);
+        }
+        .pwa-close {
+            position: absolute;
+            top: 0.5rem;
+            right: 0.75rem;
+            background: none;
+            border: none;
+            color: var(--text-muted);
+            font-size: 1.5rem;
+            line-height: 1;
+            cursor: pointer;
+            padding: 0.25rem;
+        }
+        .pwa-close:hover { color: var(--text-main); }
+        .pwa-banner-inner {
+            max-width: 900px;
+            margin: 0 auto;
+            display: flex;
+            align-items: center;
+            gap: 1.25rem;
+        }
+        .pwa-icon {
+            width: 56px;
+            height: 56px;
+            border-radius: 12px;
+            flex-shrink: 0;
+            background: var(--bg);
+            padding: 6px;
+            border: 2px solid var(--primary);
+        }
+        .pwa-content { flex: 1; min-width: 0; }
+        .pwa-title {
+            margin: 0 0 0.15rem;
+            font-size: 1.1rem;
+            font-weight: 900;
+            color: var(--primary);
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+        .pwa-text {
+            margin: 0;
+            font-size: 0.9rem;
+            color: var(--text-main);
+            line-height: 1.4;
+        }
+        .pwa-banner .btn {
+            flex-shrink: 0;
+            font-size: 0.9rem;
+            padding: 0.75rem 1.75rem;
+        }
+        @media (max-width: 480px) {
+            .pwa-banner-inner { flex-wrap: wrap; }
+            .pwa-banner .btn { width: 100%; }
+        }
+    </style>
+
     <script>
         (function() {
             var consent = localStorage.getItem('cookie_consent');
@@ -376,6 +459,79 @@
             localStorage.setItem('cookie_consent', 'declined');
             document.getElementById('cookie-consent').style.display = 'none';
         }
+    </script>
+    <script>
+        if ("serviceWorker" in navigator) {
+            navigator.serviceWorker.register("/sw.js", { scope: "/" });
+        }
+
+        (function() {
+            if (window.matchMedia("(display-mode: standalone)").matches || navigator.standalone) return;
+
+            var isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+            if (!isMobile) return;
+
+            if (localStorage.getItem("pwa_dismissed") === new Date().toDateString()) return;
+
+            var isIOS = /iPhone|iPad|iPod/i.test(navigator.userAgent) && !window.MSStream;
+            var banner = document.getElementById("pwa-install");
+            var textEl = document.getElementById("pwa-install-text");
+            var btn = document.getElementById("pwa-install-btn");
+            var deferredPrompt = null;
+
+            function showPwaBanner() {
+                /* Wait until cookie consent is resolved before showing */
+                if (!localStorage.getItem("cookie_consent")) {
+                    var observer = new MutationObserver(function() {
+                        var cookieBanner = document.getElementById("cookie-consent");
+                        if (cookieBanner && cookieBanner.style.display === "none") {
+                            observer.disconnect();
+                            banner.style.display = "block";
+                        }
+                    });
+                    var cookieBanner = document.getElementById("cookie-consent");
+                    if (cookieBanner) {
+                        observer.observe(cookieBanner, { attributes: true, attributeFilter: ["style"] });
+                    }
+                } else {
+                    banner.style.display = "block";
+                }
+            }
+
+            if (isIOS) {
+                textEl.textContent = {{ _('Classify faces on the go! Tap Share, then "Add to Home Screen" to get the app.')|tojson }};
+                btn.style.display = "none";
+                showPwaBanner();
+            } else {
+                var promptFired = false;
+                window.addEventListener("beforeinstallprompt", function(e) {
+                    e.preventDefault();
+                    promptFired = true;
+                    deferredPrompt = e;
+                    textEl.textContent = {{ _('Classify faces faster! Add WikiVisage to your home screen for instant, full-screen access.')|tojson }};
+                    showPwaBanner();
+                });
+                btn.addEventListener("click", function() {
+                    if (!deferredPrompt) return;
+                    deferredPrompt.prompt();
+                    deferredPrompt.userChoice.then(function() {
+                        deferredPrompt = null;
+                        banner.style.display = "none";
+                    });
+                });
+                setTimeout(function() {
+                    if (!promptFired) {
+                        textEl.textContent = {{ _('Classify faces on the go! Tap your browser menu and choose "Install" to get the app.')|tojson }};
+                        btn.style.display = "none";
+                        showPwaBanner();
+                    }
+                }, 3000);
+            }
+
+            window.addEventListener("appinstalled", function() {
+                banner.style.display = "none";
+            });
+        })();
     </script>
 </body>
 </html>
