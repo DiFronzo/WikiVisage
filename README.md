@@ -29,6 +29,8 @@ Active learning facial recognition for Wikimedia Commons. Train an ML model to r
 - 📖 Local dev guide: [test-local.md](test-local.md)
 - 🚀 Toolforge deploy guide: [how-to-run-it.md](how-to-run-it.md)
 - 🤝 Contributing: [CONTRIBUTING.md](CONTRIBUTING.md)
+- 🔒 Security policy: [SECURITY.md](SECURITY.md)
+- 📜 Code of conduct: [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)
 
 ## ✨ Highlights
 
@@ -158,7 +160,7 @@ The app will be live at `https://<toolname>.toolforge.org`.
 ## 🧪 Local development
 
 ```bash
-pip install -r requirements.txt
+pip install -r requirements-dev.txt
 
 export TOOL_TOOLSDB_USER=root
 export TOOL_TOOLSDB_PASSWORD=yourpassword
