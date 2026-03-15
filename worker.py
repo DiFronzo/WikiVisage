@@ -63,6 +63,10 @@ MAX_IMAGES_PER_PROJECT = 9000
 # Maximum images the bootstrap (P180 seeding) will fetch — keeps slots free for untagged category images
 MAX_BOOTSTRAP_IMAGES = 1000
 
+# Maximum number of new (image_count==0) projects to fast-track per poll cycle
+# Keeping this at 1 prevents serial traversal work from starving the thread pool
+MAX_FAST_TRACK_PER_WAKEUP = 1
+
 # Non-image file extensions to skip during category traversal (video, audio)
 _SKIP_EXTENSIONS = {".webm", ".ogv", ".ogg", ".mp3", ".wav", ".flac", ".opus", ".mid", ".oga"}
 
@@ -1907,7 +1911,6 @@ def main():
                                     # Limit to 1 fast-tracked project per wake-up to avoid
                                     # starving the thread-pool with serial traversal work.
                                     fast_tracked_this_wakeup = 0
-                                    MAX_FAST_TRACK_PER_WAKEUP = 1
                                     for project in new_projects:
                                         if project["id"] not in seen_ids:
                                             seen_ids.add(project["id"])
