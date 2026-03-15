@@ -8,7 +8,7 @@ Thanks for your interest in contributing to WikiVisage! This guide covers how to
 
 - Python 3.11+
 - MariaDB (via Docker or Homebrew)
-- cmake (macOS only, for dlib compilation)
+- cmake (macOS only — `dlib-bin` lacks ARM wheels, falls back to compiling from source)
 
 ### 1. Clone and install dependencies
 
@@ -17,7 +17,7 @@ git clone https://github.com/DiFronzo/WikiVisage.git
 cd WikiVisage
 python3 -m venv venv
 source venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements-dev.txt   # Includes runtime deps + pytest, ruff
 ```
 
 > **macOS note:** `dlib-bin` doesn't have macOS ARM wheels. It falls back to compiling from source, which requires cmake (`brew install cmake`) and takes a few minutes.
@@ -52,24 +52,33 @@ export OAUTHLIB_INSECURE_TRANSPORT=1
 ### 4. Run migrations and start
 
 ```bash
-python migrate.py          # Create/update database tables
-python app.py              # Web app on http://localhost:8000
-python -u worker.py        # Background worker (separate terminal)
+python migrate.py                          # Create/update database tables
+python app.py                              # Web app on http://localhost:8000
+python -u worker.py --worker-id local-1    # Background worker (separate terminal)
 ```
 
 The landing page and `/health` endpoint work without OAuth. See [test-local.md](test-local.md) for testing without OAuth credentials and a full smoke test checklist.
 
 ## Project Structure
 
-| File | Purpose |
-|------|---------|
+| File / Directory | Purpose |
+|---|---|
 | `app.py` | Flask web app: OAuth, routes, classification API |
-| `worker.py` | Background ML pipeline: crawl, detect, infer, write SDC |
+| `worker.py` | Background ML pipeline: crawl, detect, infer, write SDC (multi-instance) |
 | `database.py` | MariaDB connection pool with retry logic |
-| `schema.sql` | DDL for all tables |
-| `migrate.py` | Idempotent schema migrations |
-| `templates/` | Jinja2 templates (all extend `base.html`) |
+| `schema.sql` | DDL for 7 tables + indexes |
+| `migrate.py` | Idempotent schema migrations with `--reset` flag |
+| `templates/` | Jinja2 templates (9 files, all extend `base.html`) |
 | `translations/` | i18n files (en, nb, es, fr) |
+| `tests/` | Hybrid test suite: unit + integration tests |
+| `jobs.yaml` | Toolforge jobs definition (2 worker instances) |
+| `Procfile` | Gunicorn web + worker process definitions |
+| `pyproject.toml` | Ruff config, pytest config, project metadata |
+| `requirements.txt` | Runtime dependencies |
+| `requirements-dev.txt` | Dev/test deps (pytest, pytest-cov, ruff) |
+| `whitelist.txt` | Allowed usernames (one per line) |
+| `.github/workflows/` | CI (lint + test) and CD (release-triggered Toolforge deploy) |
+| `SECURITY.md` | Vulnerability reporting policy |
 
 ## Code Conventions
 
@@ -90,6 +99,8 @@ The landing page and `/health` endpoint work without OAuth. See [test-local.md](
 
 - All POST routes require CSRF tokens.
 - All face bounding box inputs are validated against `MAX_BBOX_PX` and `MIN_BBOX_AREA`.
+- Rate limiting: global 200/hour default, 10/min on bbox endpoints.
+- Security headers set on all responses: `X-Content-Type-Options`, `X-Frame-Options`, `X-XSS-Protection`.
 - Never store secrets in code. Use environment variables.
 
 ## Internationalization (i18n)
@@ -137,17 +148,43 @@ pybabel compile -d translations
 
 1. Edit `schema.sql` with the new DDL.
 2. Add an idempotent migration in `migrate.py` (check-then-alter pattern).
-3. Run `python migrate.py` to verify it applies cleanly.
-4. Migrations must be safe to run repeatedly without error.
+3. Add any new tables to `_ALL_TABLES` and `expected_tables` in `migrate.py`.
+4. Run `python migrate.py` to verify it applies cleanly.
+5. Migrations must be safe to run repeatedly without error.
+
+Currently 7 tables: `users`, `sessions`, `projects`, `images`, `faces`, `user_stats`, `worker_heartbeat`.
+
+## Testing
+
+Install dev dependencies (`pip install -r requirements-dev.txt`) to get pytest and ruff.
+
+```bash
+# Lint and format check
+ruff check .
+ruff format --check .
+
+# Unit tests only (CI mode — integration tests auto-skipped)
+pytest tests/ -v
+
+# Full suite including integration tests (requires local MariaDB)
+WIKIVISAGE_TEST_DB=1 pytest tests/ -v
+
+# With coverage
+WIKIVISAGE_TEST_DB=1 pytest tests/ --cov=. --cov-report=term-missing
+```
+
+Integration tests are marked with `@pytest.mark.integration` and require a running MariaDB (see setup above). They use a separate `wikiface_test` database that is created and dropped automatically.
 
 ## Submitting Changes
 
 1. Fork the repository and create a branch from `main`.
 2. Make your changes, following the conventions above.
-3. If you changed translatable strings, run the pybabel extract/update/compile workflow.
-4. If you changed the schema, add a migration in `migrate.py`.
-5. Test locally (see [test-local.md](test-local.md)).
-6. Open a pull request with a clear description of what changed and why.
+3. Run `ruff check .` and `ruff format --check .` — fix any issues.
+4. Run `pytest tests/ -v` — all unit tests must pass.
+5. If you changed translatable strings, run the pybabel extract/update/compile workflow.
+6. If you changed the schema, add a migration in `migrate.py`.
+7. Test locally (see [test-local.md](test-local.md)).
+8. Open a pull request with a clear description of what changed and why.
 
 ## License
 

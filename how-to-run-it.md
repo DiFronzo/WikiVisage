@@ -106,7 +106,7 @@ toolforge jobs run migrate \
   --mem 512Mi
 ```
 
-This creates all 6 tables (`users`, `sessions`, `projects`, `images`, `faces`, `worker_heartbeat`). Safe to re-run — uses `CREATE TABLE IF NOT EXISTS`.
+This creates all 7 tables (`users`, `sessions`, `projects`, `images`, `faces`, `user_stats`, `worker_heartbeat`) and their indexes. Safe to re-run — migrations are idempotent.
 
 Check the migration completed:
 
@@ -137,32 +137,44 @@ The file is checked on every request (no restart needed after changes). To updat
 toolforge webservice buildservice start --mount none
 ```
 
-The `Procfile` tells it to run gunicorn with 4 workers on port 8000.
+The `Procfile` runs gunicorn with 2 workers on port 8000.
 
 Your app will be live at: **https://wikivisage.toolforge.org**
 
 ---
 
-## 8. Start the Background Worker
+## 8. Start the Background Workers
 
-The worker job is defined in `jobs.yaml`:
+WikiVisage uses 2 concurrent worker instances for distributed processing. Workers claim projects via `SELECT … FOR UPDATE` with automatic stale-claim expiry (15 min).
+
+Load both workers from `jobs.yaml`:
 
 ```bash
 toolforge jobs load jobs.yaml
 ```
 
-if fails
-```bash
-toolforge jobs run ml-worker --command "python -u worker.py" --image tool-wikivisage/tool-wikivisage:latest --continuous --mem 2G
-```
+This starts two continuous jobs (`ml-worker` and `ml-worker-2`) that crawl Commons categories, download images, detect faces, and run the classification model. Each worker polls for new work every 60 seconds.
 
-This starts a continuous job (`ml-worker`) that crawls Commons categories, downloads images, detects faces, and runs the classification model. It polls for new work every 60 seconds.
+If `jobs.yaml` loading fails, start workers manually:
+
+```bash
+toolforge jobs run ml-worker \
+  --command 'python -u worker.py --worker-id ml-worker-1' \
+  --image tool-wikivisage/tool-wikivisage:latest \
+  --continuous --mem 3Gi
+
+toolforge jobs run ml-worker-2 \
+  --command 'python -u worker.py --worker-id ml-worker-2' \
+  --image tool-wikivisage/tool-wikivisage:latest \
+  --continuous --mem 3Gi
+```
 
 Check worker status:
 
 ```bash
 toolforge jobs list
 toolforge jobs logs ml-worker
+toolforge jobs logs ml-worker-2
 ```
 
 ---
@@ -176,6 +188,19 @@ toolforge jobs logs ml-worker
 
 ---
 
+## Automated Deployment (CD)
+
+Releases trigger an automated deployment via `.github/workflows/deploy.yml`. The CD workflow:
+
+1. Builds a new container image from the release tag
+2. Runs schema migration
+3. Restarts both workers (`ml-worker` and `ml-worker-2`)
+4. Restarts the web service
+
+To deploy manually, use the **workflow_dispatch** trigger on the Actions tab with a git tag. The workflow also supports an optional database wipe (requires typing `WIPE` as confirmation).
+
+---
+
 ## Common Operations
 
 ### View logs
@@ -184,11 +209,14 @@ toolforge jobs logs ml-worker
 # Web service logs
 toolforge webservice logs
 
-# Worker logs
+# Worker logs (both instances)
 toolforge jobs logs ml-worker
+toolforge jobs logs ml-worker-2
 ```
 
 ### Rebuild after code changes
+
+The recommended approach is to create a GitHub release, which triggers the CD workflow automatically. For manual rebuilds:
 
 ```bash
 # Rebuild the image
@@ -200,8 +228,12 @@ toolforge build show
 # Restart web service
 toolforge webservice restart
 
-# Restart worker
-toolforge jobs restart ml-worker
+# Restart both workers (delete + run because jobs load doesn't restart unchanged jobs)
+toolforge jobs delete ml-worker || true
+toolforge jobs run ml-worker --command 'python -u worker.py --worker-id ml-worker-1' --image tool-wikivisage/tool-wikivisage:latest --continuous --mem 3Gi
+
+toolforge jobs delete ml-worker-2 || true
+toolforge jobs run ml-worker-2 --command 'python -u worker.py --worker-id ml-worker-2' --image tool-wikivisage/tool-wikivisage:latest --continuous --mem 3Gi
 ```
 
 ### Restart web service only
@@ -215,6 +247,7 @@ toolforge webservice restart
 ```bash
 toolforge webservice stop
 toolforge jobs delete ml-worker
+toolforge jobs delete ml-worker-2
 ```
 
 ### Re-run migration (after schema changes)
@@ -235,7 +268,10 @@ toolforge envvars create FLASK_SECRET_KEY "<new-value>"
 
 # Restart services to pick up changes
 toolforge webservice restart
-toolforge jobs restart ml-worker
+toolforge jobs delete ml-worker || true
+toolforge jobs run ml-worker --command 'python -u worker.py --worker-id ml-worker-1' --image tool-wikivisage/tool-wikivisage:latest --continuous --mem 3Gi
+toolforge jobs delete ml-worker-2 || true
+toolforge jobs run ml-worker-2 --command 'python -u worker.py --worker-id ml-worker-2' --image tool-wikivisage/tool-wikivisage:latest --continuous --mem 3Gi
 ```
 
 ### Update the whitelist
@@ -253,19 +289,24 @@ toolforge webservice restart
 
 ### "The background worker appears to be offline" banner
 
-The web app checks if the worker has sent a heartbeat in the last 5 minutes. If you see this banner:
+The web app checks if a worker has sent a heartbeat in the last 5 minutes. If you see this banner:
 
 ```bash
-# Check if the worker is running
+# Check if workers are running
 toolforge jobs list
 
 # Check worker logs for errors
 toolforge jobs logs ml-worker
+toolforge jobs logs ml-worker-2
 
-# Restart the worker
-toolforge jobs restart ml-worker
+# Restart workers
+toolforge jobs delete ml-worker || true
+toolforge jobs run ml-worker --command 'python -u worker.py --worker-id ml-worker-1' --image tool-wikivisage/tool-wikivisage:latest --continuous --mem 3Gi
 
-# Or reload from jobs.yaml (e.g., after changing memory/image settings)
+toolforge jobs delete ml-worker-2 || true
+toolforge jobs run ml-worker-2 --command 'python -u worker.py --worker-id ml-worker-2' --image tool-wikivisage/tool-wikivisage:latest --continuous --mem 3Gi
+
+# Or reload from jobs.yaml
 toolforge jobs load jobs.yaml
 ```
 
@@ -290,4 +331,4 @@ toolforge build show
 
 - Verify credentials: `toolforge envvars list`
 - Verify the database exists: `mariadb --defaults-file=$HOME/replica.my.cnf -h tools.db.svc.wikimedia.cloud -e "SHOW DATABASES LIKE '%wikiface%'"`
-- Check that migration has run: look for 6 tables in the database
+- Check that migration has run: look for 7 tables in the database
