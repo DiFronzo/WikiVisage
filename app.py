@@ -1140,7 +1140,29 @@ def project_new():
         # MySQL error 1062 (ER_DUP_ENTRY) means a soft-deleted row with the same
         # user_id + wikidata_qid + commons_category still exists.  The background
         # worker will hard-delete it on the next poll cycle (≤60 s).
-        if "1062" in str(exc):
+        def _is_duplicate_entry_error(db_exc: Exception) -> bool:
+            """
+            Return True if the given database exception represents a MySQL
+            duplicate-entry (error code 1062) condition.
+            """
+            # SQLAlchemy-style wrappers often expose the underlying DB-API error
+            # via an `orig` attribute.
+            orig = getattr(db_exc, "orig", None)
+            if orig is not None and getattr(orig, "args", None):
+                try:
+                    return int(orig.args[0]) == 1062
+                except (ValueError, TypeError, IndexError):
+                    pass
+            # Fall back to checking the exception's own args, as used by many
+            # MySQL DB-API drivers where args[0] is the numeric error code.
+            if getattr(db_exc, "args", None):
+                try:
+                    return int(db_exc.args[0]) == 1062
+                except (ValueError, TypeError, IndexError):
+                    pass
+            return False
+
+        if _is_duplicate_entry_error(exc):
             logger.info("Project creation blocked by pending soft-deleted row: %s", exc)
             flash(
                 _(
