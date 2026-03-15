@@ -15,9 +15,9 @@ Only the latest release deployed on Toolforge receives security updates.
 Instead, report them privately:
 
 1. **GitHub Security Advisories (preferred):** Go to [Security → Advisories → New draft advisory](https://github.com/DiFronzo/WikiVisage/security/advisories/new) and fill in the details.
-2. **Email:** Send details to the repository owner listed in the [LICENSE](LICENSE).
 
 Include as much of the following as possible:
+
 
 - Description of the vulnerability
 - Steps to reproduce
