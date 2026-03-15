@@ -478,6 +478,7 @@
             var textEl = document.getElementById("pwa-install-text");
             var btn = document.getElementById("pwa-install-btn");
             var deferredPrompt = null;
+            var fallbackTimer = null;
 
             function showPwaBanner() {
                 /* Wait until cookie consent is resolved before showing */
@@ -508,6 +509,11 @@
                     e.preventDefault();
                     promptFired = true;
                     deferredPrompt = e;
+                    if (fallbackTimer) {
+                        clearTimeout(fallbackTimer);
+                        fallbackTimer = null;
+                    }
+                    btn.style.display = "inline-block";
                     textEl.textContent = {{ _('Classify faces faster! Add WikiVisage to your home screen for instant, full-screen access.')|tojson }};
                     showPwaBanner();
                 });
@@ -519,7 +525,7 @@
                         banner.style.display = "none";
                     });
                 });
-                setTimeout(function() {
+                fallbackTimer = setTimeout(function() {
                     if (!promptFired) {
                         textEl.textContent = {{ _('Classify faces on the go! Tap your browser menu and choose "Install" to get the app.')|tojson }};
                         btn.style.display = "none";
