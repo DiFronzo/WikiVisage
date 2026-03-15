@@ -16,6 +16,10 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Optional throttle (in seconds) between image downloads and processing to
+# avoid overloading Commons or downstream services. Defaults to 0 (no delay).
+COMMONS_DOWNLOAD_THROTTLE_SECONDS = float(os.getenv("COMMONS_DOWNLOAD_THROTTLE_SECONDS", "0"))
+
 import warnings
 
 warnings.filterwarnings("ignore", category=UserWarning, module="pkg_resources")
@@ -56,6 +60,13 @@ MAX_IMAGE_PIXELS = 100_000_000
 # Maximum images per project — stops category traversal once this limit is reached
 MAX_IMAGES_PER_PROJECT = 9000
 
+# Maximum images the bootstrap (P180 seeding) will fetch — keeps slots free for untagged category images
+MAX_BOOTSTRAP_IMAGES = 1000
+
+# Maximum number of new (image_count==0) projects to fast-track per poll cycle
+# Keeping this at 1 prevents serial traversal work from starving the thread pool
+MAX_FAST_TRACK_PER_WAKEUP = 1
+
 # Non-image file extensions to skip during category traversal (video, audio)
 _SKIP_EXTENSIONS = {".webm", ".ogv", ".ogg", ".mp3", ".wav", ".flac", ".opus", ".mid", ".oga"}
 
@@ -87,8 +98,8 @@ def _create_session() -> requests.Session:
     session = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT})
     retries = Retry(
-        total=3,
-        backoff_factor=1,
+        total=5,
+        backoff_factor=2,
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=["HEAD", "GET", "OPTIONS", "POST"],
     )
@@ -699,6 +710,9 @@ def _process_single_image(
         _validate_image_dimensions(image_bytes)
         t_download = time.monotonic()
 
+        if COMMONS_DOWNLOAD_THROTTLE_SECONDS > 0:
+            time.sleep(COMMONS_DOWNLOAD_THROTTLE_SECONDS)
+
         face_locations, encodings_bytes, det_width, det_height = _run_face_detection(image_bytes)
         del image_bytes
         t_detect = time.monotonic()
@@ -859,6 +873,21 @@ def bootstrap_from_sparql(project: dict[str, Any]) -> int:
     if count_row and count_row[0]["cnt"] > 0:
         return 0
 
+    # Enforce global image cap (same as traverse_category)
+    existing_count_rows = execute_query(
+        "SELECT COUNT(*) AS cnt FROM images WHERE project_id = %s",
+        (project["id"],),
+        fetch=True,
+    )
+    existing_count = existing_count_rows[0]["cnt"] if existing_count_rows else 0
+    if existing_count >= MAX_IMAGES_PER_PROJECT:
+        logger.info(
+            f"Project {project['id']} already has {existing_count} images "
+            f"(limit {MAX_IMAGES_PER_PROJECT}), skipping bootstrap."
+        )
+        return 0
+    remaining_global = MAX_IMAGES_PER_PROJECT - existing_count
+
     qid = project["wikidata_qid"]
     search_params: dict[str, Any] = {
         "action": "query",
@@ -871,19 +900,51 @@ def bootstrap_from_sparql(project: dict[str, Any]) -> int:
 
     try:
         flagged_count = 0
+        inserted_count = 0
+        results_seen = 0
+        bootstrap_cap = min(MAX_BOOTSTRAP_IMAGES, remaining_global)
+        # Hard limit on API results to scan — prevents infinite pagination
+        # when most results are already known (flagged_count stays low).
+        max_results_to_scan = max(bootstrap_cap * 3, 500)
 
         while True:
             if shutdown_requested:
+                break
+
+            if flagged_count >= bootstrap_cap:
+                logger.info(
+                    f"Bootstrap reached cap ({bootstrap_cap}) for project {project['id']}"
+                    f" (bootstrap limit={MAX_BOOTSTRAP_IMAGES}, global remaining={remaining_global})"
+                )
+                break
+
+            if inserted_count >= remaining_global:
+                logger.info(
+                    f"Bootstrap reached global image limit for project {project['id']}"
+                    f" (inserted {inserted_count}, global remaining was {remaining_global})"
+                )
+                break
+
+            if results_seen >= max_results_to_scan:
+                logger.info(
+                    f"Bootstrap scanned {results_seen} results without reaching cap "
+                    f"(flagged {flagged_count}/{bootstrap_cap}), stopping pagination "
+                    f"for project {project['id']}"
+                )
                 break
 
             resp = _api_request(COMMONS_API_URL, params=search_params)
             data = resp.json()
             results = data.get("query", {}).get("search", [])
 
+            if not results:
+                break
+
             for result in results:
                 if shutdown_requested:
                     break
 
+                results_seen += 1
                 page_id = result.get("pageid")
                 title = result.get("title")
 
@@ -912,6 +973,10 @@ def bootstrap_from_sparql(project: dict[str, Any]) -> int:
                         if affected:
                             flagged_count += 1
                 else:
+                    # Enforce global image cap before inserting new images
+                    if inserted_count >= remaining_global:
+                        continue
+
                     # New image not in category — insert as pending + bootstrapped
                     affected = execute_query(
                         """
@@ -923,6 +988,7 @@ def bootstrap_from_sparql(project: dict[str, Any]) -> int:
                     )
                     if affected:
                         flagged_count += 1
+                        inserted_count += 1
                     else:
                         # Race: another process inserted this image between our
                         # SELECT and INSERT.  Ensure it gets the bootstrap flag.
@@ -948,7 +1014,10 @@ def bootstrap_from_sparql(project: dict[str, Any]) -> int:
                 (project["id"], project["id"]),
                 fetch=False,
             )
-            logger.info(f"Bootstrap flagged {flagged_count} images for project {project['id']}")
+            logger.info(
+                f"Bootstrap flagged {flagged_count} images for project {project['id']}"
+                f" ({inserted_count} new inserts, {flagged_count - inserted_count} existing flagged)"
+            )
 
         return flagged_count
 
@@ -1146,6 +1215,17 @@ def run_autonomous_inference(project: dict[str, Any]) -> int:
         f"distances={t_distance - t_distance_start:.2f}s, "
         f"db_update={t_db - t_db_start:.2f}s, total={t_db - t_start:.2f}s"
     )
+
+    # Record which settings were used for this inference run so the web UI
+    # can detect whether a re-run is needed after settings change.
+    try:
+        execute_query(
+            "UPDATE projects SET last_inference_threshold = %s, last_inference_min_confirmed = %s WHERE id = %s",
+            (threshold, min_confirmed, project["id"]),
+            fetch=False,
+        )
+    except Exception:
+        logger.warning(f"Project {project['id']}: failed to record inference settings", exc_info=True)
 
     return classified_count
 
@@ -1509,8 +1589,14 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
     return total_written
 
 
-def process_project(project: dict[str, Any]) -> None:
-    """Orchestrate all phases for a single project."""
+def process_project(project: dict[str, Any], *, skip_discovery: bool = False) -> None:
+    """Orchestrate all phases for a single project.
+
+    Args:
+        project: Project row dict from DB (must include 'id', 'wikidata_qid', etc.).
+        skip_discovery: If True, skip traverse_category and bootstrap_from_sparql
+            (useful when these were already run in a fast-track pass).
+    """
     t_project_start = time.monotonic()
     project_id = project["id"]
     logger.info(f"--- Processing project {project_id} ({project['wikidata_qid']}) ---")
@@ -1539,21 +1625,34 @@ def process_project(project: dict[str, Any]) -> None:
             return True  # On DB error, keep going rather than silently dropping work
 
     try:
-        # 1. Traversal
-        t0 = time.monotonic()
-        traverse_category(project)
-        t_traversal = time.monotonic() - t0
-
-        if shutdown_requested or not _is_still_active():
+        # Early bail-out: the project may have been deleted / paused between the
+        # moment it was queued in the thread-pool and the moment this thread
+        # actually starts running.  Checking here avoids wasted traversal and
+        # bootstrap work for projects that are no longer active.
+        if not _is_still_active():
             return
 
-        # 2. Bootstrap (if needed)
-        t0 = time.monotonic()
-        bootstrap_from_sparql(project)
-        t_bootstrap = time.monotonic() - t0
+        t_traversal = 0.0
+        t_bootstrap = 0.0
 
-        if shutdown_requested or not _is_still_active():
-            return
+        if skip_discovery:
+            logger.info(f"Project {project_id}: skipping discovery (already fast-tracked)")
+        else:
+            # 1. Traversal
+            t0 = time.monotonic()
+            traverse_category(project)
+            t_traversal = time.monotonic() - t0
+
+            if shutdown_requested or not _is_still_active():
+                return
+
+            # 2. Bootstrap (if needed)
+            t0 = time.monotonic()
+            bootstrap_from_sparql(project)
+            t_bootstrap = time.monotonic() - t0
+
+            if shutdown_requested or not _is_still_active():
+                return
 
         # 3. Image Download & Face Detection — process all pending images
         #    Interleave inference every 5 batches so results appear progressively
@@ -1576,7 +1675,7 @@ def process_project(project: dict[str, Any]) -> None:
             if batches_since_inference >= 5:
                 batches_since_inference = 0
                 fresh = execute_query(
-                    "SELECT * FROM projects WHERE id = %s",
+                    "SELECT * FROM projects WHERE id = %s AND status != 'deleted'",
                     (project["id"],),
                     fetch=True,
                 )
@@ -1589,7 +1688,9 @@ def process_project(project: dict[str, Any]) -> None:
         # 4. Final Autonomous Inference (catch any remaining unclassified faces)
         t0 = time.monotonic()
         if not shutdown_requested and _is_still_active():
-            fresh = execute_query("SELECT * FROM projects WHERE id = %s", (project_id,), fetch=True)
+            fresh = execute_query(
+                "SELECT * FROM projects WHERE id = %s AND status != 'deleted'", (project_id,), fetch=True
+            )
             if fresh and isinstance(fresh, list):
                 run_autonomous_inference(fresh[0])
             else:
@@ -1714,7 +1815,7 @@ def main():
 
                 # Check for SDC write requests
                 sdc_projects = execute_query(
-                    "SELECT p.* FROM projects p WHERE p.sdc_write_requested = 1",
+                    "SELECT p.* FROM projects p WHERE p.sdc_write_requested = 1 AND p.status != 'deleted'",
                     fetch=True,
                 )
                 sdc_count = len(sdc_projects) if isinstance(sdc_projects, list) else 0
@@ -1725,6 +1826,44 @@ def main():
                     f"{sdc_count} SDC write request(s)"
                 )
 
+                # Fast-track new projects: run discovery (traverse + bootstrap) immediately
+                # so they don't wait behind long-running image processing in the thread pool.
+                fast_tracked_ids = set()
+                fast_tracked_count = 0
+                if active_projects and isinstance(active_projects, list):
+                    for project in active_projects:
+                        if shutdown_requested:
+                            break
+                        # Apply a per-cycle cap to keep the poll loop responsive.
+                        if fast_tracked_count >= MAX_FAST_TRACK_PER_WAKEUP:
+                            logger.debug(
+                                "Reached per-cycle fast-track cap "
+                                f"({MAX_FAST_TRACK_PER_WAKEUP}); deferring remaining projects"
+                            )
+                            break
+                        if project.get("image_count", 0) == 0:
+                            logger.info(
+                                f"Fast-tracking new project {project['id']} "
+                                f"({project['wikidata_qid']}): running discovery"
+                            )
+                            try:
+                                traverse_category(project)
+                                if not shutdown_requested:
+                                    bootstrap_from_sparql(project)
+                                fast_tracked_ids.add(project["id"])
+                                fast_tracked_count += 1
+                            except Exception as e:
+                                logger.error(f"Fast-track discovery failed for project {project['id']}: {e}")
+
+                if fast_tracked_ids:
+                    try:
+                        execute_query(
+                            "REPLACE INTO worker_heartbeat (id, last_seen) VALUES (1, NOW())",
+                            fetch=False,
+                        )
+                    except Exception:
+                        pass
+
                 # Process active projects concurrently
                 seen_ids = set()
                 if active_projects and isinstance(active_projects, list):
@@ -1734,7 +1873,8 @@ def main():
                             if shutdown_requested:
                                 break
                             seen_ids.add(project["id"])
-                            future = executor.submit(process_project, project)
+                            skip = project["id"] in fast_tracked_ids
+                            future = executor.submit(process_project, project, skip_discovery=skip)
                             futures[future] = project["id"]
 
                         last_heartbeat = time.time()
@@ -1768,11 +1908,35 @@ def main():
                                     fetch=True,
                                 )
                                 if new_projects and isinstance(new_projects, list):
+                                    # Limit to 1 fast-tracked project per wake-up to avoid
+                                    # starving the thread-pool with serial traversal work.
+                                    fast_tracked_this_wakeup = 0
                                     for project in new_projects:
                                         if project["id"] not in seen_ids:
                                             seen_ids.add(project["id"])
+                                            skip = False
+                                            # Fast-track new projects discovered mid-cycle
+                                            if (
+                                                project.get("image_count", 0) == 0
+                                                and fast_tracked_this_wakeup < MAX_FAST_TRACK_PER_WAKEUP
+                                            ):
+                                                logger.info(
+                                                    f"Fast-tracking new project {project['id']} "
+                                                    f"({project['wikidata_qid']}): running discovery"
+                                                )
+                                                try:
+                                                    traverse_category(project)
+                                                    if not shutdown_requested:
+                                                        bootstrap_from_sparql(project)
+                                                    skip = True
+                                                    fast_tracked_this_wakeup += 1
+                                                except Exception as e:
+                                                    logger.error(
+                                                        f"Fast-track discovery failed for project {project['id']}: {e}"
+                                                    )
+                                                last_heartbeat = 0  # force heartbeat refresh on next iteration
                                             logger.info(f"Adding new project {project['id']} to current cycle")
-                                            future = executor.submit(process_project, project)
+                                            future = executor.submit(process_project, project, skip_discovery=skip)
                                             futures[future] = project["id"]
 
                             done = {f for f in futures if f.done()}
@@ -1844,6 +2008,18 @@ def main():
                                 )
                             except DatabaseError:
                                 pass
+
+                # Hard-delete soft-deleted projects (FK CASCADE cleans images + faces)
+                if not shutdown_requested:
+                    try:
+                        deleted = execute_query(
+                            "DELETE FROM projects WHERE status = 'deleted'",
+                            fetch=False,
+                        )
+                        if deleted:
+                            logger.info(f"Purged {deleted} soft-deleted project(s)")
+                    except DatabaseError as exc:
+                        logger.warning("Failed to purge soft-deleted projects: %s", exc)
 
                 for _ in range(POLL_INTERVAL):
                     if shutdown_requested:

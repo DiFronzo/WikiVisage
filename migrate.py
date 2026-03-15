@@ -237,6 +237,21 @@ _ALTER_MIGRATIONS = [
         "Add index on faces(sdc_removal_pending)",
         "ALTER TABLE faces ADD INDEX idx_faces_sdc_removal (sdc_removal_pending)",
     ),
+    (
+        "Add last_inference_threshold to projects",
+        "ALTER TABLE projects ADD COLUMN last_inference_threshold FLOAT NULL "
+        "COMMENT 'distance_threshold used in last inference run' AFTER faces_confirmed",
+    ),
+    (
+        "Add last_inference_min_confirmed to projects",
+        "ALTER TABLE projects ADD COLUMN last_inference_min_confirmed INT UNSIGNED NULL "
+        "COMMENT 'min_confirmed used in last inference run' AFTER last_inference_threshold",
+    ),
+    (
+        "Add 'deleted' to projects.status ENUM for soft-delete support",
+        "ALTER TABLE projects MODIFY COLUMN status "
+        "ENUM('active', 'paused', 'completed', 'deleted') NOT NULL DEFAULT 'active'",
+    ),
 ]
 
 

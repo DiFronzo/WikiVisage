@@ -6,7 +6,7 @@ Provides OAuth 2.0 authentication, project management, and an active
 learning interface for classifying detected faces.
 """
 
-APP_VERSION = "0.2.6"
+APP_VERSION = "0.3.0"
 
 import hashlib
 import io
@@ -574,6 +574,7 @@ def _fetch_wikidata_label(qid: str) -> str | None:
                 "ids": qid,
                 "props": "labels",
                 "languages": languages,
+                "languagefallback": "1",
                 "format": "json",
             },
             headers={"User-Agent": USER_AGENT},
@@ -813,7 +814,7 @@ def dashboard():
 
     try:
         count_row = execute_query(
-            "SELECT COUNT(*) AS cnt FROM projects WHERE user_id = %s",
+            "SELECT COUNT(*) AS cnt FROM projects WHERE user_id = %s AND status != 'deleted'",
             (g.user["id"],),
         )
         total = count_row[0]["cnt"] if count_row else 0
@@ -827,7 +828,7 @@ def dashboard():
 
     try:
         projects = execute_query(
-            "SELECT * FROM projects WHERE user_id = %s ORDER BY updated_at DESC LIMIT %s OFFSET %s",
+            "SELECT * FROM projects WHERE user_id = %s AND status != 'deleted' ORDER BY updated_at DESC LIMIT %s OFFSET %s",
             (g.user["id"], PROJECTS_PER_PAGE, offset),
         )
     except DatabaseError:
@@ -1085,7 +1086,8 @@ def project_new():
     # Check for duplicate
     try:
         existing = execute_query(
-            "SELECT id FROM projects WHERE user_id = %s AND wikidata_qid = %s AND commons_category = %s",
+            "SELECT id FROM projects WHERE user_id = %s AND wikidata_qid = %s AND commons_category = %s "
+            "AND status != 'deleted'",
             (g.user["id"], wikidata_qid, commons_category),
         )
         if existing:
@@ -1134,9 +1136,44 @@ def project_new():
             pass  # Non-critical — worker will pick it up on next poll
 
         return redirect(url_for("dashboard"))
-    except DatabaseError:
-        logger.exception("Failed to create project")
-        flash(_("Failed to create project. Please try again."), "error")
+    except DatabaseError as exc:
+        # MySQL error 1062 (ER_DUP_ENTRY) means a soft-deleted row with the same
+        # user_id + wikidata_qid + commons_category still exists.  The background
+        # worker will hard-delete it on the next poll cycle (≤60 s).
+        def _is_duplicate_entry_error(db_exc: Exception) -> bool:
+            """
+            Return True if the given database exception represents a MySQL
+            duplicate-entry (error code 1062) condition.
+            """
+            # SQLAlchemy-style wrappers often expose the underlying DB-API error
+            # via an `orig` attribute.
+            orig = getattr(db_exc, "orig", None)
+            if orig is not None and getattr(orig, "args", None):
+                try:
+                    return int(orig.args[0]) == 1062
+                except (ValueError, TypeError, IndexError):
+                    pass
+            # Fall back to checking the exception's own args, as used by many
+            # MySQL DB-API drivers where args[0] is the numeric error code.
+            if getattr(db_exc, "args", None):
+                try:
+                    return int(db_exc.args[0]) == 1062
+                except (ValueError, TypeError, IndexError):
+                    pass
+            return False
+
+        if _is_duplicate_entry_error(exc):
+            logger.info("Project creation blocked by pending soft-deleted row: %s", exc)
+            flash(
+                _(
+                    "A previously deleted project with this Q-ID and category is still "
+                    "being cleaned up. Please try again in a minute."
+                ),
+                "error",
+            )
+        else:
+            logger.exception("Failed to create project")
+            flash(_("Failed to create project. Please try again."), "error")
         return render_template(
             "project_new.html",
             wikidata_qid=wikidata_qid,
@@ -1153,7 +1190,7 @@ def project_detail(project_id: int):
     """Project detail page with progress and stats."""
     try:
         rows = execute_query(
-            "SELECT * FROM projects WHERE id = %s AND user_id = %s",
+            "SELECT * FROM projects WHERE id = %s AND user_id = %s AND status != 'deleted'",
             (project_id, g.user["id"]),
         )
     except DatabaseError:
@@ -1281,7 +1318,7 @@ def classify(project_id: int):
     # Verify project ownership
     try:
         rows = execute_query(
-            "SELECT * FROM projects WHERE id = %s AND user_id = %s",
+            "SELECT * FROM projects WHERE id = %s AND user_id = %s AND status != 'deleted'",
             (project_id, g.user["id"]),
         )
     except DatabaseError:
@@ -1452,7 +1489,8 @@ def classify(project_id: int):
             "SELECT COUNT(DISTINCT i.id) AS cnt "
             "FROM images i "
             "JOIN faces f ON f.image_id = i.id "
-            "WHERE i.project_id = %s AND f.is_target = 0 AND f.classified_by = 'model' AND f.superseded_by IS NULL",
+            "WHERE i.project_id = %s AND f.is_target = 0 AND f.classified_by = 'model' "
+            "AND f.classified_by_user_id IS NULL AND f.superseded_by IS NULL",
             (project_id,),
         )
         model_review_count = model_remaining[0]["cnt"] if model_remaining else 0
@@ -1514,7 +1552,7 @@ def api_classify():
         check = execute_query(
             "SELECT i.id FROM images i "
             "JOIN projects p ON i.project_id = p.id "
-            "WHERE i.id = %s AND p.id = %s AND p.user_id = %s",
+            "WHERE i.id = %s AND p.id = %s AND p.user_id = %s AND p.status != 'deleted'",
             (image_id, project_id, g.user["id"]),
         )
         if not check:
@@ -1681,7 +1719,7 @@ def api_undo_classify():
         check = execute_query(
             "SELECT i.id FROM images i "
             "JOIN projects p ON i.project_id = p.id "
-            "WHERE i.id = %s AND p.id = %s AND p.user_id = %s",
+            "WHERE i.id = %s AND p.id = %s AND p.user_id = %s AND p.status != 'deleted'",
             (image_id, project_id, g.user["id"]),
         )
         if not check:
@@ -1797,7 +1835,7 @@ def api_manual_face():
         check = execute_query(
             "SELECT i.id, i.file_title FROM images i "
             "JOIN projects p ON i.project_id = p.id "
-            "WHERE i.id = %s AND p.id = %s AND p.user_id = %s",
+            "WHERE i.id = %s AND p.id = %s AND p.user_id = %s AND p.status != 'deleted'",
             (image_id, project_id, g.user["id"]),
         )
         if not check:
@@ -2034,7 +2072,7 @@ def api_reclassify():
             "FROM faces f "
             "JOIN images i ON f.image_id = i.id "
             "JOIN projects p ON i.project_id = p.id "
-            "WHERE f.id = %s AND p.user_id = %s AND f.superseded_by IS NULL",
+            "WHERE f.id = %s AND p.user_id = %s AND f.superseded_by IS NULL AND p.status != 'deleted'",
             (face_id, g.user["id"]),
         )
         if not rows:
@@ -2221,7 +2259,7 @@ def api_update_face_bbox():
             "FROM faces f "
             "JOIN images i ON f.image_id = i.id "
             "JOIN projects p ON i.project_id = p.id "
-            "WHERE f.id = %s AND p.user_id = %s AND f.superseded_by IS NULL",
+            "WHERE f.id = %s AND p.user_id = %s AND f.superseded_by IS NULL AND p.status != 'deleted'",
             (face_id, g.user["id"]),
         )
         if not rows:
@@ -2319,7 +2357,7 @@ def api_write_sdc(project_id: int):
     # Verify project ownership
     try:
         rows = execute_query(
-            "SELECT id, sdc_write_requested FROM projects WHERE id = %s AND user_id = %s",
+            "SELECT id, sdc_write_requested FROM projects WHERE id = %s AND user_id = %s AND status != 'deleted'",
             (project_id, g.user["id"]),
         )
         if not rows:
@@ -2392,7 +2430,8 @@ def api_sdc_status(project_id: int):
     pending, and whether the worker is actively writing."""
     try:
         rows = execute_query(
-            "SELECT id, sdc_write_requested, sdc_write_error FROM projects WHERE id = %s AND user_id = %s",
+            "SELECT id, sdc_write_requested, sdc_write_error FROM projects WHERE id = %s AND user_id = %s "
+            "AND status != 'deleted'",
             (project_id, g.user["id"]),
         )
         if not rows:
@@ -2442,7 +2481,8 @@ def api_progress(project_id: int):
     """Poll endpoint for image processing progress."""
     try:
         rows = execute_query(
-            "SELECT images_processed, images_total, status FROM projects WHERE id = %s AND user_id = %s",
+            "SELECT images_processed, images_total, status FROM projects "
+            "WHERE id = %s AND user_id = %s AND status != 'deleted'",
             (project_id, g.user["id"]),
         )
         if not rows:
@@ -2522,7 +2562,7 @@ def project_settings(project_id: int):
     """Edit project settings."""
     try:
         rows = execute_query(
-            "SELECT * FROM projects WHERE id = %s AND user_id = %s",
+            "SELECT * FROM projects WHERE id = %s AND user_id = %s AND status != 'deleted'",
             (project_id, g.user["id"]),
         )
     except DatabaseError:
@@ -2589,6 +2629,31 @@ def project_settings(project_id: int):
             fetch=False,
         )
         flash(_("Settings updated."), "success")
+
+        try:
+            stats = execute_query(
+                "SELECT "
+                "  SUM(CASE WHEN f.is_target = 1 AND f.classified_by_user_id IS NOT NULL "
+                "      THEN 1 ELSE 0 END) AS human_confirmed "
+                "FROM faces f "
+                "JOIN images i ON f.image_id = i.id "
+                "WHERE i.project_id = %s AND f.superseded_by IS NULL",
+                (project_id,),
+            )
+            human_confirmed = (stats[0]["human_confirmed"] or 0) if stats else 0
+            if human_confirmed < min_confirmed:
+                flash(
+                    _(
+                        "Warning: You currently have %(confirmed)d/%(min)d human-confirmed target faces. "
+                        "Autonomous inference will not run until this threshold is met.",
+                        confirmed=human_confirmed,
+                        min=min_confirmed,
+                    ),
+                    "warning",
+                )
+        except DatabaseError:
+            pass
+
         return redirect(url_for("project_detail", project_id=project_id))
     except DatabaseError:
         logger.exception("Failed to update project settings")
@@ -2596,16 +2661,101 @@ def project_settings(project_id: int):
         return render_template("project_settings.html", project=project)
 
 
+@app.route("/project/<int:project_id>/rerun-inference", methods=["POST"])
+@login_required
+def project_rerun_inference(project_id: int):
+    """Reset model-classified faces so the worker re-runs inference with current settings."""
+    if not _validate_csrf():
+        abort(400, _("Invalid CSRF token"))
+
+    try:
+        rows = execute_query(
+            "SELECT id, distance_threshold, min_confirmed, "
+            "last_inference_threshold, last_inference_min_confirmed "
+            "FROM projects WHERE id = %s AND user_id = %s AND status != 'deleted'",
+            (project_id, g.user["id"]),
+        )
+    except DatabaseError:
+        abort(500)
+
+    if not rows:
+        abort(404)
+
+    project = rows[0]
+
+    if (
+        project["last_inference_threshold"] is not None
+        and project["last_inference_min_confirmed"] is not None
+        and abs(float(project["distance_threshold"]) - float(project["last_inference_threshold"])) < 1e-6
+        and int(project["min_confirmed"]) == int(project["last_inference_min_confirmed"])
+    ):
+        flash(_("Settings have not changed since the last inference run. No re-run needed."), "info")
+        return redirect(url_for("project_settings", project_id=project_id))
+
+    try:
+
+        def _reset_inference(conn, cursor):
+            cursor.execute(
+                "UPDATE faces f "
+                "JOIN images i ON f.image_id = i.id "
+                "SET f.is_target = NULL, f.classified_by = NULL, f.confidence = NULL "
+                "WHERE i.project_id = %s "
+                "AND f.classified_by = 'model' "
+                "AND f.classified_by_user_id IS NULL "
+                "AND f.sdc_written = 0 "
+                "AND f.superseded_by IS NULL",
+                (project_id,),
+            )
+            rows_reset = cursor.rowcount
+            if rows_reset:
+                cursor.execute(
+                    "UPDATE projects SET last_inference_threshold = NULL, last_inference_min_confirmed = NULL "
+                    "WHERE id = %s",
+                    (project_id,),
+                )
+            return rows_reset
+
+        affected = execute_transaction(_reset_inference)
+        if affected:
+            flash(
+                _(
+                    "Reset %(num)d model-classified faces. The worker will re-classify them on the next cycle.",
+                    num=affected,
+                ),
+                "success",
+            )
+            # Signal the worker to wake up and re-run inference immediately
+            try:
+                wake_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".worker-wake-up")
+                with open(wake_file, "w") as f:
+                    f.write("")
+            except OSError:
+                pass  # Non-critical — worker will pick it up on next poll
+        else:
+            flash(_("No model-classified faces to reset."), "info")
+    except DatabaseError:
+        logger.exception("Failed to reset model-classified faces")
+        flash(_("Failed to re-run inference."), "error")
+
+    return redirect(url_for("project_settings", project_id=project_id))
+
+
 @app.route("/project/<int:project_id>/delete", methods=["POST"])
 @login_required
 def project_delete(project_id: int):
-    """Delete a project and all associated data (cascades via FK)."""
+    """Soft-delete a project by setting status to 'deleted'.
+
+    The background worker hard-deletes soft-deleted projects (and their
+    cascaded images/faces) once it confirms it is no longer processing them.
+    This prevents FK constraint violations from the worker trying to INSERT
+    faces for images that were cascade-deleted mid-processing.
+    """
     if not _validate_csrf():
         abort(400, _("Invalid CSRF token"))
 
     try:
         affected = execute_query(
-            "DELETE FROM projects WHERE id = %s AND user_id = %s",
+            "UPDATE projects SET status = 'deleted' WHERE id = %s AND user_id = %s AND status != 'deleted'",
             (project_id, g.user["id"]),
             fetch=False,
         )
@@ -2613,8 +2763,8 @@ def project_delete(project_id: int):
             flash(_("Project deleted."), "warning")
         else:
             flash(_("Project not found."), "error")
-    except DatabaseError:
-        logger.exception("Failed to delete project")
+    except DatabaseError as exc:
+        logger.exception("Failed to delete project %s: %s", project_id, exc)
         flash(_("Failed to delete project."), "error")
 
     return redirect(url_for("dashboard"))

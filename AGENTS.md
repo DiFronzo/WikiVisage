@@ -8,11 +8,11 @@ Active-learning Flask app for Wikimedia Commons. Users classify faces via yes/no
 
 ```
 WikiVisage/
-├── app.py              # Flask web app: OAuth, routes, classification API (~2660 lines)
-├── worker.py           # Background ML pipeline: crawl, detect, infer (~1730 lines)
-├── database.py         # MariaDB connection pool with retry logic (~480 lines)
+├── app.py              # Flask web app: OAuth, routes, classification API (~2750 lines)
+├── worker.py           # Background ML pipeline: crawl, detect, infer (~1880 lines)
+├── database.py         # MariaDB connection pool with retry logic (~485 lines)
 ├── schema.sql          # DDL for 6 tables: users, sessions, projects, images, faces, worker_heartbeat
-├── migrate.py          # Idempotent schema migration (reads schema.sql, executes statements)
+├── migrate.py          # Idempotent schema migration with --reset flag (~333 lines)
 ├── whitelist.txt       # Allowed usernames (one per line, checked on every request)
 ├── pyproject.toml      # Project config: Ruff linter/formatter rules, pytest config, markers
 ├── requirements.txt    # Python 3.11+, dlib-bin fork (no source compilation)
@@ -28,10 +28,10 @@ WikiVisage/
 ├── tests/              # Hybrid test suite: 56 unit + 33 integration tests
 │   ├── __init__.py
 │   ├── conftest.py     # Integration fixture infrastructure (~450 lines)
-│   ├── test_app.py     # 29 unit + 11 integration tests (~476 lines)
+│   ├── test_app.py     # 29 unit + 11 integration tests (~615 lines)
 │   ├── test_database.py # 9 unit + 9 integration tests (~235 lines)
-│   ├── test_migrate.py # 13 unit + 8 integration tests (~408 lines)
-│   └── test_worker.py  # 5 unit + 5 integration tests (~393 lines)
+│   ├── test_migrate.py # 13 unit + 8 integration tests (~471 lines)
+│   └── test_worker.py  # 5 unit + 5 integration tests (~473 lines)
 ├── templates/          # Jinja2 templates (9 files, all extend base.html)
 │   ├── base.html       # Layout: nav, flash messages, CSS variables. Blocks: title, extra_head, content
 │   ├── classify.html   # Active learning UI: face image, yes/no/skip/none buttons, keyboard shortcuts, undo
@@ -144,9 +144,9 @@ users 1──N projects 1──N images 1──N faces
   |           |                        |
   |           +-- sdc_write_requested   +-- is_target: NULL=unclassified, 1=match, 0=non-match
   |           +-- sdc_write_error       +-- classified_by: 'human' | 'model' | 'bootstrap'
-  +---- sessions (Flask-Session)       +-- classified_by_user_id: FK to users (human classifications)
-                                       +-- encoding: 128D float64 numpy array (1024 bytes BLOB)
-                                       +-- confidence: face distance from target centroid
+  |           +-- last_inference_threshold   +-- classified_by_user_id: FK to users (human classifications)
+  |           +-- last_inference_min_confirmed +-- encoding: 128D float64 numpy array (1024 bytes BLOB)
+  +---- sessions (Flask-Session)       +-- confidence: face distance from target centroid
                                        +-- sdc_written: whether P180 claim was written
                                        +-- sdc_removal_pending: 1=P180 removal queued (rejected face)
                                        +-- superseded_by: FK to replacement face (after bbox edit)
@@ -164,7 +164,7 @@ worker_heartbeat (single-row: id=1, last_seen DATETIME)
 ### app.py
 | Constant | Value | Purpose |
 |----------|-------|---------|
-| `APP_VERSION` | `"0.2.2"` | Displayed in footer |
+| `APP_VERSION` | `"0.2.7"` | Displayed in footer |
 | `LANGUAGES` | `en, nb, es, fr` | Supported locales |
 | `RTL_LANGUAGES` | `ar, he, fa, ur` | RTL layout support |
 | `MAX_IMAGE_DOWNLOAD_BYTES` | 50 MB | Image download size cap (shared with worker) |
@@ -302,6 +302,9 @@ Only 2 cookies: `session` (strictly necessary, server-side via Flask-Session) an
 ### Inference RAM
 Each face encoding is 1024 bytes (128 float64). Even 10K faces ~ 10MB. No RAM concern for inference.
 
+### Wikidata label fetching
+`_fetch_wikidata_label(qid)` in `app.py` calls the Wikidata `wbgetentities` API with `languages=en&languagefallback=1` to retrieve human-readable labels. The `languagefallback=1` parameter makes the API automatically fall back through language variants (e.g., `mul` → `en`, `en-ca` → `en`) when no exact `en` label exists. Used during project creation to auto-fill empty project labels. Without this parameter, entities like Q153694 (Michael Bublé) return empty labels because they only have `mul`/`en-ca`/`en-gb` labels, not `en`.
+
 ## Testing
 
 Hybrid test suite: **56 unit tests** (run in CI) + **33 integration tests** (require local Docker MariaDB).
@@ -377,13 +380,16 @@ Concurrency: `ci-${{ github.ref }}` with cancel-in-progress.
 
 ### CD (`.github/workflows/deploy.yml`)
 
-Triggered on GitHub release publish. Steps:
-1. SSH into Toolforge via `appleboy/ssh-action`.
-2. `become wikivisage` (tool account).
-3. `toolforge build start` — rebuild container image from repo.
-4. `toolforge jobs run migrate` — run schema migration.
-5. `toolforge webservice buildservice restart` — restart web.
-6. `toolforge jobs restart ml-worker` — restart background worker.
+Triggered on GitHub release publish or manual `workflow_dispatch` (with a `tag` input). Steps:
+1. Checkout repo + configure SSH to Toolforge bastion.
+2. Generate a deploy script locally, `scp` it to the bastion.
+3. Execute via `become wikivisage bash /tmp/deploy.sh '<tag>'`.
+4. Deploy script stages:
+   - `toolforge build start --ref "$TAG"` — rebuild container image from the given git ref.
+   - Poll `toolforge build show --json | jq -r '.build.status // empty'` every 15s (up to 600s timeout). Expects `ok`; fails on `error`/`timeout`/`cancelled`.
+   - `toolforge jobs run migrate` — run schema migration (`python migrate.py`).
+   - `toolforge jobs delete ml-worker` + `toolforge jobs run ml-worker` — restart background worker (delete+run because `jobs load` does NOT restart if the definition is unchanged).
+   - `toolforge webservice buildservice restart` — restart web.
 
 Concurrency: `deploy-production` with cancel-in-progress.
 
@@ -473,6 +479,7 @@ The English `.po` file uses identity translations (`msgstr` = `msgid`). This ens
 python app.py                    # Web app on http://localhost:8000
 python worker.py                 # Background worker (separate terminal)
 python migrate.py                # Run schema migrations (idempotent)
+python migrate.py --reset        # Drop all tables and recreate from scratch
 
 # Linting
 ruff check .                     # Lint (errors, warnings, security)
