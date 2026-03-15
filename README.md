@@ -1,82 +1,109 @@
-# WikiVisage
+<p align="center">
+        <img src="static/wikivisage-logo.svg" alt="WikiVisage" width="420" />
+</p>
 
-Active-learning web app for Wikimedia Commons. Users train an ML model via simple yes/no prompts to recognize specific people, automatically adding [P180 (depicts)](https://www.wikidata.org/wiki/Property:P180) Structured Data claims to matching images via OAuth.
+<p align="center">
+        <img alt="Python" src="https://img.shields.io/badge/python-3.11%2B-blue?style=for-the-badge" />
+        <img alt="Framework" src="https://img.shields.io/badge/flask-web-black?style=for-the-badge" />
+        <a href="https://github.com/DiFronzo/WikiVisage/actions/workflows/ci.yml">
+                <img alt="CI" src="https://img.shields.io/github/actions/workflow/status/DiFronzo/WikiVisage/ci.yml?branch=main&label=CI&style=for-the-badge" />
+        </a>
+        <a href="https://github.com/DiFronzo/WikiVisage/releases">
+                <img alt="Release" src="https://img.shields.io/github/v/release/DiFronzo/WikiVisage?label=release&style=for-the-badge" />
+        </a>
+        <img alt="Build" src="https://img.shields.io/badge/build-Toolforge-success?style=for-the-badge" />
+        <img alt="Hosting" src="https://img.shields.io/badge/hosted%20on-Toolforge-green?style=for-the-badge" />
+        <a href="LICENSE">
+                <img alt="License" src="https://img.shields.io/github/license/DiFronzo/WikiVisage?label=license&style=for-the-badge" />
+        </a>
+</p>
 
-## How It Works
+Active-learning face tagging for Wikimedia Commons: train a lightweight model with simple **Yes/No** feedback and (optionally) write [P180 (depicts)](https://www.wikidata.org/wiki/Property:P180) Structured Data claims to matching files via OAuth.
 
-1. **Create a project** — specify a Wikidata entity (e.g., Q42 for Douglas Adams) and a Commons category to search
-2. **Discover images** — the background worker crawls the category and detects faces using HOG-based face recognition
-3. **Bootstrap** — if the entity already has depicts claims on Commons, the worker uses SPARQL to find them and seed the model automatically
-4. **Classify** — you review detected faces one by one with simple Yes/No buttons (keyboard shortcuts: Y/N)
-5. **Autonomous inference** — after enough confirmed faces (default 5), the model classifies remaining faces automatically using centroid distance
-6. **Write to Commons** — click "Send Edits to Wikimedia Commons" to write P180 depicts claims for all approved matches via the Wikibase API
+![WikiVisage landing page screenshot](static/landing_page.png)
 
-## Architecture
+## 🔗 Quick links
+
+- 📖 Local dev guide: [test-local.md](test-local.md)
+- 🚀 Toolforge deploy guide: [how-to-run-it.md](how-to-run-it.md)
+- 🤝 Contributing: [CONTRIBUTING.md](CONTRIBUTING.md)
+
+## ✨ Highlights
+
+- 🧠 **Active learning UI**: fast yes/no classification with keyboard shortcuts
+- 🧵 **Background worker**: crawls Commons categories, downloads images, detects faces (HOG), and stores encodings
+- 🧷 **Bootstrap from existing tags**: seeds the model via SPARQL when depicts already exists
+- 🤖 **Autonomous inference**: centroid-distance classification once you have enough confirmed examples
+- ✍️ **User-triggered Commons edits**: click “Send Edits to Wikimedia Commons” to write depicts claims via the Wikibase API
+- 🌍 **i18n-ready**: translations included (en, nb, es, fr)
+
+## 🧭 How it works
+
+1. 🆕 **Create a project** — pick a Wikidata entity (e.g., `Q42`) and a Commons category
+2. 🔎 **Discover images** — the worker traverses the category and detects faces
+3. 🧷 **Bootstrap (optional)** — if Commons already has depicts claims, seed the model from them
+4. ✅❌ **Classify** — review faces one-by-one with Yes/No (keyboard shortcuts: `Y` / `N`)
+5. 🤖 **Infer** — after enough confirmed faces (default `5`), classify remaining faces automatically
+6. ✍️ **Write to Commons** — send approved matches as depicts claims (OAuth)
+
+## 🏗️ Architecture
 
 ```
-┌─────────────────────┐     ┌──────────────────────────┐
-│   Flask Web App     │     │   Background Worker      │
-│   (app.py)          │     │   (worker.py)            │
-│                     │     │                          │
-│  - OAuth 2.0 login  │     │  - Category traversal    │
-│  - Project CRUD     │     │  - Image download        │
-│  - Active learning  │     │  - HOG face detection    │
-│    classification   │     │  - SPARQL bootstrapping  │
-│    UI               │     │  - Autonomous inference  │
-│                     │     │  - SDC P180 writes       │
-└────────┬────────────┘     └────────┬─────────────────┘
-         │                           │
-         └─────────┬─────────────────┘
-                   │
-           ┌───────▼───────┐
-           │   MariaDB     │
-           │   (ToolsDB)   │
-           └───────────────┘
++---------------------------+      +---------------------------+
+|       Flask Web App       |      |     Background Worker     |
+|          (app.py)         |      |       (worker.py)         |
+|---------------------------|      |---------------------------|
+| OAuth 2.0 login           |      | Category traversal        |
+| Project CRUD              |      | Image download            |
+| Active learning UI        |      | HOG face detection        |
+| Classification UI         |      | SPARQL bootstrapping      |
+| Queue SDC writes          |      | Autonomous inference      |
+|                           |      | Write SDC claims          |
++------------+--------------+      +------------+--------------+
+             |                                  |
+             +----------------------------------+
+                               |
+                        +------------+
+                        |   MariaDB  |
+                        |  (ToolsDB) |
+                        +------------+
 ```
 
-**Stack:** Python 3.11+, Flask, gunicorn, face_recognition (dlib HOG), PyMySQL, requests-oauthlib
+- 🧰 **Stack**: Python 3.11+, Flask, gunicorn, face_recognition (dlib HOG), PyMySQL, requests-oauthlib
+- ☁️ **Hosted on**: [Wikimedia Toolforge](https://wikitech.wikimedia.org/wiki/Help:Toolforge) (Kubernetes Build Service)
 
-**Hosted on:** [Wikimedia Toolforge](https://wikitech.wikimedia.org/wiki/Help:Toolforge) (Kubernetes Build Service)
-
-## Project Structure
+## 🗂️ Project layout
 
 ```
 WikiVisage/
-├── Aptfile              # Runtime system dependencies (libopenblas, liblapack)
-├── Procfile             # Process types: web (gunicorn) + worker
-├── requirements.txt     # Python dependencies
+├── app.py               # Flask app: OAuth, routes, classification API
+├── worker.py            # Background ML pipeline: crawl, detect, infer, write
 ├── database.py          # MariaDB connection pool with retry logic
-├── schema.sql           # DDL for 6 tables: users, sessions, projects, images, faces, worker_heartbeat
-├── migrate.py           # Schema migration script
-├── app.py               # Flask app: OAuth 2.0, routes, classification API
-├── worker.py            # Background ML pipeline: crawl, detect, infer
-├── whitelist.txt        # Allowed usernames (one per line)
-├── templates/           # Jinja2 templates (9 files)
-│   ├── base.html            # Base layout with embedded CSS
-│   ├── index.html           # Landing page
-│   ├── dashboard.html       # Project list
-│   ├── project_new.html     # Create project form
-│   ├── project_detail.html  # Project stats, model results gallery, SDC write button
-│   ├── project_settings.html# Edit project settings
-│   ├── classify.html        # Active learning face classification UI
-│   ├── leaderboard.html     # Top classifiers
-│   └── error.html           # Error page
-├── static/              # Logo SVGs
-└── translations/        # i18n: en, nb, es, fr
+├── schema.sql           # Database schema (tables + indices)
+├── migrate.py           # Idempotent migration script
+├── templates/           # Jinja2 templates
+├── static/              # Logos + screenshots
+├── translations/        # i18n: en, nb, es, fr
+├── requirements.txt     # Runtime dependencies
+├── requirements-dev.txt # Dev/test deps
+└── whitelist.txt        # Allowed usernames (Toolforge)
 ```
 
-## Setup
+## 🧑‍💻 Setup
 
-### Prerequisites
+### ✅ Prerequisites
 
 - A [Toolforge](https://toolsadmin.wikimedia.org/) tool account
-- An [OAuth 2.0 consumer](https://meta.wikimedia.org/wiki/Special:OAuthConsumerRegistration/propose) registered on Meta with grants: `Basic rights`, `Edit existing pages` and callback URL `https://<toolname>.toolforge.org/auth/callback`
+- An [OAuth 2.0 consumer](https://meta.wikimedia.org/wiki/Special:OAuthConsumerRegistration/propose) registered on Meta with grants:
+        - `Basic rights`
+        - `Edit existing pages`
+        - Callback URL: `https://<toolname>.toolforge.org/auth/callback`
 
-### 1. Environment Variables
+### 1) 🔐 Environment variables (Toolforge)
 
 ```bash
 # Database credentials (find yours in ~/replica.my.cnf on Toolforge)
-toolforge envvars create TOOL_TOOLSDB_USER     "s<NNNNN>"
+toolforge envvars create TOOL_TOOLSDB_USER      "s<NNNNN>"
 toolforge envvars create TOOL_TOOLSDB_PASSWORD  "<password>"
 toolforge envvars create WIKIVISAGE_DB_NAME     "s<NNNNN>__wikiface"
 
@@ -86,10 +113,10 @@ toolforge envvars create OAUTH_CLIENT_SECRET    "<client-secret>"
 toolforge envvars create OAUTH_REDIRECT_URI     "https://<toolname>.toolforge.org/auth/callback"
 
 # Flask
-toolforge envvars create FLASK_SECRET_KEY       "$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+toolforge envvars create FLASK_SECRET_KEY "$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
 ```
 
-### 2. Create Database
+### 2) 🗄️ Create database
 
 ```bash
 mariadb --defaults-file=$HOME/replica.my.cnf -h tools.db.svc.wikimedia.cloud
@@ -99,13 +126,13 @@ mariadb --defaults-file=$HOME/replica.my.cnf -h tools.db.svc.wikimedia.cloud
 CREATE DATABASE s<NNNNN>__wikiface;
 ```
 
-### 3. Run Migration
+### 3) 🧱 Run migration
 
 ```bash
 python3 migrate.py
 ```
 
-### 4. Build and Deploy
+### 4) 🚀 Build & deploy
 
 ```bash
 # Build container image
@@ -120,7 +147,7 @@ toolforge jobs load jobs.yaml
 
 The app will be live at `https://<toolname>.toolforge.org`.
 
-### Local Development
+## 🧪 Local development
 
 ```bash
 pip install -r requirements.txt
@@ -141,26 +168,27 @@ python app.py        # Web app on http://localhost:8000
 python worker.py     # Background worker (separate terminal)
 ```
 
-For local OAuth you need a separate consumer with `http://localhost:8000/auth/callback` as the callback URL. Set `OAUTHLIB_INSECURE_TRANSPORT=1` to allow OAuth over HTTP.
+For local OAuth you’ll need a separate consumer with `http://localhost:8000/auth/callback` as the callback URL. Set `OAUTHLIB_INSECURE_TRANSPORT=1` to allow OAuth over HTTP.
 
-## Configuration
+## ⚙️ Configuration
 
-Each project has tunable parameters:
+Each project has a couple of tunables:
 
 | Parameter | Default | Description |
-|---|---|---|
-| `distance_threshold` | 0.6 | Face distance threshold for autonomous classification. Lower = stricter matching. |
-| `min_confirmed` | 5 | Minimum human-confirmed faces before the model classifies autonomously. |
+|---|---:|---|
+| `distance_threshold` | `0.6` | Face-distance cutoff for autonomous classification (lower = stricter). |
+| `min_confirmed` | `5` | Minimum confirmed matches before autonomous inference starts. |
 
-## Key Design Decisions
+## ✅ Testing
 
-- **HOG over CNN** — CPU-only face detection for Toolforge's constrained environment (~0.5-2s per image, no GPU needed)
-- **BLOB encoding storage** — 128D float64 numpy arrays stored as raw bytes (1024 bytes per face, 3x smaller than JSON)
-- **dlib-bin** — Pre-compiled wheels to avoid compiling dlib from source (would OOM on Toolforge)
-- **Configurable threshold** — Default 0.6 per community convention; 0.38 from the original spec caused excessive false negatives
-- **Idempotent SDC writes** — Checks existing P180 claims before writing to avoid duplicates
-- **SDC bootstrapping** — Seeds the model from files already tagged with the target entity via `haswbstatement:P180` search, reducing cold-start human labeling
+```bash
+# Unit tests (CI mode)
+pytest tests/ -v
 
-## License
+# Unit + integration tests (requires local MariaDB)
+WIKIVISAGE_TEST_DB=1 pytest tests/ -v
+```
+
+## 📝 License
 
 [MIT](LICENSE)

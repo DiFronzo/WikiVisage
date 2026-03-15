@@ -42,7 +42,7 @@
                 <div class="form-group">
                     <label for="min_confirmed">{{ _('Min Confirmed Faces') }}</label>
                     <input type="number" id="min_confirmed" name="min_confirmed" value="{{ min_confirmed or 5 }}" min="1" required>
-                    <div class="help-text">{{ _('Faces needed before auto-tagging') }}</div>
+                    <div class="help-text">{{ _('Human-confirmed faces needed before the model classifies on its own. The default of 5 works well for most categories.') }}</div>
                 </div>
             </div>
 
@@ -59,7 +59,11 @@ var i18nCatInfo = {
     files: {{ _('{files} files across {subcats} subcategories')|tojson }},
     filesApprox: {{ _('{files}+ files across {subcats}+ subcategories (estimate)')|tojson }},
     notFound: {{ _('Category not found on Commons.')|tojson }},
-    error: {{ _('Could not reach Commons API.')|tojson }}
+    error: {{ _('Could not reach Commons API.')|tojson }},
+    tipSmall: {{ _('With this category size, the default of 5 confirmed faces should work well.')|tojson }},
+    tipMedium: {{ _('This is a medium-sized category. Consider raising Min Confirmed Faces to 10–15 for better accuracy.')|tojson }},
+    tipLarge: {{ _('This is a large category. Consider raising Min Confirmed Faces to 40–50 for better accuracy.')|tojson }},
+    capNote: {{ _('Note: Only the first 9,000 images will be processed.')|tojson }}
 };
 
 function checkCategory() {
@@ -94,9 +98,12 @@ function checkCategory() {
             var files = Number(data.files).toLocaleString();
             var subcats = Number(data.subcats).toLocaleString();
             var tpl = data.approximate ? i18nCatInfo.filesApprox : i18nCatInfo.files;
-            infoDiv.textContent = tpl
+            var line1 = tpl
                 .replace('{files}', files)
                 .replace('{subcats}', subcats);
+            var tip = data.files > 2000 ? i18nCatInfo.tipLarge : data.files > 500 ? i18nCatInfo.tipMedium : i18nCatInfo.tipSmall;
+            var capWarning = data.files > 9000 ? '<br><span style="color: var(--warning); font-size: 0.8125rem;">' + i18nCatInfo.capNote + '</span>' : '';
+            infoDiv.innerHTML = line1 + '<br><span style="color: var(--text-muted); font-size: 0.8125rem;">' + tip + '</span>' + capWarning;
         })
         .catch(function() {
             infoDiv.style.borderLeftColor = 'var(--danger)';

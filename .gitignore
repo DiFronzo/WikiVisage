@@ -10,3 +10,4 @@ venv/
 .worker-wake-up
 .opencode/
 .worker_wake
+.coverage

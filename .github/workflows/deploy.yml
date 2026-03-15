@@ -92,9 +92,10 @@ jobs:
           fi
           echo "==> Running migration"
           toolforge jobs run migrate --command "python migrate.py" --image tool-wikivisage/tool-wikivisage:latest --wait
-          echo "==> Loading jobs.yaml"
-          curl -fsSL "https://raw.githubusercontent.com/DiFronzo/WikiVisage/${TAG}/jobs.yaml" -o /tmp/jobs.yaml
-          toolforge jobs load /tmp/jobs.yaml
+          echo "==> Deleting ml-worker"
+          toolforge jobs delete ml-worker
+          echo "==> Running ml-worker"
+          toolforge jobs run ml-worker --command 'python -u worker.py' --image tool-wikivisage/tool-wikivisage:latest --continuous --mem 3Gi
           echo "==> Restarting webservice"
           toolforge webservice buildservice restart
           echo "==> Deploy complete"

@@ -447,6 +447,93 @@ def test_inference_does_not_touch_bootstrap_images(
 
 
 @pytest.mark.integration
+def test_soft_delete_recreate_no_fk_errors(db_pool, db_conn, seed_user):
+    """Soft-delete → hard-delete (CASCADE) → re-create with same QID/category causes no FK errors."""
+    cur = db_conn.cursor()
+
+    # --- Phase 1: create project and simulate worker output (images + faces) ---
+    cur.execute(
+        "INSERT INTO projects (user_id, wikidata_qid, commons_category, label, "
+        "distance_threshold, min_confirmed, status, images_total, images_processed) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+        (seed_user["id"], "Q42", "Douglas Adams", "Douglas Adams", 0.6, 5, "active", 3, 3),
+    )
+    project_id_v1 = cur.lastrowid
+
+    img_ids = []
+    for title, page_id in [("File:DA_1.jpg", 900001), ("File:DA_2.jpg", 900002), ("File:DA_3.jpg", 900003)]:
+        cur.execute(
+            "INSERT INTO images (project_id, commons_page_id, file_title, status, "
+            "face_count, detection_width, detection_height) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+            (project_id_v1, page_id, title, "processed", 1, 800, 600),
+        )
+        img_ids.append(cur.lastrowid)
+
+    face_ids = []
+    for i, img_id in enumerate(img_ids):
+        cur.execute(
+            "INSERT INTO faces (image_id, encoding, bbox_top, bbox_right, bbox_bottom, bbox_left, "
+            "is_target, classified_by, classified_by_user_id) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            (img_id, _make_encoding(700 + i), 50, 200, 200, 50, 1, "human", seed_user["id"]),
+        )
+        face_ids.append(cur.lastrowid)
+
+    # Sanity: data exists
+    cur.execute("SELECT COUNT(*) AS cnt FROM images WHERE project_id = %s", (project_id_v1,))
+    assert cur.fetchone()["cnt"] == 3
+    cur.execute("SELECT COUNT(*) AS cnt FROM faces WHERE image_id IN (%s,%s,%s)", tuple(img_ids))
+    assert cur.fetchone()["cnt"] == 3
+
+    # --- Phase 2: soft-delete then hard-delete (mirrors worker main loop) ---
+    cur.execute("UPDATE projects SET status = 'deleted' WHERE id = %s", (project_id_v1,))
+    cur.execute("DELETE FROM projects WHERE id = %s AND status = 'deleted'", (project_id_v1,))
+
+    # CASCADE must have removed child rows
+    cur.execute("SELECT COUNT(*) AS cnt FROM images WHERE project_id = %s", (project_id_v1,))
+    assert cur.fetchone()["cnt"] == 0
+    cur.execute("SELECT COUNT(*) AS cnt FROM faces WHERE image_id IN (%s,%s,%s)", tuple(img_ids))
+    assert cur.fetchone()["cnt"] == 0
+
+    # --- Phase 3: re-create project with same QID + category ---
+    cur.execute(
+        "INSERT INTO projects (user_id, wikidata_qid, commons_category, label, "
+        "distance_threshold, min_confirmed, status, images_total, images_processed) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+        (seed_user["id"], "Q42", "Douglas Adams", "Douglas Adams", 0.6, 5, "active", 0, 0),
+    )
+    project_id_v2 = cur.lastrowid
+    assert project_id_v2 != project_id_v1  # new row, different auto-increment id
+
+    # Insert fresh images + faces — must not hit FK errors
+    cur.execute(
+        "INSERT INTO images (project_id, commons_page_id, file_title, status, "
+        "face_count, detection_width, detection_height) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+        (project_id_v2, 900010, "File:DA_New.jpg", "processed", 1, 800, 600),
+    )
+    new_img_id = cur.lastrowid
+
+    cur.execute(
+        "INSERT INTO faces (image_id, encoding, bbox_top, bbox_right, bbox_bottom, bbox_left) "
+        "VALUES (%s, %s, %s, %s, %s, %s)",
+        (new_img_id, _make_encoding(800), 50, 200, 200, 50),
+    )
+    new_face_id = cur.lastrowid
+
+    # Verify new project data is independently correct
+    cur.execute("SELECT COUNT(*) AS cnt FROM images WHERE project_id = %s", (project_id_v2,))
+    assert cur.fetchone()["cnt"] == 1
+    cur.execute("SELECT id, image_id FROM faces WHERE id = %s", (new_face_id,))
+    row = cur.fetchone()
+    assert row is not None
+    assert row["image_id"] == new_img_id
+
+    cur.close()
+
+
+@pytest.mark.integration
 def test_inference_does_not_touch_human_classified(db_pool, db_conn, seed_project, seed_images, seed_faces):
     with db_conn.cursor() as cur:
         face_ids = seed_faces["target"] + seed_faces["non_target"]
