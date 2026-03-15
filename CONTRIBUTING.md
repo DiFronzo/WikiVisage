@@ -100,7 +100,7 @@ The landing page and `/health` endpoint work without OAuth. See [test-local.md](
 - All POST routes require CSRF tokens.
 - All face bounding box inputs are validated against `MAX_BBOX_PX` and `MIN_BBOX_AREA`.
 - Rate limiting: global 200/hour default, 10/min on bbox endpoints.
-- Security headers set on all responses: `X-Content-Type-Options`, `X-Frame-Options`, `X-XSS-Protection`.
+- Security headers set on all responses: `X-Content-Type-Options`, `X-Frame-Options`. (`X-XSS-Protection` is deprecated and not used.)
 - Never store secrets in code. Use environment variables.
 
 ## Internationalization (i18n)
