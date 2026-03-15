@@ -207,7 +207,7 @@ def db_conn(test_db):
         # Clean up: truncate all data tables (order matters due to FKs)
         with conn.cursor() as cur:
             cur.execute("SET FOREIGN_KEY_CHECKS = 0")
-            for table in ("faces", "images", "projects", "sessions", "users", "worker_heartbeat"):
+            for table in ("faces", "images", "projects", "sessions", "user_stats", "users", "worker_heartbeat"):
                 cur.execute(f"TRUNCATE TABLE `{table}`")
             cur.execute("SET FOREIGN_KEY_CHECKS = 1")
         conn.close()

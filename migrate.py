@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 SCHEMA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "schema.sql")
 
 # Drop order respects foreign key dependencies (children first).
-_ALL_TABLES = ["faces", "images", "projects", "sessions", "worker_heartbeat", "users"]
+_ALL_TABLES = ["faces", "images", "projects", "sessions", "user_stats", "worker_heartbeat", "users"]
 
 
 def load_schema(path: str) -> list[str]:
@@ -252,6 +252,40 @@ _ALTER_MIGRATIONS = [
         "ALTER TABLE projects MODIFY COLUMN status "
         "ENUM('active', 'paused', 'completed', 'deleted') NOT NULL DEFAULT 'active'",
     ),
+    (
+        "Add worker_claimed_by to projects for distributed locking",
+        "ALTER TABLE projects ADD COLUMN worker_claimed_by VARCHAR(255) NULL "
+        "COMMENT 'Worker instance ID that claimed this project' AFTER sdc_write_error",
+    ),
+    (
+        "Add worker_claimed_at to projects for distributed locking",
+        "ALTER TABLE projects ADD COLUMN worker_claimed_at DATETIME NULL "
+        "COMMENT 'When the worker claimed this project' AFTER worker_claimed_by",
+    ),
+    (
+        "Add composite index on projects(worker_claimed_by, worker_claimed_at)",
+        "ALTER TABLE projects ADD INDEX idx_projects_worker_claim (worker_claimed_by, worker_claimed_at)",
+    ),
+    (
+        "Add composite index on projects(status, worker_claimed_by, worker_claimed_at) for claim queries",
+        "ALTER TABLE projects ADD INDEX idx_projects_status_claim (status, worker_claimed_by, worker_claimed_at)",
+    ),
+    (
+        "Add composite index on projects(sdc_write_requested, worker_claimed_by, worker_claimed_at) for SDC claim queries",
+        "ALTER TABLE projects ADD INDEX idx_projects_sdc_claim (sdc_write_requested, worker_claimed_by, worker_claimed_at)",
+    ),
+    (
+        "Create user_stats table for persistent leaderboard stats",
+        "CREATE TABLE IF NOT EXISTS user_stats ("
+        "  user_id BIGINT UNSIGNED PRIMARY KEY,"
+        "  classifications BIGINT UNSIGNED NOT NULL DEFAULT 0"
+        "    COMMENT 'Archived classification count from deleted projects',"
+        "  sdc_tags BIGINT UNSIGNED NOT NULL DEFAULT 0"
+        "    COMMENT 'Archived SDC written count from deleted projects',"
+        "  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,"
+        "  CONSTRAINT fk_user_stats_user FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE"
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
+    ),
 ]
 
 
@@ -292,6 +326,7 @@ def verify_tables() -> None:
         "projects",
         "images",
         "faces",
+        "user_stats",
         "worker_heartbeat",
     ]
 

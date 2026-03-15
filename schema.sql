@@ -52,12 +52,17 @@ CREATE TABLE IF NOT EXISTS projects (
     last_inference_min_confirmed INT UNSIGNED NULL COMMENT 'min_confirmed used in last inference run',
     sdc_write_requested TINYINT(1)      NOT NULL DEFAULT 0 COMMENT '1=user requested SDC writes, worker picks up',
     sdc_write_error     VARCHAR(1024)   NULL COMMENT 'Error message from last SDC write attempt',
+    worker_claimed_by   VARCHAR(255)    NULL COMMENT 'Worker instance ID that claimed this project',
+    worker_claimed_at   DATETIME        NULL COMMENT 'When the worker claimed this project',
     created_at          DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at          DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
 
     INDEX idx_projects_user_id (user_id),
     INDEX idx_projects_status (status),
     INDEX idx_projects_sdc_write_requested (sdc_write_requested),
+    INDEX idx_projects_worker_claim (worker_claimed_by, worker_claimed_at),
+    INDEX idx_projects_status_claim (status, worker_claimed_by, worker_claimed_at),
+    INDEX idx_projects_sdc_claim (sdc_write_requested, worker_claimed_by, worker_claimed_at),
     UNIQUE INDEX idx_projects_user_qid_cat (user_id, wikidata_qid, commons_category),
 
     CONSTRAINT fk_projects_user
@@ -127,6 +132,21 @@ CREATE TABLE IF NOT EXISTS faces (
         FOREIGN KEY (classified_by_user_id) REFERENCES users (id) ON DELETE SET NULL,
     CONSTRAINT fk_faces_superseded_by
         FOREIGN KEY (superseded_by) REFERENCES faces (id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+
+-- User stats table: archived leaderboard stats that persist after project deletion.
+-- When a project is hard-deleted, the worker aggregates face classification counts
+-- per user into this table before CASCADE deletes the faces. The leaderboard query
+-- combines live face data with these archived totals.
+CREATE TABLE IF NOT EXISTS user_stats (
+    user_id         BIGINT UNSIGNED PRIMARY KEY,
+    classifications BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'Archived classification count from deleted projects',
+    sdc_tags        BIGINT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'Archived SDC written count from deleted projects',
+    updated_at      DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+    CONSTRAINT fk_user_stats_user
+        FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 

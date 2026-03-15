@@ -9,7 +9,13 @@
 #      value: "100"
 ---
 - name: ml-worker
-  command: python -u worker.py
+  command: python -u worker.py --worker-id ml-worker-1
+  image: tool-wikivisage/tool-wikivisage:latest
+  continuous: true
+  mem: 3Gi
+
+- name: ml-worker-2
+  command: python -u worker.py --worker-id ml-worker-2
   image: tool-wikivisage/tool-wikivisage:latest
   continuous: true
   mem: 3Gi

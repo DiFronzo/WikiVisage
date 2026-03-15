@@ -6,7 +6,7 @@ Provides OAuth 2.0 authentication, project management, and an active
 learning interface for classifying detected faces.
 """
 
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.3.1"
 
 import hashlib
 import io
@@ -2514,6 +2514,7 @@ def api_progress(project_id: int):
             "  SUM(CASE WHEN f.is_target = 0 THEN 1 ELSE 0 END) AS confirmed_non_matches, "
             "  SUM(CASE WHEN f.is_target IS NULL THEN 1 ELSE 0 END) AS unclassified, "
             "  SUM(CASE WHEN f.sdc_written = 1 THEN 1 ELSE 0 END) AS sdc_written, "
+            "  SUM(CASE WHEN f.is_target = 1 AND f.sdc_written = 0 AND f.classified_by != 'bootstrap' AND i.bootstrapped = 0 THEN 1 ELSE 0 END) AS sdc_pending, "
             "  SUM(CASE WHEN f.classified_by_user_id IS NOT NULL THEN 1 ELSE 0 END) AS by_human, "
             "  SUM(CASE WHEN f.classified_by = 'model' AND f.classified_by_user_id IS NULL THEN 1 ELSE 0 END) AS by_model, "
             "  SUM(CASE WHEN f.classified_by = 'bootstrap' AND f.classified_by_user_id IS NULL THEN 1 ELSE 0 END) AS by_bootstrap "
@@ -2634,13 +2635,16 @@ def project_settings(project_id: int):
             stats = execute_query(
                 "SELECT "
                 "  SUM(CASE WHEN f.is_target = 1 AND f.classified_by_user_id IS NOT NULL "
-                "      THEN 1 ELSE 0 END) AS human_confirmed "
+                "      THEN 1 ELSE 0 END) AS human_confirmed, "
+                "  SUM(CASE WHEN f.is_target = 1 AND f.classified_by = 'bootstrap' "
+                "      AND f.classified_by_user_id IS NULL THEN 1 ELSE 0 END) AS by_bootstrap "
                 "FROM faces f "
                 "JOIN images i ON f.image_id = i.id "
                 "WHERE i.project_id = %s AND f.superseded_by IS NULL",
                 (project_id,),
             )
             human_confirmed = (stats[0]["human_confirmed"] or 0) if stats else 0
+            by_bootstrap = (stats[0]["by_bootstrap"] or 0) if stats else 0
             if human_confirmed < min_confirmed:
                 flash(
                     _(
@@ -2651,6 +2655,15 @@ def project_settings(project_id: int):
                     ),
                     "warning",
                 )
+                if by_bootstrap > 0:
+                    flash(
+                        _(
+                            "Tip: You have %(count)d bootstrapped matches from existing Commons depicts claims. "
+                            "Approve them in Model Results to count them as human-confirmed.",
+                            count=by_bootstrap,
+                        ),
+                        "info",
+                    )
         except DatabaseError:
             pass
 
@@ -2733,6 +2746,54 @@ def project_rerun_inference(project_id: int):
                 pass  # Non-critical — worker will pick it up on next poll
         else:
             flash(_("No model-classified faces to reset."), "info")
+
+        try:
+            stats = execute_query(
+                "SELECT "
+                "  SUM(CASE WHEN f.is_target = 1 AND f.classified_by_user_id IS NOT NULL "
+                "      THEN 1 ELSE 0 END) AS human_confirmed, "
+                "  SUM(CASE WHEN f.is_target = 1 AND f.classified_by = 'bootstrap' "
+                "      AND f.classified_by_user_id IS NULL THEN 1 ELSE 0 END) AS by_bootstrap "
+                "FROM faces f "
+                "JOIN images i ON f.image_id = i.id "
+                "WHERE i.project_id = %s AND f.superseded_by IS NULL",
+                (project_id,),
+            )
+            human_confirmed = (stats[0]["human_confirmed"] or 0) if stats else 0
+            by_bootstrap = (stats[0]["by_bootstrap"] or 0) if stats else 0
+            min_confirmed = int(project["min_confirmed"])
+            if human_confirmed >= min_confirmed:
+                flash(
+                    _(
+                        "You have %(confirmed)d/%(min)d human-confirmed target faces — "
+                        "inference will run on the next worker cycle.",
+                        confirmed=human_confirmed,
+                        min=min_confirmed,
+                    ),
+                    "info",
+                )
+            else:
+                flash(
+                    _(
+                        "Warning: You currently have %(confirmed)d/%(min)d human-confirmed target faces. "
+                        "Autonomous inference will not run until this threshold is met.",
+                        confirmed=human_confirmed,
+                        min=min_confirmed,
+                    ),
+                    "warning",
+                )
+                if by_bootstrap > 0:
+                    flash(
+                        _(
+                            "Tip: You have %(count)d bootstrapped matches from existing Commons depicts claims. "
+                            "Approve them in Model Results to count them as human-confirmed.",
+                            count=by_bootstrap,
+                        ),
+                        "info",
+                    )
+        except DatabaseError:
+            pass
+
     except DatabaseError:
         logger.exception("Failed to reset model-classified faces")
         flash(_("Failed to re-run inference."), "error")
@@ -2777,16 +2838,20 @@ def leaderboard():
         rows = execute_query(
             "SELECT "
             "  u.wiki_username, "
-            "  COUNT(*) AS classifications, "
+            "  COUNT(f.id) + COALESCE(us.classifications, 0) "
+            "    AS classifications, "
             "  COUNT(CASE WHEN f.sdc_written = 1 THEN 1 END) "
-            "    AS sdc_tags "
+            "    + COALESCE(us.sdc_tags, 0) AS sdc_tags "
             "FROM users u "
-            "INNER JOIN faces f ON f.classified_by_user_id = u.id "
-            "WHERE f.superseded_by IS NULL "
-            "GROUP BY u.id, u.wiki_username "
-            "ORDER BY (COUNT(*) "
-            "        + COUNT(CASE WHEN f.sdc_written = 1 THEN 1 END)) DESC, "
-            "         COUNT(*) DESC "
+            "LEFT JOIN faces f ON f.classified_by_user_id = u.id "
+            "  AND f.superseded_by IS NULL "
+            "LEFT JOIN user_stats us ON us.user_id = u.id "
+            "WHERE (f.id IS NOT NULL OR us.user_id IS NOT NULL) "
+            "GROUP BY u.id, u.wiki_username, us.classifications, us.sdc_tags "
+            "ORDER BY (COUNT(f.id) + COALESCE(us.classifications, 0) "
+            "        + COUNT(CASE WHEN f.sdc_written = 1 THEN 1 END) "
+            "        + COALESCE(us.sdc_tags, 0)) DESC, "
+            "         (COUNT(f.id) + COALESCE(us.classifications, 0)) DESC "
             "LIMIT 100",
         )
     except DatabaseError:
