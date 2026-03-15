@@ -37,4 +37,4 @@ Flask-Limiter==3.8.0
 Flask-Babel==4.0.0
 
 # Environment variables from .env files
-python-dotenv==1.1.0
+python-dotenv==1.2.2
