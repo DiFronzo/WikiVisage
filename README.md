@@ -165,7 +165,6 @@ pip install -r requirements-dev.txt
 export TOOL_TOOLSDB_USER=root
 export TOOL_TOOLSDB_PASSWORD=yourpassword
 export TOOL_TOOLSDB_HOST=127.0.0.1
-export TOOL_TOOLSDB_HOST=127.0.0.1
 export WIKIVISAGE_DB_NAME=wikiface_dev
 export OAUTH_CLIENT_ID=<client-id>
 export OAUTH_CLIENT_SECRET=<client-secret>
