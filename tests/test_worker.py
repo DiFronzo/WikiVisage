@@ -10,7 +10,19 @@ from unittest.mock import patch
 import numpy as np
 
 with patch("database.init_db"):
-    from worker import _process_single_image, run_autonomous_inference
+    import worker as _worker_module
+    from worker import (
+        _claim_active_projects,
+        _claim_inference_projects,
+        _claim_sdc_projects,
+        _infer_and_release,
+        _process_and_release,
+        _process_single_image,
+        _refresh_claims,
+        _release_all_claims,
+        _release_project,
+        run_autonomous_inference,
+    )
 
 
 def _make_encoding(seed: int) -> bytes:
@@ -558,3 +570,216 @@ def test_inference_does_not_touch_human_classified(db_pool, db_conn, seed_projec
         after_rows = cur.fetchall()
 
     assert before_rows == after_rows
+
+
+# ---------------------------------------------------------------------------
+# Unit tests: distributed-claim helpers
+# ---------------------------------------------------------------------------
+
+
+def test_claim_active_projects_success():
+    """_claim_active_projects returns whatever the transaction closure produces."""
+    fake_projects = [{"id": 1, "status": "active"}, {"id": 2, "status": "active"}]
+
+    with patch("worker.execute_transaction", return_value=fake_projects) as mock_txn:
+        result = _claim_active_projects(max_count=3)
+
+    assert result == fake_projects
+    mock_txn.assert_called_once()
+
+
+def test_claim_active_projects_returns_empty_on_db_error():
+    """_claim_active_projects swallows DatabaseError and returns []."""
+    from database import DatabaseError
+
+    with patch("worker.execute_transaction", side_effect=DatabaseError("boom")):
+        result = _claim_active_projects(max_count=3)
+
+    assert result == []
+
+
+def test_claim_active_projects_returns_empty_when_no_rows():
+    """_claim_active_projects returns [] when the transaction finds nothing to claim."""
+    with patch("worker.execute_transaction", return_value=[]):
+        result = _claim_active_projects(max_count=3)
+
+    assert result == []
+
+
+def test_claim_inference_projects_success():
+    """_claim_inference_projects returns whatever the transaction closure produces."""
+    fake_projects = [{"id": 5, "status": "completed"}]
+
+    with patch("worker.execute_transaction", return_value=fake_projects) as mock_txn:
+        result = _claim_inference_projects(max_count=2)
+
+    assert result == fake_projects
+    mock_txn.assert_called_once()
+
+
+def test_claim_inference_projects_returns_empty_on_db_error():
+    """_claim_inference_projects swallows DatabaseError and returns []."""
+    from database import DatabaseError
+
+    with patch("worker.execute_transaction", side_effect=DatabaseError("boom")):
+        result = _claim_inference_projects(max_count=2)
+
+    assert result == []
+
+
+def test_claim_sdc_projects_success():
+    """_claim_sdc_projects returns whatever the transaction closure produces."""
+    fake_projects = [{"id": 7, "sdc_write_requested": 1}]
+
+    with patch("worker.execute_transaction", return_value=fake_projects) as mock_txn:
+        result = _claim_sdc_projects()
+
+    assert result == fake_projects
+    mock_txn.assert_called_once()
+
+
+def test_claim_sdc_projects_returns_empty_on_db_error():
+    """_claim_sdc_projects swallows DatabaseError and returns []."""
+    from database import DatabaseError
+
+    with patch("worker.execute_transaction", side_effect=DatabaseError("boom")):
+        result = _claim_sdc_projects()
+
+    assert result == []
+
+
+def test_release_project_issues_correct_query():
+    """_release_project updates the correct project row using the worker id."""
+    _worker_module._worker_id = "test-worker-1"
+
+    with patch("worker.execute_query") as mock_q:
+        _release_project(42)
+
+    mock_q.assert_called_once()
+    call_args = mock_q.call_args
+    sql, params = call_args[0][0], call_args[0][1]
+    assert "worker_claimed_by = NULL" in sql
+    assert params == (42, "test-worker-1")
+
+
+def test_release_project_swallows_db_error():
+    """_release_project does not raise when execute_query throws DatabaseError."""
+    from database import DatabaseError
+
+    _worker_module._worker_id = "test-worker-1"
+
+    with patch("worker.execute_query", side_effect=DatabaseError("gone")):
+        _release_project(99)  # must not raise
+
+
+def test_release_all_claims_issues_correct_query():
+    """_release_all_claims releases all rows owned by this worker."""
+    _worker_module._worker_id = "test-worker-2"
+
+    with patch("worker.execute_query", return_value=3) as mock_q:
+        _release_all_claims()
+
+    mock_q.assert_called_once()
+    call_args = mock_q.call_args
+    sql, params = call_args[0][0], call_args[0][1]
+    assert "worker_claimed_by = NULL" in sql
+    assert params == ("test-worker-2",)
+
+
+def test_release_all_claims_swallows_db_error():
+    """_release_all_claims does not raise when execute_query throws DatabaseError."""
+    from database import DatabaseError
+
+    _worker_module._worker_id = "test-worker-2"
+
+    with patch("worker.execute_query", side_effect=DatabaseError("gone")):
+        _release_all_claims()  # must not raise
+
+
+def test_refresh_claims_issues_correct_query():
+    """_refresh_claims updates worker_claimed_at for this worker's rows."""
+    _worker_module._worker_id = "test-worker-3"
+
+    with patch("worker.execute_query", return_value=2) as mock_q:
+        _refresh_claims()
+
+    mock_q.assert_called_once()
+    call_args = mock_q.call_args
+    sql, params = call_args[0][0], call_args[0][1]
+    assert "worker_claimed_at = NOW()" in sql
+    assert params == ("test-worker-3",)
+
+
+def test_refresh_claims_swallows_db_error():
+    """_refresh_claims does not raise when execute_query throws DatabaseError."""
+    from database import DatabaseError
+
+    _worker_module._worker_id = "test-worker-3"
+
+    with patch("worker.execute_query", side_effect=DatabaseError("gone")):
+        _refresh_claims()  # must not raise
+
+
+def test_process_and_release_releases_on_success():
+    """_process_and_release releases the project claim after process_project succeeds."""
+    project = {"id": 10}
+    _worker_module._worker_id = "test-worker-4"
+
+    with (
+        patch("worker.process_project") as mock_process,
+        patch("worker._release_project") as mock_release,
+    ):
+        _process_and_release(project)
+
+    mock_process.assert_called_once_with(project, skip_discovery=False)
+    mock_release.assert_called_once_with(10)
+
+
+def test_process_and_release_releases_even_on_exception():
+    """_process_and_release releases the project claim even when process_project raises."""
+    project = {"id": 11}
+    _worker_module._worker_id = "test-worker-4"
+
+    with (
+        patch("worker.process_project", side_effect=RuntimeError("crash")),
+        patch("worker._release_project") as mock_release,
+    ):
+        try:
+            _process_and_release(project)
+        except RuntimeError:
+            pass
+
+    mock_release.assert_called_once_with(11)
+
+
+def test_infer_and_release_releases_on_success():
+    """_infer_and_release releases the claim and returns the inference count."""
+    project = {"id": 20}
+    _worker_module._worker_id = "test-worker-5"
+
+    with (
+        patch("worker.run_autonomous_inference", return_value=7) as mock_infer,
+        patch("worker._release_project") as mock_release,
+    ):
+        result = _infer_and_release(project)
+
+    assert result == 7
+    mock_infer.assert_called_once_with(project)
+    mock_release.assert_called_once_with(20)
+
+
+def test_infer_and_release_releases_even_on_exception():
+    """_infer_and_release releases the project claim even when run_autonomous_inference raises."""
+    project = {"id": 21}
+    _worker_module._worker_id = "test-worker-5"
+
+    with (
+        patch("worker.run_autonomous_inference", side_effect=RuntimeError("crash")),
+        patch("worker._release_project") as mock_release,
+    ):
+        try:
+            _infer_and_release(project)
+        except RuntimeError:
+            pass
+
+    mock_release.assert_called_once_with(21)
