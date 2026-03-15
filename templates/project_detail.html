@@ -260,8 +260,8 @@
         {% if project.p18_thumb_url %}
         <img src="{{ project.p18_thumb_url }}" alt="{{ project.label or project.wikidata_qid }}" loading="lazy" style="width: 80px; height: 80px; object-fit: cover; object-position: top center; border: 2px solid var(--border); flex-shrink: 0;">
         {% endif %}
-        <div>
-            <h1 style="margin-bottom: 0.5rem;">{{ project.label or project.wikidata_qid }}</h1>
+        <div style="min-width: 0;">
+            <h1 style="margin-bottom: 0.5rem; font-size: 2rem; font-size: clamp(1.5rem, 5vw, 3rem);">{{ project.label or project.wikidata_qid }}</h1>
             <p style="color: var(--text-muted);">
                 <a href="https://www.wikidata.org/wiki/{{ project.wikidata_qid }}" target="_blank" rel="noopener">{{ project.wikidata_qid }}</a> &bull; 
                 <a href="https://commons.wikimedia.org/wiki/Category:{{ project.commons_category | urlencode }}" target="_blank" rel="noopener">Category:{{ project.commons_category }}</a>
@@ -284,18 +284,18 @@
             <div class="progress-text" id="progressPct" style="font-size: 1rem;">{{ _('Waiting for worker') }}&hellip;</div>
         </div>
     {% elif project.images_processed == project.images_total %}
-        <div style="display: flex; justify-content: space-between; align-items: flex-end; margin-bottom: 1rem;">
-            <h2>{{ _('Processing Progress') }}</h2>
-            <span id="progressCount" style="font-weight: bold; color: var(--success);">{{ _('Complete') }}</span>
+        <div style="display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: 0.5rem 1rem; margin-bottom: 1rem;">
+            <h2 style="margin-bottom: 0;">{{ _('Processing Progress') }}</h2>
+            <span id="progressCount" style="font-weight: bold; color: var(--success); white-space: nowrap;">{{ _('Complete') }}</span>
         </div>
         <div class="progress-wrap" style="height: 2.5rem;">
             <div class="progress-bar" id="progressBar" style="width: 100%;"></div>
             <div class="progress-text" id="progressPct" style="font-size: 1rem;">{{ _('%(num)d images processed', num=project.images_total) }}</div>
         </div>
     {% else %}
-        <div style="display: flex; justify-content: space-between; align-items: flex-end; margin-bottom: 1rem;">
-            <h2>{{ _('Processing Progress') }}</h2>
-            <span id="progressCount" style="font-weight: bold; color: var(--primary);">{{ _('%(done)d / %(total)d images', done=project.images_processed, total=project.images_total) }}</span>
+        <div style="display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: 0.5rem 1rem; margin-bottom: 1rem;">
+            <h2 style="margin-bottom: 0;">{{ _('Processing Progress') }}</h2>
+            <span id="progressCount" style="font-weight: bold; color: var(--primary); white-space: nowrap;">{{ _('%(done)d / %(total)d images', done=project.images_processed, total=project.images_total) }}</span>
         </div>
         {% set pct = (project.images_processed / project.images_total * 100) %}
         <div class="progress-wrap" style="height: 2.5rem;">
@@ -328,6 +328,10 @@
         <div class="stat-value" id="statSdcWritten" style="color: var(--info);">{{ stats.sdc_written or 0 }}</div>
         <div class="stat-label">{{ _('SDC Written') }}</div>
     </div>
+<div class="stat-box" data-stat="sdc_pending" style="border-color: #a855f7;">
+    <div class="stat-value" id="statSdcPending" style="color: #a855f7;">{{ stats.sdc_pending or 0 }}</div>
+        <div class="stat-label">{{ _('SDC Pending') }}</div>
+    </div>
 </div>
 
 {% set by_human = stats.by_human or 0 %}
@@ -336,7 +340,7 @@
 {% set classified_total = by_human + by_model + by_bootstrap %}
 {% if classified_total > 0 %}
 <h2 style="margin-top: 3rem;">{{ _('Classification Breakdown') }}</h2>
-<div class="stats-grid">
+<div class="stats-grid" style="grid-template-columns: repeat(auto-fit, minmax(100px, 1fr));">
     <div class="stat-box">
         <div class="stat-value" id="statByHuman">{{ by_human }}</div>
         <div class="stat-label">{{ _('By Human') }}</div>
@@ -1266,6 +1270,7 @@ data-detection-width="{{ face.detection_width or 0 }}" data-detection-height="{{
                 'statNonMatches': fs.confirmed_non_matches,
                 'statUnclassified': fs.unclassified,
                 'statSdcWritten': fs.sdc_written,
+                'statSdcPending': fs.sdc_pending,
                 'statByHuman': fs.by_human,
                 'statByModel': fs.by_model,
                 'statByBootstrap': fs.by_bootstrap

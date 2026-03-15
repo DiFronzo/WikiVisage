@@ -648,7 +648,7 @@ def test_project_settings_successful_update_redirects(monkeypatch, fake_user):
             updates.append((params, fetch))
             return 1
         if "AS human_confirmed" in sql:
-            return [{"human_confirmed": 10}]
+            return [{"human_confirmed": 10, "by_bootstrap": 0}]
         raise AssertionError(f"Unexpected SQL: {sql}")
 
     client = _make_authed_client(monkeypatch, fake_user, route_execute)
@@ -679,7 +679,7 @@ def test_project_settings_success_with_warning_for_min_confirmed(monkeypatch, fa
         if "UPDATE projects SET distance_threshold" in sql:
             return 1
         if "AS human_confirmed" in sql:
-            return [{"human_confirmed": 1}]
+            return [{"human_confirmed": 1, "by_bootstrap": 0}]
         raise AssertionError(f"Unexpected SQL: {sql}")
 
     client = _make_authed_client(monkeypatch, fake_user, route_execute)
@@ -801,6 +801,8 @@ def test_project_rerun_inference_successful_reset_with_affected_faces(monkeypatc
                     "last_inference_min_confirmed": 5,
                 }
             ]
+        if "AS human_confirmed" in sql:
+            return [{"human_confirmed": 10, "by_bootstrap": 3}]
         raise AssertionError(f"Unexpected SQL: {sql}")
 
     def fake_transaction(fn):
@@ -821,6 +823,7 @@ def test_project_rerun_inference_successful_reset_with_affected_faces(monkeypatc
     assert any("UPDATE projects SET last_inference_threshold = NULL" in sql for sql in executed_sql)
     flashes = _flashes(client)
     assert any(cat == "success" and "Reset 4 model-classified faces." in msg for cat, msg in flashes)
+    assert any(cat == "info" and "10/7 human-confirmed" in msg for cat, msg in flashes)
 
 
 def test_project_rerun_inference_null_last_inference_values_still_resets(monkeypatch, fake_user):
@@ -837,6 +840,8 @@ def test_project_rerun_inference_null_last_inference_values_still_resets(monkeyp
                     "last_inference_min_confirmed": None,
                 }
             ]
+        if "AS human_confirmed" in sql:
+            return [{"human_confirmed": 3, "by_bootstrap": 2}]
         raise AssertionError(f"Unexpected SQL: {sql}")
 
     def fake_transaction(fn):
@@ -855,11 +860,19 @@ def test_project_rerun_inference_null_last_inference_values_still_resets(monkeyp
     assert response.status_code == 302
     assert any("UPDATE faces f" in sql for sql in executed_sql)
     assert any("UPDATE projects SET last_inference_threshold = NULL" in sql for sql in executed_sql)
+    flashes = _flashes(client)
+    # Below threshold (3/5) + has bootstrap faces → warning + bootstrap tip
+    assert any(cat == "warning" and "3/5 human-confirmed" in msg for cat, msg in flashes)
+    assert any(cat == "info" and "2 bootstrapped" in msg for cat, msg in flashes)
 
 
 def test_project_rerun_inference_no_faces_to_reset(monkeypatch, fake_user):
     def route_execute(sql, _params, _fetch):
-        if "last_inference_threshold" in sql and "last_inference_min_confirmed" in sql:
+        if (
+            "last_inference_threshold" in sql
+            and "last_inference_min_confirmed" in sql
+            and "AS human_confirmed" not in sql
+        ):
             return [
                 {
                     "id": 1,
@@ -869,6 +882,8 @@ def test_project_rerun_inference_no_faces_to_reset(monkeypatch, fake_user):
                     "last_inference_min_confirmed": 5,
                 }
             ]
+        if "AS human_confirmed" in sql:
+            return [{"human_confirmed": 8, "by_bootstrap": 0}]
         raise AssertionError(f"Unexpected SQL: {sql}")
 
     executed_sql = []
@@ -894,7 +909,11 @@ def test_project_rerun_inference_no_faces_to_reset(monkeypatch, fake_user):
 
 def test_project_rerun_inference_db_error(monkeypatch, fake_user):
     def route_execute(sql, _params, _fetch):
-        if "last_inference_threshold" in sql and "last_inference_min_confirmed" in sql:
+        if (
+            "last_inference_threshold" in sql
+            and "last_inference_min_confirmed" in sql
+            and "AS human_confirmed" not in sql
+        ):
             return [
                 {
                     "id": 1,
@@ -904,6 +923,8 @@ def test_project_rerun_inference_db_error(monkeypatch, fake_user):
                     "last_inference_min_confirmed": 5,
                 }
             ]
+        if "AS human_confirmed" in sql:
+            return [{"human_confirmed": 0, "by_bootstrap": 0}]
         raise AssertionError(f"Unexpected SQL: {sql}")
 
     def fake_transaction(_fn):
@@ -983,7 +1004,7 @@ def test_leaderboard_success_with_rows(monkeypatch):
     def execute_query_mock(sql, _params=None, _fetch=True):
         if "FROM worker_heartbeat" in sql:
             return [{"is_stale": 0}]
-        if "FROM users u" in sql and "INNER JOIN faces f" in sql:
+        if "FROM users u" in sql and "LEFT JOIN faces f" in sql:
             return rows
         return []
 

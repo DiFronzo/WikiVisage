@@ -18,7 +18,9 @@
         </a>
 </p>
 
-Active-learning face tagging for Wikimedia Commons: train a lightweight model with simple **Yes/No** feedback and (optionally) write [P180 (depicts)](https://www.wikidata.org/wiki/Property:P180) Structured Data claims to matching files via OAuth.
+<p align="center">
+Active learning facial recognition for Wikimedia Commons. Train an ML model to recognize specific people and automatically add <a href="https://www.wikidata.org/wiki/Property:P180">P180 (depicts)</a> Structured Data to matching images.
+</p>
 
 ![WikiVisage landing page screenshot](static/landing_page.png)
 
@@ -30,11 +32,13 @@ Active-learning face tagging for Wikimedia Commons: train a lightweight model wi
 
 ## ✨ Highlights
 
-- 🧠 **Active learning UI**: fast yes/no classification with keyboard shortcuts
-- 🧵 **Background worker**: crawls Commons categories, downloads images, detects faces (HOG), and stores encodings
-- 🧷 **Bootstrap from existing tags**: seeds the model via SPARQL when depicts already exists
+- 🧠 **Active learning UI**: fast yes/no classification with keyboard shortcuts, undo, skip, and manual face drawing
+- 🧵 **Background worker**: crawls Commons categories, downloads images, detects faces (HOG), and stores 128D encodings
+- 🔀 **Multi-instance workers**: distributed locking lets multiple workers process projects concurrently without conflicts
+- 🧪 **Persistent subprocess pool**: face detection runs in long-lived subprocesses, eliminating per-image dlib import overhead
+- 🧷 **Bootstrap from existing tags**: seeds the model via SPARQL when P180 depicts claims already exist on Commons
 - 🤖 **Autonomous inference**: centroid-distance classification once you have enough confirmed examples
-- ✍️ **User-triggered Commons edits**: click “Send Edits to Wikimedia Commons” to write depicts claims via the Wikibase API
+- ✍️ **User-triggered Commons edits**: click "Send Edits to Wikimedia Commons" to write depicts claims via the Wikibase API
 - 🌍 **i18n-ready**: translations included (en, nb, es, fr)
 
 ## 🧭 How it works
@@ -50,15 +54,16 @@ Active-learning face tagging for Wikimedia Commons: train a lightweight model wi
 
 ```
 +---------------------------+      +---------------------------+
-|       Flask Web App       |      |     Background Worker     |
+|       Flask Web App       |      |  Background Worker(s)     |
 |          (app.py)         |      |       (worker.py)         |
 |---------------------------|      |---------------------------|
 | OAuth 2.0 login           |      | Category traversal        |
 | Project CRUD              |      | Image download            |
-| Active learning UI        |      | HOG face detection        |
+| Active learning UI        |      | HOG face detection (pool) |
 | Classification UI         |      | SPARQL bootstrapping      |
 | Queue SDC writes          |      | Autonomous inference      |
-|                           |      | Write SDC claims          |
+| Approve/reject/edit bbox  |      | Write SDC claims          |
+|                           |      | Distributed claim locking |
 +------------+--------------+      +------------+--------------+
              |                                  |
              +----------------------------------+
@@ -71,22 +76,25 @@ Active-learning face tagging for Wikimedia Commons: train a lightweight model wi
 
 - 🧰 **Stack**: Python 3.11+, Flask, gunicorn, face_recognition (dlib HOG), PyMySQL, requests-oauthlib
 - ☁️ **Hosted on**: [Wikimedia Toolforge](https://wikitech.wikimedia.org/wiki/Help:Toolforge) (Kubernetes Build Service)
+- 🔀 **Workers**: Multiple instances run concurrently — each claims projects via `SELECT … FOR UPDATE` with automatic stale-claim expiry (15 min)
 
 ## 🗂️ Project layout
 
 ```
 WikiVisage/
 ├── app.py               # Flask app: OAuth, routes, classification API
-├── worker.py            # Background ML pipeline: crawl, detect, infer, write
+├── worker.py            # Background ML pipeline: crawl, detect, infer, write (multi-instance)
 ├── database.py          # MariaDB connection pool with retry logic
-├── schema.sql           # Database schema (tables + indices)
-├── migrate.py           # Idempotent migration script
-├── templates/           # Jinja2 templates
+├── schema.sql           # Database schema (7 tables + indices)
+├── migrate.py           # Idempotent migration script with --reset flag
+├── jobs.yaml            # Toolforge jobs definition (2 worker instances)
+├── templates/           # Jinja2 templates (9 files, all extend base.html)
 ├── static/              # Logos + screenshots
 ├── translations/        # i18n: en, nb, es, fr
 ├── requirements.txt     # Runtime dependencies
-├── requirements-dev.txt # Dev/test deps
-└── whitelist.txt        # Allowed usernames (Toolforge)
+├── requirements-dev.txt # Dev/test deps (pytest, ruff)
+├── whitelist.txt        # Allowed usernames (Toolforge)
+└── tests/               # 101 tests (unit + integration)
 ```
 
 ## 🧑‍💻 Setup
@@ -141,7 +149,7 @@ toolforge build start https://github.com/DiFronzo/WikiVisage.git
 # Start web service
 toolforge webservice buildservice start
 
-# Start background worker (uses jobs.yaml)
+# Start background workers (uses jobs.yaml — 2 worker instances)
 toolforge jobs load jobs.yaml
 ```
 
@@ -164,11 +172,11 @@ export OAUTHLIB_INSECURE_TRANSPORT=1
 
 mysql -u root -p -e "CREATE DATABASE wikiface_dev"
 python migrate.py
-python app.py        # Web app on http://localhost:8000
-python worker.py     # Background worker (separate terminal)
+python app.py                                   # Web app on http://localhost:8000
+python worker.py --worker-id local-1            # Background worker (separate terminal)
 ```
 
-For local OAuth you’ll need a separate consumer with `http://localhost:8000/auth/callback` as the callback URL. Set `OAUTHLIB_INSECURE_TRANSPORT=1` to allow OAuth over HTTP.
+For local OAuth you'll need a separate consumer with `http://localhost:8000/auth/callback` as the callback URL. Set `OAUTHLIB_INSECURE_TRANSPORT=1` to allow OAuth over HTTP.
 
 ## ⚙️ Configuration
 
@@ -179,14 +187,28 @@ Each project has a couple of tunables:
 | `distance_threshold` | `0.6` | Face-distance cutoff for autonomous classification (lower = stricter). |
 | `min_confirmed` | `5` | Minimum confirmed matches before autonomous inference starts. |
 
+### 🔧 Worker environment variables (optional)
+
+| Variable | Default | Description |
+|---|---:|---|
+| `WIKIVISAGE_WORKER_POLL_INTERVAL` | `60` | Seconds between poll cycles |
+| `WIKIVISAGE_WORKER_MAX_PROJECTS` | `3` | Max projects processed concurrently per worker |
+| `WIKIVISAGE_WORKER_IMAGE_THREADS` | `4` | Parallel image download/detection threads per project |
+| `WIKIVISAGE_WORKER_BATCH_SIZE` | `50` | Images per processing batch |
+| `WIKIVISAGE_DB_POOL_SIZE` | auto | DB connection pool size (auto = `max_projects × image_threads + 3`) |
+| `COMMONS_DOWNLOAD_THROTTLE_SECONDS` | `0` | Delay between image downloads (seconds) |
+
 ## ✅ Testing
 
 ```bash
-# Unit tests (CI mode)
+# Unit tests (CI mode — integration tests auto-skipped)
 pytest tests/ -v
 
 # Unit + integration tests (requires local MariaDB)
 WIKIVISAGE_TEST_DB=1 pytest tests/ -v
+
+# With coverage
+WIKIVISAGE_TEST_DB=1 pytest tests/ --cov=. --cov-report=term-missing
 ```
 
 ## 📝 License

@@ -6,6 +6,7 @@ import os
 import queue
 import re
 import signal
+import socket
 import sys
 import threading
 import time
@@ -32,7 +33,7 @@ from PIL import Image
 from requests.adapters import HTTPAdapter
 from requests.packages.urllib3.util.retry import Retry
 
-from database import DatabaseError, close_pool, execute_query, init_db
+from database import DatabaseError, close_pool, execute_query, execute_transaction, init_db
 
 # Configure Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
@@ -50,6 +51,9 @@ BATCH_SIZE = int(os.environ.get("WIKIVISAGE_WORKER_BATCH_SIZE", 50))
 WAKE_UP_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".worker-wake-up")
 MAX_CONCURRENT_PROJECTS = int(os.environ.get("WIKIVISAGE_WORKER_MAX_PROJECTS", 3))
 IMAGE_THREADS = int(os.environ.get("WIKIVISAGE_WORKER_IMAGE_THREADS", 4))
+
+# Distributed locking: stale claims from crashed workers expire after this many minutes
+CLAIM_EXPIRY_MINUTES = 15
 
 # Maximum image download size (50 MB) — prevents OOM on abnormally large files
 MAX_IMAGE_DOWNLOAD_BYTES = 50 * 1024 * 1024
@@ -91,6 +95,9 @@ SKIP_EXTENSIONS_REGEX = _build_skip_extensions_regex(_SKIP_EXTENSIONS)
 
 # Global Shutdown Flag
 shutdown_requested = False
+
+# Unique identifier for this worker instance (set in main())
+_worker_id: str = ""
 
 
 def _create_session() -> requests.Session:
@@ -1589,6 +1596,230 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
     return total_written
 
 
+# ---------------------------------------------------------------------------
+# Distributed locking: claim / release / refresh helpers
+# ---------------------------------------------------------------------------
+
+
+def _claim_active_projects(max_count: int) -> list[dict[str, Any]]:
+    """Atomically claim up to *max_count* unclaimed (or stale-claimed) active projects.
+
+    Uses SELECT … FOR UPDATE inside a transaction so two workers racing on the
+    same poll cycle will never both claim the same project.
+
+    Only claims projects that have remaining work: at least one pending image
+    to process OR at least one unclassified face.  This avoids wasting worker
+    slots on fully-processed projects that the user hasn't marked completed.
+
+    Returns:
+        List of project dicts that were successfully claimed by this worker.
+    """
+
+    def _txn(conn: Any, cursor: Any) -> list[dict[str, Any]]:
+        cursor.execute(
+            "SELECT p.id FROM projects p "
+            "WHERE p.status = 'active' "
+            "AND (p.worker_claimed_by IS NULL "
+            "     OR p.worker_claimed_at < NOW() - INTERVAL %s MINUTE) "
+            "AND ("
+            "  NOT EXISTS (SELECT 1 FROM images i WHERE i.project_id = p.id) "
+            "  OR EXISTS (SELECT 1 FROM images i WHERE i.project_id = p.id AND i.status = 'pending') "
+            "  OR EXISTS ("
+            "    SELECT 1 FROM faces f JOIN images i ON f.image_id = i.id "
+            "    WHERE i.project_id = p.id AND f.is_target IS NULL AND f.superseded_by IS NULL"
+            "  )"
+            ") "
+            "ORDER BY COALESCE(p.worker_claimed_at, '1970-01-01') ASC, "
+            "(SELECT COUNT(*) FROM images i WHERE i.project_id = p.id) ASC, p.id DESC "
+            "LIMIT %s "
+            "FOR UPDATE",
+            (CLAIM_EXPIRY_MINUTES, max_count),
+        )
+        rows = cursor.fetchall()
+        if not rows:
+            return []
+
+        ids = [r["id"] for r in rows]
+        placeholders = ", ".join(["%s"] * len(ids))
+        cursor.execute(
+            f"UPDATE projects SET worker_claimed_by = %s, worker_claimed_at = NOW() WHERE id IN ({placeholders})",
+            [_worker_id, *ids],
+        )
+
+        # Re-fetch the full project rows (now claimed) so callers get all columns.
+        cursor.execute(
+            f"SELECT p.*, "
+            f"  (SELECT COUNT(*) FROM images i WHERE i.project_id = p.id) AS image_count "
+            f"FROM projects p WHERE p.id IN ({placeholders})",
+            ids,
+        )
+        return list(cursor.fetchall())
+
+    try:
+        result = execute_transaction(_txn)
+        if result:
+            logger.info(f"Claimed {len(result)} active project(s): {[p['id'] for p in result]}")
+        return result
+    except DatabaseError:
+        logger.exception("Failed to claim active projects")
+        return []
+
+
+def _claim_inference_projects(max_count: int) -> list[dict[str, Any]]:
+    """Atomically claim inference-eligible projects not already claimed by any worker.
+
+    An inference-eligible project is active or completed, has enough human-confirmed
+    target faces (>= min_confirmed), and still has unclassified faces remaining.
+    """
+
+    def _txn(conn: Any, cursor: Any) -> list[dict[str, Any]]:
+        cursor.execute(
+            "SELECT p.id FROM projects p "
+            "WHERE p.status IN ('active', 'completed') "
+            "AND (p.worker_claimed_by IS NULL "
+            "     OR p.worker_claimed_at < NOW() - INTERVAL %s MINUTE) "
+            "AND ("
+            "  SELECT COUNT(*) FROM faces f "
+            "  JOIN images i ON f.image_id = i.id "
+            "  WHERE i.project_id = p.id AND f.is_target = 1 AND f.superseded_by IS NULL"
+            "  AND f.classified_by_user_id IS NOT NULL"
+            ") >= p.min_confirmed "
+            "AND EXISTS ("
+            "  SELECT 1 FROM faces f "
+            "  JOIN images i ON f.image_id = i.id "
+            "  WHERE i.project_id = p.id AND f.is_target IS NULL AND f.superseded_by IS NULL"
+            ") "
+            "ORDER BY COALESCE(p.worker_claimed_at, '1970-01-01') ASC, p.id ASC "
+            "LIMIT %s "
+            "FOR UPDATE",
+            (CLAIM_EXPIRY_MINUTES, max_count),
+        )
+        rows = cursor.fetchall()
+        if not rows:
+            return []
+
+        ids = [r["id"] for r in rows]
+        placeholders = ", ".join(["%s"] * len(ids))
+        cursor.execute(
+            f"UPDATE projects SET worker_claimed_by = %s, worker_claimed_at = NOW() WHERE id IN ({placeholders})",
+            [_worker_id, *ids],
+        )
+
+        cursor.execute(
+            f"SELECT p.* FROM projects p WHERE p.id IN ({placeholders})",
+            ids,
+        )
+        return list(cursor.fetchall())
+
+    try:
+        result = execute_transaction(_txn)
+        if result:
+            logger.info(f"Claimed {len(result)} inference project(s): {[p['id'] for p in result]}")
+        return result
+    except DatabaseError:
+        logger.exception("Failed to claim inference projects")
+        return []
+
+
+def _claim_sdc_projects() -> list[dict[str, Any]]:
+    """Atomically claim projects that have pending SDC write requests."""
+
+    def _txn(conn: Any, cursor: Any) -> list[dict[str, Any]]:
+        cursor.execute(
+            "SELECT p.id FROM projects p "
+            "WHERE p.sdc_write_requested = 1 AND p.status != 'deleted' "
+            "AND (p.worker_claimed_by IS NULL "
+            "     OR p.worker_claimed_at < NOW() - INTERVAL %s MINUTE) "
+            "ORDER BY COALESCE(p.worker_claimed_at, '1970-01-01') ASC "
+            "LIMIT %s "
+            "FOR UPDATE",
+            (CLAIM_EXPIRY_MINUTES, MAX_CONCURRENT_PROJECTS),
+        )
+        rows = cursor.fetchall()
+        if not rows:
+            return []
+
+        ids = [r["id"] for r in rows]
+        placeholders = ", ".join(["%s"] * len(ids))
+        cursor.execute(
+            f"UPDATE projects SET worker_claimed_by = %s, worker_claimed_at = NOW() WHERE id IN ({placeholders})",
+            [_worker_id, *ids],
+        )
+
+        cursor.execute(
+            f"SELECT p.* FROM projects p WHERE p.id IN ({placeholders})",
+            ids,
+        )
+        return list(cursor.fetchall())
+
+    try:
+        result = execute_transaction(_txn)
+        if result:
+            logger.info(f"Claimed {len(result)} SDC project(s): {[p['id'] for p in result]}")
+        return result
+    except DatabaseError:
+        logger.exception("Failed to claim SDC projects")
+        return []
+
+
+def _release_project(project_id: int) -> None:
+    """Release this worker's claim on a single project."""
+    try:
+        execute_query(
+            "UPDATE projects SET worker_claimed_by = NULL WHERE id = %s AND worker_claimed_by = %s",
+            (project_id, _worker_id),
+            fetch=False,
+        )
+    except DatabaseError:
+        logger.warning("Failed to release claim on project %s", project_id)
+
+
+def _release_all_claims() -> None:
+    """Release all claims held by this worker (shutdown cleanup)."""
+    try:
+        released = execute_query(
+            "UPDATE projects SET worker_claimed_by = NULL WHERE worker_claimed_by = %s",
+            (_worker_id,),
+            fetch=False,
+        )
+        if released:
+            logger.info(f"Released {released} project claim(s) on shutdown")
+    except DatabaseError:
+        logger.warning("Failed to release claims on shutdown")
+
+
+def _refresh_claims() -> None:
+    """Refresh worker_claimed_at for all projects claimed by this worker.
+
+    This prevents our claims from expiring while we are still actively
+    processing them (the expiry window is CLAIM_EXPIRY_MINUTES).
+    """
+    try:
+        execute_query(
+            "UPDATE projects SET worker_claimed_at = NOW() WHERE worker_claimed_by = %s",
+            (_worker_id,),
+            fetch=False,
+        )
+    except DatabaseError:
+        logger.warning("Failed to refresh claim timestamps")
+
+
+def _process_and_release(project: dict[str, Any], *, skip_discovery: bool = False) -> None:
+    """Wrapper: run process_project then release the claim no matter what."""
+    try:
+        process_project(project, skip_discovery=skip_discovery)
+    finally:
+        _release_project(project["id"])
+
+
+def _infer_and_release(project: dict[str, Any]) -> int:
+    """Wrapper: run run_autonomous_inference then release the claim."""
+    try:
+        return run_autonomous_inference(project)
+    finally:
+        _release_project(project["id"])
+
+
 def process_project(project: dict[str, Any], *, skip_discovery: bool = False) -> None:
     """Orchestrate all phases for a single project.
 
@@ -1602,19 +1833,40 @@ def process_project(project: dict[str, Any], *, skip_discovery: bool = False) ->
     logger.info(f"--- Processing project {project_id} ({project['wikidata_qid']}) ---")
 
     def _is_still_active() -> bool:
-        """Re-check project status from DB; return False if no longer active."""
+        """Re-check project status and claim ownership from DB.
+
+        Returns False if the project is no longer active or if another worker
+        has reclaimed it (e.g. because our claim expired).  Also refreshes the
+        claim timestamp on success so the claim does not expire while we work.
+        """
         try:
             row = execute_query(
-                "SELECT status FROM projects WHERE id = %s",
+                "SELECT status, worker_claimed_by FROM projects WHERE id = %s",
                 (project_id,),
                 fetch=True,
             )
-            if row and isinstance(row, list) and row[0]["status"] == "active":
-                return True
-            logger.info(
-                f"Project {project_id} is no longer active (status={row[0]['status'] if row and isinstance(row, list) else 'unknown'}), stopping processing"
+            if not row or not isinstance(row, list):
+                logger.info(f"Project {project_id} not found, stopping processing")
+                return False
+
+            status = row[0]["status"]
+            claimed_by = row[0].get("worker_claimed_by")
+
+            if status != "active":
+                logger.info(f"Project {project_id} is no longer active (status={status}), stopping processing")
+                return False
+
+            if claimed_by != _worker_id:
+                logger.info(f"Project {project_id} not claimed by us (claimed_by={claimed_by}), stopping processing")
+                return False
+
+            # Refresh our claim timestamp so it doesn't expire mid-processing
+            execute_query(
+                "UPDATE projects SET worker_claimed_at = NOW() WHERE id = %s AND worker_claimed_by = %s",
+                (project_id, _worker_id),
+                fetch=False,
             )
-            return False
+            return True
         except DatabaseError as exc:
             logger.warning(
                 "DatabaseError while checking if project %s is still active; "
@@ -1720,25 +1972,37 @@ def signal_handler(signum, frame):
 
 
 def main():
-    """Main worker loop with concurrent project processing."""
-    logger.info(f"Starting WikiVisage Worker (max_projects={MAX_CONCURRENT_PROJECTS}, image_threads={IMAGE_THREADS})")
+    """Main worker loop with distributed locking for concurrent multi-instance processing."""
+    global _worker_id
+    # Accept --worker-id from command line (used in jobs.yaml), fall back to hostname-pid.
+    wid = None
+    if "--worker-id" in sys.argv:
+        idx = sys.argv.index("--worker-id")
+        if idx + 1 < len(sys.argv):
+            wid = sys.argv[idx + 1]
+    _worker_id = wid or f"{socket.gethostname()}-{os.getpid()}"
+    logger.info(
+        f"Starting WikiVisage Worker {_worker_id} "
+        f"(max_projects={MAX_CONCURRENT_PROJECTS}, image_threads={IMAGE_THREADS})"
+    )
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
     try:
         # Respect WIKIVISAGE_DB_POOL_SIZE env var if set; otherwise compute from concurrency settings.
-        # Toolforge shared MariaDB has a low max_user_connections limit (~10), so keep this modest.
-        # The web process (gunicorn) also uses connections from the same user account.
+        # Toolforge ToolsDB enforces max_user_connections=20 across ALL processes sharing the same
+        # DB user account (gunicorn + all worker instances). Default gunicorn uses pool_size=2 per
+        # worker (2 workers = 4 conns). Cap each worker at 8 so 2 workers + web stays <= 20.
         db_pool_env = os.environ.get("WIKIVISAGE_DB_POOL_SIZE")
         if db_pool_env:
             worker_pool_size = int(db_pool_env)
         else:
-            worker_pool_size = MAX_CONCURRENT_PROJECTS * IMAGE_THREADS + 3
-        if worker_pool_size > 10:
+            worker_pool_size = min(MAX_CONCURRENT_PROJECTS * IMAGE_THREADS + 3, 8)
+        if worker_pool_size > 8:
             logger.warning(
-                "DB pool size %d may exceed Toolforge max_user_connections. "
-                "Set WIKIVISAGE_DB_POOL_SIZE <= 10 if you see 'Too many connections' errors.",
+                "DB pool size %d may exceed Toolforge max_user_connections (20 shared across all processes). "
+                "With 2 workers + gunicorn, keep each worker's pool <= 8.",
                 worker_pool_size,
             )
         init_db(pool_size=worker_pool_size)
@@ -1785,75 +2049,53 @@ def main():
                     fetch=False,
                 )
 
-                active_projects = execute_query(
-                    "SELECT p.*, "
-                    "  (SELECT COUNT(*) FROM images i WHERE i.project_id = p.id) AS image_count "
-                    "FROM projects p WHERE p.status = 'active' "
-                    "ORDER BY image_count ASC, p.id DESC",
-                    fetch=True,
-                )
+                # ---- Claim active projects (atomic, distributed-safe) ----
+                active_projects = _claim_active_projects(MAX_CONCURRENT_PROJECTS)
 
-                inference_projects = execute_query(
-                    "SELECT p.* FROM projects p "
-                    "WHERE p.status IN ('active', 'completed') "
-                    "AND ("
-                    "  SELECT COUNT(*) FROM faces f "
-                    "  JOIN images i ON f.image_id = i.id "
-                    "  WHERE i.project_id = p.id AND f.is_target = 1 AND f.superseded_by IS NULL"
-                    "  AND f.classified_by_user_id IS NOT NULL"
-                    ") >= p.min_confirmed "
-                    "AND EXISTS ("
-                    "  SELECT 1 FROM faces f "
-                    "  JOIN images i ON f.image_id = i.id "
-                    "  WHERE i.project_id = p.id AND f.is_target IS NULL AND f.superseded_by IS NULL"
-                    ")",
-                    fetch=True,
-                )
+                # ---- Claim inference-eligible projects (skip those we already claimed above) ----
+                active_ids = {p["id"] for p in active_projects}
+                inference_projects = _claim_inference_projects(MAX_CONCURRENT_PROJECTS)
+                inference_only = [p for p in inference_projects if p["id"] not in active_ids]
 
-                active_count = len(active_projects) if isinstance(active_projects, list) else 0
-                inference_count = len(inference_projects) if isinstance(inference_projects, list) else 0
-
-                # Check for SDC write requests
-                sdc_projects = execute_query(
-                    "SELECT p.* FROM projects p WHERE p.sdc_write_requested = 1 AND p.status != 'deleted'",
-                    fetch=True,
-                )
-                sdc_count = len(sdc_projects) if isinstance(sdc_projects, list) else 0
+                # ---- Claim SDC write-requested projects ----
+                sdc_projects = _claim_sdc_projects()
 
                 logger.info(
-                    f"Poll: {active_count} active project(s), "
-                    f"{inference_count} inference-eligible project(s), "
-                    f"{sdc_count} SDC write request(s)"
+                    f"Poll: claimed {len(active_projects)} active, "
+                    f"{len(inference_only)} inference-only, "
+                    f"{len(sdc_projects)} SDC project(s)"
                 )
 
                 # Fast-track new projects: run discovery (traverse + bootstrap) immediately
                 # so they don't wait behind long-running image processing in the thread pool.
                 fast_tracked_ids = set()
                 fast_tracked_count = 0
-                if active_projects and isinstance(active_projects, list):
-                    for project in active_projects:
-                        if shutdown_requested:
-                            break
-                        # Apply a per-cycle cap to keep the poll loop responsive.
-                        if fast_tracked_count >= MAX_FAST_TRACK_PER_WAKEUP:
-                            logger.debug(
-                                "Reached per-cycle fast-track cap "
-                                f"({MAX_FAST_TRACK_PER_WAKEUP}); deferring remaining projects"
-                            )
-                            break
-                        if project.get("image_count", 0) == 0:
-                            logger.info(
-                                f"Fast-tracking new project {project['id']} "
-                                f"({project['wikidata_qid']}): running discovery"
-                            )
-                            try:
-                                traverse_category(project)
-                                if not shutdown_requested:
-                                    bootstrap_from_sparql(project)
-                                fast_tracked_ids.add(project["id"])
-                                fast_tracked_count += 1
-                            except Exception as e:
-                                logger.error(f"Fast-track discovery failed for project {project['id']}: {e}")
+                for project in active_projects:
+                    if shutdown_requested:
+                        break
+                    # Apply a per-cycle cap to keep the poll loop responsive.
+                    if fast_tracked_count >= MAX_FAST_TRACK_PER_WAKEUP:
+                        logger.debug(
+                            "Reached per-cycle fast-track cap "
+                            f"({MAX_FAST_TRACK_PER_WAKEUP}); deferring remaining projects"
+                        )
+                        break
+                    if project.get("image_count", 0) == 0:
+                        logger.info(
+                            f"Fast-tracking new project {project['id']} ({project['wikidata_qid']}): running discovery"
+                        )
+                        try:
+                            traverse_category(project)
+                            # Refresh claim after potentially long category traversal
+                            _refresh_claims()
+                            if not shutdown_requested:
+                                bootstrap_from_sparql(project)
+                                # Refresh claim after bootstrap SPARQL queries
+                                _refresh_claims()
+                            fast_tracked_ids.add(project["id"])
+                            fast_tracked_count += 1
+                        except Exception as e:
+                            logger.error(f"Fast-track discovery failed for project {project['id']}: {e}")
 
                 if fast_tracked_ids:
                     try:
@@ -1864,9 +2106,9 @@ def main():
                     except Exception:
                         pass
 
-                # Process active projects concurrently
+                # Process active projects concurrently (claims released in wrapper)
                 seen_ids = set()
-                if active_projects and isinstance(active_projects, list):
+                if active_projects:
                     with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_PROJECTS) as executor:
                         futures = {}
                         for project in active_projects:
@@ -1874,7 +2116,7 @@ def main():
                                 break
                             seen_ids.add(project["id"])
                             skip = project["id"] in fast_tracked_ids
-                            future = executor.submit(process_project, project, skip_discovery=skip)
+                            future = executor.submit(_process_and_release, project, skip_discovery=skip)
                             futures[future] = project["id"]
 
                         last_heartbeat = time.time()
@@ -1882,7 +2124,7 @@ def main():
                             if shutdown_requested:
                                 break
 
-                            # Refresh heartbeat during long processing cycles
+                            # Refresh heartbeat + claim timestamps during long processing cycles
                             if time.time() - last_heartbeat >= 60:
                                 try:
                                     execute_query(
@@ -1891,6 +2133,7 @@ def main():
                                     )
                                 except Exception:
                                     pass
+                                _refresh_claims()
                                 last_heartbeat = time.time()
 
                             # Check for wake-up signal every iteration (even if no futures done)
@@ -1900,44 +2143,32 @@ def main():
                                 except OSError:
                                     pass
                                 logger.info("Wake-up signal received mid-cycle, checking for new projects")
-                                new_projects = execute_query(
-                                    "SELECT p.*, "
-                                    "  (SELECT COUNT(*) FROM images i WHERE i.project_id = p.id) AS image_count "
-                                    "FROM projects p WHERE p.status = 'active' "
-                                    "ORDER BY image_count ASC, p.id DESC",
-                                    fetch=True,
-                                )
-                                if new_projects and isinstance(new_projects, list):
-                                    # Limit to 1 fast-tracked project per wake-up to avoid
-                                    # starving the thread-pool with serial traversal work.
-                                    fast_tracked_this_wakeup = 0
-                                    for project in new_projects:
-                                        if project["id"] not in seen_ids:
-                                            seen_ids.add(project["id"])
-                                            skip = False
-                                            # Fast-track new projects discovered mid-cycle
-                                            if (
-                                                project.get("image_count", 0) == 0
-                                                and fast_tracked_this_wakeup < MAX_FAST_TRACK_PER_WAKEUP
-                                            ):
-                                                logger.info(
-                                                    f"Fast-tracking new project {project['id']} "
-                                                    f"({project['wikidata_qid']}): running discovery"
+                                new_projects = _claim_active_projects(MAX_CONCURRENT_PROJECTS)
+                                for project in new_projects:
+                                    if project["id"] not in seen_ids:
+                                        seen_ids.add(project["id"])
+                                        skip = False
+                                        # Fast-track new projects discovered mid-cycle
+                                        if project.get("image_count", 0) == 0:
+                                            logger.info(
+                                                f"Fast-tracking new project {project['id']} "
+                                                f"({project['wikidata_qid']}): running discovery"
+                                            )
+                                            try:
+                                                traverse_category(project)
+                                                _refresh_claims()
+                                                if not shutdown_requested:
+                                                    bootstrap_from_sparql(project)
+                                                    _refresh_claims()
+                                                skip = True
+                                            except Exception as e:
+                                                logger.error(
+                                                    f"Fast-track discovery failed for project {project['id']}: {e}"
                                                 )
-                                                try:
-                                                    traverse_category(project)
-                                                    if not shutdown_requested:
-                                                        bootstrap_from_sparql(project)
-                                                    skip = True
-                                                    fast_tracked_this_wakeup += 1
-                                                except Exception as e:
-                                                    logger.error(
-                                                        f"Fast-track discovery failed for project {project['id']}: {e}"
-                                                    )
-                                                last_heartbeat = 0  # force heartbeat refresh on next iteration
-                                            logger.info(f"Adding new project {project['id']} to current cycle")
-                                            future = executor.submit(process_project, project, skip_discovery=skip)
-                                            futures[future] = project["id"]
+                                            last_heartbeat = 0  # force heartbeat refresh on next iteration
+                                        logger.info(f"Adding new project {project['id']} to current cycle")
+                                        future = executor.submit(_process_and_release, project, skip_discovery=skip)
+                                        futures[future] = project["id"]
 
                             done = {f for f in futures if f.done()}
                             if not done:
@@ -1951,71 +2182,106 @@ def main():
                                 except Exception as e:
                                     logger.error(f"Project {project_id} processing failed: {e}")
 
-                # Run inference for eligible projects not already processed
-                if inference_projects and isinstance(inference_projects, list):
-                    inference_only = [p for p in inference_projects if p["id"] not in seen_ids]
-                    if inference_only:
-                        with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_PROJECTS) as executor:
-                            futures = {}
-                            for project in inference_only:
-                                if shutdown_requested:
-                                    break
-                                logger.info(
-                                    f"Running inference-only for project {project['id']} "
-                                    f"(status={project.get('status')})"
-                                )
-                                future = executor.submit(run_autonomous_inference, project)
-                                futures[future] = project["id"]
+                # Run inference for eligible projects not already processed (claims released in wrapper)
+                if inference_only:
+                    with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_PROJECTS) as executor:
+                        futures = {}
+                        for project in inference_only:
+                            if shutdown_requested:
+                                break
+                            logger.info(
+                                f"Running inference-only for project {project['id']} (status={project.get('status')})"
+                            )
+                            future = executor.submit(_infer_and_release, project)
+                            futures[future] = project["id"]
 
-                            last_heartbeat_inf = time.time()
-                            for future in as_completed(futures):
-                                if shutdown_requested:
-                                    break
-                                # Refresh heartbeat during inference
-                                if time.time() - last_heartbeat_inf >= 60:
-                                    try:
-                                        execute_query(
-                                            "REPLACE INTO worker_heartbeat (id, last_seen) VALUES (1, NOW())",
-                                            fetch=False,
-                                        )
-                                    except Exception:
-                                        pass
-                                    last_heartbeat_inf = time.time()
-                                project_id = futures[future]
+                        last_heartbeat_inf = time.time()
+                        while futures:
+                            if shutdown_requested:
+                                break
+
+                            # Refresh heartbeat + claims during inference
+                            if time.time() - last_heartbeat_inf >= 60:
+                                try:
+                                    execute_query(
+                                        "REPLACE INTO worker_heartbeat (id, last_seen) VALUES (1, NOW())",
+                                        fetch=False,
+                                    )
+                                except Exception:
+                                    pass
+                                _refresh_claims()
+                                last_heartbeat_inf = time.time()
+
+                            done = {f for f in futures if f.done()}
+                            if not done:
+                                time.sleep(1)
+                                continue
+
+                            for future in done:
+                                project_id = futures.pop(future)
                                 try:
                                     classified = future.result()
                                     logger.info(f"Inference classified {classified} faces for project {project_id}")
                                 except Exception as e:
                                     logger.error(f"Inference failed for project {project_id}: {e}")
 
-                # Process SDC write requests (sequential — one project at a time)
-                if sdc_projects and isinstance(sdc_projects, list):
-                    for sdc_project in sdc_projects:
-                        if shutdown_requested:
-                            break
-                        logger.info(f"Processing SDC write request for project {sdc_project['id']}")
-                        try:
-                            written = write_sdc_claims(sdc_project)
-                            logger.info(f"SDC write complete for project {sdc_project['id']}: {written} claims written")
-                        except Exception as e:
-                            logger.error(f"SDC write failed for project {sdc_project['id']}: {e}")
-                            # Clear the flag so it doesn't retry endlessly
-                            try:
-                                execute_query(
-                                    "UPDATE projects SET sdc_write_requested = 0, sdc_write_error = %s WHERE id = %s",
-                                    (str(e)[:1000], sdc_project["id"]),
-                                    fetch=False,
-                                )
-                            except DatabaseError:
-                                pass
-
-                # Hard-delete soft-deleted projects (FK CASCADE cleans images + faces)
-                if not shutdown_requested:
+                # Process SDC write requests (sequential — one project at a time, claim released after each)
+                for sdc_project in sdc_projects:
+                    if shutdown_requested:
+                        break
+                    # Refresh claim before starting potentially long SDC write
                     try:
-                        deleted = execute_query(
-                            "DELETE FROM projects WHERE status = 'deleted'",
+                        execute_query(
+                            "UPDATE projects SET worker_claimed_at = NOW() WHERE id = %s AND worker_claimed_by = %s",
+                            (sdc_project["id"], _worker_id),
                             fetch=False,
                         )
+                    except DatabaseError:
+                        pass
+                    logger.info(f"Processing SDC write request for project {sdc_project['id']}")
+                    try:
+                        written = write_sdc_claims(sdc_project)
+                        logger.info(f"SDC write complete for project {sdc_project['id']}: {written} claims written")
+                    except Exception as e:
+                        logger.error(f"SDC write failed for project {sdc_project['id']}: {e}")
+                        # Clear the flag so it doesn't retry endlessly
+                        try:
+                            execute_query(
+                                "UPDATE projects SET sdc_write_requested = 0, sdc_write_error = %s WHERE id = %s",
+                                (str(e)[:1000], sdc_project["id"]),
+                                fetch=False,
+                            )
+                        except DatabaseError:
+                            pass
+                    finally:
+                        _release_project(sdc_project["id"])
+
+                # Hard-delete soft-deleted projects (FK CASCADE cleans images + faces).
+                # Archive leaderboard stats and delete atomically to prevent double-counting.
+                if not shutdown_requested:
+                    try:
+
+                        def _archive_and_purge(conn: Any, cursor: Any) -> int:
+                            cursor.execute(
+                                "INSERT INTO user_stats (user_id, classifications, sdc_tags) "
+                                "SELECT f.classified_by_user_id, "
+                                "  COUNT(*), "
+                                "  COUNT(CASE WHEN f.sdc_written = 1 THEN 1 END) "
+                                "FROM faces f "
+                                "INNER JOIN images i ON i.id = f.image_id "
+                                "INNER JOIN projects p ON p.id = i.project_id "
+                                "WHERE p.status = 'deleted' "
+                                "  AND f.classified_by_user_id IS NOT NULL "
+                                "  AND f.superseded_by IS NULL "
+                                "GROUP BY f.classified_by_user_id "
+                                "ON DUPLICATE KEY UPDATE "
+                                "  classifications = classifications + VALUES(classifications), "
+                                "  sdc_tags = sdc_tags + VALUES(sdc_tags)",
+                            )
+                            cursor.execute("DELETE FROM projects WHERE status = 'deleted'")
+                            return cursor.rowcount
+
+                        deleted = execute_transaction(_archive_and_purge)
                         if deleted:
                             logger.info(f"Purged {deleted} soft-deleted project(s)")
                     except DatabaseError as exc:
@@ -2041,7 +2307,8 @@ def main():
                 time.sleep(10)
 
     finally:
-        logger.info("Worker shutting down, closing resources.")
+        logger.info("Worker %s shutting down, releasing claims and closing resources.", _worker_id)
+        _release_all_claims()
         if _face_pool is not None:
             _face_pool.shutdown()
         close_pool()

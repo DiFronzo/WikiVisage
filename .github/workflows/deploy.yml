@@ -7,9 +7,21 @@ on:
       tag:
         description: "Git tag to deploy (e.g. v0.2.5)"
         required: true
+      db-reset:
+        description: "Whether to wipe the database (true/false)"
+        required: true
+        default: "false"
+        type: choice
+        options:
+          - "true"
+          - "false"
+      db-reset-confirm:
+        description: "If db-reset is true, type WIPE to confirm"
+        required: false
+        default: ""
 concurrency:
   group: deploy-production
-  cancel-in-progress: true
+  cancel-in-progress: false
 jobs:
   deploy:
     runs-on: ubuntu-latest
@@ -34,6 +46,8 @@ jobs:
         timeout-minutes: 20
         env:
           TAG: ${{ github.event.release.tag_name || github.event.inputs.tag }}
+          DB_RESET: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs['db-reset'] || 'false' }}
+          DB_RESET_CONFIRM: ${{ github.event.inputs['db-reset-confirm'] || '' }}
         run: |
           set -euo pipefail
 
@@ -47,9 +61,24 @@ jobs:
             exit 1
           fi
 
+          if [ "$DB_RESET" = "true" ] && [ "$DB_RESET_CONFIRM" != "WIPE" ]; then
+            echo "::error::DB reset requested but confirmation missing. Type 'WIPE' in the confirmation field."
+            exit 1
+          fi
+
           cat > /tmp/deploy.sh << 'SCRIPT'
           set -euo pipefail
           TAG="$1"
+          DB_RESET="${2:-false}"
+
+          case "$DB_RESET" in
+            true|false) ;;
+            *)
+              echo "Invalid DB_RESET '$DB_RESET' (expected true/false)"
+              exit 1
+              ;;
+          esac
+
           echo "==> Building image from ref $TAG"
           toolforge build start --ref "$TAG" https://github.com/DiFronzo/WikiVisage.git 2>&1 | tail -5
           echo "==> Waiting for build to complete..."
@@ -90,12 +119,18 @@ jobs:
             toolforge build show
             exit 1
           fi
-          echo "==> Running migration"
-          toolforge jobs run migrate --command "python migrate.py" --image tool-wikivisage/tool-wikivisage:latest --wait
-          echo "==> Deleting ml-worker"
-          toolforge jobs delete ml-worker
-          echo "==> Running ml-worker"
-          toolforge jobs run ml-worker --command 'python -u worker.py' --image tool-wikivisage/tool-wikivisage:latest --continuous --mem 3Gi
+          RESET_FLAG=""
+          [ "$DB_RESET" = "true" ] && RESET_FLAG=" --reset"
+          echo "==> Running migration (db-reset=$DB_RESET)"
+          toolforge jobs run migrate --command "python migrate.py${RESET_FLAG}" --image tool-wikivisage/tool-wikivisage:latest --wait
+          echo "==> Deleting ml-worker 1"
+          toolforge jobs delete ml-worker || true
+          echo "==> Running ml-worker 1"
+          toolforge jobs run ml-worker --command 'python -u worker.py --worker-id ml-worker-1' --image tool-wikivisage/tool-wikivisage:latest --continuous --mem 3Gi
+          echo "==> Deleting ml-worker 2"
+          toolforge jobs delete ml-worker-2 || true
+          echo "==> Running ml-worker 2"
+          toolforge jobs run ml-worker-2 --command 'python -u worker.py --worker-id ml-worker-2' --image tool-wikivisage/tool-wikivisage:latest --continuous --mem 3Gi
           echo "==> Restarting webservice"
           toolforge webservice buildservice restart
           echo "==> Deploy complete"
@@ -103,7 +138,14 @@ jobs:
 
           scp -i ~/.ssh/id_ed25519 /tmp/deploy.sh "${{ secrets.USERNAME }}@${{ secrets.HOST }}":/tmp/deploy.sh
           ssh -i ~/.ssh/id_ed25519 "${{ secrets.USERNAME }}@${{ secrets.HOST }}" \
-            "become wikivisage bash /tmp/deploy.sh '${TAG}'"
+            "become wikivisage bash /tmp/deploy.sh '${TAG}' '${DB_RESET}'"
+
+          echo "## 🚀 Deploy Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "| | |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Tag** | \`${TAG}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **DB Reset** | \`${DB_RESET}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Triggered by** | \`${{ github.actor }}\` |" >> "$GITHUB_STEP_SUMMARY"
       - name: Cleanup SSH
         if: always()
         run: rm -f ~/.ssh/id_ed25519
