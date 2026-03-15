@@ -62,7 +62,7 @@ The following are **out of scope**:
 - Open redirect protection on login
 - Parameterized SQL queries (no string interpolation of values)
 - Rate limiting on sensitive endpoints
-- Security headers (`X-Content-Type-Options`, `X-Frame-Options`, `X-XSS-Protection`)
+- Security headers (`X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`, `Permissions-Policy`)
 - Input validation on bounding box coordinates
 - Image download size cap (50 MB) and pixel dimension validation
 - Distributed worker locking (`SELECT … FOR UPDATE`) with stale-claim expiry
