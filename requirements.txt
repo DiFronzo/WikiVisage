@@ -2,7 +2,7 @@
 # Python 3.11+
 
 # face_recognition_models uses pkg_resources, which was removed in setuptools 82+
-setuptools<81
+setuptools<83
 
 # Web framework
 Flask==3.1.3
