@@ -6,7 +6,7 @@ Provides OAuth 2.0 authentication, project management, and an active
 learning interface for classifying detected faces.
 """
 
-APP_VERSION = "0.3.3"
+APP_VERSION = "0.3.4"
 
 import hashlib
 import io
@@ -2870,6 +2870,24 @@ def leaderboard():
 # ---------------------------------------------------------------------------
 # Utility routes
 # ---------------------------------------------------------------------------
+
+
+@app.route("/sw.js")
+@limiter.exempt
+def service_worker():
+    """Serve the service worker from the root scope."""
+    response = app.send_static_file("sw.js")
+    response.headers["Content-Type"] = "application/javascript"
+    response.headers["Service-Worker-Allowed"] = "/"
+    response.headers["Cache-Control"] = "no-cache"
+    return response
+
+
+@app.route("/.well-known/appspecific/com.chrome.devtools.json")
+@limiter.exempt
+def chrome_devtools_json():
+    """Silence Chrome DevTools auto-request."""
+    return jsonify({}), 200
 
 
 @app.route("/health")
