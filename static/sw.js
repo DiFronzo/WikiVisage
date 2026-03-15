@@ -50,21 +50,25 @@ self.addEventListener("fetch", (event) => {
     return;
   }
 
-  /* Static assets — cache-first */
+  /* Static assets — stale-while-revalidate */
   if (url.pathname.startsWith("/static/")) {
     event.respondWith(
-      caches.match(event.request).then((cached) => {
-        if (cached) {
-          return cached;
-        }
-        return fetch(event.request).then((response) => {
-          if (response.ok) {
-            const clone = response.clone();
-            caches.open(CACHE_NAME).then((cache) => cache.put(event.request, clone));
-          }
-          return response;
-        });
-      })
+      caches.open(CACHE_NAME).then((cache) =>
+        cache.match(event.request).then((cached) => {
+          // Always try to update the cache in the background
+          const fetchPromise = fetch(event.request)
+            .then((response) => {
+              if (response && response.ok) {
+                cache.put(event.request, response.clone());
+              }
+              return response;
+            })
+            .catch(() => cached);
+
+          // If we have something cached, return it immediately; otherwise wait for network
+          return cached || fetchPromise;
+        })
+      )
     );
     return;
   }
