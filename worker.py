@@ -1826,9 +1826,17 @@ def main():
                 # Fast-track new projects: run discovery (traverse + bootstrap) immediately
                 # so they don't wait behind long-running image processing in the thread pool.
                 fast_tracked_ids = set()
+                fast_tracked_count = 0
                 if active_projects and isinstance(active_projects, list):
                     for project in active_projects:
                         if shutdown_requested:
+                            break
+                        # Apply a per-cycle cap to keep the poll loop responsive.
+                        if fast_tracked_count >= MAX_FAST_TRACK_PER_WAKEUP:
+                            logger.debug(
+                                "Reached per-cycle fast-track cap "
+                                f"({MAX_FAST_TRACK_PER_WAKEUP}); deferring remaining projects"
+                            )
                             break
                         if project.get("image_count", 0) == 0:
                             logger.info(
@@ -1840,6 +1848,7 @@ def main():
                                 if not shutdown_requested:
                                     bootstrap_from_sparql(project)
                                 fast_tracked_ids.add(project["id"])
+                                fast_tracked_count += 1
                             except Exception as e:
                                 logger.error(f"Fast-track discovery failed for project {project['id']}: {e}")
 
