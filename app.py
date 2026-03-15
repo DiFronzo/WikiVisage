@@ -2874,11 +2874,11 @@ def leaderboard():
     @limiter.exempt
     def service_worker():
         """Serve the service worker from the root scope."""
-        return (
-            app.send_static_file("sw.js"),
-            200,
-            {"Content-Type": "application/javascript", "Service-Worker-Allowed": "/"},
-        )
+        response = app.send_static_file("sw.js")
+        response.headers["Content-Type"] = "application/javascript"
+        response.headers["Service-Worker-Allowed"] = "/"
+        response.headers["Cache-Control"] = "no-cache"
+        return response
 
     @app.route("/.well-known/appspecific/com.chrome.devtools.json")
     @limiter.exempt
