@@ -27,7 +27,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: toolforge
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Setup SSH
         run: |
           if [ -z "$SSH_HOST" ] || [ -z "$SSH_KEY" ] || [ -z "$SSH_USER" ]; then
