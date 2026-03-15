@@ -16,6 +16,10 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Optional throttle (in seconds) between image downloads and processing to
+# avoid overloading Commons or downstream services. Defaults to 0 (no delay).
+COMMONS_DOWNLOAD_THROTTLE_SECONDS = float(os.getenv("COMMONS_DOWNLOAD_THROTTLE_SECONDS", "0"))
+
 import warnings
 
 warnings.filterwarnings("ignore", category=UserWarning, module="pkg_resources")
@@ -702,7 +706,8 @@ def _process_single_image(
         _validate_image_dimensions(image_bytes)
         t_download = time.monotonic()
 
-        time.sleep(0.5)
+        if COMMONS_DOWNLOAD_THROTTLE_SECONDS > 0:
+            time.sleep(COMMONS_DOWNLOAD_THROTTLE_SECONDS)
 
         face_locations, encodings_bytes, det_width, det_height = _run_face_detection(image_bytes)
         del image_bytes
