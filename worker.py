@@ -1214,15 +1214,14 @@ def run_autonomous_inference(project: dict[str, Any]) -> int:
 
     # Record which settings were used for this inference run so the web UI
     # can detect whether a re-run is needed after settings change.
-    if classified_count > 0:
-        try:
-            execute_query(
-                "UPDATE projects SET last_inference_threshold = %s, last_inference_min_confirmed = %s WHERE id = %s",
-                (threshold, min_confirmed, project["id"]),
-                fetch=False,
-            )
-        except Exception:
-            logger.warning(f"Project {project['id']}: failed to record inference settings", exc_info=True)
+    try:
+        execute_query(
+            "UPDATE projects SET last_inference_threshold = %s, last_inference_min_confirmed = %s WHERE id = %s",
+            (threshold, min_confirmed, project["id"]),
+            fetch=False,
+        )
+    except Exception:
+        logger.warning(f"Project {project['id']}: failed to record inference settings", exc_info=True)
 
     return classified_count
 
