@@ -2256,31 +2256,32 @@ def main():
                     finally:
                         _release_project(sdc_project["id"])
 
-                # Hard-delete soft-deleted projects (FK CASCADE cleans images + faces)
+                # Hard-delete soft-deleted projects (FK CASCADE cleans images + faces).
+                # Archive leaderboard stats and delete atomically to prevent double-counting.
                 if not shutdown_requested:
                     try:
-                        # Archive leaderboard stats before CASCADE deletes face rows
-                        execute_query(
-                            "INSERT INTO user_stats (user_id, classifications, sdc_tags) "
-                            "SELECT f.classified_by_user_id, "
-                            "  COUNT(*), "
-                            "  COUNT(CASE WHEN f.sdc_written = 1 THEN 1 END) "
-                            "FROM faces f "
-                            "INNER JOIN images i ON i.id = f.image_id "
-                            "INNER JOIN projects p ON p.id = i.project_id "
-                            "WHERE p.status = 'deleted' "
-                            "  AND f.classified_by_user_id IS NOT NULL "
-                            "  AND f.superseded_by IS NULL "
-                            "GROUP BY f.classified_by_user_id "
-                            "ON DUPLICATE KEY UPDATE "
-                            "  classifications = classifications + VALUES(classifications), "
-                            "  sdc_tags = sdc_tags + VALUES(sdc_tags)",
-                            fetch=False,
-                        )
-                        deleted = execute_query(
-                            "DELETE FROM projects WHERE status = 'deleted'",
-                            fetch=False,
-                        )
+
+                        def _archive_and_purge(conn: Any, cursor: Any) -> int:
+                            cursor.execute(
+                                "INSERT INTO user_stats (user_id, classifications, sdc_tags) "
+                                "SELECT f.classified_by_user_id, "
+                                "  COUNT(*), "
+                                "  COUNT(CASE WHEN f.sdc_written = 1 THEN 1 END) "
+                                "FROM faces f "
+                                "INNER JOIN images i ON i.id = f.image_id "
+                                "INNER JOIN projects p ON p.id = i.project_id "
+                                "WHERE p.status = 'deleted' "
+                                "  AND f.classified_by_user_id IS NOT NULL "
+                                "  AND f.superseded_by IS NULL "
+                                "GROUP BY f.classified_by_user_id "
+                                "ON DUPLICATE KEY UPDATE "
+                                "  classifications = classifications + VALUES(classifications), "
+                                "  sdc_tags = sdc_tags + VALUES(sdc_tags)",
+                            )
+                            cursor.execute("DELETE FROM projects WHERE status = 'deleted'")
+                            return cursor.rowcount
+
+                        deleted = execute_transaction(_archive_and_purge)
                         if deleted:
                             logger.info(f"Purged {deleted} soft-deleted project(s)")
                     except DatabaseError as exc:
