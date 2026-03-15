@@ -85,7 +85,7 @@ WikiVisage/
 ├── app.py               # Flask app: OAuth, routes, classification API
 ├── worker.py            # Background ML pipeline: crawl, detect, infer, write (multi-instance)
 ├── database.py          # MariaDB connection pool with retry logic
-├── schema.sql           # Database schema (6 tables + indices)
+├── schema.sql           # Database schema (7 tables + indices)
 ├── migrate.py           # Idempotent migration script with --reset flag
 ├── jobs.yaml            # Toolforge jobs definition (2 worker instances)
 ├── templates/           # Jinja2 templates (9 files, all extend base.html)
