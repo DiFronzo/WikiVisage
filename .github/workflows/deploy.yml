@@ -119,16 +119,16 @@ jobs:
             toolforge build show
             exit 1
           fi
+          echo "==> Deleting ml-worker 1"
+          toolforge jobs delete ml-worker || true
+          echo "==> Deleting ml-worker 2"
+          toolforge jobs delete ml-worker-2 || true
           RESET_FLAG=""
           [ "$DB_RESET" = "true" ] && RESET_FLAG=" --reset"
           echo "==> Running migration (db-reset=$DB_RESET)"
           toolforge jobs run migrate --command "python migrate.py${RESET_FLAG}" --image tool-wikivisage/tool-wikivisage:latest --wait
-          echo "==> Deleting ml-worker 1"
-          toolforge jobs delete ml-worker || true
           echo "==> Running ml-worker 1"
           toolforge jobs run ml-worker --command 'python -u worker.py --worker-id ml-worker-1' --image tool-wikivisage/tool-wikivisage:latest --continuous --mem 3Gi
-          echo "==> Deleting ml-worker 2"
-          toolforge jobs delete ml-worker-2 || true
           echo "==> Running ml-worker 2"
           toolforge jobs run ml-worker-2 --command 'python -u worker.py --worker-id ml-worker-2' --image tool-wikivisage/tool-wikivisage:latest --continuous --mem 3Gi
           echo "==> Restarting webservice"
