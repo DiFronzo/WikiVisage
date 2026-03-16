@@ -562,10 +562,14 @@ data-detection-width="{{ face.detection_width or 0 }}" data-detection-height="{{
             loading.classList.remove('active');
             if (data.status === 'ok') {
                 card.dataset.result = isTarget === 1 ? 'match' : 'rejected';
+                card.dataset.source = 'human';
                 
                 var badge = card.querySelector('.badge');
                 badge.className = 'badge ' + (isTarget === 1 ? 'badge-active' : 'badge-paused');
                 badge.textContent = isTarget === 1 ? i18nReclassify.verified + ' \u2713' : i18nReclassify.rejected;
+
+                var methodLabel = card.querySelector('.result-method');
+                if (methodLabel) methodLabel.textContent = i18nReclassify.human;
                 
                 // Update SDC pending state
                 var isBootstrapped = card.dataset.bootstrapped === '1';

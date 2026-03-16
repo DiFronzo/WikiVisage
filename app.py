@@ -1265,7 +1265,10 @@ def project_detail(project_id: int):
             "  AND (f.classified_by IN ('model', 'bootstrap') "
             "       OR (f.classified_by = 'human' AND f.classified_by_user_id IS NOT NULL)) "
             "  AND LOWER(i.file_title) NOT REGEXP '\\\\.(webm|ogv|ogg|mp3|wav|flac|opus|mid|oga)$' "
-            "ORDER BY f.is_target DESC, COALESCE(f.confidence, 999) ASC "
+            "ORDER BY "
+            "  (CASE WHEN f.is_target = 1 AND f.sdc_written = 0 "
+            "        AND f.classified_by != 'bootstrap' AND i.bootstrapped = 0 THEN 0 ELSE 1 END), "
+            "  f.is_target DESC, COALESCE(f.confidence, 999) ASC "
             "LIMIT 200",
             (project_id,),
         )
@@ -2142,7 +2145,7 @@ def api_reclassify():
 
         def _reclassify(conn, cursor):
             cursor.execute(
-                "UPDATE faces SET is_target = %s, "
+                "UPDATE faces SET is_target = %s, classified_by = 'human', "
                 "classified_by_user_id = %s, sdc_written = %s, "
                 "sdc_removal_pending = %s "
                 "WHERE id = %s AND (classified_by_user_id IS NULL OR classified_by_user_id = %s)",

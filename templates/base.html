@@ -546,13 +546,14 @@
             function shouldIgnore(target) {
                 return target.closest && (
                     target.closest("#imageWrapper") ||
-                    target.closest(".bbox-modal") ||
+                    target.closest("#bboxModal") ||
                     target.closest("[data-no-ptr]")
                 );
             }
 
             document.addEventListener("touchstart", function(e) {
                 if (refreshing) return;
+                if (e.touches.length !== 1) return;
                 if (getScrollTop() > 0) return;
                 if (shouldIgnore(e.target)) return;
                 startY = e.touches[0].clientY;
@@ -569,6 +570,12 @@
 
             document.addEventListener("touchmove", function(e) {
                 if (!pulling) return;
+                if (e.touches.length !== 1) {
+                    /* Multi-touch (pinch-zoom etc.) — abort PTR */
+                    pulling = false;
+                    indicator.style.transform = "translateY(-60px)";
+                    return;
+                }
                 var dy = e.touches[0].clientY - startY;
                 if (dy < 0) { dy = 0; }
                 if (dy > MAX_PULL) { dy = MAX_PULL; }
@@ -633,6 +640,17 @@
                     for (var i = 0; i < segs.length; i++) {
                         segs[i].style.opacity = "0";
                     }
+                }
+            }, { passive: true });
+
+            document.addEventListener("touchcancel", function() {
+                if (!pulling) return;
+                pulling = false;
+                indicator.classList.remove("releasing", "refreshing");
+                indicator.style.transform = "translateY(-60px)";
+                var segs = indicator.querySelectorAll(".ptr-seg");
+                for (var i = 0; i < segs.length; i++) {
+                    segs[i].style.opacity = "0";
                 }
             }, { passive: true });
         })();
