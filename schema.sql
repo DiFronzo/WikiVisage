@@ -10,6 +10,7 @@ CREATE TABLE IF NOT EXISTS users (
     access_token    VARBINARY(2048) NOT NULL,
     refresh_token   VARBINARY(2048) NOT NULL,
     token_expires_at DATETIME       NOT NULL,
+    leaderboard_opt_out TINYINT(1)   NOT NULL DEFAULT 0 COMMENT '1=user opted out of leaderboard',
     created_at      DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at      DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
 

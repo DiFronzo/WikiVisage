@@ -1,0 +1,95 @@
+{% extends "base.html" %}
+
+{% block title %}{{ _('Account Settings') }} - WikiVisage BETA{% endblock %}
+
+{% block extra_head %}
+<style>
+    .settings-card {
+        max-width: 600px;
+        margin: 0 auto;
+    }
+    .toggle-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 1rem;
+        padding: 1.25rem 0;
+        border-bottom: 1px solid var(--border);
+    }
+    .toggle-row:last-child {
+        border-bottom: none;
+    }
+    .toggle-label {
+        font-weight: 700;
+    }
+    .toggle-desc {
+        color: var(--text-muted);
+        font-size: 0.875rem;
+        margin-top: 0.25rem;
+    }
+    .switch {
+        position: relative;
+        width: 48px;
+        height: 26px;
+        flex-shrink: 0;
+    }
+    .switch input { opacity: 0; width: 0; height: 0; }
+    .switch .slider {
+        position: absolute;
+        inset: 0;
+        background: var(--border);
+        border-radius: 26px;
+        cursor: pointer;
+        transition: background 0.2s;
+    }
+    .switch .slider::before {
+        content: '';
+        position: absolute;
+        left: 3px;
+        top: 3px;
+        width: 20px;
+        height: 20px;
+        background: var(--text-main);
+        border-radius: 50%;
+        transition: transform 0.2s;
+    }
+    .switch input:checked + .slider {
+        background: var(--primary);
+    }
+    .switch input:checked + .slider::before {
+        transform: translateX(22px);
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<h1>{{ _('Account Settings') }}</h1>
+
+<div class="card settings-card">
+    <form method="POST" action="{{ url_for('account_settings') }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+
+        <div class="toggle-row">
+            <div>
+                <div class="toggle-label" id="leaderboard_opt_out_label">{{ _('Hide from leaderboard') }}</div>
+                <div class="toggle-desc" id="leaderboard_opt_out_desc">{{ _('Your contributions will still count, but your name will not appear on the public leaderboard.') }}</div>
+            </div>
+            <label class="switch">
+                <input
+                    type="checkbox"
+                    id="leaderboard_opt_out"
+                    name="leaderboard_opt_out"
+                    value="1"
+                    aria-labelledby="leaderboard_opt_out_label"
+                    aria-describedby="leaderboard_opt_out_desc"
+                    {% if leaderboard_opt_out %}checked{% endif %}>
+                <span class="slider"></span>
+            </label>
+        </div>
+
+        <div style="margin-top: 2rem;">
+            <button type="submit" class="btn btn-primary" style="width: 100%;">{{ _('Save Settings') }}</button>
+        </div>
+    </form>
+</div>
+{% endblock %}

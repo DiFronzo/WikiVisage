@@ -67,6 +67,7 @@
         .lang-select:hover { border-color: var(--primary); }
         .lang-select:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; border-color: var(--primary); }
 
+        .nav-links a.active:not(.btn) { color: var(--text-main); border-bottom: 2px solid var(--primary); padding-bottom: 0.15rem; }
         .nav-separator { display: none; }
 
         @media (max-width: 600px) {
@@ -90,6 +91,7 @@
                 padding: 0.5rem 0;
                 font-size: 0.9375rem;
             }
+            .nav-links a.active:not(.btn) { border-bottom: none; border-left: 2px solid var(--primary); padding-left: 0.75rem; padding-bottom: 0.5rem; }
             .nav-separator {
                 display: block;
                 height: 1px;
@@ -271,25 +273,74 @@
         .header-actions { display: flex; justify-content: space-between; align-items: center; margin-bottom: 2rem; flex-wrap: wrap; gap: 1rem; }
 
         @keyframes pulse { 0%, 100% { opacity: 0.1; } 50% { opacity: 0.25; } }
+
+        .ptr-indicator {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            z-index: 10001;
+            display: flex;
+            justify-content: center;
+            pointer-events: none;
+            transform: translateY(-60px);
+            transition: none;
+        }
+        .ptr-indicator.releasing { transition: transform 0.3s ease; }
+        .ptr-spinner {
+            margin-top: 14px;
+        }
+        .ptr-seg {
+            stroke: var(--text-muted);
+            opacity: 0;
+        }
+        .ptr-indicator.refreshing .ptr-seg {
+            animation: ptr-fade 0.8s linear infinite;
+        }
+        .ptr-indicator.refreshing .ptr-seg:nth-child(1) { animation-delay: 0s; }
+        .ptr-indicator.refreshing .ptr-seg:nth-child(2) { animation-delay: 0.1s; }
+        .ptr-indicator.refreshing .ptr-seg:nth-child(3) { animation-delay: 0.2s; }
+        .ptr-indicator.refreshing .ptr-seg:nth-child(4) { animation-delay: 0.3s; }
+        .ptr-indicator.refreshing .ptr-seg:nth-child(5) { animation-delay: 0.4s; }
+        .ptr-indicator.refreshing .ptr-seg:nth-child(6) { animation-delay: 0.5s; }
+        .ptr-indicator.refreshing .ptr-seg:nth-child(7) { animation-delay: 0.6s; }
+        .ptr-indicator.refreshing .ptr-seg:nth-child(8) { animation-delay: 0.7s; }
+        @keyframes ptr-fade {
+            0% { opacity: 1; }
+            50%, 100% { opacity: 0.15; }
+        }
     </style>
     {% block extra_head %}{% endblock %}
 </head>
 <body>
+    <div id="ptr-indicator" class="ptr-indicator" aria-hidden="true">
+        <svg class="ptr-spinner" viewBox="0 0 32 32" width="26" height="26">
+            <line class="ptr-seg" x1="16" y1="2" x2="16" y2="7" stroke-width="2.4" stroke-linecap="round"/>
+            <line class="ptr-seg" x1="23.07" y1="4.93" x2="19.54" y2="8.46" stroke-width="2.4" stroke-linecap="round"/>
+            <line class="ptr-seg" x1="27" y1="12" x2="22" y2="12" stroke-width="2.4" stroke-linecap="round" transform="translate(0,4)"/>
+            <line class="ptr-seg" x1="23.07" y1="27.07" x2="19.54" y2="23.54" stroke-width="2.4" stroke-linecap="round"/>
+            <line class="ptr-seg" x1="16" y1="30" x2="16" y2="25" stroke-width="2.4" stroke-linecap="round"/>
+            <line class="ptr-seg" x1="8.93" y1="27.07" x2="12.46" y2="23.54" stroke-width="2.4" stroke-linecap="round"/>
+            <line class="ptr-seg" x1="5" y1="12" x2="10" y2="12" stroke-width="2.4" stroke-linecap="round" transform="translate(0,4)"/>
+            <line class="ptr-seg" x1="8.93" y1="4.93" x2="12.46" y2="8.46" stroke-width="2.4" stroke-linecap="round"/>
+        </svg>
+    </div>
     <nav>
         <div class="nav-container nav-inner">
             <a href="{{ url_for('index') }}" class="nav-brand">WikiVisage <span class="beta-tag">BETA</span></a>
             <button class="nav-toggle" onclick="var nl=document.querySelector('.nav-links');nl.classList.toggle('open');this.setAttribute('aria-expanded',nl.classList.contains('open'))" aria-label="{{ _('Toggle menu') }}" aria-expanded="false">&#9776;</button>
             <div class="nav-links">
                 {% if g.user %}
-                    <a href="{{ url_for('dashboard') }}">{{ _('Dashboard') }}</a>
-                    <a href="{{ url_for('leaderboard') }}">{{ _('Leaderboard') }}</a>
+                    <a href="{{ url_for('dashboard') }}" {% if request.endpoint in ('dashboard', 'project_detail', 'classify', 'project_settings') %}class="active"{% endif %}>{{ _('Dashboard') }}</a>
+                    <a href="{{ url_for('leaderboard') }}" {% if request.endpoint == 'leaderboard' %}class="active"{% endif %}>{{ _('Leaderboard') }}</a>
+                    <a href="{{ url_for('account_settings') }}" {% if request.endpoint == 'account_settings' %}class="active"{% endif %}>{{ _('Settings') }}</a>
                     <span class="nav-separator"></span>
                     <form action="{{ url_for('logout') }}" method="post" style="display: inline;">
                         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                         <button type="submit" class="nav-logout" style="background: none; border: none; color: var(--text-muted); cursor: pointer; font: inherit; padding: 0;">{{ _('Logout') }} ({{ g.user.wiki_username }})</button>
                     </form>
                 {% else %}
-                    <a href="{{ url_for('leaderboard') }}">{{ _('Leaderboard') }}</a>
+                    <a href="{{ url_for('leaderboard') }}" {% if request.endpoint == 'leaderboard' %}class="active"{% endif %}>{{ _('Leaderboard') }}</a>
                     <span class="nav-separator"></span>
                     <a href="{{ url_for('login') }}" class="btn btn-primary btn-sm">{{ _('Log in') }}</a>
                 {% endif %}
@@ -464,7 +515,149 @@
         if ("serviceWorker" in navigator) {
             navigator.serviceWorker.register("/sw.js", { scope: "/" });
         }
+    </script>
+    <script>
+        /* Pull-to-refresh for iOS standalone (PWA) mode.
+           Safari iOS does not provide native pull-to-refresh in standalone mode,
+           unlike Chrome on Android which does. This adds a custom touch-based
+           pull-to-refresh that only activates on iOS standalone. */
+        (function() {
+            var isIOS = /iPhone|iPad|iPod/i.test(navigator.userAgent) && !window.MSStream;
+            var isStandalone = window.navigator.standalone === true ||
+                               window.matchMedia("(display-mode: standalone)").matches;
+            if (!isIOS || !isStandalone) return;
 
+            var indicator = document.getElementById("ptr-indicator");
+            if (!indicator) return;
+
+            var startY = 0;
+            var pulling = false;
+            var refreshing = false;
+            var THRESHOLD = 80;  /* pixels to pull before triggering refresh */
+            var MAX_PULL = 130;  /* visual cap */
+
+            function getScrollTop() {
+                return document.scrollingElement
+                    ? document.scrollingElement.scrollTop
+                    : (document.documentElement.scrollTop || document.body.scrollTop);
+            }
+
+            /* Skip if touch starts inside the classify drawing area or bbox editor */
+            function shouldIgnore(target) {
+                return target.closest && (
+                    target.closest("#imageWrapper") ||
+                    target.closest("#bboxModal") ||
+                    target.closest("[data-no-ptr]")
+                );
+            }
+
+            document.addEventListener("touchstart", function(e) {
+                if (refreshing) return;
+                if (e.touches.length !== 1) return;
+                if (getScrollTop() > 0) return;
+                if (shouldIgnore(e.target)) return;
+                startY = e.touches[0].clientY;
+                pulling = true;
+                indicator.classList.remove("releasing", "refreshing");
+                indicator.style.transition = "none";
+                /* Reset all segments */
+                var segs = indicator.querySelectorAll(".ptr-seg");
+                for (var i = 0; i < segs.length; i++) {
+                    segs[i].style.opacity = "0";
+                    segs[i].style.animation = "none";
+                }
+            }, { passive: true });
+
+            document.addEventListener("touchmove", function(e) {
+                if (!pulling) return;
+                if (e.touches.length !== 1) {
+                    /* Multi-touch (pinch-zoom etc.) — abort PTR */
+                    pulling = false;
+                    indicator.style.transform = "translateY(-60px)";
+                    return;
+                }
+                var dy = e.touches[0].clientY - startY;
+                if (dy < 0) { dy = 0; }
+                if (dy > MAX_PULL) { dy = MAX_PULL; }
+
+                /* If page has scrolled down (e.g. elastic overscroll ended), abort */
+                if (getScrollTop() > 0) {
+                    pulling = false;
+                    indicator.style.transform = "translateY(-60px)";
+                    return;
+                }
+
+                /* Position indicator */
+                indicator.style.transform = "translateY(" + (dy - 60) + "px)";
+
+                /* Progressively reveal segments based on pull progress */
+                var progress = Math.min(dy / THRESHOLD, 1);
+                var segs = indicator.querySelectorAll(".ptr-seg");
+                var total = segs.length;
+                var reveal = Math.round(progress * total);
+                for (var i = 0; i < total; i++) {
+                    if (i < reveal) {
+                        /* Earlier segments are dimmer, latest is brightest */
+                        var segOpacity = 0.15 + 0.85 * ((i + 1) / reveal);
+                        segs[i].style.opacity = String(segOpacity);
+                    } else {
+                        segs[i].style.opacity = "0";
+                    }
+                }
+
+                /* Prevent page bounce when we're handling the pull */
+                if (dy > 10) { e.preventDefault(); }
+            }, { passive: false });
+
+            document.addEventListener("touchend", function() {
+                if (!pulling) return;
+                pulling = false;
+
+                var currentTransform = indicator.style.transform;
+                var match = currentTransform.match(/translateY\(([-\d.]+)px\)/);
+                var currentY = match ? parseFloat(match[1]) : -60;
+                var pullDistance = currentY + 60;
+
+                // Clear inline transition override so CSS transitions on .releasing can apply
+                indicator.style.transition = "";
+                indicator.classList.add("releasing");
+
+                if (pullDistance >= THRESHOLD && !refreshing) {
+                    /* Trigger refresh — switch to iOS-style chase animation */
+                    refreshing = true;
+                    var segs = indicator.querySelectorAll(".ptr-seg");
+                    for (var i = 0; i < segs.length; i++) {
+                        segs[i].style.opacity = "";
+                        segs[i].style.animation = "";
+                    }
+                    indicator.classList.add("refreshing");
+                    indicator.style.transform = "translateY(10px)";
+                    setTimeout(function() {
+                        window.location.reload();
+                    }, 400);
+                } else {
+                    /* Snap back */
+                    indicator.style.transform = "translateY(-60px)";
+                    var segs = indicator.querySelectorAll(".ptr-seg");
+                    for (var i = 0; i < segs.length; i++) {
+                        segs[i].style.opacity = "0";
+                    }
+                }
+            }, { passive: true });
+
+            document.addEventListener("touchcancel", function() {
+                if (!pulling) return;
+                pulling = false;
+                indicator.classList.remove("releasing", "refreshing");
+                indicator.style.transform = "translateY(-60px)";
+                var segs = indicator.querySelectorAll(".ptr-seg");
+                for (var i = 0; i < segs.length; i++) {
+                    segs[i].style.opacity = "0";
+                }
+            }, { passive: true });
+        })();
+    </script>
+    <script>
         (function() {
             if (window.matchMedia("(display-mode: standalone)").matches || navigator.standalone) return;
 

@@ -4,6 +4,7 @@ import logging
 import multiprocessing
 import os
 import queue
+import random
 import re
 import signal
 import socket
@@ -2287,7 +2288,10 @@ def main():
                     except DatabaseError as exc:
                         logger.warning("Failed to purge soft-deleted projects: %s", exc)
 
-                for _ in range(POLL_INTERVAL):
+                # Add random jitter (0–15s) so multiple workers desynchronize
+                # and don't all race to claim the same projects every cycle.
+                jitter = random.randint(0, 15)
+                for _ in range(POLL_INTERVAL + jitter):
                     if shutdown_requested:
                         break
                     if os.path.exists(WAKE_UP_FILE):

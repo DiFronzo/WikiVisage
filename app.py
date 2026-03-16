@@ -6,7 +6,7 @@ Provides OAuth 2.0 authentication, project management, and an active
 learning interface for classifying detected faces.
 """
 
-APP_VERSION = "0.3.4"
+APP_VERSION = "0.3.5"
 
 import hashlib
 import io
@@ -1263,9 +1263,12 @@ def project_detail(project_id: int):
             "WHERE i.project_id = %s "
             "  AND f.superseded_by IS NULL "
             "  AND (f.classified_by IN ('model', 'bootstrap') "
-            "       OR (f.is_target = 0 AND f.classified_by = 'human' AND f.classified_by_user_id IS NOT NULL)) "
+            "       OR (f.classified_by = 'human' AND f.classified_by_user_id IS NOT NULL)) "
             "  AND LOWER(i.file_title) NOT REGEXP '\\\\.(webm|ogv|ogg|mp3|wav|flac|opus|mid|oga)$' "
-            "ORDER BY f.is_target DESC, COALESCE(f.confidence, 999) ASC "
+            "ORDER BY "
+            "  (CASE WHEN f.is_target = 1 AND f.sdc_written = 0 "
+            "        AND f.classified_by != 'bootstrap' AND i.bootstrapped = 0 THEN 0 ELSE 1 END), "
+            "  f.is_target DESC, COALESCE(f.confidence, 999) ASC "
             "LIMIT 200",
             (project_id,),
         )
@@ -2142,7 +2145,7 @@ def api_reclassify():
 
         def _reclassify(conn, cursor):
             cursor.execute(
-                "UPDATE faces SET is_target = %s, "
+                "UPDATE faces SET is_target = %s, classified_by = 'human', "
                 "classified_by_user_id = %s, sdc_written = %s, "
                 "sdc_removal_pending = %s "
                 "WHERE id = %s AND (classified_by_user_id IS NULL OR classified_by_user_id = %s)",
@@ -2831,6 +2834,47 @@ def project_delete(project_id: int):
     return redirect(url_for("dashboard"))
 
 
+# ---------------------------------------------------------------------------
+# Account settings
+# ---------------------------------------------------------------------------
+
+
+@app.route("/account/settings", methods=["GET", "POST"])
+@login_required
+def account_settings():
+    """User account settings page (leaderboard opt-out, etc.)."""
+    if request.method == "POST":
+        if not _validate_csrf():
+            abort(400, _("Invalid CSRF token"))
+
+        opt_out = 1 if request.form.get("leaderboard_opt_out") else 0
+        try:
+            execute_query(
+                "UPDATE users SET leaderboard_opt_out = %s WHERE id = %s",
+                (opt_out, g.user["id"]),
+                fetch=False,
+            )
+            flash(_("Settings saved."), "success")
+        except DatabaseError:
+            logger.exception("Failed to save account settings for user %s", g.user["id"])
+            flash(_("Failed to save settings."), "error")
+
+        return redirect(url_for("account_settings"))
+
+    # GET — load current preference
+    try:
+        rows = execute_query(
+            "SELECT leaderboard_opt_out FROM users WHERE id = %s",
+            (g.user["id"],),
+        )
+        opt_out = rows[0]["leaderboard_opt_out"] if rows else 0
+    except DatabaseError:
+        logger.exception("Failed to load account settings for user %s", g.user["id"])
+        opt_out = 0
+
+    return render_template("account_settings.html", leaderboard_opt_out=opt_out)
+
+
 @app.route("/leaderboard")
 def leaderboard():
     """Community leaderboard ranking users by classifications and SDC tags."""
@@ -2846,7 +2890,8 @@ def leaderboard():
             "LEFT JOIN faces f ON f.classified_by_user_id = u.id "
             "  AND f.superseded_by IS NULL "
             "LEFT JOIN user_stats us ON us.user_id = u.id "
-            "WHERE (f.id IS NOT NULL OR us.user_id IS NOT NULL) "
+            "WHERE u.leaderboard_opt_out = 0 "
+            "  AND (f.id IS NOT NULL OR us.user_id IS NOT NULL) "
             "GROUP BY u.id, u.wiki_username, us.classifications, us.sdc_tags "
             "ORDER BY (COUNT(f.id) + COALESCE(us.classifications, 0) "
             "        + COUNT(CASE WHEN f.sdc_written = 1 THEN 1 END) "
