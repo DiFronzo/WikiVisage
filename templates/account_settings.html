@@ -71,11 +71,18 @@
 
         <div class="toggle-row">
             <div>
-                <div class="toggle-label">{{ _('Hide from leaderboard') }}</div>
-                <div class="toggle-desc">{{ _('Your contributions will still count, but your name will not appear on the public leaderboard.') }}</div>
+                <div class="toggle-label" id="leaderboard_opt_out_label">{{ _('Hide from leaderboard') }}</div>
+                <div class="toggle-desc" id="leaderboard_opt_out_desc">{{ _('Your contributions will still count, but your name will not appear on the public leaderboard.') }}</div>
             </div>
             <label class="switch">
-                <input type="checkbox" name="leaderboard_opt_out" value="1" {% if leaderboard_opt_out %}checked{% endif %}>
+                <input
+                    type="checkbox"
+                    id="leaderboard_opt_out"
+                    name="leaderboard_opt_out"
+                    value="1"
+                    aria-labelledby="leaderboard_opt_out_label"
+                    aria-describedby="leaderboard_opt_out_desc"
+                    {% if leaderboard_opt_out %}checked{% endif %}>
                 <span class="slider"></span>
             </label>
         </div>
