@@ -286,6 +286,11 @@ _ALTER_MIGRATIONS = [
         "  CONSTRAINT fk_user_stats_user FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE"
         ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
     ),
+    (
+        "Add leaderboard_opt_out to users",
+        "ALTER TABLE users ADD COLUMN leaderboard_opt_out TINYINT(1) NOT NULL DEFAULT 0 "
+        "COMMENT '1=user opted out of leaderboard' AFTER token_expires_at",
+    ),
 ]
 
 
