@@ -618,6 +618,8 @@
                 var currentY = match ? parseFloat(match[1]) : -60;
                 var pullDistance = currentY + 60;
 
+                // Clear inline transition override so CSS transitions on .releasing can apply
+                indicator.style.transition = "";
                 indicator.classList.add("releasing");
 
                 if (pullDistance >= THRESHOLD && !refreshing) {
