@@ -2490,7 +2490,7 @@ def api_gallery(project_id: int):
         page = max(1, int(request.args.get("page", 1)))
         per_page = min(100, max(1, int(request.args.get("per_page", 27))))
     except (ValueError, TypeError):
-        return jsonify({"error": "Invalid pagination parameters"}), 400
+        return jsonify({"error": _("Invalid pagination parameters")}), 400
 
     result_filter = request.args.get("result", "all")
     source_filter = request.args.get("source", "all")
