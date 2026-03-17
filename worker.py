@@ -159,7 +159,11 @@ def _api_request(
             # MediaWiki returns HTTP 503 with Retry-After header for maxlag,
             # so raise_for_status() would throw before we can handle it.
             if resp.status_code == 503 and "Retry-After" in resp.headers:
-                retry_after = int(resp.headers.get("Retry-After", 5))
+                retry_after_header = resp.headers.get("Retry-After", "5")
+                try:
+                    retry_after = float(retry_after_header)
+                except (TypeError, ValueError):
+                    retry_after = 5.0
                 logger.warning(f"Maxlag encountered (503). Sleeping for {retry_after} seconds.")
                 time.sleep(retry_after)
                 continue
@@ -171,7 +175,11 @@ def _api_request(
                 try:
                     data_json = resp.json()
                     if "error" in data_json and data_json["error"].get("code") == "maxlag":
-                        retry_after = int(resp.headers.get("Retry-After", 5))
+                        retry_after_header = resp.headers.get("Retry-After", "5")
+                        try:
+                            retry_after = float(retry_after_header)
+                        except (TypeError, ValueError):
+                            retry_after = 5.0
                         logger.warning(f"Maxlag encountered (200). Sleeping for {retry_after} seconds.")
                         time.sleep(retry_after)
                         continue
