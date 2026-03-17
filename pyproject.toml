@@ -1,6 +1,6 @@
 [project]
 name = "wikivisage"
-version = "0.2.2"
+version = "0.4.0"
 requires-python = ">=3.11"
 
 [tool.ruff]
@@ -20,7 +20,7 @@ select = [
 ]
 ignore = [
     "E501",   # line too long (handled by formatter)
-    "E402",   # module level import not at top — intentional (load_dotenv, APP_VERSION before imports)
+    "E402",   # module level import not at top — intentional (load_dotenv before imports)
     "S101",   # assert used (needed in tests)
     "S105",   # possible hardcoded password — false positives on URL constants and test fixtures
     "S110",   # try-except-pass — intentional for connection cleanup and non-critical ops

@@ -264,18 +264,35 @@
         box-shadow: 8px 8px 0px rgba(239, 68, 68, 0.5);
         color: white;
     }
+    .header-back { color: var(--text-muted); text-decoration: none; margin-right: 0.5rem; }
+    .header-project-link { color: var(--text-main); text-decoration: none; }
+    .badge-review { font-size: 1.1rem; padding: 0.6rem 0.9rem; background-color: var(--warning); color: var(--bg); }
+    .badge-remaining { font-size: 1.25rem; padding: 0.75rem 1rem; }
+    .empty-card { text-align: center; padding: 4rem 2rem; width: 100%; }
+    .empty-card h2 { border: none; color: var(--success); }
+    .empty-card-text { color: var(--text-muted); font-size: 1.25rem; }
+    .empty-card-subtext { color: var(--text-muted); font-size: 1.1rem; }
+    .empty-card-skipped { color: var(--text-muted); font-size: 0.95rem; margin-top: 0.5rem; }
+    .empty-card-actions { margin-top: 2rem; }
+    .btn-inline-link { background: none; border: none; color: var(--primary); cursor: pointer; font: inherit; padding: 0; }
+    .btn-back-muted { border-color: var(--text-muted); color: var(--text-muted); }
+    .btn-back-muted-spaced { border-color: var(--text-muted); color: var(--text-muted); margin-right: 1rem; }
+    .review-banner { background: rgba(245, 158, 11, 0.1); border: 2px solid var(--warning); padding: 0.75rem 1.25rem; margin-bottom: 1.5rem; width: 100%; text-align: center; }
+    .review-banner-title { color: var(--warning); font-weight: 700; text-transform: uppercase; font-size: 0.85rem; letter-spacing: 0.05em; }
+    .review-banner-desc { color: var(--text-muted); font-size: 0.9rem; margin-left: 0.5rem; }
+    .undo-wrap { margin-top: 1rem; text-align: center; }
 </style>
 {% endblock %}
 
 {% block content %}
 <div class="header-actions">
-    <h1><a href="{{ url_for('project_detail', project_id=project.id) }}" style="color: var(--text-muted); text-decoration: none; margin-right: 0.5rem;" title="{{ _('Back to Project') }}" aria-label="{{ _('Back to Project') }}">&larr;</a><a href="{{ url_for('project_detail', project_id=project.id) }}" style="color: var(--text-main); text-decoration: none;">{{ project.label or project.wikidata_qid }}</a></h1>
+    <h1><a href="{{ url_for('project_detail', project_id=project.id) }}" class="header-back" title="{{ _('Back to Project') }}" aria-label="{{ _('Back to Project') }}">&larr;</a><a href="{{ url_for('project_detail', project_id=project.id) }}" class="header-project-link">{{ project.label or project.wikidata_qid }}</a></h1>
     {% if reviewing_model %}
-    <span class="badge" style="font-size: 1.1rem; padding: 0.6rem 0.9rem; background-color: var(--warning); color: var(--bg);">
+    <span class="badge badge-review">
         {{ ngettext('%(num)d model rejection to review', '%(num)d model rejections to review', model_review_count, num=model_review_count) }}
     </span>
     {% else %}
-    <span class="badge badge-info" style="font-size: 1.25rem; padding: 0.75rem 1rem;">
+    <span class="badge badge-info badge-remaining">
         {{ ngettext('%(num)d image remaining', '%(num)d images remaining', remaining, num=remaining) }}
     </span>
     {% endif %}
@@ -285,50 +302,50 @@
     {% if image is none %}
         {% if model_review_count > 0 and not reviewing_model %}
         {# Unclassified done, but model rejections available for review #}
-        <div class="card" style="text-align: center; padding: 4rem 2rem; width: 100%;">
-            <h2 style="border: none; color: var(--success);">{{ _('All Classified!') }}</h2>
-            <p style="color: var(--text-muted); font-size: 1.25rem;">{{ _('No more unclassified faces. However, the model rejected some faces you might want to review.') }}</p>
-            <p style="color: var(--text-muted); font-size: 1.1rem;">
+        <div class="card empty-card">
+            <h2>{{ _('All Classified!') }}</h2>
+            <p class="empty-card-text">{{ _('No more unclassified faces. However, the model rejected some faces you might want to review.') }}</p>
+            <p class="empty-card-subtext">
                 {{ ngettext('%(num)d image with model-rejected faces to review.', '%(num)d images with model-rejected faces to review.', model_review_count, num=model_review_count) }}
             </p>
             {% if skipped_count > 0 %}
-            <p style="color: var(--text-muted); font-size: 0.95rem; margin-top: 0.5rem;">
+            <p class="empty-card-skipped">
                 {{ ngettext('%(num)d skipped image.', '%(num)d skipped images.', skipped_count, num=skipped_count) }}
                 <form action="{{ url_for('clear_skips', project_id=project.id) }}" method="post" style="display: inline;">
                     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                    <button type="submit" style="background: none; border: none; color: var(--primary); cursor: pointer; font: inherit; padding: 0;">{{ _('Show skipped') }}</button>
+                    <button type="submit" class="btn-inline-link">{{ _('Show skipped') }}</button>
                 </form>
             </p>
             {% endif %}
-            <div style="margin-top: 2rem;">
-                <a href="{{ url_for('classify', project_id=project.id) }}" class="btn btn-primary" style="margin-right: 1rem;">{{ _('Review Model Rejections') }}</a>
-                <a href="{{ url_for('project_detail', project_id=project.id) }}" class="btn" style="border-color: var(--text-muted); color: var(--text-muted);">{{ _('Back to Project') }}</a>
+            <div class="empty-card-actions">
+                <a href="{{ url_for('classify', project_id=project.id) }}" class="btn btn-primary btn-back-muted-spaced">{{ _('Review Model Rejections') }}</a>
+                <a href="{{ url_for('project_detail', project_id=project.id) }}" class="btn btn-back-muted">{{ _('Back to Project') }}</a>
             </div>
         </div>
         {% else %}
-        <div class="card" style="text-align: center; padding: 4rem 2rem; width: 100%;">
-            <h2 style="border: none; color: var(--success);">{{ _('All Caught Up!') }}</h2>
-            <p style="color: var(--text-muted); font-size: 1.25rem;">{{ _('No more faces to classify for this project right now.') }}</p>
+        <div class="card empty-card">
+            <h2>{{ _('All Caught Up!') }}</h2>
+            <p class="empty-card-text">{{ _('No more faces to classify for this project right now.') }}</p>
             {% if skipped_count > 0 or skipped_review_count > 0 %}
             {% set total_skipped = skipped_count + skipped_review_count %}
-            <p style="color: var(--text-muted); font-size: 0.95rem; margin-top: 0.5rem;">
+            <p class="empty-card-skipped">
                 {{ ngettext('%(num)d skipped image.', '%(num)d skipped images.', total_skipped, num=total_skipped) }}
                 <form action="{{ url_for('clear_skips', project_id=project.id) }}" method="post" style="display: inline;">
                     <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                    <button type="submit" style="background: none; border: none; color: var(--primary); cursor: pointer; font: inherit; padding: 0;">{{ _('Show skipped') }}</button>
+                    <button type="submit" class="btn-inline-link">{{ _('Show skipped') }}</button>
                 </form>
             </p>
             {% endif %}
-            <div style="margin-top: 2rem;">
+            <div class="empty-card-actions">
                 <a href="{{ url_for('project_detail', project_id=project.id) }}" class="btn btn-primary">{{ _('Back to Project') }}</a>
             </div>
         </div>
         {% endif %}
     {% else %}
         {% if reviewing_model %}
-        <div class="review-banner" style="background: rgba(245, 158, 11, 0.1); border: 2px solid var(--warning); padding: 0.75rem 1.25rem; margin-bottom: 1.5rem; width: 100%; text-align: center;">
-            <span style="color: var(--warning); font-weight: 700; text-transform: uppercase; font-size: 0.85rem; letter-spacing: 0.05em;">{{ _('Model Review') }}</span>
-            <span style="color: var(--text-muted); font-size: 0.9rem; margin-left: 0.5rem;">{{ _('The model classified these faces as not matching. Confirm or correct below.') }}</span>
+        <div class="review-banner">
+            <span class="review-banner-title">{{ _('Model Review') }}</span>
+            <span class="review-banner-desc">{{ _('The model classified these faces as not matching. Confirm or correct below.') }}</span>
         </div>
         {% endif %}
 
@@ -360,7 +377,8 @@
                  data-bbox-top="{{ face.bbox_top }}"
                  data-bbox-right="{{ face.bbox_right }}"
                  data-bbox-bottom="{{ face.bbox_bottom }}"
-                 data-bbox-left="{{ face.bbox_left }}">
+                 data-bbox-left="{{ face.bbox_left }}"
+                 role="button" tabindex="0" aria-label="{{ _('Face %(num)d', num=loop.index) }}">
                 {% if faces | length > 1 %}
                 <span class="face-label">{{ _('Face %(num)d', num=loop.index) }}</span>
                 {% endif %}
@@ -400,14 +418,14 @@
             {% endif %}
         </div>
         {% if has_undo %}
-        <div style="margin-top: 1rem; text-align: center;">
+        <div class="undo-wrap">
             <button class="btn btn-undo" id="undoBtn" onclick="undoClassify()">↩ {{ _('Undo Last') }}</button>
         </div>
         {% endif %}
     {% endif %}
 </div>
 
-<div class="loading-overlay" id="loadingOverlay">{{ _('Saving...') }}</div>
+<div class="loading-overlay" id="loadingOverlay" role="status" aria-live="polite">{{ _('Saving...') }}</div>
 
 {% if image %}
 <script>
@@ -424,8 +442,8 @@
         unknownError: {{ _('Unknown error')|tojson }}
     };
 
-    const img = document.getElementById('classifyImg');
-    const boxes = document.querySelectorAll('.face-box');
+    var img = document.getElementById('classifyImg');
+    var boxes = document.querySelectorAll('.face-box');
 
     /* Detection dimensions: the image resolution at which bboxes were computed.
        Falls back to the displayed thumbnail's natural size for legacy images
@@ -465,6 +483,12 @@
     boxes.forEach(function(box) {
         box.addEventListener('click', function() {
             selectFace(parseInt(box.dataset.faceId));
+        });
+        box.addEventListener('keydown', function(e) {
+            if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                selectFace(parseInt(box.dataset.faceId));
+            }
         });
     });
 

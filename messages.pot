@@ -732,7 +732,7 @@ msgid "Classified"
 msgstr ""
 
 #: templates/leaderboard.html:80 templates/leaderboard.html:97
-msgid "SDC Tags"
+msgid "SDC Written"
 msgstr ""
 
 #: templates/leaderboard.html:84

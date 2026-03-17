@@ -117,7 +117,21 @@
         letter-spacing: 0.05em;
         margin-left: auto;
     }
-    .results-filter.active {
+    .filter-select {
+        background: var(--surface);
+        color: var(--text-main);
+        border: 2px solid var(--border);
+        padding: 0.4rem 0.75rem;
+        font-size: 0.85rem;
+        font-family: inherit;
+        cursor: pointer;
+        appearance: auto;
+    }
+    .filter-select:focus {
+        border-color: var(--primary);
+        outline: none;
+    }
+    #sdcToggle.active {
         background-color: var(--primary);
         color: var(--bg);
     }
@@ -251,56 +265,140 @@
         min-width: auto;
         padding: 0 0.25rem;
     }
+    .stat-box-success { border-color: var(--success); }
+    .stat-box-success .stat-value { color: var(--success); }
+    .stat-box-danger { border-color: var(--danger); }
+    .stat-box-danger .stat-value { color: var(--danger); }
+    .stat-box-warning { border-color: var(--warning); }
+    .stat-box-warning .stat-value { color: var(--warning); }
+    .stat-box-info { border-color: var(--info); }
+    .stat-box-info .stat-value { color: var(--info); }
+    .stat-box-purple { border-color: #a855f7; }
+    .stat-box-purple .stat-value { color: #a855f7; }
+    .stat-box-primary { border-color: var(--primary); }
+    .stat-box-primary .stat-value { color: var(--primary); }
+    .project-header-row { display: flex; gap: 1.25rem; align-items: flex-start; }
+    .project-avatar { width: 80px; height: 80px; object-fit: cover; object-position: top center; border: 2px solid var(--border); flex-shrink: 0; }
+    .project-header-text { min-width: 0; }
+    .project-title { margin-bottom: 0.5rem; font-size: 2rem; font-size: clamp(1.5rem, 5vw, 3rem); }
+    .project-links { color: var(--text-muted); }
+    .project-status-badge { font-size: 1rem; padding: 0.5rem 1rem; }
+    .text-muted-msg { color: var(--text-muted); margin-top: 1rem; margin-bottom: 0; }
+    .progress-wrap-lg { height: 2.5rem; margin-top: 1.5rem; }
+    .progress-wrap-lg .progress-text { font-size: 1rem; }
+    .progress-header { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: 0.5rem 1rem; margin-bottom: 1rem; }
+    .progress-header h2 { margin-bottom: 0; }
+    .progress-count-complete { font-weight: bold; color: var(--success); white-space: nowrap; }
+    .progress-count-active { font-weight: bold; color: var(--primary); white-space: nowrap; }
+    .progress-wrap-std { height: 2.5rem; }
+    .breakdown-grid { grid-template-columns: repeat(auto-fit, minmax(100px, 1fr)); }
+    .section-heading { margin-top: 3rem; }
+    .info-banner { margin-top: 2rem; border-color: var(--info); background: rgba(59, 130, 246, 0.05); }
+    .info-banner-text { font-weight: 700; margin-bottom: 0; }
+    .info-text-info { color: var(--info); }
+    .info-text-danger { color: var(--danger); margin-bottom: 0.5rem; }
+    .info-text-warning { color: var(--warning); }
+    .info-text-muted { color: var(--text-muted); margin-bottom: 0; }
+    .info-text-muted-tip { color: var(--text-muted); margin-top: 0.5rem; margin-bottom: 0; }
+    .info-link { color: var(--primary); }
+    .action-buttons { margin: 3rem 0; display: flex; gap: 1rem; flex-wrap: wrap; }
+    .btn-lg { font-size: 1.25rem; }
+    .results-description { color: var(--text-muted); margin-bottom: 1.5rem; }
+    .results-filters { display: flex; gap: 0.75rem; margin-bottom: 1.5rem; flex-wrap: wrap; align-items: center; }
+    .results-filters .filter-select {
+        width: auto;
+        padding: 0.5rem 0.75rem;
+        font-size: 0.75rem;
+        font-weight: 800;
+        text-transform: uppercase;
+        letter-spacing: 0.1em;
+        background-color: var(--bg);
+        border: 2px solid var(--primary);
+        color: var(--primary);
+        cursor: pointer;
+        box-shadow: var(--shadow);
+        transition: all 0.2s ease;
+        -webkit-appearance: none;
+        -moz-appearance: none;
+        appearance: none;
+        padding-right: 2rem;
+        background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%2314b8a6' d='M2 4l4 4 4-4'/%3E%3C/svg%3E");
+        background-repeat: no-repeat;
+        background-position: right 0.6rem center;
+    }
+    .results-filters .filter-select:hover { transform: translate(-2px, -2px); box-shadow: var(--shadow-hover); }
+    .results-filters .filter-select:focus { outline: none; border-color: var(--primary); }
+    .results-filters .results-filter { white-space: nowrap; }
+    .sdc-section { border-color: var(--primary); background: rgba(59, 130, 246, 0.05); margin-top: 4rem; }
+    .sdc-title { color: var(--primary); margin-bottom: 0.5rem; }
+    .sdc-description { color: var(--text-muted); margin-bottom: 1.5rem; }
+    .sdc-license { color: var(--text-muted); font-size: 0.85rem; margin-bottom: 1.5rem; }
+    .sdc-license a { color: var(--primary); }
+    .sdc-status-wrap { margin-bottom: 1rem; }
+    .sdc-status-text { font-weight: 700; }
+    .sdc-status-muted { color: var(--text-muted); }
+    .sdc-progress-area { display: none; margin-bottom: 1rem; }
+    .sdc-progress-bar-wrap { height: 2rem; }
+    .sdc-progress-text { font-size: 0.85rem; }
+    .sdc-result-area { display: none; margin-bottom: 1rem; }
+    .modal-title { margin: 0; }
+    .modal-instructions { color: var(--text-muted); margin-bottom: 1rem; text-align: center; }
+    .modal-commons-link { margin-left: 0.5rem; }
+    .modal-actions { margin-top: 1rem; display: flex; gap: 1rem; justify-content: center; }
+    .badge-sm { font-size: 0.65rem; }
+    .sdc-note { display: none; padding: 0 0.75rem 0.75rem; font-size: 0.65rem; color: var(--danger); }
+    .gallery-error { color: var(--danger); }
+    .gallery-empty { color: var(--text-muted); }
 </style>
 {% endblock %}
 
 {% block content %}
 <div class="header-actions">
-    <div style="display: flex; gap: 1.25rem; align-items: flex-start;">
+    <div class="project-header-row">
         {% if project.p18_thumb_url %}
-        <img src="{{ project.p18_thumb_url }}" alt="{{ project.label or project.wikidata_qid }}" loading="lazy" style="width: 80px; height: 80px; object-fit: cover; object-position: top center; border: 2px solid var(--border); flex-shrink: 0;">
+        <img src="{{ project.p18_thumb_url }}" alt="{{ project.label or project.wikidata_qid }}" loading="lazy" class="project-avatar">
         {% endif %}
-        <div style="min-width: 0;">
-            <h1 style="margin-bottom: 0.5rem; font-size: 2rem; font-size: clamp(1.5rem, 5vw, 3rem);">{{ project.label or project.wikidata_qid }}</h1>
-            <p style="color: var(--text-muted);">
+        <div class="project-header-text">
+            <h1 class="project-title">{{ project.label or project.wikidata_qid }}</h1>
+            <p class="project-links">
                 <a href="https://www.wikidata.org/wiki/{{ project.wikidata_qid }}" target="_blank" rel="noopener">{{ project.wikidata_qid }}</a> &bull; 
                 <a href="https://commons.wikimedia.org/wiki/Category:{{ project.commons_category | urlencode }}" target="_blank" rel="noopener">Category:{{ project.commons_category }}</a>
             </p>
         </div>
     </div>
     <div>
-        <span class="badge badge-{{ project.status }}" style="font-size: 1rem; padding: 0.5rem 1rem;">{{ project.status }}</span>
+        <span class="badge badge-{{ project.status }} project-status-badge">{{ project.status }}</span>
     </div>
 </div>
 
 <div class="card" id="progressCard">
     {% if project.images_total == 0 %}
         <h2>{{ _('Processing Progress') }}</h2>
-        <p id="progressMsg" style="color: var(--text-muted); margin-top: 1rem; margin-bottom: 0;">
+        <p id="progressMsg" class="text-muted-msg">
             {{ _("The background worker hasn't discovered images in this category yet. This usually takes a minute or two after creating a project.") }}
         </p>
-        <div class="progress-wrap" style="height: 2.5rem; margin-top: 1.5rem;">
+        <div class="progress-wrap progress-wrap-lg">
             <div class="progress-bar" id="progressBar" style="width: 100%; opacity: 0.15; animation: pulse 2s ease-in-out infinite;"></div>
-            <div class="progress-text" id="progressPct" style="font-size: 1rem;">{{ _('Waiting for worker') }}&hellip;</div>
+            <div class="progress-text" id="progressPct">{{ _('Waiting for worker') }}&hellip;</div>
         </div>
     {% elif project.images_processed == project.images_total %}
-        <div style="display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: 0.5rem 1rem; margin-bottom: 1rem;">
-            <h2 style="margin-bottom: 0;">{{ _('Processing Progress') }}</h2>
-            <span id="progressCount" style="font-weight: bold; color: var(--success); white-space: nowrap;">{{ _('Complete') }}</span>
+        <div class="progress-header">
+            <h2>{{ _('Processing Progress') }}</h2>
+            <span id="progressCount" class="progress-count-complete">{{ _('Complete') }}</span>
         </div>
-        <div class="progress-wrap" style="height: 2.5rem;">
+        <div class="progress-wrap progress-wrap-std">
             <div class="progress-bar" id="progressBar" style="width: 100%;"></div>
-            <div class="progress-text" id="progressPct" style="font-size: 1rem;">{{ _('%(num)d images processed', num=project.images_total) }}</div>
+            <div class="progress-text" id="progressPct">{{ _('%(num)d images processed', num=project.images_total) }}</div>
         </div>
     {% else %}
-        <div style="display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: 0.5rem 1rem; margin-bottom: 1rem;">
-            <h2 style="margin-bottom: 0;">{{ _('Processing Progress') }}</h2>
-            <span id="progressCount" style="font-weight: bold; color: var(--primary); white-space: nowrap;">{{ _('%(done)d / %(total)d images', done=project.images_processed, total=project.images_total) }}</span>
+        <div class="progress-header">
+            <h2>{{ _('Processing Progress') }}</h2>
+            <span id="progressCount" class="progress-count-active">{{ _('%(done)d / %(total)d images', done=project.images_processed, total=project.images_total) }}</span>
         </div>
         {% set pct = (project.images_processed / project.images_total * 100) %}
-        <div class="progress-wrap" style="height: 2.5rem;">
+        <div class="progress-wrap progress-wrap-std">
             <div class="progress-bar" id="progressBar" style="width: {{ pct }}%; transition: width 0.3s ease;"></div>
-            <div class="progress-text" id="progressPct" style="font-size: 1rem;">{{ "%.1f"|format(pct) }}%</div>
+            <div class="progress-text" id="progressPct">{{ "%.1f"|format(pct) }}%</div>
         </div>
     {% endif %}
 </div>
@@ -312,24 +410,24 @@
         <div class="stat-value" id="statTotalFaces">{{ stats.total_faces or 0 }}</div>
         <div class="stat-label">{{ _('Total Faces Found') }}</div>
     </div>
-    <div class="stat-box" style="border-color: var(--success);">
-        <div class="stat-value" id="statMatches" style="color: var(--success);">{{ stats.confirmed_matches or 0 }}</div>
+    <div class="stat-box stat-box-success">
+        <div class="stat-value" id="statMatches">{{ stats.confirmed_matches or 0 }}</div>
         <div class="stat-label">{{ _('Target Matches') }}</div>
     </div>
-    <div class="stat-box" style="border-color: var(--danger);">
-        <div class="stat-value" id="statNonMatches" style="color: var(--danger);">{{ stats.confirmed_non_matches or 0 }}</div>
+    <div class="stat-box stat-box-danger">
+        <div class="stat-value" id="statNonMatches">{{ stats.confirmed_non_matches or 0 }}</div>
         <div class="stat-label">{{ _('Not Target') }}</div>
     </div>
-    <div class="stat-box" style="border-color: var(--warning);">
-        <div class="stat-value" id="statUnclassified" style="color: var(--warning);">{{ stats.unclassified or 0 }}</div>
+    <div class="stat-box stat-box-warning">
+        <div class="stat-value" id="statUnclassified">{{ stats.unclassified or 0 }}</div>
         <div class="stat-label">{{ _('Unclassified') }}</div>
     </div>
-    <div class="stat-box" data-stat="sdc_written" style="border-color: var(--info);">
-        <div class="stat-value" id="statSdcWritten" style="color: var(--info);">{{ stats.sdc_written or 0 }}</div>
+    <div class="stat-box stat-box-info" data-stat="sdc_written">
+        <div class="stat-value" id="statSdcWritten">{{ stats.sdc_written or 0 }}</div>
         <div class="stat-label">{{ _('SDC Written') }}</div>
     </div>
-<div class="stat-box" data-stat="sdc_pending" style="border-color: #a855f7;">
-    <div class="stat-value" id="statSdcPending" style="color: #a855f7;">{{ stats.sdc_pending or 0 }}</div>
+<div class="stat-box stat-box-purple" data-stat="sdc_pending">
+    <div class="stat-value" id="statSdcPending">{{ stats.sdc_pending or 0 }}</div>
         <div class="stat-label">{{ _('SDC Pending') }}</div>
     </div>
 </div>
@@ -339,18 +437,18 @@
 {% set by_bootstrap = stats.by_bootstrap or 0 %}
 {% set classified_total = by_human + by_model + by_bootstrap %}
 {% if classified_total > 0 %}
-<h2 style="margin-top: 3rem;">{{ _('Classification Breakdown') }}</h2>
-<div class="stats-grid" style="grid-template-columns: repeat(auto-fit, minmax(100px, 1fr));">
+<h2 class="section-heading">{{ _('Classification Breakdown') }}</h2>
+<div class="stats-grid breakdown-grid">
     <div class="stat-box">
         <div class="stat-value" id="statByHuman">{{ by_human }}</div>
         <div class="stat-label">{{ _('By Human') }}</div>
     </div>
-    <div class="stat-box" style="border-color: var(--primary);">
-        <div class="stat-value" id="statByModel" style="color: var(--primary);">{{ by_model }}</div>
+    <div class="stat-box stat-box-primary">
+        <div class="stat-value" id="statByModel">{{ by_model }}</div>
         <div class="stat-label">{{ _('By Model') }}</div>
     </div>
-    <div class="stat-box" style="border-color: var(--info);">
-        <div class="stat-value" id="statByBootstrap" style="color: var(--info);">{{ by_bootstrap }}</div>
+    <div class="stat-box stat-box-info">
+        <div class="stat-value" id="statByBootstrap">{{ by_bootstrap }}</div>
         <div class="stat-label">{{ _('By Bootstrap') }}</div>
     </div>
 </div>
@@ -362,32 +460,32 @@
 {% set human_confirmed = stats.human_confirmed or 0 %}
 {% set eligible = inference_eligible or 0 %}
 {% if unclassified > 0 or pending_images > 0 %}
-<div class="card" id="infoBanner" style="margin-top: 2rem; border-color: var(--info); background: rgba(59, 130, 246, 0.05);">
+<div class="card info-banner" id="infoBanner">
     {% if human_confirmed >= project.min_confirmed and eligible > 0 %}
-    <p style="color: var(--info); font-weight: 700; margin-bottom: 0;">
+    <p class="info-banner-text info-text-info">
         {{ ngettext('%(num)d face waiting for model inference. The background worker will classify it automatically within the next minute.', '%(num)d faces waiting for model inference. The background worker will classify them automatically within the next minute.', eligible, num=eligible) }}
     </p>
     {% elif human_confirmed >= project.min_confirmed %}
-    <p style="color: var(--info); font-weight: 700; margin-bottom: 0;">
+    <p class="info-banner-text info-text-info">
         {{ ngettext('%(num)d unclassified face remaining, but none are currently eligible for automatic model inference.', '%(num)d unclassified faces remaining, but none are currently eligible for automatic model inference.', unclassified, num=unclassified) }}
     </p>
     {% elif pending_images > 0 %}
-    <p style="color: var(--info); font-weight: 700; margin-bottom: 0;">
+    <p class="info-banner-text info-text-info">
         {{ ngettext('The background worker is still processing images (%(pending)d image remaining). More faces will appear as processing continues.', 'The background worker is still processing images (%(pending)d images remaining). More faces will appear as processing continues.', pending_images, pending=pending_images) }}
     </p>
     {% elif human_confirmed + unclassified < project.min_confirmed %}
-    <p style="color: var(--danger); font-weight: 700; margin-bottom: 0.5rem;">
+    <p class="info-banner-text info-text-danger">
         {{ _('Cannot reach autonomous inference: even if all %(unclassified)d unclassified faces are target matches, you would have %(potential)d/%(min)d human-confirmed — below the threshold.', unclassified=unclassified, potential=human_confirmed + unclassified, min=project.min_confirmed) }}
     </p>
-    <p style="color: var(--text-muted); margin-bottom: 0;">
-        {{ _('Lower the min_confirmed setting in') }} <a href="{{ url_for('project_settings', project_id=project.id) }}" style="color: var(--primary);">{{ _('Project Settings') }}</a> {{ _('to proceed, or wait for the background worker to detect more faces.') }}
+    <p class="info-text-muted">
+        {{ _('Lower the min_confirmed setting in') }} <a href="{{ url_for('project_settings', project_id=project.id) }}" class="info-link">{{ _('Project Settings') }}</a> {{ _('to proceed, or wait for the background worker to detect more faces.') }}
     </p>
     {% else %}
-    <p style="color: var(--warning); font-weight: 700; margin-bottom: 0;">
+    <p class="info-banner-text info-text-warning">
         {{ _('%(count)d unclassified faces remaining. Classify at least %(needed)d more target faces to enable autonomous inference (%(confirmed)d/%(min)d human-confirmed).', count=unclassified, needed=project.min_confirmed - human_confirmed, confirmed=human_confirmed, min=project.min_confirmed) }}
     </p>
     {% if by_bootstrap > 0 %}
-    <p style="color: var(--text-muted); margin-top: 0.5rem; margin-bottom: 0;">
+    <p class="info-text-muted-tip">
         {{ _('Tip: You have %(count)d bootstrapped matches from existing Commons depicts claims. These were auto-classified and may be incorrect — verify them in Classification Results below to count them as human-confirmed.', count=by_bootstrap) }}
     </p>
     {% endif %}
@@ -395,128 +493,103 @@
 </div>
 {% endif %}
 
-<div style="margin: 3rem 0; display: flex; gap: 1rem; flex-wrap: wrap;">
+<div class="action-buttons">
     {% if project.images_total > 0 %}
-    <a href="{{ url_for('classify', project_id=project.id) }}" class="btn btn-primary" style="font-size: 1.25rem;">{{ _('Start Classifying') }}</a>
+    <a href="{{ url_for('classify', project_id=project.id) }}" class="btn btn-primary btn-lg">{{ _('Start Classifying') }}</a>
     {% endif %}
-    <a href="{{ url_for('project_settings', project_id=project.id) }}" class="btn" style="font-size: 1.25rem;">{{ _('Settings') }}</a>
+    <a href="{{ url_for('project_settings', project_id=project.id) }}" class="btn btn-lg">{{ _('Settings') }}</a>
 </div>
 
-{% if model_faces %}
-<h2 style="margin-top: 3rem;">{{ _('Classification Results') }}</h2>
-<p style="color: var(--text-muted); margin-bottom: 1.5rem;">
+{% if gallery_total > 0 %}
+<h2 class="section-heading">{{ _('Classification Results') }}</h2>
+<p class="results-description">
     {{ _('Faces classified by the model, bootstrap, or human review. Lower distance = closer match to the target. Threshold: %(threshold)s.', threshold=project.distance_threshold) }}
 </p>
 
-<div class="results-filters" style="display: flex; gap: 0.75rem; margin-bottom: 1.5rem; flex-wrap: wrap;">
-    <button class="btn btn-sm results-filter active" data-filter="all" data-filter-type="result" onclick="filterResults('all', 'result')">{{ _('All') }} ({{ model_faces | length }})</button>
-    <button class="btn btn-sm results-filter" data-filter="match" data-filter-type="result" onclick="filterResults('match', 'result')">{{ _('Matches') }}</button>
-    <button class="btn btn-sm results-filter" data-filter="non-match" data-filter-type="result" onclick="filterResults('non-match', 'result')">{{ _('Non-matches') }}</button>
-    <button class="btn btn-sm results-filter" data-filter="rejected" data-filter-type="result" onclick="filterResults('rejected', 'result')">{{ _('Rejected') }}</button>
-    <span style="border-left: 2px solid var(--border); margin: 0 0.25rem;"></span>
-    <button class="btn btn-sm results-filter" data-filter="model" data-filter-type="source" onclick="filterResults('model', 'source')">{{ _('Model') }}</button>
-    <button class="btn btn-sm results-filter" data-filter="bootstrap" data-filter-type="source" onclick="filterResults('bootstrap', 'source')">{{ _('Bootstrap') }}</button>
-    <button class="btn btn-sm results-filter" data-filter="human" data-filter-type="source" onclick="filterResults('human', 'source')">{{ _('Human') }}</button>
-    <span style="border-left: 2px solid var(--border); margin: 0 0.25rem;"></span>
-    <button class="btn btn-sm results-filter" data-filter="sdc-pending" data-filter-type="sdc" onclick="filterResults('sdc-pending', 'sdc')">{{ _('SDC Pending') }}</button>
+<div class="results-filters">
+    <select id="resultFilter" class="filter-select" onchange="onFilterChange()" aria-label="{{ _('Filter by result') }}">
+        <option value="all" selected>{{ _('All') }}</option>
+        <option value="match">{{ _('Matches') }}</option>
+        <option value="non-match">{{ _('Non-matches') }}</option>
+        <option value="rejected">{{ _('Rejected') }}</option>
+    </select>
+    <select id="sourceFilter" class="filter-select" onchange="onFilterChange()" aria-label="{{ _('Filter by source') }}">
+        <option value="all" selected>{{ _('All sources') }}</option>
+        <option value="model">{{ _('Model') }}</option>
+        <option value="bootstrap">{{ _('Bootstrap') }}</option>
+        <option value="human">{{ _('Human') }}</option>
+    </select>
+    <button type="button" class="btn btn-sm results-filter" id="sdcToggle" onclick="toggleSdcFilter()" aria-pressed="false">{{ _('SDC Pending') }}</button>
+    <select id="sortSelect" class="filter-select" onchange="onSortChange()" aria-label="{{ _('Sort results') }}" style="display: none;">
+        <option value="threshold-asc" selected>{{ _('Threshold: Low → High') }}</option>
+        <option value="threshold-desc">{{ _('Threshold: High → Low') }}</option>
+    </select>
 </div>
 
-<div class="results-gallery" id="resultsGallery">
-    {% for face in model_faces %}
-    {% set is_sdc_pending = face.is_target == 1 and face.sdc_written == 0 and face.classified_by != 'bootstrap' and face.bootstrapped == 0 %}
-    <div class="result-card" data-result="{{ 'rejected' if face.is_target == 0 and face.classified_by_user_id else ('match' if face.is_target == 1 else 'non-match') }}" data-source="{{ face.classified_by }}" data-face-id="{{ face.id }}" data-image-id="{{ face.image_id }}" data-sdc-written="{{ face.sdc_written }}" data-sdc-pending="{{ '1' if is_sdc_pending else '0' }}" data-bootstrapped="{{ face.bootstrapped }}">
-<div class="result-thumb" data-file-title="{{ face.file_title }}"
-data-bbox-top="{{ face.bbox_top }}" data-bbox-right="{{ face.bbox_right }}"
-data-bbox-bottom="{{ face.bbox_bottom }}" data-bbox-left="{{ face.bbox_left }}"
-data-detection-width="{{ face.detection_width or 0 }}" data-detection-height="{{ face.detection_height or 0 }}">
-            <img src="{{ commons_thumb_url(face.file_title, 330) }}"
-                 alt="{{ face.file_title }}" loading="lazy">
-            <div class="result-actions">
-                <button class="btn-icon success" onclick="reclassifyFace(this, 1)" title="{{ _('Approve') }}">&#10003;</button>
-                <button class="btn-icon danger" onclick="reclassifyFace(this, 0)" title="{{ _('Reject') }}">&#10007;</button>
-                <button class="btn-icon" onclick="openBboxModal(this)" title="{{ _('Edit bounding box') }}">&#9998;</button>
-            </div>
-            <div class="result-loading">{{ _('Loading...') }}</div>
-        </div>
-        <div class="result-info">
-            <span class="badge {{ 'badge-active' if face.is_target == 1 else 'badge-paused' }}" style="font-size: 0.65rem;">
-                {% if face.is_target == 1 and face.classified_by_user_id %}{{ _('Verified') }} &#10003;{% elif face.is_target == 1 %}{{ _('Match') }}{% elif face.classified_by_user_id %}{{ _('Rejected') }}{% else %}{{ _('Not target') }}{% endif %}
-            </span>
-            {% if is_sdc_pending %}
-            <span class="badge badge-sdc-pending" style="font-size: 0.65rem;" data-sdc-badge>{{ _('SDC pending') }}</span>
-            {% endif %}
-            <span class="result-distance" title="{{ _('Face distance from target centroid') }}">
-                {{ "%.3f"|format(face.confidence) if face.confidence is not none else '—' }}
-            </span>
-            <span class="result-method">{{ face.classified_by }}</span>
-        </div>
-        <div class="sdc-note" style="display: none; padding: 0 0.75rem 0.75rem; font-size: 0.65rem; color: var(--danger);"></div>
-    </div>
-    {% endfor %}
-</div>
-<nav class="pagination" id="resultsPagination"></nav>
+<div class="results-gallery" id="resultsGallery"></div>
+<nav class="pagination" id="resultsPagination" aria-label="{{ _('Gallery pagination') }}"></nav>
 {% endif %}
 
 {% if project.images_total > 0 %}
 {% set sdc_pending = stats.sdc_pending or 0 %}
 {% set sdc_removal = stats.sdc_removal_pending or 0 %}
-<div class="card" id="sdcWriteSection" style="border-color: var(--primary); background: rgba(59, 130, 246, 0.05); margin-top: 4rem;">
-    <h3 style="color: var(--primary); margin-bottom: 0.5rem;">{{ _('Send Edits to Wikimedia Commons') }}</h3>
-    <p style="color: var(--text-muted); margin-bottom: 1.5rem;">
+<div class="card sdc-section" id="sdcWriteSection">
+    <h3 class="sdc-title">{{ _('Send Edits to Wikimedia Commons') }}</h3>
+    <p class="sdc-description">
         {{ _('Write P180 depicts claims for all approved target faces that have not yet been written to Commons. Review the Classification Results above to remove false positives before sending.') }}
     </p>
-    <p style="color: var(--text-muted); font-size: 0.85rem; margin-bottom: 1.5rem;">
-        {{ _('All structured data edits will be published under the') }} <a rel="nofollow" href="https://creativecommons.org/publicdomain/zero/1.0/" style="color: var(--primary);">Creative Commons CC0 License</a>.
+    <p class="sdc-license">
+        {{ _('All structured data edits will be published under the') }} <a rel="nofollow" href="https://creativecommons.org/publicdomain/zero/1.0/">Creative Commons CC0 License</a>.
     </p>
-    <div id="sdcStatus" style="margin-bottom: 1rem;">
+    <div id="sdcStatus" class="sdc-status-wrap">
         {% if sdc_pending > 0 and sdc_removal > 0 %}
-        <p style="font-weight: 700;">
+        <p class="sdc-status-text">
             {{ ngettext('%(num)d face ready to send', '%(num)d faces ready to send', sdc_pending, num=sdc_pending) }}
             {{ _('and') }}
             {{ ngettext('%(num)d ready to be removed.', '%(num)d ready to be removed.', sdc_removal, num=sdc_removal) }}
         </p>
         {% elif sdc_pending > 0 %}
-        <p style="font-weight: 700;">
+        <p class="sdc-status-text">
             {{ ngettext('%(num)d face ready to send.', '%(num)d faces ready to send.', sdc_pending, num=sdc_pending) }}
         </p>
         {% elif sdc_removal > 0 %}
-        <p style="font-weight: 700;">
+        <p class="sdc-status-text">
             {{ ngettext('%(num)d image ready to be removed.', '%(num)d images ready to be removed.', sdc_removal, num=sdc_removal) }}
         </p>
         {% else %}
-        <p style="color: var(--text-muted);">{{ _('No pending faces to write. All approved faces have already been sent.') }}</p>
+        <p class="sdc-status-muted">{{ _('No pending faces to write. All approved faces have already been sent.') }}</p>
         {% endif %}
     </div>
-    <div id="sdcProgress" style="display: none; margin-bottom: 1rem;">
-        <div class="progress-wrap" style="height: 2rem;">
+    <div id="sdcProgress" class="sdc-progress-area">
+        <div class="progress-wrap sdc-progress-bar-wrap">
             <div class="progress-bar" id="sdcProgressBar" style="width: 0%; transition: width 0.3s ease;"></div>
-            <div class="progress-text" id="sdcProgressText" style="font-size: 0.85rem;">{{ _('Starting...') }}</div>
+            <div class="progress-text sdc-progress-text" id="sdcProgressText">{{ _('Starting...') }}</div>
         </div>
     </div>
-    <div id="sdcResult" style="display: none; margin-bottom: 1rem;"></div>
+    <div id="sdcResult" class="sdc-result-area"></div>
     <button class="btn btn-primary" id="sdcWriteBtn" onclick="startSdcWrite()" {{ 'disabled' if (sdc_pending == 0 and sdc_removal == 0) or project.sdc_write_requested }}>
         {{ _('Send Edits to Wikimedia Commons') }}
     </button>
 </div>
 {% endif %}
 
-<div class="modal-overlay" id="bboxModal">
+<div class="modal-overlay" id="bboxModal" role="dialog" aria-modal="true" aria-labelledby="bboxModalTitle">
     <div class="modal-content">
         <div class="modal-header">
-            <h3 style="margin: 0;">{{ _('Edit Bounding Box') }}</h3>
-            <button class="modal-close" onclick="closeBboxModal()">&times;</button>
+            <h3 class="modal-title" id="bboxModalTitle" tabindex="-1">{{ _('Edit Bounding Box') }}</h3>
+            <button class="modal-close" aria-label="{{ _('Close') }}" onclick="closeBboxModal()">&times;</button>
         </div>
         <div class="modal-body">
-            <p style="color: var(--text-muted); margin-bottom: 1rem; text-align: center;">
+            <p class="modal-instructions">
                 {{ _('Click and drag on the image to draw a new bounding box.') }}
-                <a id="modalCommonsLink" href="" target="_blank" rel="noopener" style="margin-left: 0.5rem;">{{ _('View on Commons') }} &rarr;</a>
+                <a id="modalCommonsLink" href="" target="_blank" rel="noopener" class="modal-commons-link">{{ _('View on Commons') }} &rarr;</a>
             </p>
             <div class="drawing-area" id="drawingArea">
                 <img id="modalImg" src="" alt="{{ _('Full resolution') }}" draggable="false">
                 <div class="old-bbox" id="oldBbox"></div>
                 <div class="drawing-box" id="drawingBox"></div>
             </div>
-            <div style="margin-top: 1rem; display: flex; gap: 1rem; justify-content: center;">
+            <div class="modal-actions">
                 <button class="btn" onclick="closeBboxModal()">{{ _('Cancel') }}</button>
                 <button class="btn btn-primary" id="saveBboxBtn" onclick="saveNewBbox()" disabled>{{ _('Save') }}</button>
             </div>
@@ -525,11 +598,12 @@ data-detection-width="{{ face.detection_width or 0 }}" data-detection-height="{{
     </div>
 </div>
 
-{% if model_faces %}
+{% if gallery_total > 0 %}
 <script>
     var csrfToken = {{ csrf_token()|tojson }};
     var apiReclassifyUrl = {{ url_for('api_reclassify')|tojson }};
     var apiUpdateBboxUrl = {{ url_for('api_update_face_bbox')|tojson }};
+    var apiGalleryUrl = {{ url_for('api_gallery', project_id=project.id)|tojson }};
     var i18nReclassify = {
         verified: {{ _('Verified')|tojson }},
         rejected: {{ _('Rejected')|tojson }},
@@ -539,6 +613,27 @@ data-detection-width="{{ face.detection_width or 0 }}" data-detection-height="{{
         sdcRemovalQueued: {{ _('SDC claim removal queued.')|tojson }},
         saveError: {{ _('Error saving classification')|tojson }},
         bboxError: {{ _('Error saving new bounding box')|tojson }}
+    };
+    var i18nGallery = {
+        allResults: {{ _('All')|tojson }},
+        matches: {{ _('Matches')|tojson }},
+        nonMatches: {{ _('Non-matches')|tojson }},
+        allSources: {{ _('All sources')|tojson }},
+        model: {{ _('Model')|tojson }},
+        bootstrap: {{ _('Bootstrap')|tojson }},
+        human: {{ _('Human')|tojson }},
+        approve: {{ _('Approve')|tojson }},
+        reject: {{ _('Reject')|tojson }},
+        editBbox: {{ _('Edit bounding box')|tojson }},
+        loading: {{ _('Loading...')|tojson }},
+        match: {{ _('Match')|tojson }},
+        notTarget: {{ _('Not target')|tojson }},
+        verified: {{ _('Verified')|tojson }},
+        rejected: {{ _('Rejected')|tojson }},
+        sdcPending: {{ _('SDC pending')|tojson }},
+        distance: {{ _('Face distance from target centroid')|tojson }},
+        noResults: {{ _('No classification results yet.')|tojson }},
+        loadError: {{ _('Failed to load results. Please try again.')|tojson }}
     };
 
     function reclassifyFace(btn, isTarget) {
@@ -580,8 +675,7 @@ data-detection-width="{{ face.detection_width or 0 }}" data-detection-height="{{
                 var sdcBadge = card.querySelector('[data-sdc-badge]');
                 if (nowSdcPending && !sdcBadge) {
                     sdcBadge = document.createElement('span');
-                    sdcBadge.className = 'badge badge-sdc-pending';
-                    sdcBadge.style.fontSize = '0.65rem';
+                    sdcBadge.className = 'badge badge-sdc-pending badge-sm';
                     sdcBadge.setAttribute('data-sdc-badge', '');
                     sdcBadge.textContent = i18nReclassify.sdcPending;
                     card.querySelector('.result-info').insertBefore(sdcBadge, badge.nextSibling);
@@ -616,6 +710,7 @@ data-detection-width="{{ face.detection_width or 0 }}" data-detection-height="{{
     var imgScale = 1;
     var imgOffsetX = 0;
     var imgOffsetY = 0;
+    var bboxTriggerElement = null;
 
     var VIDEO_EXTENSIONS = ['.webm', '.ogv', '.ogg'];
     var TIF_EXTENSIONS = ['.tif', '.tiff'];
@@ -716,19 +811,8 @@ data-detection-width="{{ face.detection_width or 0 }}" data-detection-height="{{
         img.style.top = offsetY + 'px';
     }
 
-    // Apply face cropping to all gallery thumbnails
-    (function() {
-        var thumbs = document.querySelectorAll('.results-gallery .result-thumb img');
-        thumbs.forEach(function(img) {
-            if (img.complete && img.naturalWidth > 0) {
-                cropToFace(img);
-            } else {
-                img.addEventListener('load', function() { cropToFace(img); });
-            }
-        });
-    })();
-
     function openBboxModal(btn) {
+        bboxTriggerElement = btn;
         var card = btn.closest('.result-card');
         currentEditFaceId = card.dataset.faceId;
         var thumb = card.querySelector('.result-thumb');
@@ -776,11 +860,13 @@ data-detection-width="{{ face.detection_width or 0 }}" data-detection-height="{{
         };
         
         modal.classList.add('active');
+        document.getElementById('bboxModalTitle').focus();
     }
 
     function closeBboxModal() {
         document.getElementById('bboxModal').classList.remove('active');
         currentEditFaceId = null;
+        if (bboxTriggerElement) { bboxTriggerElement.focus(); bboxTriggerElement = null; }
     }
 
     document.addEventListener('keydown', function(e) {
@@ -895,7 +981,8 @@ data-detection-width="{{ face.detection_width or 0 }}" data-detection-height="{{
             return r.json();
         }).then(function(data) {
             if (data.status === 'ok') {
-                window.location.reload();
+                closeBboxModal();
+                loadGalleryPage(currentPage);
             } else {
                 alert(data.error || i18nReclassify.bboxError);
                 loading.classList.remove('active');
@@ -910,6 +997,7 @@ data-detection-width="{{ face.detection_width or 0 }}" data-detection-height="{{
     var activeResultFilter = 'all';
     var activeSourceFilter = 'all';
     var activeSdcFilter = 'all';
+    var activeSortOrder = 'threshold-asc';
     var currentPage = 1;
     var perPage = 27;
     var i18nPagination = {
@@ -918,34 +1006,197 @@ data-detection-width="{{ face.detection_width or 0 }}" data-detection-height="{{
         pageOf: {{ _('Page {current} of {total}')|tojson }}
     };
 
-    function getFilteredCards() {
-        var cards = Array.prototype.slice.call(document.querySelectorAll('.result-card'));
-        return cards.filter(function(card) {
-            var matchResult = (activeResultFilter === 'all' || card.dataset.result === activeResultFilter);
-            var matchSource = (activeSourceFilter === 'all' || card.dataset.source === activeSourceFilter);
-            var matchSdc = (activeSdcFilter === 'all' || card.dataset.sdcPending === '1');
-            return matchResult && matchSource && matchSdc;
-        });
+    function renderCard(face) {
+        var card = document.createElement('div');
+        card.className = 'result-card';
+        card.dataset.result = face.result;
+        card.dataset.source = face.classified_by;
+        card.dataset.faceId = face.id;
+        card.dataset.imageId = face.image_id;
+        card.dataset.sdcWritten = face.sdc_written;
+        card.dataset.sdcPending = face.sdc_pending ? '1' : '0';
+        card.dataset.bootstrapped = face.bootstrapped;
+
+        var thumb = document.createElement('div');
+        thumb.className = 'result-thumb';
+        thumb.dataset.fileTitle = face.file_title;
+        thumb.dataset.bboxTop = face.bbox_top;
+        thumb.dataset.bboxRight = face.bbox_right;
+        thumb.dataset.bboxBottom = face.bbox_bottom;
+        thumb.dataset.bboxLeft = face.bbox_left;
+        thumb.dataset.detectionWidth = face.detection_width;
+        thumb.dataset.detectionHeight = face.detection_height;
+
+        var img = document.createElement('img');
+        img.src = face.thumb_url;
+        img.alt = face.file_title;
+        img.loading = 'lazy';
+        thumb.appendChild(img);
+
+        var actions = document.createElement('div');
+        actions.className = 'result-actions';
+        
+        var approveBtn = document.createElement('button');
+        approveBtn.className = 'btn-icon success';
+        approveBtn.setAttribute('onclick', 'reclassifyFace(this, 1)');
+        approveBtn.setAttribute('aria-label', i18nGallery.approve);
+        approveBtn.title = i18nGallery.approve;
+        approveBtn.innerHTML = '&#10003;';
+        actions.appendChild(approveBtn);
+
+        var rejectBtn = document.createElement('button');
+        rejectBtn.className = 'btn-icon danger';
+        rejectBtn.setAttribute('onclick', 'reclassifyFace(this, 0)');
+        rejectBtn.setAttribute('aria-label', i18nGallery.reject);
+        rejectBtn.title = i18nGallery.reject;
+        rejectBtn.innerHTML = '&#10007;';
+        actions.appendChild(rejectBtn);
+
+        var editBtn = document.createElement('button');
+        editBtn.className = 'btn-icon';
+        editBtn.setAttribute('onclick', 'openBboxModal(this)');
+        editBtn.setAttribute('aria-label', i18nGallery.editBbox);
+        editBtn.title = i18nGallery.editBbox;
+        editBtn.innerHTML = '&#9998;';
+        actions.appendChild(editBtn);
+        
+        thumb.appendChild(actions);
+
+        var loadingDiv = document.createElement('div');
+        loadingDiv.className = 'result-loading';
+        loadingDiv.textContent = i18nGallery.loading;
+        thumb.appendChild(loadingDiv);
+
+        card.appendChild(thumb);
+
+        var info = document.createElement('div');
+        info.className = 'result-info';
+
+        var badge = document.createElement('span');
+        if (face.is_target === 1 && face.classified_by_user_id) {
+            badge.className = 'badge badge-active badge-sm';
+            badge.textContent = i18nGallery.verified + ' \u2713';
+        } else if (face.is_target === 1) {
+            badge.className = 'badge badge-active badge-sm';
+            badge.textContent = i18nGallery.match;
+        } else if (face.classified_by_user_id) {
+            badge.className = 'badge badge-paused badge-sm';
+            badge.textContent = i18nGallery.rejected;
+        } else {
+            badge.className = 'badge badge-paused badge-sm';
+            badge.textContent = i18nGallery.notTarget;
+        }
+        info.appendChild(badge);
+
+        if (face.sdc_pending) {
+            var sdcBadge = document.createElement('span');
+            sdcBadge.className = 'badge badge-sdc-pending badge-sm';
+            sdcBadge.setAttribute('data-sdc-badge', '');
+            sdcBadge.textContent = i18nGallery.sdcPending;
+            info.appendChild(sdcBadge);
+        }
+
+        var distance = document.createElement('span');
+        distance.className = 'result-distance';
+        distance.title = i18nGallery.distance;
+        distance.textContent = face.confidence !== null ? face.confidence.toFixed(3) : '\u2014';
+        info.appendChild(distance);
+
+        var method = document.createElement('span');
+        method.className = 'result-method';
+        method.textContent = face.classified_by;
+        info.appendChild(method);
+
+        card.appendChild(info);
+
+        var sdcNote = document.createElement('div');
+        sdcNote.className = 'sdc-note';
+        card.appendChild(sdcNote);
+
+        return card;
     }
 
-    function applyPagination() {
-        var allCards = Array.prototype.slice.call(document.querySelectorAll('.result-card'));
-        var filtered = getFilteredCards();
-        var totalPages = Math.max(1, Math.ceil(filtered.length / perPage));
-        if (currentPage > totalPages) currentPage = totalPages;
+    var galleryLoading = false;
 
-        var start = (currentPage - 1) * perPage;
-        var end = start + perPage;
-        var visible = filtered.slice(start, end);
+    function loadGalleryPage(page) {
+        if (galleryLoading) return;
+        galleryLoading = true;
+        
+        var params = new URLSearchParams();
+        params.set('page', page);
+        params.set('per_page', perPage);
+        if (activeResultFilter !== 'all') params.set('result', activeResultFilter);
+        if (activeSourceFilter !== 'all') params.set('source', activeSourceFilter);
+        if (activeSdcFilter !== 'all') params.set('sdc', activeSdcFilter);
+        if (activeSortOrder !== 'threshold-asc') params.set('sort', activeSortOrder);
 
-        allCards.forEach(function(card) {
-            card.classList.add('hidden');
-        });
-        visible.forEach(function(card) {
-            card.classList.remove('hidden');
-        });
+        var gallery = document.getElementById('resultsGallery');
+        
+        fetch(apiGalleryUrl + '?' + params.toString())
+            .then(function(r) {
+                if (!r.ok) throw new Error('HTTP ' + r.status);
+                return r.json();
+            })
+            .then(function(data) {
+                galleryLoading = false;
+                gallery.innerHTML = '';
+                
+                if (data.faces.length === 0) {
+                    var empty = document.createElement('p');
+                    empty.className = 'gallery-empty';
+                    empty.textContent = i18nGallery.noResults;
+                    gallery.appendChild(empty);
+                } else {
+                    data.faces.forEach(function(face) {
+                        gallery.appendChild(renderCard(face));
+                    });
+                }
 
-        renderPagination(totalPages, filtered.length);
+                currentPage = data.page;
+                renderPagination(data.total_pages, data.total);
+                
+                // Update filter counts on page 1
+                if (data.counts) {
+                    updateFilterCounts(data.counts);
+                }
+                
+                // Apply face cropping to newly rendered cards
+                var thumbs = gallery.querySelectorAll('.result-thumb img');
+                thumbs.forEach(function(img) {
+                    if (img.complete && img.naturalWidth > 0) {
+                        cropToFace(img);
+                    } else {
+                        img.addEventListener('load', function() { cropToFace(img); });
+                    }
+                });
+            })
+            .catch(function(e) {
+                galleryLoading = false;
+                console.error('Gallery load error:', e);
+                gallery.innerHTML = '';
+                var errMsg = document.createElement('p');
+                errMsg.className = 'gallery-error';
+                errMsg.textContent = i18nGallery.loadError;
+                gallery.appendChild(errMsg);
+            });
+    }
+
+    function updateFilterCounts(counts) {
+        var rf = document.getElementById('resultFilter');
+        rf.options[0].textContent = i18nGallery.allResults + ' (' + counts.total + ')';
+        rf.options[1].textContent = i18nGallery.matches + ' (' + counts.matches + ')';
+        rf.options[2].textContent = i18nGallery.nonMatches + ' (' + counts.non_matches + ')';
+        rf.options[3].textContent = i18nGallery.rejected + ' (' + counts.rejected + ')';
+
+        var sf = document.getElementById('sourceFilter');
+        sf.options[0].textContent = i18nGallery.allSources;
+        sf.options[1].textContent = i18nGallery.model + ' (' + counts.source_model + ')';
+        sf.options[2].textContent = i18nGallery.bootstrap + ' (' + counts.source_bootstrap + ')';
+        sf.options[3].textContent = i18nGallery.human + ' (' + counts.source_human + ')';
+
+        var sdcBtn = document.getElementById('sdcToggle');
+        var sdcLabel = sdcBtn.textContent.replace(/\s*\(\d+\)\s*$/, '');
+        sdcBtn.textContent = sdcLabel + ' (' + counts.sdc_pending + ')';
     }
 
     function renderPagination(totalPages, totalItems) {
@@ -985,43 +1236,49 @@ data-detection-width="{{ face.detection_width or 0 }}" data-detection-height="{{
     }
 
     function goToPage(page) {
-        var filtered = getFilteredCards();
-        var totalPages = Math.max(1, Math.ceil(filtered.length / perPage));
-        if (page < 1 || page > totalPages) return;
-        currentPage = page;
-        applyPagination();
+        if (page < 1 || galleryLoading) return;
+        loadGalleryPage(page);
         document.getElementById('resultsGallery').scrollIntoView({ behavior: 'smooth', block: 'start' });
     }
 
-    function filterResults(filter, type) {
-        if (type === 'result') {
-            activeResultFilter = filter;
-        } else if (type === 'source') {
-            // Clicking same source filter again toggles it off
-            activeSourceFilter = (activeSourceFilter === filter) ? 'all' : filter;
-        } else if (type === 'sdc') {
-            // Clicking same SDC filter again toggles it off
-            activeSdcFilter = (activeSdcFilter === filter) ? 'all' : filter;
+    function onFilterChange() {
+        activeResultFilter = document.getElementById('resultFilter').value;
+        activeSourceFilter = document.getElementById('sourceFilter').value;
+        var sortEl = document.getElementById('sortSelect');
+        if (activeSourceFilter === 'model') {
+            sortEl.style.display = '';
+        } else {
+            sortEl.style.display = 'none';
+            sortEl.value = 'threshold-asc';
+            activeSortOrder = 'threshold-asc';
         }
-
-        // Update button states
-        document.querySelectorAll('.results-filter[data-filter-type="result"]').forEach(function(btn) {
-            btn.classList.toggle('active', btn.dataset.filter === activeResultFilter);
-        });
-        document.querySelectorAll('.results-filter[data-filter-type="source"]').forEach(function(btn) {
-            btn.classList.toggle('active', btn.dataset.filter === activeSourceFilter);
-        });
-        document.querySelectorAll('.results-filter[data-filter-type="sdc"]').forEach(function(btn) {
-            btn.classList.toggle('active', activeSdcFilter === btn.dataset.filter);
-        });
-
-        // Reset to page 1 when filter changes
         currentPage = 1;
-        applyPagination();
+        loadGalleryPage(1);
     }
 
-    // Initial pagination on load
-    applyPagination();
+    function toggleSdcFilter() {
+        var btn = document.getElementById('sdcToggle');
+        if (activeSdcFilter === 'sdc-pending') {
+            activeSdcFilter = 'all';
+            btn.classList.remove('active');
+            btn.setAttribute('aria-pressed', 'false');
+        } else {
+            activeSdcFilter = 'sdc-pending';
+            btn.classList.add('active');
+            btn.setAttribute('aria-pressed', 'true');
+        }
+        currentPage = 1;
+        loadGalleryPage(1);
+    }
+
+    function onSortChange() {
+        activeSortOrder = document.getElementById('sortSelect').value;
+        currentPage = 1;
+        loadGalleryPage(1);
+    }
+
+    // Initial load
+    loadGalleryPage(1);
 </script>
 {% endif %}
 
@@ -1051,7 +1308,6 @@ data-detection-width="{{ face.detection_width or 0 }}" data-detection-height="{{
     var sdcPollErrors = 0;
     var SDC_POLL_BASE_INTERVAL = 5000;
     var SDC_POLL_MAX_INTERVAL = 60000;
-    var sdcInitialWritten = {{ (stats.sdc_written or 0)|tojson }};
 
     // Helper: safely set message text without innerHTML
     function sdcShowMessage(container, text, color) {
@@ -1168,26 +1424,25 @@ data-detection-width="{{ face.detection_width or 0 }}" data-detection-height="{{
             var pending = data.pending || 0;
             var removalPending = data.removal_pending || 0;
             var total = written + pending;
-            var newlyWritten = written - sdcInitialWritten;
-            if (newlyWritten < 0) newlyWritten = 0;
-            var totalInitialWork = (sdcInitialPending || 0) + (sdcInitialRemoval || 0);
-            var totalDone = newlyWritten + (sdcInitialRemoval - removalPending);
-            if (totalDone < 0) totalDone = 0;
-            var pct = Math.min(100, Math.round(totalDone / (totalInitialWork || 1) * 100));
+            var removalsDone = (sdcInitialRemoval || 0) - removalPending;
+            if (removalsDone < 0) removalsDone = 0;
+            var totalWork = total + (sdcInitialRemoval || 0);
+            var totalDone = written + removalsDone;
+            var pct = Math.min(100, Math.round(totalDone / (totalWork || 1) * 100));
 
             if (data.in_progress) {
                 // Worker is actively writing
                 progress.style.display = 'block';
                 progressBar.style.width = pct + '%';
-                if (newlyWritten > 0) {
+                if (written > 0 && pending > 0) {
                     progressText.textContent = i18nSdc.written
-                        .replace('{written}', newlyWritten)
-                        .replace('{total}', sdcInitialPending);
-                } else if (sdcInitialPending === 0 && sdcInitialRemoval > 0) {
+                        .replace('{written}', written)
+                        .replace('{total}', total);
+                } else if (pending === 0 && removalPending > 0) {
                     progressText.textContent = i18nSdc.removing;
                 } else {
-        progressText.textContent = (sdcInitialPending === 0 && sdcInitialRemoval > 0)
-            ? i18nSdc.removing : i18nSdc.writing;
+                    progressText.textContent = (pending === 0 && removalPending > 0)
+                        ? i18nSdc.removing : i18nSdc.writing;
                 }
                 btn.disabled = true;
                 btn.textContent = i18nSdc.btnInProgress;
@@ -1222,7 +1477,6 @@ data-detection-width="{{ face.detection_width or 0 }}" data-detection-height="{{
                     btn.textContent = i18nSdc.btnLabel;
                     sdcInitialPending = pending;
                     sdcInitialRemoval = removalPending;
-                    sdcInitialWritten = written;
                 }
 
                 // Update SDC Written stat box on the page

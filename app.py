@@ -6,11 +6,16 @@ Provides OAuth 2.0 authentication, project management, and an active
 learning interface for classifying detected faces.
 """
 
-APP_VERSION = "0.3.5"
+import tomllib
+from pathlib import Path
+
+with Path(__file__).parent.joinpath("pyproject.toml").open("rb") as _f:
+    APP_VERSION: str = tomllib.load(_f)["project"]["version"]
 
 import hashlib
 import io
 import logging
+import math
 import os
 import random
 import secrets
@@ -18,7 +23,7 @@ import time
 from datetime import UTC, datetime, timedelta
 from functools import wraps
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 from dotenv import load_dotenv
 
@@ -43,6 +48,7 @@ from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from requests_oauthlib import OAuth2Session
 
+from config import WAKE_FILE_PATH
 from database import (
     DatabaseError,
     execute_query,
@@ -78,6 +84,14 @@ OAUTH_AUTHORIZE_URL = "https://meta.wikimedia.org/w/rest.php/oauth2/authorize"
 OAUTH_TOKEN_URL = "https://meta.wikimedia.org/w/rest.php/oauth2/access_token"
 OAUTH_PROFILE_URL = "https://meta.wikimedia.org/w/rest.php/oauth2/resource/profile"
 OAUTH_REDIRECT_URI = os.environ.get("OAUTH_REDIRECT_URI", "")
+
+# Shared constants
+MAX_BBOX_PX = 10000  # Maximum bounding box coordinate value
+MIN_BBOX_AREA = 100  # Minimum bounding box area in pixels (10×10)
+PROJECTS_PER_PAGE = 25
+MAX_CATEGORY_TRAVERSAL = 50  # Max subcategories to visit in BFS
+CATEGORY_API_TIMEOUT = 8  # Seconds for category info API calls
+COMMONS_API_LIMIT = "500"  # MediaWiki API cmlimit
 
 # Beta whitelist — fetched from GitHub every 5 minutes, falls back to local file
 _WHITELIST_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "whitelist.txt")
@@ -263,11 +277,16 @@ def teardown_appcontext(exception: BaseException | None = None) -> None:
 
 
 def _is_safe_url(target: str) -> bool:
-    """Check that a redirect URL is safe (relative, no scheme/netloc)."""
+    """Check that a redirect URL is safe (same-host relative path only)."""
     if not target:
         return False
-    parsed = urlparse(target)
-    return parsed.scheme == "" and parsed.netloc == ""
+    # Canonicalize to absolute URL against our host, then verify
+    # the result points back to the same host. This catches edge cases
+    # like "///evil.com" which urlparse alone misclassifies.
+    ref_url = request.host_url
+    test_url = urljoin(ref_url, target)
+    parsed = urlparse(test_url)
+    return parsed.scheme in ("http", "https") and parsed.netloc == urlparse(ref_url).netloc
 
 
 def _download_image(url: str, max_bytes: int = MAX_IMAGE_DOWNLOAD_BYTES) -> bytes:
@@ -787,6 +806,48 @@ def logout():
 
 
 # ---------------------------------------------------------------------------
+# DB helpers — deduplicated query patterns
+# ---------------------------------------------------------------------------
+
+
+def get_project_for_user(project_id: int, user_id: int) -> dict | None:
+    """Fetch a non-deleted project owned by *user_id*, or return ``None``."""
+    rows = execute_query(
+        "SELECT * FROM projects WHERE id = %s AND user_id = %s AND status != 'deleted'",
+        (project_id, user_id),
+    )
+    return rows[0] if rows else None
+
+
+def verify_image_ownership(image_id: int, project_id: int, user_id: int) -> dict | None:
+    """Confirm *image_id* belongs to a non-deleted project of *user_id*.
+
+    Returns the image row (``id``, ``file_title``) or ``None``.
+    """
+    rows = execute_query(
+        "SELECT i.id, i.file_title FROM images i "
+        "JOIN projects p ON i.project_id = p.id "
+        "WHERE i.id = %s AND p.id = %s AND p.user_id = %s AND p.status != 'deleted'",
+        (image_id, project_id, user_id),
+    )
+    return rows[0] if rows else None
+
+
+def has_sibling_match(image_id: int, exclude_face_id: int) -> bool:
+    """Return ``True`` if another target-match face exists on *image_id*
+    (excluding *exclude_face_id* and superseded faces)."""
+    rows = execute_query(
+        "SELECT EXISTS("
+        "  SELECT 1 FROM faces f2 "
+        "  WHERE f2.image_id = %s AND f2.is_target = 1 "
+        "  AND f2.superseded_by IS NULL AND f2.id != %s"
+        ") AS has_sibling",
+        (image_id, exclude_face_id),
+    )
+    return bool(rows[0]["has_sibling"]) if rows else False
+
+
+# ---------------------------------------------------------------------------
 # Page routes
 # ---------------------------------------------------------------------------
 
@@ -803,8 +864,6 @@ def index():
 @login_required
 def dashboard():
     """User dashboard showing all projects."""
-    PROJECTS_PER_PAGE = 25
-
     try:
         page = max(1, int(request.args.get("page", 1)))
     except (ValueError, TypeError):
@@ -836,11 +895,15 @@ def dashboard():
         projects = []
         flash(_("Failed to load projects."), "error")
 
-    # Lazily populate P18 thumbnails for projects missing them
+    # Lazily populate P18 thumbnails for projects missing them (cap to avoid slow page loads)
     if isinstance(projects, list):
+        fetched = 0
         for proj in projects:
             if not proj.get("p18_thumb_url") and proj.get("wikidata_qid"):
+                if fetched >= 3:
+                    break
                 thumb = _fetch_p18_thumb_url(proj["wikidata_qid"])
+                fetched += 1
                 if thumb:
                     proj["p18_thumb_url"] = thumb
                     try:
@@ -868,7 +931,7 @@ def api_category_info():
     """Return total file count for a Commons category (including subcategories).
 
     Does a BFS traversal of subcategories, batch-fetching categoryinfo to sum
-    file counts. Bounded to MAX_CATS categories and a wall-clock timeout to
+    file counts. Bounded to MAX_CATEGORY_TRAVERSAL categories and a wall-clock timeout to
     stay responsive.
     """
     category = request.args.get("category", "").strip()
@@ -878,10 +941,7 @@ def api_category_info():
     if len(category) > 200 or any(c in category for c in "|\n\r\x00"):
         return jsonify({"error": "invalid category name"}), 400
 
-    MAX_CATS = 50
-    TIMEOUT = 8
-
-    deadline = time.monotonic() + TIMEOUT
+    deadline = time.monotonic() + CATEGORY_API_TIMEOUT
 
     root_title = f"Category:{category}"
 
@@ -922,7 +982,7 @@ def api_category_info():
                     "list": "categorymembers",
                     "cmtitle": root_title,
                     "cmtype": "subcat",
-                    "cmlimit": "500",
+                    "cmlimit": COMMONS_API_LIMIT,
                     "format": "json",
                 },
                 headers={"User-Agent": USER_AGENT},
@@ -936,10 +996,10 @@ def api_category_info():
             if "continue" in sub_data:
                 approximate = True
 
-        while cat_queue and len(visited) < MAX_CATS and time.monotonic() < deadline:
+        while cat_queue and len(visited) < MAX_CATEGORY_TRAVERSAL and time.monotonic() < deadline:
             # Batch up to 50 titles for categoryinfo
             batch = []
-            while cat_queue and len(batch) < 50 and len(visited) + len(batch) < MAX_CATS:
+            while cat_queue and len(batch) < 50 and len(visited) + len(batch) < MAX_CATEGORY_TRAVERSAL:
                 title = cat_queue.pop(0)
                 if title not in visited:
                     batch.append(title)
@@ -973,7 +1033,7 @@ def api_category_info():
                     subcats_to_fetch.append(p["title"])
 
             for sub_title in subcats_to_fetch:
-                if time.monotonic() >= deadline or len(visited) >= MAX_CATS:
+                if time.monotonic() >= deadline or len(visited) >= MAX_CATEGORY_TRAVERSAL:
                     break
                 sub_resp = requests.get(
                     COMMONS_API_URL,
@@ -982,7 +1042,7 @@ def api_category_info():
                         "list": "categorymembers",
                         "cmtitle": sub_title,
                         "cmtype": "subcat",
-                        "cmlimit": "500",
+                        "cmlimit": COMMONS_API_LIMIT,
                         "format": "json",
                     },
                     headers={"User-Agent": USER_AGENT},
@@ -996,7 +1056,9 @@ def api_category_info():
                 if "continue" in sub_data:
                     approximate = True
 
-        approximate = approximate or len(visited) >= MAX_CATS or (cat_queue and time.monotonic() >= deadline)
+        approximate = (
+            approximate or len(visited) >= MAX_CATEGORY_TRAVERSAL or (cat_queue and time.monotonic() >= deadline)
+        )
 
         return jsonify(
             {
@@ -1129,8 +1191,7 @@ def project_new():
 
         # Signal the worker to wake up and process the new project immediately
         try:
-            wake_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".worker-wake-up")
-            with open(wake_file, "w") as f:
+            with open(WAKE_FILE_PATH, "w") as f:
                 f.write("")
         except OSError:
             pass  # Non-critical — worker will pick it up on next poll
@@ -1189,18 +1250,13 @@ def project_new():
 def project_detail(project_id: int):
     """Project detail page with progress and stats."""
     try:
-        rows = execute_query(
-            "SELECT * FROM projects WHERE id = %s AND user_id = %s AND status != 'deleted'",
-            (project_id, g.user["id"]),
-        )
+        project = get_project_for_user(project_id, g.user["id"])
     except DatabaseError:
         logger.exception("Failed to load project")
         abort(500)
 
-    if not rows:
+    if not project:
         abort(404)
-
-    project = rows[0]
 
     # Lazily populate P18 thumbnail if missing
     if not project.get("p18_thumb_url") and project.get("wikidata_qid"):
@@ -1248,34 +1304,22 @@ def project_detail(project_id: int):
         logger.exception("Failed to load face stats")
         face_stats = {}
 
-    # Get model-classified faces for the results gallery (sorted by confidence)
-    # Exclude video/audio files — only show images with renderable thumbnails
-    model_faces: list = []
+    gallery_total = 0
     try:
         rows = execute_query(
-            "SELECT f.id, f.image_id, f.is_target, f.confidence, f.classified_by, "
-            "  f.bbox_top, f.bbox_right, f.bbox_bottom, f.bbox_left, "
-            "  f.sdc_written, f.classified_by_user_id, "
-            "  i.file_title, i.commons_page_id, "
-            "  i.detection_width, i.detection_height, i.bootstrapped "
+            "SELECT COUNT(*) AS cnt "
             "FROM faces f "
             "JOIN images i ON f.image_id = i.id "
             "WHERE i.project_id = %s "
             "  AND f.superseded_by IS NULL "
             "  AND (f.classified_by IN ('model', 'bootstrap') "
             "       OR (f.classified_by = 'human' AND f.classified_by_user_id IS NOT NULL)) "
-            "  AND LOWER(i.file_title) NOT REGEXP '\\\\.(webm|ogv|ogg|mp3|wav|flac|opus|mid|oga)$' "
-            "ORDER BY "
-            "  (CASE WHEN f.is_target = 1 AND f.sdc_written = 0 "
-            "        AND f.classified_by != 'bootstrap' AND i.bootstrapped = 0 THEN 0 ELSE 1 END), "
-            "  f.is_target DESC, COALESCE(f.confidence, 999) ASC "
-            "LIMIT 200",
+            "  AND LOWER(i.file_title) NOT REGEXP '\\\\.(webm|ogv|ogg|mp3|wav|flac|opus|mid|oga)$'",
             (project_id,),
         )
-        if isinstance(rows, list):
-            model_faces = rows
+        gallery_total = rows[0]["cnt"] if rows else 0
     except DatabaseError:
-        logger.exception("Failed to load model faces")
+        logger.exception("Failed to count gallery faces")
 
     pending_images = 0
     if project.get("status") == "active":
@@ -1308,7 +1352,7 @@ def project_detail(project_id: int):
         "project_detail.html",
         project=project,
         stats=face_stats,
-        model_faces=model_faces,
+        gallery_total=gallery_total,
         pending_images=pending_images,
         inference_eligible=inference_eligible,
     )
@@ -1318,19 +1362,13 @@ def project_detail(project_id: int):
 @login_required
 def classify(project_id: int):
     """Active learning classification interface."""
-    # Verify project ownership
     try:
-        rows = execute_query(
-            "SELECT * FROM projects WHERE id = %s AND user_id = %s AND status != 'deleted'",
-            (project_id, g.user["id"]),
-        )
+        project = get_project_for_user(project_id, g.user["id"])
     except DatabaseError:
         abort(500)
 
-    if not rows:
+    if not project:
         abort(404)
-
-    project = rows[0]
 
     # Handle skipped images (stored in session, reset when project changes)
     skip_key = f"skipped_images_{project_id}"
@@ -1552,13 +1590,8 @@ def api_classify():
 
     # Verify ownership: image belongs to a project owned by this user
     try:
-        check = execute_query(
-            "SELECT i.id FROM images i "
-            "JOIN projects p ON i.project_id = p.id "
-            "WHERE i.id = %s AND p.id = %s AND p.user_id = %s AND p.status != 'deleted'",
-            (image_id, project_id, g.user["id"]),
-        )
-        if not check:
+        img = verify_image_ownership(image_id, project_id, g.user["id"])
+        if not img:
             return jsonify({"error": _("Image not found or access denied")}), 404
     except DatabaseError:
         return jsonify({"error": _("Database error")}), 500
@@ -1719,13 +1752,8 @@ def api_undo_classify():
 
     # Verify ownership
     try:
-        check = execute_query(
-            "SELECT i.id FROM images i "
-            "JOIN projects p ON i.project_id = p.id "
-            "WHERE i.id = %s AND p.id = %s AND p.user_id = %s AND p.status != 'deleted'",
-            (image_id, project_id, g.user["id"]),
-        )
-        if not check:
+        img = verify_image_ownership(image_id, project_id, g.user["id"])
+        if not img:
             return jsonify({"error": _("Image not found or access denied")}), 404
     except DatabaseError:
         return jsonify({"error": _("Database error")}), 500
@@ -1819,9 +1847,6 @@ def api_manual_face():
     if bbox_top >= bbox_bottom or bbox_left >= bbox_right:
         return jsonify({"error": _("Invalid bounding box dimensions")}), 400
 
-    # Constrain bbox to reasonable image bounds
-    MAX_BBOX_PX = 10000
-    MIN_BBOX_AREA = 100  # 10×10 minimum
     if (
         bbox_top < 0
         or bbox_left < 0
@@ -1835,18 +1860,13 @@ def api_manual_face():
     is_review_mode = request.form.get("reviewing_model") == "1"
 
     try:
-        check = execute_query(
-            "SELECT i.id, i.file_title FROM images i "
-            "JOIN projects p ON i.project_id = p.id "
-            "WHERE i.id = %s AND p.id = %s AND p.user_id = %s AND p.status != 'deleted'",
-            (image_id, project_id, g.user["id"]),
-        )
-        if not check:
+        img = verify_image_ownership(image_id, project_id, g.user["id"])
+        if not img:
             return jsonify({"error": _("Image not found or access denied")}), 404
     except DatabaseError:
         return jsonify({"error": _("Database error")}), 500
 
-    file_title = check[0]["file_title"]
+    file_title = img["file_title"]
     clean_title = file_title[5:] if file_title.startswith("File:") else file_title
     url = FILE_PATH_URL.format(file_title=clean_title)
 
@@ -2100,15 +2120,7 @@ def api_reclassify():
         # Check if another face on the same image is confirmed as target.
         # If so, the P180 claim must stay — don't queue removal.
         try:
-            sibling_rows = execute_query(
-                "SELECT EXISTS("
-                "  SELECT 1 FROM faces f2 "
-                "  WHERE f2.image_id = %s AND f2.is_target = 1 "
-                "  AND f2.superseded_by IS NULL AND f2.id != %s"
-                ") AS has_sibling_match",
-                (face_row["image_id"], face_id),
-            )
-            has_sibling = sibling_rows[0]["has_sibling_match"] if sibling_rows else False
+            has_sibling = has_sibling_match(face_row["image_id"], face_id)
         except DatabaseError:
             return jsonify({"error": _("Database error")}), 500
 
@@ -2118,15 +2130,7 @@ def api_reclassify():
         # Check if another face on the same image is confirmed as target.
         # If so, the P180 claim must stay — only clear sdc_written on this face.
         try:
-            sibling_rows = execute_query(
-                "SELECT EXISTS("
-                "  SELECT 1 FROM faces f2 "
-                "  WHERE f2.image_id = %s AND f2.is_target = 1 "
-                "  AND f2.superseded_by IS NULL AND f2.id != %s"
-                ") AS has_sibling_match",
-                (face_row["image_id"], face_id),
-            )
-            has_sibling = sibling_rows[0]["has_sibling_match"] if sibling_rows else False
+            has_sibling = has_sibling_match(face_row["image_id"], face_id)
         except DatabaseError:
             return jsonify({"error": _("Database error")}), 500
 
@@ -2242,9 +2246,6 @@ def api_update_face_bbox():
     if bbox_top >= bbox_bottom or bbox_left >= bbox_right:
         return jsonify({"error": _("Invalid bounding box dimensions")}), 400
 
-    # Constrain bbox to reasonable image bounds
-    MAX_BBOX_PX = 10000
-    MIN_BBOX_AREA = 100  # 10×10 minimum
     if (
         bbox_top < 0
         or bbox_left < 0
@@ -2359,16 +2360,11 @@ def api_write_sdc(project_id: int):
 
     # Verify project ownership
     try:
-        rows = execute_query(
-            "SELECT id, sdc_write_requested FROM projects WHERE id = %s AND user_id = %s AND status != 'deleted'",
-            (project_id, g.user["id"]),
-        )
-        if not rows:
+        project = get_project_for_user(project_id, g.user["id"])
+        if not project:
             return jsonify({"error": _("Project not found or access denied")}), 404
     except DatabaseError:
         return jsonify({"error": _("Database error")}), 500
-
-    project = rows[0]
 
     # Query current counts (needed for both already_requested and normal paths)
     try:
@@ -2416,8 +2412,7 @@ def api_write_sdc(project_id: int):
 
     # Touch wake-up file to reduce latency (worker checks every 60s)
     try:
-        wake_up_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".worker-wake-up")
-        with open(wake_up_path, "w") as f:
+        with open(WAKE_FILE_PATH, "w") as f:
             f.write("sdc")
     except OSError:
         pass
@@ -2432,17 +2427,11 @@ def api_sdc_status(project_id: int):
     """Poll endpoint for SDC write progress. Returns counts of written,
     pending, and whether the worker is actively writing."""
     try:
-        rows = execute_query(
-            "SELECT id, sdc_write_requested, sdc_write_error FROM projects WHERE id = %s AND user_id = %s "
-            "AND status != 'deleted'",
-            (project_id, g.user["id"]),
-        )
-        if not rows:
+        project = get_project_for_user(project_id, g.user["id"])
+        if not project:
             return jsonify({"error": _("Project not found or access denied")}), 404
     except DatabaseError:
         return jsonify({"error": _("Database error")}), 500
-
-    project = rows[0]
 
     try:
         counts = execute_query(
@@ -2477,23 +2466,207 @@ def api_sdc_status(project_id: int):
     )
 
 
+@app.route("/api/project/<int:project_id>/gallery", methods=["GET"])
+@login_required
+@limiter.limit("60 per minute")
+def api_gallery(project_id: int):
+    """Paginated JSON API for the Classification Results gallery.
+
+    Query params:
+        page        -- 1-based page number (default 1)
+        per_page    -- items per page, capped at 100 (default 27)
+        result      -- filter by result type: match | non-match | rejected | all (default all)
+        source      -- filter by classification source: model | bootstrap | human | all (default all)
+        sdc         -- filter by SDC status: sdc-pending | all (default all)
+    """
+    try:
+        project = get_project_for_user(project_id, g.user["id"])
+        if not project:
+            return jsonify({"error": _("Project not found or access denied")}), 404
+    except DatabaseError:
+        return jsonify({"error": _("Database error")}), 500
+
+    try:
+        page = max(1, int(request.args.get("page", 1)))
+        per_page = min(100, max(1, int(request.args.get("per_page", 27))))
+    except (ValueError, TypeError):
+        return jsonify({"error": "Invalid pagination parameters"}), 400
+
+    result_filter = request.args.get("result", "all")
+    source_filter = request.args.get("source", "all")
+    sdc_filter = request.args.get("sdc", "all")
+    sort_param = request.args.get("sort", "threshold-asc")
+
+    base_where = (
+        "i.project_id = %s "
+        "AND f.superseded_by IS NULL "
+        "AND (f.classified_by IN ('model', 'bootstrap') "
+        "     OR (f.classified_by = 'human' AND f.classified_by_user_id IS NOT NULL)) "
+        "AND LOWER(i.file_title) NOT REGEXP '\\\\.(webm|ogv|ogg|mp3|wav|flac|opus|mid|oga)$'"
+    )
+    params: list = [project_id]
+
+    filter_clauses: list[str] = []
+    if result_filter == "match":
+        filter_clauses.append("f.is_target = 1")
+    elif result_filter == "non-match":
+        filter_clauses.append("f.is_target != 1")
+        filter_clauses.append("NOT (f.is_target = 0 AND f.classified_by_user_id IS NOT NULL)")
+    elif result_filter == "rejected":
+        filter_clauses.append("f.is_target = 0")
+        filter_clauses.append("f.classified_by_user_id IS NOT NULL")
+
+    if source_filter == "model":
+        filter_clauses.append("f.classified_by = 'model'")
+        filter_clauses.append("f.classified_by_user_id IS NULL")
+    elif source_filter == "bootstrap":
+        filter_clauses.append("f.classified_by = 'bootstrap'")
+        filter_clauses.append("f.classified_by_user_id IS NULL")
+    elif source_filter == "human":
+        filter_clauses.append("f.classified_by_user_id IS NOT NULL")
+
+    if sdc_filter == "sdc-pending":
+        filter_clauses.append(
+            "(f.is_target = 1 AND f.sdc_written = 0 AND f.classified_by != 'bootstrap' AND i.bootstrapped = 0)"
+        )
+
+    where = base_where
+    if filter_clauses:
+        where += " AND " + " AND ".join(filter_clauses)
+
+    try:
+        count_rows = execute_query(
+            f"SELECT COUNT(*) AS cnt FROM faces f JOIN images i ON f.image_id = i.id WHERE {where}",  # noqa: S608
+            tuple(params),
+        )
+        total = count_rows[0]["cnt"] if count_rows else 0
+    except DatabaseError:
+        return jsonify({"error": _("Database error")}), 500
+
+    counts = {}
+    if page == 1:
+        try:
+            count_data = execute_query(
+                "SELECT "
+                "  COUNT(*) AS total, "
+                "  SUM(CASE WHEN f.is_target = 1 THEN 1 ELSE 0 END) AS matches, "
+                "  SUM(CASE WHEN f.is_target != 1 AND NOT (f.is_target = 0 AND f.classified_by_user_id IS NOT NULL) THEN 1 ELSE 0 END) AS non_matches, "
+                "  SUM(CASE WHEN f.is_target = 0 AND f.classified_by_user_id IS NOT NULL THEN 1 ELSE 0 END) AS rejected, "
+                "  SUM(CASE WHEN f.classified_by = 'model' AND f.classified_by_user_id IS NULL THEN 1 ELSE 0 END) AS source_model, "
+                "  SUM(CASE WHEN f.classified_by = 'bootstrap' AND f.classified_by_user_id IS NULL THEN 1 ELSE 0 END) AS source_bootstrap, "
+                "  SUM(CASE WHEN f.classified_by_user_id IS NOT NULL THEN 1 ELSE 0 END) AS source_human, "
+                "  SUM(CASE WHEN f.is_target = 1 AND f.sdc_written = 0 AND f.classified_by != 'bootstrap' AND i.bootstrapped = 0 THEN 1 ELSE 0 END) AS sdc_pending "
+                f"FROM faces f JOIN images i ON f.image_id = i.id WHERE {base_where}",  # noqa: S608
+                (project_id,),
+            )
+            if count_data:
+                c = count_data[0]
+                counts = {
+                    "total": c["total"] or 0,
+                    "matches": c["matches"] or 0,
+                    "non_matches": c["non_matches"] or 0,
+                    "rejected": c["rejected"] or 0,
+                    "source_model": c["source_model"] or 0,
+                    "source_bootstrap": c["source_bootstrap"] or 0,
+                    "source_human": c["source_human"] or 0,
+                    "sdc_pending": c["sdc_pending"] or 0,
+                }
+        except DatabaseError:
+            pass
+
+    sort_options = {
+        "threshold-asc": "COALESCE(f.confidence, 999) ASC",
+        "threshold-desc": "COALESCE(f.confidence, 999) DESC",
+    }
+    sort_clause = sort_options.get(sort_param, sort_options["threshold-asc"])
+
+    offset = (page - 1) * per_page
+    try:
+        face_rows = execute_query(
+            "SELECT f.id, f.image_id, f.is_target, f.confidence, f.classified_by, "
+            "  f.bbox_top, f.bbox_right, f.bbox_bottom, f.bbox_left, "
+            "  f.sdc_written, f.classified_by_user_id, "
+            "  i.file_title, i.commons_page_id, "
+            "  i.detection_width, i.detection_height, i.bootstrapped "
+            "FROM faces f "
+            "JOIN images i ON f.image_id = i.id "
+            f"WHERE {where} "  # noqa: S608
+            "ORDER BY "
+            "  (CASE WHEN f.is_target = 1 AND f.sdc_written = 0 "
+            "        AND f.classified_by != 'bootstrap' AND i.bootstrapped = 0 THEN 0 ELSE 1 END), "
+            f"  {sort_clause} "  # noqa: S608
+            "LIMIT %s OFFSET %s",
+            (*params, per_page, offset),
+        )
+    except DatabaseError:
+        return jsonify({"error": _("Database error")}), 500
+
+    total_pages = max(1, math.ceil(total / per_page))
+
+    faces = []
+    for face in face_rows if face_rows else []:
+        is_sdc_pending = (
+            face["is_target"] == 1
+            and face["sdc_written"] == 0
+            and face["classified_by"] != "bootstrap"
+            and face["bootstrapped"] == 0
+        )
+        if face["is_target"] == 0 and face["classified_by_user_id"]:
+            result_type = "rejected"
+        elif face["is_target"] == 1:
+            result_type = "match"
+        else:
+            result_type = "non-match"
+
+        faces.append(
+            {
+                "id": face["id"],
+                "image_id": face["image_id"],
+                "is_target": face["is_target"],
+                "confidence": float(face["confidence"]) if face["confidence"] is not None else None,
+                "classified_by": face["classified_by"],
+                "classified_by_user_id": face["classified_by_user_id"],
+                "bbox_top": face["bbox_top"],
+                "bbox_right": face["bbox_right"],
+                "bbox_bottom": face["bbox_bottom"],
+                "bbox_left": face["bbox_left"],
+                "sdc_written": face["sdc_written"],
+                "bootstrapped": face["bootstrapped"],
+                "file_title": face["file_title"],
+                "detection_width": face["detection_width"] or 0,
+                "detection_height": face["detection_height"] or 0,
+                "thumb_url": commons_thumb_url(face["file_title"], 330),
+                "result": result_type,
+                "sdc_pending": is_sdc_pending,
+            }
+        )
+
+    result = {
+        "status": "ok",
+        "faces": faces,
+        "page": page,
+        "per_page": per_page,
+        "total": total,
+        "total_pages": total_pages,
+    }
+    if counts:
+        result["counts"] = counts
+
+    return jsonify(result)
+
+
 @app.route("/api/progress/<int:project_id>", methods=["GET"])
 @login_required
 @limiter.limit("30 per minute")
 def api_progress(project_id: int):
     """Poll endpoint for image processing progress."""
     try:
-        rows = execute_query(
-            "SELECT images_processed, images_total, status FROM projects "
-            "WHERE id = %s AND user_id = %s AND status != 'deleted'",
-            (project_id, g.user["id"]),
-        )
-        if not rows:
+        project = get_project_for_user(project_id, g.user["id"])
+        if not project:
             return jsonify({"error": _("Project not found or access denied")}), 404
     except DatabaseError:
         return jsonify({"error": _("Database error")}), 500
 
-    project = rows[0]
     images_processed = project["images_processed"] or 0
     images_total = project["images_total"] or 0
 
@@ -2565,17 +2738,12 @@ def api_progress(project_id: int):
 def project_settings(project_id: int):
     """Edit project settings."""
     try:
-        rows = execute_query(
-            "SELECT * FROM projects WHERE id = %s AND user_id = %s AND status != 'deleted'",
-            (project_id, g.user["id"]),
-        )
+        project = get_project_for_user(project_id, g.user["id"])
     except DatabaseError:
         abort(500)
 
-    if not rows:
+    if not project:
         abort(404)
-
-    project = rows[0]
 
     if request.method == "GET":
         return render_template("project_settings.html", project=project)
@@ -2668,7 +2836,7 @@ def project_settings(project_id: int):
                         "info",
                     )
         except DatabaseError:
-            pass
+            logger.debug("Non-critical: failed to fetch stats after settings update for project %s", project_id)
 
         return redirect(url_for("project_detail", project_id=project_id))
     except DatabaseError:
@@ -2685,19 +2853,12 @@ def project_rerun_inference(project_id: int):
         abort(400, _("Invalid CSRF token"))
 
     try:
-        rows = execute_query(
-            "SELECT id, distance_threshold, min_confirmed, "
-            "last_inference_threshold, last_inference_min_confirmed "
-            "FROM projects WHERE id = %s AND user_id = %s AND status != 'deleted'",
-            (project_id, g.user["id"]),
-        )
+        project = get_project_for_user(project_id, g.user["id"])
     except DatabaseError:
         abort(500)
 
-    if not rows:
+    if not project:
         abort(404)
-
-    project = rows[0]
 
     if (
         project["last_inference_threshold"] is not None
@@ -2742,8 +2903,7 @@ def project_rerun_inference(project_id: int):
             )
             # Signal the worker to wake up and re-run inference immediately
             try:
-                wake_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".worker-wake-up")
-                with open(wake_file, "w") as f:
+                with open(WAKE_FILE_PATH, "w") as f:
                     f.write("")
             except OSError:
                 pass  # Non-critical — worker will pick it up on next poll
@@ -2795,7 +2955,7 @@ def project_rerun_inference(project_id: int):
                         "info",
                     )
         except DatabaseError:
-            pass
+            logger.debug("Non-critical: failed to fetch stats after inference reset for project %s", project_id)
 
     except DatabaseError:
         logger.exception("Failed to reset model-classified faces")
@@ -2973,7 +3133,8 @@ def commons_thumb_route(file_title: str):
 @app.errorhandler(400)
 def bad_request(e):
     """Handle 400 errors."""
-    return render_template("error.html", code=400, message=str(e)), 400
+    msg = e.description if hasattr(e, "description") and isinstance(e.description, str) else _("Bad request")
+    return render_template("error.html", code=400, message=msg), 400
 
 
 @app.errorhandler(404)

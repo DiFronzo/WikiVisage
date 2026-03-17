@@ -34,6 +34,7 @@ from PIL import Image
 from requests.adapters import HTTPAdapter
 from requests.packages.urllib3.util.retry import Retry
 
+from config import WAKE_FILE_PATH
 from database import DatabaseError, close_pool, execute_query, execute_transaction, init_db
 
 # Configure Logging
@@ -49,8 +50,7 @@ USER_AGENT = "WikiVisage/1.0 (Wikimedia Toolforge; https://toolsadmin.wikimedia.
 
 POLL_INTERVAL = int(os.environ.get("WIKIVISAGE_WORKER_POLL_INTERVAL", 60))
 BATCH_SIZE = int(os.environ.get("WIKIVISAGE_WORKER_BATCH_SIZE", 50))
-WAKE_UP_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".worker-wake-up")
-MAX_CONCURRENT_PROJECTS = int(os.environ.get("WIKIVISAGE_WORKER_MAX_PROJECTS", 3))
+MAX_CONCURRENT_PROJECTS = int(os.environ.get("WIKIVISAGE_WORKER_MAX_PROJECTS", 4))
 IMAGE_THREADS = int(os.environ.get("WIKIVISAGE_WORKER_IMAGE_THREADS", 4))
 
 # Distributed locking: stale claims from crashed workers expire after this many minutes
@@ -68,9 +68,6 @@ MAX_IMAGES_PER_PROJECT = 9000
 # Maximum images the bootstrap (P180 seeding) will fetch — keeps slots free for untagged category images
 MAX_BOOTSTRAP_IMAGES = 1000
 
-# Maximum number of new (image_count==0) projects to fast-track per poll cycle
-# Keeping this at 1 prevents serial traversal work from starving the thread pool
-MAX_FAST_TRACK_PER_WAKEUP = 1
 
 # Non-image file extensions to skip during category traversal (video, audio)
 _SKIP_EXTENSIONS = {".webm", ".ogv", ".ogg", ".mp3", ".wav", ".flac", ".opus", ".mid", ".oga"}
@@ -120,13 +117,16 @@ def _create_session() -> requests.Session:
 # Module-level singleton session — reuses TCP connections and TLS state across all
 # HTTP requests, avoiding the ~100ms+ overhead of per-request Session creation.
 _http_session: requests.Session | None = None
+_http_session_lock = threading.Lock()
 
 
 def _get_session() -> requests.Session:
     """Return the singleton HTTP session, creating it on first use."""
     global _http_session
     if _http_session is None:
-        _http_session = _create_session()
+        with _http_session_lock:
+            if _http_session is None:
+                _http_session = _create_session()
     return _http_session
 
 
@@ -155,15 +155,24 @@ def _api_request(
             else:
                 resp = session.post(url, data=data, params=params, headers=headers, timeout=timeout)
 
+            # Check for MediaWiki maxlag before raise_for_status().
+            # MediaWiki returns HTTP 503 with Retry-After header for maxlag,
+            # so raise_for_status() would throw before we can handle it.
+            if resp.status_code == 503 and "Retry-After" in resp.headers:
+                retry_after = int(resp.headers.get("Retry-After", 5))
+                logger.warning(f"Maxlag encountered (503). Sleeping for {retry_after} seconds.")
+                time.sleep(retry_after)
+                continue
+
             resp.raise_for_status()
 
-            # Check for MediaWiki Maxlag
-            if "Retry-After" in resp.headers and resp.status_code == 200:
+            # Also check for maxlag reported inside a 200 JSON response
+            if "Retry-After" in resp.headers:
                 try:
                     data_json = resp.json()
                     if "error" in data_json and data_json["error"].get("code") == "maxlag":
                         retry_after = int(resp.headers.get("Retry-After", 5))
-                        logger.warning(f"Maxlag encountered. Sleeping for {retry_after} seconds.")
+                        logger.warning(f"Maxlag encountered (200). Sleeping for {retry_after} seconds.")
                         time.sleep(retry_after)
                         continue
                 except ValueError:
@@ -422,6 +431,7 @@ def _face_detect_worker_loop(
 
         except Exception:
             # Queue error or other fatal issue — subprocess exits, will be respawned
+            logging.getLogger(__name__).exception("Fatal error in face detection subprocess, exiting")
             break
 
 
@@ -451,6 +461,7 @@ class FaceDetectPool:
         self._task_queue: multiprocessing.Queue = multiprocessing.Queue()
         self._result_queue: multiprocessing.Queue = multiprocessing.Queue()
         self._workers: list[multiprocessing.Process] = []
+        self._workers_lock = threading.Lock()
         self._request_counter = 0
         self._counter_lock = threading.Lock()
         # Per-request result routing: request_id -> queue.Queue holding the result
@@ -466,8 +477,9 @@ class FaceDetectPool:
             return
         logger.info(f"Starting face detection subprocess pool (size={self._pool_size})")
         self._shutdown_event.clear()
-        for i in range(self._pool_size):
-            self._spawn_worker(i)
+        with self._workers_lock:
+            for i in range(self._pool_size):
+                self._spawn_worker(i)
         # Start background thread that routes results to per-request queues
         self._dispatcher_thread = threading.Thread(
             target=self._dispatch_results, daemon=True, name="face-pool-dispatch"
@@ -476,7 +488,7 @@ class FaceDetectPool:
         self._started = True
 
     def _spawn_worker(self, worker_id: int) -> None:
-        """Spawn a single worker subprocess."""
+        """Spawn a single worker subprocess. Caller must hold self._workers_lock."""
         proc = multiprocessing.Process(
             target=_face_detect_worker_loop,
             args=(self._task_queue, self._result_queue, worker_id),
@@ -491,11 +503,12 @@ class FaceDetectPool:
 
     def _ensure_workers_alive(self) -> None:
         """Check all workers and respawn any that have died."""
-        for i, proc in enumerate(self._workers):
-            if not proc.is_alive():
-                exitcode = proc.exitcode
-                logger.warning(f"Face detection subprocess {i} died (exitcode={exitcode}), respawning")
-                self._spawn_worker(i)
+        with self._workers_lock:
+            for i, proc in enumerate(self._workers):
+                if not proc.is_alive():
+                    exitcode = proc.exitcode
+                    logger.warning(f"Face detection subprocess {i} died (exitcode={exitcode}), respawning")
+                    self._spawn_worker(i)
 
     def _dispatch_results(self) -> None:
         """Background thread: drain _result_queue and route to per-request queues.
@@ -562,6 +575,10 @@ class FaceDetectPool:
             try:
                 result = result_q.get(timeout=FACE_DETECT_TIMEOUT)
             except queue.Empty:
+                logger.warning(
+                    f"Face detection timed out after {FACE_DETECT_TIMEOUT}s (request_id={request_id}). "
+                    "Orphaned task will be discarded when a subprocess picks it up."
+                )
                 raise RuntimeError(f"Face detection timed out after {FACE_DETECT_TIMEOUT}s")
 
             if result[1] == "error":
@@ -590,26 +607,28 @@ class FaceDetectPool:
         self._started = False
 
         # 2. Send sentinel to each worker subprocess so they exit cleanly
-        for _ in self._workers:
-            try:
-                self._task_queue.put(None)
-            except Exception:
-                pass
+        with self._workers_lock:
+            for _ in self._workers:
+                try:
+                    self._task_queue.put(None)
+                except Exception:
+                    pass
 
-        # 3. Wait for workers to exit (dispatcher still routing results)
-        for i, proc in enumerate(self._workers):
-            proc.join(timeout=5)
-            if proc.is_alive():
-                logger.warning(f"Force-killing face detection subprocess {i}")
-                proc.kill()
-                proc.join(timeout=2)
+            # 3. Wait for workers to exit (dispatcher still routing results)
+            for i, proc in enumerate(self._workers):
+                proc.join(timeout=5)
+                if proc.is_alive():
+                    logger.warning(f"Force-killing face detection subprocess {i}")
+                    proc.kill()
+                    proc.join(timeout=2)
 
         # 4. Now stop the dispatcher — all workers are gone, no more results
         self._shutdown_event.set()
         if self._dispatcher_thread is not None:
             self._dispatcher_thread.join(timeout=5)
 
-        self._workers.clear()
+        with self._workers_lock:
+            self._workers.clear()
         logger.info("Face detection subprocess pool shut down")
 
 
@@ -655,7 +674,6 @@ def _run_face_detection_fallback(
     proc = multiprocessing.Process(
         target=_detect_faces_in_subprocess,
         args=(image_bytes, child_conn),
-        daemon=True,
     )
     proc.start()
     child_conn.close()
@@ -1631,7 +1649,7 @@ def _claim_active_projects(max_count: int) -> list[dict[str, Any]]:
             "  )"
             ") "
             "ORDER BY COALESCE(p.worker_claimed_at, '1970-01-01') ASC, "
-            "(SELECT COUNT(*) FROM images i WHERE i.project_id = p.id) ASC, p.id DESC "
+            "p.images_total ASC, p.id DESC "
             "LIMIT %s "
             "FOR UPDATE",
             (CLAIM_EXPIRY_MINUTES, max_count),
@@ -1826,8 +1844,7 @@ def process_project(project: dict[str, Any], *, skip_discovery: bool = False) ->
 
     Args:
         project: Project row dict from DB (must include 'id', 'wikidata_qid', etc.).
-        skip_discovery: If True, skip traverse_category and bootstrap_from_sparql
-            (useful when these were already run in a fast-track pass).
+        skip_discovery: If True, skip traverse_category and bootstrap_from_sparql.
     """
     t_project_start = time.monotonic()
     project_id = project["id"]
@@ -2067,47 +2084,9 @@ def main():
                     f"{len(sdc_projects)} SDC project(s)"
                 )
 
-                # Fast-track new projects: run discovery (traverse + bootstrap) immediately
-                # so they don't wait behind long-running image processing in the thread pool.
-                fast_tracked_ids = set()
-                fast_tracked_count = 0
-                for project in active_projects:
-                    if shutdown_requested:
-                        break
-                    # Apply a per-cycle cap to keep the poll loop responsive.
-                    if fast_tracked_count >= MAX_FAST_TRACK_PER_WAKEUP:
-                        logger.debug(
-                            "Reached per-cycle fast-track cap "
-                            f"({MAX_FAST_TRACK_PER_WAKEUP}); deferring remaining projects"
-                        )
-                        break
-                    if project.get("image_count", 0) == 0:
-                        logger.info(
-                            f"Fast-tracking new project {project['id']} ({project['wikidata_qid']}): running discovery"
-                        )
-                        try:
-                            traverse_category(project)
-                            # Refresh claim after potentially long category traversal
-                            _refresh_claims()
-                            if not shutdown_requested:
-                                bootstrap_from_sparql(project)
-                                # Refresh claim after bootstrap SPARQL queries
-                                _refresh_claims()
-                            fast_tracked_ids.add(project["id"])
-                            fast_tracked_count += 1
-                        except Exception as e:
-                            logger.error(f"Fast-track discovery failed for project {project['id']}: {e}")
-
-                if fast_tracked_ids:
-                    try:
-                        execute_query(
-                            "REPLACE INTO worker_heartbeat (id, last_seen) VALUES (1, NOW())",
-                            fetch=False,
-                        )
-                    except Exception:
-                        pass
-
-                # Process active projects concurrently (claims released in wrapper)
+                # Process active projects concurrently (claims released in wrapper).
+                # Each thread handles its own discovery (traverse_category + bootstrap)
+                # so all claimed projects start working immediately — no serial bottleneck.
                 seen_ids = set()
                 if active_projects:
                     with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_PROJECTS) as executor:
@@ -2116,8 +2095,7 @@ def main():
                             if shutdown_requested:
                                 break
                             seen_ids.add(project["id"])
-                            skip = project["id"] in fast_tracked_ids
-                            future = executor.submit(_process_and_release, project, skip_discovery=skip)
+                            future = executor.submit(_process_and_release, project)
                             futures[future] = project["id"]
 
                         last_heartbeat = time.time()
@@ -2138,38 +2116,26 @@ def main():
                                 last_heartbeat = time.time()
 
                             # Check for wake-up signal every iteration (even if no futures done)
-                            if os.path.exists(WAKE_UP_FILE):
+                            if os.path.exists(WAKE_FILE_PATH):
                                 try:
-                                    os.remove(WAKE_UP_FILE)
+                                    os.remove(WAKE_FILE_PATH)
                                 except OSError:
                                     pass
                                 logger.info("Wake-up signal received mid-cycle, checking for new projects")
-                                new_projects = _claim_active_projects(MAX_CONCURRENT_PROJECTS)
-                                for project in new_projects:
-                                    if project["id"] not in seen_ids:
-                                        seen_ids.add(project["id"])
-                                        skip = False
-                                        # Fast-track new projects discovered mid-cycle
-                                        if project.get("image_count", 0) == 0:
-                                            logger.info(
-                                                f"Fast-tracking new project {project['id']} "
-                                                f"({project['wikidata_qid']}): running discovery"
-                                            )
-                                            try:
-                                                traverse_category(project)
-                                                _refresh_claims()
-                                                if not shutdown_requested:
-                                                    bootstrap_from_sparql(project)
-                                                    _refresh_claims()
-                                                skip = True
-                                            except Exception as e:
-                                                logger.error(
-                                                    f"Fast-track discovery failed for project {project['id']}: {e}"
-                                                )
-                                            last_heartbeat = 0  # force heartbeat refresh on next iteration
-                                        logger.info(f"Adding new project {project['id']} to current cycle")
-                                        future = executor.submit(_process_and_release, project, skip_discovery=skip)
-                                        futures[future] = project["id"]
+                                free_slots = MAX_CONCURRENT_PROJECTS - len(futures)
+                                if free_slots <= 0:
+                                    logger.debug(
+                                        "All %d worker slots occupied, skipping mid-cycle claim",
+                                        MAX_CONCURRENT_PROJECTS,
+                                    )
+                                else:
+                                    new_projects = _claim_active_projects(free_slots)
+                                    for project in new_projects:
+                                        if project["id"] not in seen_ids:
+                                            seen_ids.add(project["id"])
+                                            logger.info(f"Adding new project {project['id']} to current cycle")
+                                            future = executor.submit(_process_and_release, project)
+                                            futures[future] = project["id"]
 
                             done = {f for f in futures if f.done()}
                             if not done:
@@ -2294,9 +2260,9 @@ def main():
                 for _ in range(POLL_INTERVAL + jitter):
                     if shutdown_requested:
                         break
-                    if os.path.exists(WAKE_UP_FILE):
+                    if os.path.exists(WAKE_FILE_PATH):
                         try:
-                            os.remove(WAKE_UP_FILE)
+                            os.remove(WAKE_FILE_PATH)
                         except OSError:
                             pass
                         logger.info("Wake-up signal received, starting next cycle")

@@ -778,8 +778,8 @@ msgid "Classified"
 msgstr "Classified"
 
 #: templates/leaderboard.html:80 templates/leaderboard.html:97
-msgid "SDC Tags"
-msgstr "SDC Tags"
+msgid "SDC Written"
+msgstr "SDC Written"
 
 #: templates/leaderboard.html:84
 msgid "Contributors"

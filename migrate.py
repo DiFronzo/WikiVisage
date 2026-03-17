@@ -291,6 +291,10 @@ _ALTER_MIGRATIONS = [
         "ALTER TABLE users ADD COLUMN leaderboard_opt_out TINYINT(1) NOT NULL DEFAULT 0 "
         "COMMENT '1=user opted out of leaderboard' AFTER token_expires_at",
     ),
+    (
+        "Add composite index on faces(image_id, is_target, superseded_by) for classification queries",
+        "ALTER TABLE faces ADD INDEX idx_faces_image_target_superseded (image_id, is_target, superseded_by)",
+    ),
 ]
 
 
