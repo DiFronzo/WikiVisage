@@ -2594,7 +2594,7 @@ def api_gallery(project_id: int):
             "ORDER BY "
             "  (CASE WHEN f.is_target = 1 AND f.sdc_written = 0 "
             "        AND f.classified_by != 'bootstrap' AND i.bootstrapped = 0 THEN 0 ELSE 1 END), "
-            f"  {sort_clause} "  # noqa: S608
+            f"  {sort_clause}, f.id ASC "  # noqa: S608
             "LIMIT %s OFFSET %s",
             (*params, per_page, offset),
         )
