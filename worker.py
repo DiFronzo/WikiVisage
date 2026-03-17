@@ -2130,7 +2130,8 @@ def main():
                                 except OSError:
                                     pass
                                 logger.info("Wake-up signal received mid-cycle, checking for new projects")
-                                free_slots = MAX_CONCURRENT_PROJECTS - len(futures)
+                                unfinished_futures = [f for f in futures if not f.done()]
+                                free_slots = MAX_CONCURRENT_PROJECTS - len(unfinished_futures)
                                 if free_slots <= 0:
                                     logger.debug(
                                         "All %d worker slots occupied, skipping mid-cycle claim",
