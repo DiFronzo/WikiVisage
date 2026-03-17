@@ -126,6 +126,7 @@ CREATE TABLE IF NOT EXISTS faces (
     INDEX idx_faces_sdc_removal (sdc_removal_pending),
     INDEX idx_faces_classified_by_user (classified_by_user_id),
     INDEX idx_faces_superseded (superseded_by),
+    INDEX idx_faces_image_target_superseded (image_id, is_target, superseded_by),
 
     CONSTRAINT fk_faces_image
         FOREIGN KEY (image_id) REFERENCES images (id) ON DELETE CASCADE,

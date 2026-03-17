@@ -7,7 +7,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: PROJECT VERSION\n"
 "Report-Msgid-Bugs-To: EMAIL@ADDRESS\n"
-"POT-Creation-Date: 2026-03-16 16:03+0100\n"
+"POT-Creation-Date: 2026-03-17 20:27+0000\n"
 "PO-Revision-Date: 2026-03-06 22:34+0100\n"
 "Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
 "Language: nb\n"
@@ -16,74 +16,74 @@ msgstr ""
 "MIME-Version: 1.0\n"
 "Content-Type: text/plain; charset=utf-8\n"
 "Content-Transfer-Encoding: 8bit\n"
-"Generated-By: Babel 2.18.0\n"
+"Generated-By: Babel 2.10.3\n"
 
-#: app.py:316
+#: app.py:335
 msgid "Please log in to continue."
 msgstr "Vennligst logg inn for å fortsette."
 
-#: app.py:677
+#: app.py:696
 msgid "Invalid OAuth state. Please try again."
 msgstr "Ugyldig OAuth-tilstand. Prøv igjen."
 
-#: app.py:690
+#: app.py:709
 msgid "Authentication failed. Please try again."
 msgstr "Autentisering mislyktes. Prøv igjen."
 
-#: app.py:704
+#: app.py:723
 msgid "Could not retrieve your profile. Please try again."
 msgstr "Kunne ikke hente profilen din. Prøv igjen."
 
-#: app.py:711
+#: app.py:730
 msgid "Invalid profile data received."
 msgstr "Mottok ugyldige profildata."
 
-#: app.py:718
+#: app.py:737
 msgid "Access is currently restricted to approved testers."
 msgstr "Tilgang er for øyeblikket begrenset til godkjente testere."
 
-#: app.py:760
+#: app.py:779
 msgid "Database error. Please try again."
 msgstr "Databasefeil. Prøv igjen."
 
-#: app.py:785
+#: app.py:804
 msgid "You have been logged out."
 msgstr "Du er nå logget ut."
 
-#: app.py:837
+#: app.py:896
 msgid "Failed to load projects."
 msgstr "Kunne ikke laste prosjekter."
 
-#: app.py:1023 app.py:1534 app.py:1702 app.py:1785 app.py:2049 app.py:2219
-#: app.py:2355 app.py:2581 app.py:2682 app.py:2815 app.py:2845
+#: app.py:1085 app.py:1575 app.py:1738 app.py:1816 app.py:2072 app.py:2226
+#: app.py:2359 app.py:2752 app.py:2853 app.py:2978 app.py:3008
 msgid "Invalid CSRF token"
 msgstr "Ugyldig CSRF-token"
 
-#: app.py:1034
+#: app.py:1096
 msgid "Wikidata Q-ID must start with 'Q' (e.g., Q42)."
 msgstr "Wikidata Q-ID må starte med 'Q' (f.eks. Q42)."
 
-#: app.py:1036
+#: app.py:1098
 msgid "Commons category is required."
 msgstr "Commons-kategori er påkrevd."
 
-#: app.py:1041 app.py:2592
+#: app.py:1103 app.py:2763
 msgid "Distance threshold must be between 0.1 and 1.0."
 msgstr "Avstandsterskel må være mellom 0,1 og 1,0."
 
-#: app.py:1043 app.py:2594
+#: app.py:1105 app.py:2765
 msgid "Distance threshold must be a number."
 msgstr "Avstandsterskel må være et tall."
 
-#: app.py:1049 app.py:2600
+#: app.py:1111 app.py:2771
 msgid "Minimum confirmed must be at least 1."
 msgstr "Minimum bekreftet må være minst 1."
 
-#: app.py:1051 app.py:2602
+#: app.py:1113 app.py:2773
 msgid "Minimum confirmed must be a whole number."
 msgstr "Minimum bekreftet må være et heltall."
 
-#: app.py:1059
+#: app.py:1120
 #, python-format
 msgid ""
 "The Wikidata entity %(qid)s is not an instance of human (Q5). Only human "
@@ -92,20 +92,20 @@ msgstr ""
 "Wikidata-entiteten %(qid)s er ikke en instans av menneske (Q5). Kun "
 "menneskelige entiteter støttes."
 
-#: app.py:1069
+#: app.py:1130
 #, python-format
 msgid "The Commons category \"%(category)s\" does not exist."
 msgstr "Commons-kategorien «%(category)s» finnes ikke."
 
-#: app.py:1094
+#: app.py:1156
 msgid "A project with this Q-ID and category already exists."
 msgstr "Et prosjekt med denne Q-ID-en og kategorien finnes allerede."
 
-#: app.py:1128
+#: app.py:1190
 msgid "Project created successfully!"
 msgstr "Prosjektet ble opprettet!"
 
-#: app.py:1169
+#: app.py:1229
 msgid ""
 "A previously deleted project with this Q-ID and category is still being "
 "cleaned up. Please try again in a minute."
@@ -113,53 +113,53 @@ msgstr ""
 "Et tidligere slettet prosjekt med denne Q-ID-en og kategorien ryddes "
 "fortsatt opp. Prøv igjen om et minutt."
 
-#: app.py:1176
+#: app.py:1237
 msgid "Failed to create project. Please try again."
 msgstr "Kunne ikke opprette prosjekt. Prøv igjen."
 
-#: app.py:1542 app.py:1804 app.py:2055 app.py:2228
+#: app.py:1583 app.py:1835 app.py:2078 app.py:2235
 msgid "Missing required fields"
 msgstr "Mangler påkrevde felt"
 
-#: app.py:1548 app.py:1814 app.py:2063 app.py:2237
+#: app.py:1589 app.py:1845 app.py:2086 app.py:2244
 msgid "Invalid field values"
 msgstr "Ugyldige feltverdier"
 
-#: app.py:1559 app.py:1726 app.py:1842
+#: app.py:1595 app.py:1757 app.py:1865
 msgid "Image not found or access denied"
 msgstr "Bildet ble ikke funnet eller tilgang ble nektet"
 
-#: app.py:1561 app.py:1728 app.py:1844 app.py:2081 app.py:2110 app.py:2128
-#: app.py:2268 app.py:2366 app.py:2389 app.py:2412 app.py:2440 app.py:2463
-#: app.py:2491
+#: app.py:1597 app.py:1759 app.py:1867 app.py:2104 app.py:2125 app.py:2135
+#: app.py:2272 app.py:2367 app.py:2388 app.py:2411 app.py:2434 app.py:2455
+#: app.py:2487 app.py:2544 app.py:2602 app.py:2668
 msgid "Database error"
 msgstr "Databasefeil"
 
-#: app.py:1634
+#: app.py:1670
 msgid "Invalid face ID"
 msgstr "Ugyldig ansikts-ID"
 
-#: app.py:1691
+#: app.py:1727
 msgid "Failed to save classification"
 msgstr "Kunne ikke lagre klassifisering"
 
-#: app.py:1706 app.py:1715
+#: app.py:1742 app.py:1751
 msgid "Nothing to undo"
 msgstr "Ingenting å angre"
 
-#: app.py:1773
+#: app.py:1804
 msgid "Failed to undo classification"
 msgstr "Kunne ikke angre klassifisering"
 
-#: app.py:1817 app.py:2240
+#: app.py:1848 app.py:2247
 msgid "Invalid bounding box dimensions"
 msgstr "Ugyldige dimensjoner for markeringsboks"
 
-#: app.py:1829 app.py:2252
+#: app.py:1857 app.py:2256
 msgid "Bounding box out of allowed range"
 msgstr "Markeringsboks utenfor tillatt område"
 
-#: app.py:1864 app.py:2291
+#: app.py:1886 app.py:2294
 msgid ""
 "Could not compute face encoding for the selected region. Try drawing a "
 "slightly larger box."
@@ -167,53 +167,53 @@ msgstr ""
 "Kunne ikke beregne ansiktskoding for det valgte området. Prøv å tegne en "
 "litt større boks."
 
-#: app.py:1950 app.py:2338
+#: app.py:1973 app.py:2342
 msgid "Failed to download image from Commons"
 msgstr "Kunne ikke laste ned bilde fra Commons"
 
-#: app.py:1953 app.py:2341
+#: app.py:1976 app.py:2345
 msgid "Failed to save face"
 msgstr "Kunne ikke lagre ansikt"
 
-#: app.py:1956 app.py:2344
+#: app.py:1979 app.py:2348
 msgid "Failed to process face region"
 msgstr "Kunne ikke behandle ansiktsområdet"
 
-#: app.py:2079 app.py:2266
+#: app.py:2102 app.py:2270
 msgid "Face not found or access denied"
 msgstr "Ansiktet ble ikke funnet eller tilgang ble nektet"
 
-#: app.py:2133
+#: app.py:2140
 msgid "OAuth token expired. Please log in again."
 msgstr "OAuth-tokenet er utløpt. Vennligst logg inn igjen."
 
-#: app.py:2138
+#: app.py:2145
 msgid "Failed to remove SDC claim from Commons. The face was not reclassified."
 msgstr ""
 "Kunne ikke fjerne SDC-påstand fra Commons. Ansiktet ble ikke "
 "omklassifisert."
 
-#: app.py:2194
+#: app.py:2201
 msgid "This face has already been reviewed by another user"
 msgstr "Dette ansiktet er allerede gjennomgått av en annen bruker"
 
-#: app.py:2198
+#: app.py:2205
 msgid "Failed to save reclassification"
 msgstr "Kunne ikke lagre omklassifisering"
 
-#: app.py:2364 app.py:2438 app.py:2489
+#: app.py:2365 app.py:2432 app.py:2485 app.py:2666
 msgid "Project not found or access denied"
 msgstr "Prosjekt ikke funnet eller tilgang nektet"
 
-#: app.py:2606
+#: app.py:2777
 msgid "Invalid status."
 msgstr "Ugyldig status."
 
-#: app.py:2632
+#: app.py:2803
 msgid "Settings updated."
 msgstr "Innstillinger oppdatert."
 
-#: app.py:2651 app.py:2778
+#: app.py:2821 app.py:2940
 #, python-format
 msgid ""
 "Warning: You currently have %(confirmed)d/%(min)d human-confirmed target "
@@ -222,7 +222,7 @@ msgstr ""
 "Advarsel: Du har for øyeblikket %(confirmed)d/%(min)d menneskebekreftede "
 "målansikter. Autonom inferens vil ikke kjøre før denne terskelen er nådd."
 
-#: app.py:2661 app.py:2788
+#: app.py:2831 app.py:2950
 #, python-format
 msgid ""
 "Tip: You have %(count)d bootstrapped matches from existing Commons "
@@ -233,17 +233,17 @@ msgstr ""
 "påstander på Commons. Godkjenn dem i Modellresultater for å telle dem som"
 " menneskebekreftet."
 
-#: app.py:2673
+#: app.py:2844
 msgid "Failed to update settings."
 msgstr "Kunne ikke oppdatere innstillingene."
 
-#: app.py:2705
+#: app.py:2869
 msgid "Settings have not changed since the last inference run. No re-run needed."
 msgstr ""
 "Innstillingene er ikke endret siden forrige inferenskjøring. Ingen ny "
 "kjøring nødvendig."
 
-#: app.py:2735
+#: app.py:2898
 #, python-format
 msgid ""
 "Reset %(num)d model-classified faces. The worker will re-classify them on"
@@ -252,11 +252,11 @@ msgstr ""
 "Nullstilte %(num)d modellklassifiserte ansikter. Arbeideren vil "
 "klassifisere dem på nytt i neste syklus."
 
-#: app.py:2748
+#: app.py:2911
 msgid "No model-classified faces to reset."
 msgstr "Ingen modellklassifiserte ansikter å nullstille."
 
-#: app.py:2768
+#: app.py:2930
 #, python-format
 msgid ""
 "You have %(confirmed)d/%(min)d human-confirmed target faces — inference "
@@ -265,43 +265,47 @@ msgstr ""
 "Du har %(confirmed)d/%(min)d menneskebekreftede målansikter — inferens "
 "kjøres ved neste arbeidssyklus."
 
-#: app.py:2799
+#: app.py:2962
 msgid "Failed to re-run inference."
 msgstr "Kunne ikke kjøre inferens på nytt."
 
-#: app.py:2824
+#: app.py:2987
 msgid "Project deleted."
 msgstr "Prosjekt slettet."
 
-#: app.py:2826
+#: app.py:2989
 msgid "Project not found."
 msgstr "Fant ikke prosjektet."
 
-#: app.py:2829
+#: app.py:2992
 msgid "Failed to delete project."
 msgstr "Kunne ikke slette prosjekt."
 
-#: app.py:2854
+#: app.py:3017
 msgid "Settings saved."
 msgstr "Innstillinger lagret."
 
-#: app.py:2857
+#: app.py:3020
 msgid "Failed to save settings."
 msgstr "Kunne ikke lagre innstillingene."
 
-#: app.py:2902
+#: app.py:3065
 msgid "Failed to load leaderboard."
 msgstr "Kunne ikke laste ledertavle."
 
-#: app.py:2979
+#: app.py:3136
+msgid "Bad request"
+msgstr "Ugyldig forespørsel"
+
+#: app.py:3143
 msgid "Page not found"
 msgstr "Siden ble ikke funnet"
 
-#: app.py:2989
+#: app.py:3153
 msgid "Rate limit exceeded. Please try again later."
 msgstr "Hastighetsbegrensningen er nådd. Prøv igjen senere."
 
-#: app.py:3000
+#: app.py:3164
 msgid "Internal server error"
 msgstr "Intern serverfeil"
 
@@ -321,7 +325,7 @@ msgstr ""
 "Bidragene dine teller fortsatt, men navnet ditt vises ikke på den "
 "offentlige ledertavlen."
 
-#: templates/account_settings.html:84 templates/project_settings.html:55
+#: templates/account_settings.html:91 templates/project_settings.html:55
 msgid "Save Settings"
 msgstr "Lagre innstillinger"
 
@@ -339,7 +343,7 @@ msgid "Leaderboard"
 msgstr "Ledertavle"
 
 #: templates/base.html:336 templates/dashboard.html:197
-#: templates/project_detail.html:402 templates/project_settings.html:3
+#: templates/project_detail.html:500 templates/project_settings.html:3
 msgid "Settings"
 msgstr "Innstillinger"
 
@@ -363,11 +367,12 @@ msgstr ""
 "Bakgrunnsarbeideren ser ut til å være frakoblet. Bildebehandling og "
 "ansiktsgjenkjenning er satt på pause."
 
-#: templates/base.html:358 templates/base.html:364 templates/base.html:421
+#: templates/base.html:358 templates/base.html:364 templates/base.html:422
+#: templates/project_detail.html:580
 msgid "Close"
 msgstr "Lukk"
 
-#: templates/base.html:379
+#: templates/base.html:380
 msgid ""
 "This site uses a cookie to remember your language preference. The session"
 " cookie is required for the site to function."
@@ -375,19 +380,19 @@ msgstr ""
 "Denne siden bruker en informasjonskapsel for å huske språkvalget ditt. "
 "Øktinformasjonskapselen er nødvendig for at siden skal fungere."
 
-#: templates/base.html:381
+#: templates/base.html:382
 msgid "Accept"
 msgstr "Godta"
 
-#: templates/base.html:382
+#: templates/base.html:383
 msgid "Decline"
 msgstr "Avslå"
 
-#: templates/base.html:428
+#: templates/base.html:429
 msgid "Install"
 msgstr "Installer"
 
-#: templates/base.html:676
+#: templates/base.html:697
 msgid ""
 "Classify faces on the go! Tap Share, then \"Add to Home Screen\" to get "
 "the app."
@@ -395,7 +400,7 @@ msgstr ""
 "Klassifiser ansikter på farten! Trykk Del, deretter \"Legg til på Hjem-"
 "skjerm\" for å få appen."
 
-#: templates/base.html:690
+#: templates/base.html:711
 msgid ""
 "Classify faces faster! Add WikiVisage to your home screen for instant, "
 "full-screen access."
@@ -403,7 +408,7 @@ msgstr ""
 "Klassifiser ansikter raskere! Legg WikiVisage til startskjermen for "
 "umiddelbar fullskjermtilgang."
 
-#: templates/base.html:703
+#: templates/base.html:724
 msgid ""
 "Classify faces on the go! Tap your browser menu and choose \"Install\" to"
 " get the app."
@@ -415,30 +420,30 @@ msgstr ""
 msgid "Classify"
 msgstr "Klassifiser"
 
-#: templates/classify.html:272 templates/classify.html:305
-#: templates/classify.html:323 templates/project_settings.html:8
+#: templates/classify.html:289 templates/classify.html:322
+#: templates/classify.html:340 templates/project_settings.html:8
 msgid "Back to Project"
 msgstr "Tilbake til prosjekt"
 
-#: templates/classify.html:275
+#: templates/classify.html:292
 #, python-format
 msgid "%(num)d model rejection to review"
 msgid_plural "%(num)d model rejections to review"
 msgstr[0] "%(num)d modellvurdering å gjennomgå"
 msgstr[1] "%(num)d modellvurderinger å gjennomgå"
 
-#: templates/classify.html:279
+#: templates/classify.html:296
 #, python-format
 msgid "%(num)d image remaining"
 msgid_plural "%(num)d images remaining"
 msgstr[0] "%(num)d bilde gjenstår"
 msgstr[1] "%(num)d bilder gjenstår"
 
-#: templates/classify.html:289
+#: templates/classify.html:306
 msgid "All Classified!"
 msgstr "Alt er klassifisert!"
 
-#: templates/classify.html:290
+#: templates/classify.html:307
 msgid ""
 "No more unclassified faces. However, the model rejected some faces you "
 "might want to review."
@@ -446,41 +451,41 @@ msgstr ""
 "Ingen flere uklassifiserte ansikter. Modellen avviste noen ansikter du "
 "kanskje vil gjennomgå."
 
-#: templates/classify.html:292
+#: templates/classify.html:309
 #, python-format
 msgid "%(num)d image with model-rejected faces to review."
 msgid_plural "%(num)d images with model-rejected faces to review."
 msgstr[0] "%(num)d bilde med modellavviste ansikter å gjennomgå."
 msgstr[1] "%(num)d bilder med modellavviste ansikter å gjennomgå."
 
-#: templates/classify.html:296 templates/classify.html:315
+#: templates/classify.html:313 templates/classify.html:332
 #, python-format
 msgid "%(num)d skipped image."
 msgid_plural "%(num)d skipped images."
 msgstr[0] "%(num)d hoppet over bilde."
 msgstr[1] "%(num)d hoppet over bilder."
 
-#: templates/classify.html:299 templates/classify.html:318
+#: templates/classify.html:316 templates/classify.html:335
 msgid "Show skipped"
 msgstr "Vis hoppet over"
 
-#: templates/classify.html:304
+#: templates/classify.html:321
 msgid "Review Model Rejections"
 msgstr "Gjennomgå modellens avvisninger"
 
-#: templates/classify.html:310
+#: templates/classify.html:327
 msgid "All Caught Up!"
 msgstr "Alt er ferdig!"
 
-#: templates/classify.html:311
+#: templates/classify.html:328
 msgid "No more faces to classify for this project right now."
 msgstr "Ingen flere ansikter å klassifisere for dette prosjektet akkurat nå."
 
-#: templates/classify.html:330
+#: templates/classify.html:347
 msgid "Model Review"
 msgstr "Modellgjennomgang"
 
-#: templates/classify.html:331
+#: templates/classify.html:348
 msgid ""
 "The model classified these faces as not matching. Confirm or correct "
 "below."
@@ -488,136 +493,137 @@ msgstr ""
 "Modellen klassifiserte disse ansiktene som ikke-treff. Bekreft eller "
 "korriger nedenfor."
 
-#: templates/classify.html:341
+#: templates/classify.html:358
 msgid "Click on the face if it actually is"
 msgstr "Klikk på ansiktet hvis det faktisk er"
 
-#: templates/classify.html:341
+#: templates/classify.html:358
 msgid ", or press \"None\" to confirm the model's rejection."
 msgstr ", eller trykk \"Ingen\" for å bekrefte modellens avvisning."
 
-#: templates/classify.html:343
+#: templates/classify.html:360
 msgid "Click on the face of"
 msgstr "Klikk på ansiktet til"
 
-#: templates/classify.html:343
+#: templates/classify.html:360
 msgid ", or press \"None\" if they are not in this photo."
 msgstr ", eller trykk \"Ingen\" hvis personen ikke er i dette bildet."
 
-#: templates/classify.html:346
+#: templates/classify.html:363
 msgid "The model says this is not"
 msgstr "Modellen sier dette ikke er"
 
-#: templates/classify.html:346
+#: templates/classify.html:363
 msgid ". Is that correct?"
 msgstr ". Er det riktig?"
 
-#: templates/classify.html:350
+#: templates/classify.html:367
 msgid "Draw a box around a missed face"
 msgstr "Tegn en boks rundt et ansikt som ble oversett"
 
-#: templates/classify.html:350 templates/classify.html:422
+#: templates/classify.html:367 templates/classify.html:440
 msgid "+ Add Missing Face"
 msgstr "+ Legg til manglende ansikt"
 
-#: templates/classify.html:351
+#: templates/classify.html:368
 msgid "Click and drag on the image to draw a face box. Press Esc to cancel."
 msgstr ""
 "Klikk og dra på bildet for å tegne en ansiktsboks. Trykk Esc for å "
 "avbryte.Klikk og dra på bildet for å tegne en ansiktsboks. Trykk Esc for "
 "å avbryte."
 
-#: templates/classify.html:357
+#: templates/classify.html:374
 msgid "Image to classify"
 msgstr "Bilde å klassifisere"
 
-#: templates/classify.html:365 templates/classify.html:395
+#: templates/classify.html:381 templates/classify.html:383
+#: templates/classify.html:413
 #, python-format
 msgid "Face %(num)d"
 msgstr "Ansikt %(num)d"
 
-#: templates/classify.html:375 templates/classify.html:378
-#: templates/classify.html:384
+#: templates/classify.html:393 templates/classify.html:396
+#: templates/classify.html:402
 msgid "Yes"
 msgstr "Ja"
 
-#: templates/classify.html:375
+#: templates/classify.html:393
 msgid "Override Model"
 msgstr "Overstyr modellen"
 
-#: templates/classify.html:376 templates/classify.html:379
-#: templates/classify.html:385
+#: templates/classify.html:394 templates/classify.html:397
+#: templates/classify.html:403
 msgid "No"
 msgstr "Nei"
 
-#: templates/classify.html:376
+#: templates/classify.html:394
 msgid "Confirm Rejection"
 msgstr "Bekreft avvisning"
 
-#: templates/classify.html:378
+#: templates/classify.html:396
 msgid "Target"
 msgstr "Målperson"
 
-#: templates/classify.html:379 templates/project_detail.html:321
+#: templates/classify.html:397 templates/project_detail.html:419
 msgid "Not Target"
 msgstr "Ikke målperson"
 
-#: templates/classify.html:381 templates/classify.html:386
-#: templates/classify.html:392 templates/classify.html:397
+#: templates/classify.html:399 templates/classify.html:404
+#: templates/classify.html:410 templates/classify.html:415
 msgid "Skip"
 msgstr "Hopp over"
 
-#: templates/classify.html:387 templates/classify.html:398
+#: templates/classify.html:405 templates/classify.html:416
 msgid "Undo"
 msgstr "Angre"
 
-#: templates/classify.html:391
+#: templates/classify.html:409
 msgid "None of These"
 msgstr "Ingen av disse"
 
-#: templates/classify.html:396
+#: templates/classify.html:414
 msgid "None"
 msgstr "Ingen"
 
-#: templates/classify.html:404
+#: templates/classify.html:422
 msgid "Undo Last"
 msgstr "Angre forrige"
 
-#: templates/classify.html:410 templates/classify.html:415
-#: templates/project_detail.html:523
+#: templates/classify.html:428 templates/classify.html:433
+#: templates/project_detail.html:596
 msgid "Saving..."
 msgstr "Lagrer..."
 
-#: templates/classify.html:416
+#: templates/classify.html:434
 msgid "Undoing..."
 msgstr "Angrer..."
 
-#: templates/classify.html:417
+#: templates/classify.html:435
 msgid "Failed to undo. Please try again."
 msgstr "Kunne ikke angre. Prøv igjen."
 
-#: templates/classify.html:418
+#: templates/classify.html:436
 msgid "Detecting face..."
 msgstr "Søker etter ansikt..."
 
-#: templates/classify.html:419
+#: templates/classify.html:437
 msgid "An error occurred while saving. Please try again."
 msgstr "En feil oppstod under lagring. Prøv igjen."
 
-#: templates/classify.html:420
+#: templates/classify.html:438
 msgid "Failed to add manual face. Please try again."
 msgstr "Kunne ikke legge til ansikt manuelt. Prøv igjen."
 
-#: templates/classify.html:421
+#: templates/classify.html:439
 msgid "Cancel Drawing"
 msgstr "Avbryt tegning"
 
-#: templates/classify.html:423
+#: templates/classify.html:441
 #, python-brace-format
 msgid "Error: {message}"
 msgstr "Feil: {message}"
 
-#: templates/classify.html:424
+#: templates/classify.html:442
 msgid "Unknown error"
 msgstr "Ukjent feil"
 
@@ -634,17 +640,17 @@ msgstr "Nytt prosjekt"
 msgid "Category:"
 msgstr "Kategori:"
 
-#: templates/dashboard.html:170 templates/project_detail.html:284
-#: templates/project_detail.html:1261
+#: templates/dashboard.html:170 templates/project_detail.html:382
+#: templates/project_detail.html:1519
 msgid "Waiting for worker"
 msgstr "Venter på bakgrunnsprosess"
 
-#: templates/dashboard.html:176 templates/project_detail.html:289
-#: templates/project_detail.html:1258
+#: templates/dashboard.html:176 templates/project_detail.html:387
+#: templates/project_detail.html:1516
 msgid "Complete"
 msgstr "Fullført"
 
-#: templates/dashboard.html:176 templates/project_detail.html:293
+#: templates/dashboard.html:176 templates/project_detail.html:391
 #, python-format
 msgid "%(num)d images processed"
 msgstr "%(num)d bilder behandlet"
@@ -663,12 +669,12 @@ msgid "No faces classified yet"
 msgstr "Ingen ansikter er klassifisert ennå"
 
 #: templates/dashboard.html:208 templates/dashboard.html:210
-#: templates/project_detail.html:912
+#: templates/project_detail.html:1004
 msgid "Prev"
 msgstr "Forrige"
 
 #: templates/dashboard.html:226 templates/dashboard.html:228
-#: templates/project_detail.html:913
+#: templates/project_detail.html:1005
 msgid "Next"
 msgstr "Neste"
 
@@ -786,8 +792,9 @@ msgid "Classified"
 msgstr "Klassifisert"
 
 #: templates/leaderboard.html:80 templates/leaderboard.html:97
-msgid "SDC Tags"
-msgstr "SDC-merker"
+#: templates/project_detail.html:427
+msgid "SDC Written"
+msgstr "SDC skrevet"
 
 #: templates/leaderboard.html:84
 msgid "Contributors"
@@ -817,12 +824,12 @@ msgstr "Begynn å klassifisere ansikter i et prosjekt for å vises på ledertavl
 msgid "Log In"
 msgstr "Logg inn"
 
-#: templates/project_detail.html:278 templates/project_detail.html:288
-#: templates/project_detail.html:297
+#: templates/project_detail.html:376 templates/project_detail.html:386
+#: templates/project_detail.html:395
 msgid "Processing Progress"
 msgstr "Fremdrift for behandling"
 
-#: templates/project_detail.html:280
+#: templates/project_detail.html:378
 msgid ""
 "The background worker hasn't discovered images in this category yet. This"
 " usually takes a minute or two after creating a project."
@@ -830,52 +837,48 @@ msgstr ""
 "Bakgrunnsprosessen har ikke funnet bilder i denne kategorien ennå. Dette "
 "tar vanligvis et minutt eller to etter at et prosjekt er opprettet."
 
-#: templates/project_detail.html:298
+#: templates/project_detail.html:396
 #, python-format
 msgid "%(done)d / %(total)d images"
 msgstr "%(done)d / %(total)d bilder"
 
-#: templates/project_detail.html:309
+#: templates/project_detail.html:407
 msgid "Project Statistics"
 msgstr "Prosjektstatistikk"
 
-#: templates/project_detail.html:313
+#: templates/project_detail.html:411
 msgid "Total Faces Found"
 msgstr "Antall ansikter funnet"
 
-#: templates/project_detail.html:317
+#: templates/project_detail.html:415
 msgid "Target Matches"
 msgstr "Treff på målperson"
 
-#: templates/project_detail.html:325
+#: templates/project_detail.html:423
 msgid "Unclassified"
 msgstr "Uklassifisert"
 
-#: templates/project_detail.html:329
-msgid "SDC Written"
-msgstr "SDC skrevet"
-
-#: templates/project_detail.html:333 templates/project_detail.html:421
+#: templates/project_detail.html:431 templates/project_detail.html:522
 msgid "SDC Pending"
 msgstr "SDC ventende"
 
-#: templates/project_detail.html:342
+#: templates/project_detail.html:440
 msgid "Classification Breakdown"
 msgstr "Fordeling av klassifisering"
 
-#: templates/project_detail.html:346
+#: templates/project_detail.html:444
 msgid "By Human"
 msgstr "Av menneske"
 
-#: templates/project_detail.html:350
+#: templates/project_detail.html:448
 msgid "By Model"
 msgstr "Av modell"
 
-#: templates/project_detail.html:354
+#: templates/project_detail.html:452
 msgid "By Bootstrap"
 msgstr "Av bootstrap"
 
-#: templates/project_detail.html:368
+#: templates/project_detail.html:466
 #, python-format
 msgid ""
 "%(num)d face waiting for model inference. The background worker will "
@@ -890,7 +893,7 @@ msgstr[1] ""
 "%(num)d ansikter venter på modellinferens. Bakgrunnsprosessen vil "
 "klassifisere dem automatisk i løpet av det neste minuttet."
 
-#: templates/project_detail.html:372
+#: templates/project_detail.html:470
 #, python-format
 msgid ""
 "%(num)d unclassified face remaining, but none are currently eligible for "
@@ -905,7 +908,7 @@ msgstr[1] ""
 "%(num)d uklassifiserte ansikter gjenstår, men ingen er for øyeblikket "
 "kvalifisert for automatisk modellinferens."
 
-#: templates/project_detail.html:376
+#: templates/project_detail.html:474
 #, python-format
 msgid ""
 "The background worker is still processing images (%(pending)d image "
@@ -922,7 +925,7 @@ msgstr[1] ""
 "gjenstår). Flere ansikter vil dukke opp etter hvert som behandlingen "
 "fortsetter."
 
-#: templates/project_detail.html:380
+#: templates/project_detail.html:478
 #, python-format
 msgid ""
 "Cannot reach autonomous inference: even if all %(unclassified)d "
@@ -933,21 +936,21 @@ msgstr ""
 "uklassifiserte ansikter er treff, ville du hatt %(potential)d/%(min)d "
 "menneskebekreftet — under terskelen."
 
-#: templates/project_detail.html:383
+#: templates/project_detail.html:481
 msgid "Lower the min_confirmed setting in"
 msgstr "Senk min_confirmed-innstillingen i"
 
-#: templates/project_detail.html:383 templates/project_settings.html:7
+#: templates/project_detail.html:481 templates/project_settings.html:7
 msgid "Project Settings"
 msgstr "Prosjektinnstillinger"
 
-#: templates/project_detail.html:383
+#: templates/project_detail.html:481
 msgid "to proceed, or wait for the background worker to detect more faces."
 msgstr ""
 "for å fortsette, eller vent til bakgrunnsprosessen oppdager flere "
 "ansikter."
 
-#: templates/project_detail.html:387
+#: templates/project_detail.html:485
 #, python-format
 msgid ""
 "%(count)d unclassified faces remaining. Classify at least %(needed)d more"
@@ -958,7 +961,7 @@ msgstr ""
 "flere ansikter av målpersonen for å aktivere automatisk inferens "
 "(%(confirmed)d/%(min)d menneskebekreftet)."
 
-#: templates/project_detail.html:391
+#: templates/project_detail.html:489
 #, python-format
 msgid ""
 "Tip: You have %(count)d bootstrapped matches from existing Commons "
@@ -970,15 +973,15 @@ msgstr ""
 "verifiser dem i Klassifiseringsresultater nedenfor for å telle dem som "
 "menneskebekreftet."
 
-#: templates/project_detail.html:400
+#: templates/project_detail.html:498
 msgid "Start Classifying"
 msgstr "Start klassifisering"
 
-#: templates/project_detail.html:406
+#: templates/project_detail.html:504
 msgid "Classification Results"
 msgstr "Klassifiseringsresultater"
 
-#: templates/project_detail.html:408
+#: templates/project_detail.html:506
 #, python-format
 msgid ""
 "Faces classified by the model, bootstrap, or human review. Lower distance"
@@ -988,77 +991,69 @@ msgstr ""
 "gjennomgang. Lavere avstand = nærmere treff på målpersonen. Terskel: "
 "%(threshold)s."
 
-#: templates/project_detail.html:412
+#: templates/project_detail.html:510
+msgid "Filter by result"
+msgstr "Filtrer etter resultat"
+
+#: templates/project_detail.html:511 templates/project_detail.html:618
 msgid "All"
 msgstr "Alle"
 
-#: templates/project_detail.html:413
+#: templates/project_detail.html:512 templates/project_detail.html:619
 msgid "Matches"
 msgstr "Treff"
 
-#: templates/project_detail.html:414
+#: templates/project_detail.html:513 templates/project_detail.html:620
 msgid "Non-matches"
 msgstr "Ikke-treff"
 
-#: templates/project_detail.html:415 templates/project_detail.html:443
-#: templates/project_detail.html:535
+#: templates/project_detail.html:514 templates/project_detail.html:609
+#: templates/project_detail.html:632
 msgid "Rejected"
 msgstr "Avvist"
 
-#: templates/project_detail.html:417
+#: templates/project_detail.html:516
+msgid "Filter by source"
+msgstr "Filtrer etter kilde"
+
+#: templates/project_detail.html:517 templates/project_detail.html:621
+msgid "All sources"
+msgstr "Alle kilder"
+
+#: templates/project_detail.html:518 templates/project_detail.html:622
 msgid "Model"
 msgstr "Modell"
 
-#: templates/project_detail.html:418
+#: templates/project_detail.html:519 templates/project_detail.html:623
 msgid "Bootstrap"
 msgstr "Bootstrap"
 
-#: templates/project_detail.html:419
+#: templates/project_detail.html:520 templates/project_detail.html:624
 msgid "Human"
 msgstr "Menneske"
 
-#: templates/project_detail.html:435
-msgid "Approve"
-msgstr "Godkjenn"
+#: templates/project_detail.html:523
+msgid "Sort results"
+msgstr "Sorter resultater"
 
-#: templates/project_detail.html:436
-msgid "Reject"
-msgstr "Avvis"
+#: templates/project_detail.html:524
+msgid "Threshold: Low → High"
+msgstr "Terskel: Lav → Høy"
 
-#: templates/project_detail.html:437
-msgid "Edit bounding box"
-msgstr "Rediger markeringsboks"
+#: templates/project_detail.html:525
+msgid "Threshold: High → Low"
+msgstr "Terskel: Høy → Lav"
 
-#: templates/project_detail.html:439
-msgid "Loading..."
-msgstr "Laster..."
+#: templates/project_detail.html:530
+msgid "Gallery pagination"
+msgstr "Galleri-paginering"
 
-#: templates/project_detail.html:443 templates/project_detail.html:534
-msgid "Verified"
-msgstr "Verifisert"
-
-#: templates/project_detail.html:443
-msgid "Match"
-msgstr "Treff"
-
-#: templates/project_detail.html:443
-msgid "Not target"
-msgstr "Ikke målperson"
-
-#: templates/project_detail.html:446 templates/project_detail.html:537
-msgid "SDC pending"
-msgstr "SDC ventende"
-
-#: templates/project_detail.html:448
-msgid "Face distance from target centroid"
-msgstr "Ansiktsavstand fra målpersonens tyngdepunkt (centroid)"
-
-#: templates/project_detail.html:464 templates/project_detail.html:498
-#: templates/project_detail.html:1038
+#: templates/project_detail.html:537 templates/project_detail.html:571
+#: templates/project_detail.html:1299
 msgid "Send Edits to Wikimedia Commons"
 msgstr "Send redigeringer til Wikimedia Commons"
 
-#: templates/project_detail.html:466
+#: templates/project_detail.html:539
 msgid ""
 "Write P180 depicts claims for all approved target faces that have not yet"
 " been written to Commons. Review the Classification Results above to "
@@ -1068,160 +1063,204 @@ msgstr ""
 " er skrevet til Commons. Gjennomgå klassifiseringsresultatene ovenfor for"
 " å fjerne falske positive før sending."
 
-#: templates/project_detail.html:469
+#: templates/project_detail.html:542
 msgid "All structured data edits will be published under the"
 msgstr "Alle strukturerte dataredigeringer vil bli publisert under"
 
-#: templates/project_detail.html:474
+#: templates/project_detail.html:547
 #, python-format
 msgid "%(num)d face ready to send"
 msgid_plural "%(num)d faces ready to send"
 msgstr[0] "%(num)d ansikt klart til å sende"
 msgstr[1] "%(num)d ansikter klare til å sende"
 
-#: templates/project_detail.html:475
+#: templates/project_detail.html:548
 msgid "and"
 msgstr "og"
 
-#: templates/project_detail.html:476
+#: templates/project_detail.html:549
 #, python-format
 msgid "%(num)d ready to be removed."
 msgid_plural "%(num)d ready to be removed."
 msgstr[0] "%(num)d klar til å bli fjernet."
 msgstr[1] "%(num)d klare til å bli fjernet."
 
-#: templates/project_detail.html:480
+#: templates/project_detail.html:553
 #, python-format
 msgid "%(num)d face ready to send."
 msgid_plural "%(num)d faces ready to send."
 msgstr[0] "%(num)d ansikt klart til å sende."
 msgstr[1] "%(num)d ansikter klare til å sende."
 
-#: templates/project_detail.html:484
+#: templates/project_detail.html:557
 #, python-format
 msgid "%(num)d image ready to be removed."
 msgid_plural "%(num)d images ready to be removed."
 msgstr[0] "%(num)d bilde klart til å bli fjernet."
 msgstr[1] "%(num)d bilder klare til å bli fjernet."
 
-#: templates/project_detail.html:487 templates/project_detail.html:1035
+#: templates/project_detail.html:560 templates/project_detail.html:1296
 msgid "No pending faces to write. All approved faces have already been sent."
 msgstr ""
 "Ingen ventende ansikter å skrive. Alle godkjente ansikter er allerede "
 "sendt."
 
-#: templates/project_detail.html:493
+#: templates/project_detail.html:566
 msgid "Starting..."
 msgstr "Starter..."
 
-#: templates/project_detail.html:506
+#: templates/project_detail.html:579
 msgid "Edit Bounding Box"
 msgstr "Rediger markeringsboks"
 
-#: templates/project_detail.html:511
+#: templates/project_detail.html:584
 msgid "Click and drag on the image to draw a new bounding box."
 msgstr "Klikk og dra på bildet for å tegne en ny markeringsboks."
 
-#: templates/project_detail.html:512
+#: templates/project_detail.html:585
 msgid "View on Commons"
 msgstr "Vis på Commons"
 
-#: templates/project_detail.html:515
+#: templates/project_detail.html:588
 msgid "Full resolution"
 msgstr "Full oppløsning"
 
-#: templates/project_detail.html:520
+#: templates/project_detail.html:593
 msgid "Cancel"
 msgstr "Avbryt"
 
-#: templates/project_detail.html:521
+#: templates/project_detail.html:594
 msgid "Save"
 msgstr "Lagre"
 
-#: templates/project_detail.html:536
+#: templates/project_detail.html:608 templates/project_detail.html:631
+msgid "Verified"
+msgstr "Verifisert"
+
+#: templates/project_detail.html:610
 msgid "human"
 msgstr "menneske"
 
-#: templates/project_detail.html:538
+#: templates/project_detail.html:611 templates/project_detail.html:633
+msgid "SDC pending"
+msgstr "SDC ventende"
+
+#: templates/project_detail.html:612
 msgid "SDC claim was removed."
 msgstr "SDC-påstanden ble fjernet."
 
-#: templates/project_detail.html:539
+#: templates/project_detail.html:613
 msgid "SDC claim removal queued."
 msgstr "SDC-fjerning lagt i kø."
 
-#: templates/project_detail.html:540
+#: templates/project_detail.html:614
 msgid "Error saving classification"
 msgstr "Feil ved lagring av klassifisering"
 
-#: templates/project_detail.html:541
+#: templates/project_detail.html:615
 msgid "Error saving new bounding box"
 msgstr "Feil ved lagring av ny markeringsboks"
 
-#: templates/project_detail.html:914
+#: templates/project_detail.html:625
+msgid "Approve"
+msgstr "Godkjenn"
+
+#: templates/project_detail.html:626
+msgid "Reject"
+msgstr "Avvis"
+
+#: templates/project_detail.html:627
+msgid "Edit bounding box"
+msgstr "Rediger markeringsboks"
+
+#: templates/project_detail.html:628
+msgid "Loading..."
+msgstr "Laster..."
+
+#: templates/project_detail.html:629
+msgid "Match"
+msgstr "Treff"
+
+#: templates/project_detail.html:630
+msgid "Not target"
+msgstr "Ikke målperson"
+
+#: templates/project_detail.html:634
+msgid "Face distance from target centroid"
+msgstr "Ansiktsavstand fra målpersonens tyngdepunkt (centroid)"
+
+#: templates/project_detail.html:635
+msgid "No classification results yet."
+msgstr "Ingen klassifiseringsresultater ennå."
+
+#: templates/project_detail.html:636
+msgid "Failed to load results. Please try again."
+msgstr "Kunne ikke laste resultater. Prøv igjen."
+
+#: templates/project_detail.html:1006
 #, python-brace-format
 msgid "Page {current} of {total}"
 msgstr "Side {current} av {total}"
 
-#: templates/project_detail.html:1029
+#: templates/project_detail.html:1290
 msgid "Queued — waiting for background worker..."
 msgstr "I kø — venter på bakgrunnsprosess..."
 
-#: templates/project_detail.html:1030
+#: templates/project_detail.html:1291
 msgid "Worker is writing claims..."
 msgstr "Bakgrunnsprosessen skriver påstander..."
 
-#: templates/project_detail.html:1031
+#: templates/project_detail.html:1292
 msgid "Worker is removing claims..."
 msgstr "Bakgrunnsprosessen fjerner påstander..."
 
-#: templates/project_detail.html:1032
+#: templates/project_detail.html:1293
 #, python-brace-format
 msgid "{written} of {total} written..."
 msgstr "{written} av {total} skrevet..."
 
-#: templates/project_detail.html:1033
+#: templates/project_detail.html:1294
 msgid "Done!"
 msgstr "Ferdig!"
 
-#: templates/project_detail.html:1034
+#: templates/project_detail.html:1295
 #, python-brace-format
 msgid "All {num} claims written successfully!"
 msgstr "Alle {num} påstander ble skrevet!"
 
-#: templates/project_detail.html:1036
+#: templates/project_detail.html:1297
 msgid "Failed to queue edits. Please try again."
 msgstr "Kunne ikke sette redigeringer i kø. Prøv igjen."
 
-#: templates/project_detail.html:1037
+#: templates/project_detail.html:1298
 #, python-brace-format
 msgid "Worker error: {error}"
 msgstr "Feil i bakgrunnsprosess: {error}"
 
-#: templates/project_detail.html:1039
+#: templates/project_detail.html:1300
 msgid "Writing in progress..."
 msgstr "Skriving pågår..."
 
-#: templates/project_detail.html:1040
+#: templates/project_detail.html:1301
 #, python-brace-format
 msgid "{num} images ready to be removed"
 msgstr "{num} bilder klare til å bli fjernet"
 
-#: templates/project_detail.html:1041
+#: templates/project_detail.html:1302
 msgid "All edits completed successfully!"
 msgstr "Alle redigeringer ble fullført!"
 
-#: templates/project_detail.html:1259
+#: templates/project_detail.html:1517
 #, python-brace-format
 msgid "{done} / {total} images"
 msgstr "{done} / {total} bilder"
 
-#: templates/project_detail.html:1260
+#: templates/project_detail.html:1518
 #, python-brace-format
 msgid "{num} images processed"
 msgstr "{num} bilder behandlet"
 
-#: templates/project_detail.html:1262
+#: templates/project_detail.html:1520
 #, python-brace-format
 msgid ""
 "The background worker is still processing images ({pending} image "
@@ -1230,7 +1269,7 @@ msgstr ""
 "Bakgrunnsprosessen behandler fortsatt bilder ({pending} bilde gjenstår). "
 "Flere ansikter vil dukke opp etter hvert som behandlingen fortsetter."
 
-#: templates/project_detail.html:1263
+#: templates/project_detail.html:1521
 #, python-brace-format
 msgid ""
 "The background worker is still processing images ({pending} images "

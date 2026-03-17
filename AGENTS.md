@@ -164,7 +164,7 @@ worker_heartbeat (single-row: id=1, last_seen DATETIME)
 ### app.py
 | Constant | Value | Purpose |
 |----------|-------|---------|
-| `APP_VERSION` | `"0.2.7"` | Displayed in footer |
+| `APP_VERSION` | Read from `pyproject.toml` | Displayed in footer |
 | `LANGUAGES` | `en, nb, es, fr` | Supported locales |
 | `RTL_LANGUAGES` | `ar, he, fa, ur` | RTL layout support |
 | `MAX_IMAGE_DOWNLOAD_BYTES` | 50 MB | Image download size cap (shared with worker) |

@@ -68,27 +68,33 @@ def test_snap_between_steps():
 
 
 def test_safe_relative_path():
-    assert _is_safe_url("/dashboard") is True
+    with flask_app.test_request_context():
+        assert _is_safe_url("/dashboard") is True
 
 
 def test_safe_relative_with_query():
-    assert _is_safe_url("/project/1?tab=model") is True
+    with flask_app.test_request_context():
+        assert _is_safe_url("/project/1?tab=model") is True
 
 
 def test_unsafe_absolute_url():
-    assert _is_safe_url("https://evil.com/phish") is False
+    with flask_app.test_request_context():
+        assert _is_safe_url("https://evil.com/phish") is False
 
 
 def test_unsafe_protocol_relative():
-    assert _is_safe_url("//evil.com/phish") is False
+    with flask_app.test_request_context():
+        assert _is_safe_url("//evil.com/phish") is False
 
 
 def test_empty_string():
-    assert _is_safe_url("") is False
+    with flask_app.test_request_context():
+        assert _is_safe_url("") is False
 
 
 def test_safe_plain_path():
-    assert _is_safe_url("dashboard") is True
+    with flask_app.test_request_context():
+        assert _is_safe_url("dashboard") is True
 
 
 def test_basic_jpg():
@@ -600,7 +606,8 @@ def test_login_required_uses_relative_path():
         parsed = urlparse(location)
         qs = parse_qs(parsed.query)
         next_val = qs.get("next", [""])[0]
-        assert _is_safe_url(next_val), f"next= value '{next_val}' is not safe (would be rejected)"
+        with flask_app.test_request_context():
+            assert _is_safe_url(next_val), f"next= value '{next_val}' is not safe (would be rejected)"
 
 
 # ---------------------------------------------------------------------------
@@ -609,15 +616,18 @@ def test_login_required_uses_relative_path():
 
 
 def test_wake_file_path_consistent():
-    """Both project creation and SDC write should use the same wake file name."""
+    """Both app.py and worker.py should import WAKE_FILE_PATH from config."""
     import inspect
 
-    source = inspect.getsource(app_module)
-    wake_refs = [line.strip() for line in source.splitlines() if "worker-wake" in line or "worker_wake" in line]
-    for ref in wake_refs:
-        if ref.lstrip().startswith("#"):
-            continue
-        assert ".worker-wake-up" in ref, f"Inconsistent wake file name in: {ref}"
+    import config as config_module
+
+    # config.py must define the canonical path using '.worker-wake-up'
+    config_source = inspect.getsource(config_module)
+    assert ".worker-wake-up" in config_source, "config.py must define WAKE_FILE_PATH with '.worker-wake-up'"
+
+    # app.py must import WAKE_FILE_PATH from config (not define its own)
+    app_source = inspect.getsource(app_module)
+    assert "from config import WAKE_FILE_PATH" in app_source, "app.py must import WAKE_FILE_PATH from config"
 
 
 def _reset_whitelist_cache(monkeypatch, cache=None, cache_time=0.0):
@@ -3141,8 +3151,8 @@ def test_project_detail_full_success_with_lazy_p18_update(monkeypatch):
             return 1
         if "COUNT(*) AS total_faces" in sql:
             return [{"total_faces": 10, "confirmed_matches": 2}]
-        if "FROM faces f JOIN images i" in sql and "LIMIT 200" in sql:
-            return [{"id": 5, "image_id": 9, "is_target": 0, "classified_by": "model"}]
+        if "COUNT(*) AS cnt" in sql and "classified_by IN" in sql:
+            return [{"cnt": 5}]
         if "status = 'pending'" in sql:
             return [{"cnt": 7}]
         if "f.is_target IS NULL" in sql and "classified_by_user_id IS NULL" in sql:
@@ -3157,7 +3167,7 @@ def test_project_detail_full_success_with_lazy_p18_update(monkeypatch):
     assert captured["template"] == "project_detail.html"
     assert captured["context"]["project"]["p18_thumb_url"] == "https://thumb/Q42.jpg"
     assert captured["context"]["stats"]["total_faces"] == 10
-    assert captured["context"]["model_faces"][0]["id"] == 5
+    assert captured["context"]["gallery_total"] == 5
     assert captured["context"]["pending_images"] == 7
     assert captured["context"]["inference_eligible"] == 4
     assert len(updates) == 1
@@ -3264,7 +3274,7 @@ def test_project_detail_face_stats_db_error_returns_empty_stats(monkeypatch):
     assert captured["context"]["stats"] == {}
 
 
-def test_project_detail_model_faces_db_error_returns_empty_list(monkeypatch):
+def test_project_detail_gallery_count_db_error_returns_zero(monkeypatch):
     captured = _capture_render_template_chunk4(monkeypatch)
 
     def eq(sql, params=None, fetch=True):
@@ -3283,7 +3293,7 @@ def test_project_detail_model_faces_db_error_returns_empty_list(monkeypatch):
             return [{"id": 1, "user_id": 1, "wikidata_qid": "Q1", "p18_thumb_url": "x", "status": "completed"}]
         if "COUNT(*) AS total_faces" in sql:
             return [{"total_faces": 3}]
-        if "LIMIT 200" in sql:
+        if "COUNT(*) AS cnt" in sql and "classified_by IN" in sql:
             raise app_module.DatabaseError("gallery fail")
         if "COUNT(*) AS cnt" in sql:
             return [{"cnt": 1}]
@@ -3292,7 +3302,7 @@ def test_project_detail_model_faces_db_error_returns_empty_list(monkeypatch):
     client, _ = _auth_client_chunk4(monkeypatch, eq)
     response = client.get("/project/1")
     assert response.status_code == 200
-    assert captured["context"]["model_faces"] == []
+    assert captured["context"]["gallery_total"] == 0
 
 
 def test_project_detail_pending_images_only_for_active(monkeypatch):
@@ -4048,7 +4058,7 @@ def test_api_classify_ownership_check_fail(monkeypatch):
                     "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
                 }
             ]
-        if "SELECT i.id FROM images i" in sql:
+        if "SELECT i.id, i.file_title FROM images i" in sql:
             return ()
         return ()
 
@@ -4075,7 +4085,7 @@ def test_api_classify_ownership_check_db_error(monkeypatch):
                     "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
                 }
             ]
-        if "SELECT i.id FROM images i" in sql:
+        if "SELECT i.id, i.file_title FROM images i" in sql:
             raise app_module.DatabaseError("db")
         return ()
 
@@ -4104,8 +4114,8 @@ def test_api_classify_invalid_selected_face_id(monkeypatch):
                     "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
                 }
             ]
-        if "SELECT i.id FROM images i" in sql:
-            return [{"id": 2}]
+        if "SELECT i.id, i.file_title FROM images i" in sql:
+            return [{"id": 2, "file_title": "File:Test.jpg"}]
         return ()
 
     client, _ = _auth_client_chunk4(monkeypatch, eq)
@@ -4116,7 +4126,7 @@ def test_api_classify_invalid_selected_face_id(monkeypatch):
     )
     assert response.status_code == 400
     assert response.get_json()["error"] == "Invalid face ID"
-    assert any("SELECT i.id FROM images i" in q[0] for q in queries)
+    assert any("SELECT i.id, i.file_title FROM images i" in q[0] for q in queries)
 
 
 def test_api_classify_none_normal_mode_sets_last_classify(monkeypatch):
@@ -4134,8 +4144,8 @@ def test_api_classify_none_normal_mode_sets_last_classify(monkeypatch):
                     "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
                 }
             ]
-        if "SELECT i.id FROM images i" in sql:
-            return [{"id": 22}]
+        if "SELECT i.id, i.file_title FROM images i" in sql:
+            return [{"id": 22, "file_title": "File:Test.jpg"}]
         return ()
 
     def tx(fn):
@@ -4181,8 +4191,8 @@ def test_api_classify_none_review_mode_updates_human_flags(monkeypatch):
                     "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
                 }
             ]
-        if "SELECT i.id FROM images i" in sql:
-            return [{"id": 22}]
+        if "SELECT i.id, i.file_title FROM images i" in sql:
+            return [{"id": 22, "file_title": "File:Test.jpg"}]
         return ()
 
     def tx(fn):
@@ -4224,8 +4234,8 @@ def test_api_classify_none_bootstrapped_without_sibling_queues_removal(monkeypat
                     "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
                 }
             ]
-        if "SELECT i.id FROM images i" in sql:
-            return [{"id": 22}]
+        if "SELECT i.id, i.file_title FROM images i" in sql:
+            return [{"id": 22, "file_title": "File:Test.jpg"}]
         return ()
 
     def tx(fn):
@@ -4261,8 +4271,8 @@ def test_api_classify_none_bootstrapped_with_sibling_does_not_queue_removal(monk
                     "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
                 }
             ]
-        if "SELECT i.id FROM images i" in sql:
-            return [{"id": 22}]
+        if "SELECT i.id, i.file_title FROM images i" in sql:
+            return [{"id": 22, "file_title": "File:Test.jpg"}]
         return ()
 
     def tx(fn):
@@ -4298,8 +4308,8 @@ def test_api_classify_target_normal_mode_updates_and_counter(monkeypatch):
                     "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
                 }
             ]
-        if "SELECT i.id FROM images i" in sql:
-            return [{"id": 22}]
+        if "SELECT i.id, i.file_title FROM images i" in sql:
+            return [{"id": 22, "file_title": "File:Test.jpg"}]
         return ()
 
     def tx(fn):
@@ -4340,8 +4350,8 @@ def test_api_classify_target_review_mode_updates_other_faces_human(monkeypatch):
                     "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
                 }
             ]
-        if "SELECT i.id FROM images i" in sql:
-            return [{"id": 22}]
+        if "SELECT i.id, i.file_title FROM images i" in sql:
+            return [{"id": 22, "file_title": "File:Test.jpg"}]
         return ()
 
     def tx(fn):
@@ -4382,8 +4392,8 @@ def test_api_classify_db_error_during_transaction(monkeypatch):
                     "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
                 }
             ]
-        if "SELECT i.id FROM images i" in sql:
-            return [{"id": 22}]
+        if "SELECT i.id, i.file_title FROM images i" in sql:
+            return [{"id": 22, "file_title": "File:Test.jpg"}]
         return ()
 
     def tx(_fn):
@@ -4441,7 +4451,7 @@ def test_api_undo_classify_ownership_check_fail(monkeypatch):
                     "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
                 }
             ]
-        if "SELECT i.id FROM images i" in sql:
+        if "SELECT i.id, i.file_title FROM images i" in sql:
             return ()
         return ()
 
@@ -4467,7 +4477,7 @@ def test_api_undo_classify_ownership_check_db_error(monkeypatch):
                     "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
                 }
             ]
-        if "SELECT i.id FROM images i" in sql:
+        if "SELECT i.id, i.file_title FROM images i" in sql:
             raise app_module.DatabaseError("db")
         return ()
 
@@ -4495,8 +4505,8 @@ def test_api_undo_classify_target_normal_decrements_counter(monkeypatch):
                     "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
                 }
             ]
-        if "SELECT i.id FROM images i" in sql:
-            return [{"id": 2}]
+        if "SELECT i.id, i.file_title FROM images i" in sql:
+            return [{"id": 2, "file_title": "File:Test.jpg"}]
         return ()
 
     def tx(fn):
@@ -4539,8 +4549,8 @@ def test_api_undo_classify_none_review_restores_model(monkeypatch):
                     "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
                 }
             ]
-        if "SELECT i.id FROM images i" in sql:
-            return [{"id": 2}]
+        if "SELECT i.id, i.file_title FROM images i" in sql:
+            return [{"id": 2, "file_title": "File:Test.jpg"}]
         return ()
 
     def tx(fn):
@@ -4581,8 +4591,8 @@ def test_api_undo_classify_manual_face_deletion_and_exclusion(monkeypatch):
                     "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
                 }
             ]
-        if "SELECT i.id FROM images i" in sql:
-            return [{"id": 2}]
+        if "SELECT i.id, i.file_title FROM images i" in sql:
+            return [{"id": 2, "file_title": "File:Test.jpg"}]
         return ()
 
     def tx(fn):
@@ -4625,8 +4635,8 @@ def test_api_undo_classify_manual_face_review_action_decrements(monkeypatch):
                     "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
                 }
             ]
-        if "SELECT i.id FROM images i" in sql:
-            return [{"id": 2}]
+        if "SELECT i.id, i.file_title FROM images i" in sql:
+            return [{"id": 2, "file_title": "File:Test.jpg"}]
         return ()
 
     def tx(fn):
@@ -4664,8 +4674,8 @@ def test_api_undo_classify_db_error_during_transaction(monkeypatch):
                     "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
                 }
             ]
-        if "SELECT i.id FROM images i" in sql:
-            return [{"id": 2}]
+        if "SELECT i.id, i.file_title FROM images i" in sql:
+            return [{"id": 2, "file_title": "File:Test.jpg"}]
         return ()
 
     def tx(_fn):
@@ -4703,8 +4713,8 @@ def test_api_undo_classify_success_response_contains_ids(monkeypatch):
                     "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
                 }
             ]
-        if "SELECT i.id FROM images i" in sql:
-            return [{"id": 2}]
+        if "SELECT i.id, i.file_title FROM images i" in sql:
+            return [{"id": 2, "file_title": "File:Test.jpg"}]
         return ()
 
     def tx(fn):
@@ -4832,10 +4842,10 @@ def _reclassify_query_router(
             if ownership_error:
                 raise app_module.DatabaseError("ownership failure")
             return [local_face_row] if ownership_exists else []
-        if "has_sibling_match" in sql:
+        if "has_sibling" in sql:
             if sibling_error:
                 raise app_module.DatabaseError("sibling failure")
-            return [{"has_sibling_match": sibling_match}]
+            return [{"has_sibling": sibling_match}]
         return []
 
     return _route_query
@@ -5793,7 +5803,7 @@ def test_api_write_sdc_csrf_fail(monkeypatch, fake_user):
 
 def test_api_write_sdc_project_not_found(monkeypatch, fake_user):
     def route_execute(sql, _params, _fetch):
-        if "SELECT id, sdc_write_requested FROM projects" in sql:
+        if "SELECT * FROM projects WHERE id" in sql:
             return []
         raise AssertionError(f"Unexpected SQL: {sql}")
 
@@ -5808,7 +5818,7 @@ def test_api_write_sdc_project_not_found(monkeypatch, fake_user):
 
 def test_api_write_sdc_project_query_db_error(monkeypatch, fake_user):
     def route_execute(sql, _params, _fetch):
-        if "SELECT id, sdc_write_requested FROM projects" in sql:
+        if "SELECT * FROM projects WHERE id" in sql:
             raise app_module.DatabaseError("boom")
         raise AssertionError(f"Unexpected SQL: {sql}")
 
@@ -5823,8 +5833,8 @@ def test_api_write_sdc_project_query_db_error(monkeypatch, fake_user):
 
 def test_api_write_sdc_pending_query_db_error(monkeypatch, fake_user):
     def route_execute(sql, _params, _fetch):
-        if "SELECT id, sdc_write_requested FROM projects" in sql:
-            return [{"id": 1, "sdc_write_requested": 0}]
+        if "SELECT * FROM projects WHERE id" in sql:
+            return [{"id": 1, "user_id": 1, "status": "active", "sdc_write_requested": 0}]
         if "AS write_cnt" in sql and "AS removal_cnt" in sql:
             raise app_module.DatabaseError("boom")
         raise AssertionError(f"Unexpected SQL: {sql}")
@@ -5840,8 +5850,8 @@ def test_api_write_sdc_pending_query_db_error(monkeypatch, fake_user):
 
 def test_api_write_sdc_already_requested(monkeypatch, fake_user):
     def route_execute(sql, _params, _fetch):
-        if "SELECT id, sdc_write_requested FROM projects" in sql:
-            return [{"id": 1, "sdc_write_requested": 1}]
+        if "SELECT * FROM projects WHERE id" in sql:
+            return [{"id": 1, "user_id": 1, "status": "active", "sdc_write_requested": 1}]
         if "AS write_cnt" in sql and "AS removal_cnt" in sql:
             return [{"write_cnt": 5, "removal_cnt": 2}]
         raise AssertionError(f"Unexpected SQL: {sql}")
@@ -5863,8 +5873,8 @@ def test_api_write_sdc_no_pending_writes(monkeypatch, fake_user):
     updates = []
 
     def route_execute(sql, _params, fetch):
-        if "SELECT id, sdc_write_requested FROM projects" in sql:
-            return [{"id": 1, "sdc_write_requested": 0}]
+        if "SELECT * FROM projects WHERE id" in sql:
+            return [{"id": 1, "user_id": 1, "status": "active", "sdc_write_requested": 0}]
         if "AS write_cnt" in sql and "AS removal_cnt" in sql:
             return [{"write_cnt": 0, "removal_cnt": 0}]
         if "UPDATE projects SET sdc_write_requested = 1" in sql:
@@ -5886,8 +5896,8 @@ def test_api_write_sdc_successful_flag_set(monkeypatch, fake_user):
     update_calls = []
 
     def route_execute(sql, _params, _fetch):
-        if "SELECT id, sdc_write_requested FROM projects" in sql:
-            return [{"id": 1, "sdc_write_requested": 0}]
+        if "SELECT * FROM projects WHERE id" in sql:
+            return [{"id": 1, "user_id": 1, "status": "active", "sdc_write_requested": 0}]
         if "AS write_cnt" in sql and "AS removal_cnt" in sql:
             return [{"write_cnt": 3, "removal_cnt": 1}]
         if "UPDATE projects SET sdc_write_requested = 1" in sql:
@@ -5909,8 +5919,8 @@ def test_api_write_sdc_successful_flag_set(monkeypatch, fake_user):
 
 def test_api_write_sdc_update_db_error(monkeypatch, fake_user):
     def route_execute(sql, _params, _fetch):
-        if "SELECT id, sdc_write_requested FROM projects" in sql:
-            return [{"id": 1, "sdc_write_requested": 0}]
+        if "SELECT * FROM projects WHERE id" in sql:
+            return [{"id": 1, "user_id": 1, "status": "active", "sdc_write_requested": 0}]
         if "AS write_cnt" in sql and "AS removal_cnt" in sql:
             return [{"write_cnt": 7, "removal_cnt": 0}]
         if "UPDATE projects SET sdc_write_requested = 1" in sql:
@@ -5928,8 +5938,8 @@ def test_api_write_sdc_update_db_error(monkeypatch, fake_user):
 
 def test_api_write_sdc_wakeup_file_oserror_ignored(monkeypatch, fake_user):
     def route_execute(sql, _params, _fetch):
-        if "SELECT id, sdc_write_requested FROM projects" in sql:
-            return [{"id": 1, "sdc_write_requested": 0}]
+        if "SELECT * FROM projects WHERE id" in sql:
+            return [{"id": 1, "user_id": 1, "status": "active", "sdc_write_requested": 0}]
         if "AS write_cnt" in sql and "AS removal_cnt" in sql:
             return [{"write_cnt": 1, "removal_cnt": 0}]
         if "UPDATE projects SET sdc_write_requested = 1" in sql:
@@ -5948,7 +5958,7 @@ def test_api_write_sdc_wakeup_file_oserror_ignored(monkeypatch, fake_user):
 
 def test_api_sdc_status_project_not_found(monkeypatch, fake_user):
     def route_execute(sql, _params, _fetch):
-        if "SELECT id, sdc_write_requested, sdc_write_error FROM projects" in sql:
+        if "SELECT * FROM projects WHERE id" in sql:
             return []
         raise AssertionError(f"Unexpected SQL: {sql}")
 
@@ -5962,8 +5972,8 @@ def test_api_sdc_status_project_not_found(monkeypatch, fake_user):
 
 def test_api_sdc_status_success(monkeypatch, fake_user):
     def route_execute(sql, _params, _fetch):
-        if "SELECT id, sdc_write_requested, sdc_write_error FROM projects" in sql:
-            return [{"id": 1, "sdc_write_requested": 1, "sdc_write_error": None}]
+        if "SELECT * FROM projects WHERE id" in sql:
+            return [{"id": 1, "user_id": 1, "status": "active", "sdc_write_requested": 1, "sdc_write_error": None}]
         if "AS written" in sql and "AS pending" in sql and "AS removal_pending" in sql:
             return [{"written": 9, "pending": 2, "removal_pending": 1}]
         raise AssertionError(f"Unexpected SQL: {sql}")
@@ -5986,7 +5996,7 @@ def test_api_sdc_status_success(monkeypatch, fake_user):
 
 def test_api_sdc_status_project_query_db_error(monkeypatch, fake_user):
     def route_execute(sql, _params, _fetch):
-        if "SELECT id, sdc_write_requested, sdc_write_error FROM projects" in sql:
+        if "SELECT * FROM projects WHERE id" in sql:
             raise app_module.DatabaseError("boom")
         raise AssertionError(f"Unexpected SQL: {sql}")
 
@@ -6000,8 +6010,8 @@ def test_api_sdc_status_project_query_db_error(monkeypatch, fake_user):
 
 def test_api_sdc_status_counts_query_db_error(monkeypatch, fake_user):
     def route_execute(sql, _params, _fetch):
-        if "SELECT id, sdc_write_requested, sdc_write_error FROM projects" in sql:
-            return [{"id": 1, "sdc_write_requested": 0, "sdc_write_error": "oops"}]
+        if "SELECT * FROM projects WHERE id" in sql:
+            return [{"id": 1, "user_id": 1, "status": "active", "sdc_write_requested": 0, "sdc_write_error": "oops"}]
         if "AS written" in sql and "AS pending" in sql and "AS removal_pending" in sql:
             raise app_module.DatabaseError("boom")
         raise AssertionError(f"Unexpected SQL: {sql}")
@@ -6016,7 +6026,7 @@ def test_api_sdc_status_counts_query_db_error(monkeypatch, fake_user):
 
 def test_api_progress_project_not_found(monkeypatch, fake_user):
     def route_execute(sql, _params, _fetch):
-        if "SELECT images_processed, images_total, status FROM projects" in sql:
+        if "SELECT * FROM projects WHERE id" in sql:
             return []
         raise AssertionError(f"Unexpected SQL: {sql}")
 
@@ -6029,8 +6039,8 @@ def test_api_progress_project_not_found(monkeypatch, fake_user):
 
 def test_api_progress_active_with_pending_and_stats(monkeypatch, fake_user):
     def route_execute(sql, _params, _fetch):
-        if "SELECT images_processed, images_total, status FROM projects" in sql:
-            return [{"images_processed": 4, "images_total": 10, "status": "active"}]
+        if "SELECT * FROM projects WHERE id" in sql:
+            return [{"id": 1, "user_id": 1, "images_processed": 4, "images_total": 10, "status": "active"}]
         if "SELECT COUNT(*) AS cnt FROM images" in sql:
             return [{"cnt": 6}]
         if "COUNT(*) AS total_faces" in sql:
@@ -6069,8 +6079,8 @@ def test_api_progress_completed_project(monkeypatch, fake_user):
     seen_pending_query = {"called": False}
 
     def route_execute(sql, _params, _fetch):
-        if "SELECT images_processed, images_total, status FROM projects" in sql:
-            return [{"images_processed": 10, "images_total": 10, "status": "completed"}]
+        if "SELECT * FROM projects WHERE id" in sql:
+            return [{"id": 1, "user_id": 1, "images_processed": 10, "images_total": 10, "status": "completed"}]
         if "SELECT COUNT(*) AS cnt FROM images" in sql:
             seen_pending_query["called"] = True
             return [{"cnt": 1}]
@@ -6093,8 +6103,8 @@ def test_api_progress_completed_project(monkeypatch, fake_user):
 
 def test_api_progress_face_stats_db_error_is_ignored(monkeypatch, fake_user):
     def route_execute(sql, _params, _fetch):
-        if "SELECT images_processed, images_total, status FROM projects" in sql:
-            return [{"images_processed": 1, "images_total": 3, "status": "active"}]
+        if "SELECT * FROM projects WHERE id" in sql:
+            return [{"id": 1, "user_id": 1, "images_processed": 1, "images_total": 3, "status": "active"}]
         if "SELECT COUNT(*) AS cnt FROM images" in sql:
             return [{"cnt": 2}]
         if "COUNT(*) AS total_faces" in sql:
@@ -6115,8 +6125,8 @@ def test_api_progress_face_stats_db_error_is_ignored(monkeypatch, fake_user):
 
 def test_api_progress_inference_eligible_db_error_is_ignored(monkeypatch, fake_user):
     def route_execute(sql, _params, _fetch):
-        if "SELECT images_processed, images_total, status FROM projects" in sql:
-            return [{"images_processed": 2, "images_total": 3, "status": "active"}]
+        if "SELECT * FROM projects WHERE id" in sql:
+            return [{"id": 1, "user_id": 1, "images_processed": 2, "images_total": 3, "status": "active"}]
         if "SELECT COUNT(*) AS cnt FROM images" in sql:
             return [{"cnt": 1}]
         if "COUNT(*) AS total_faces" in sql:
@@ -6136,8 +6146,8 @@ def test_api_progress_inference_eligible_db_error_is_ignored(monkeypatch, fake_u
 
 def test_api_progress_pending_images_db_error_is_ignored(monkeypatch, fake_user):
     def route_execute(sql, _params, _fetch):
-        if "SELECT images_processed, images_total, status FROM projects" in sql:
-            return [{"images_processed": 0, "images_total": 8, "status": "active"}]
+        if "SELECT * FROM projects WHERE id" in sql:
+            return [{"id": 1, "user_id": 1, "images_processed": 0, "images_total": 8, "status": "active"}]
         if "SELECT COUNT(*) AS cnt FROM images" in sql:
             raise app_module.DatabaseError("boom")
         if "COUNT(*) AS total_faces" in sql:
@@ -6156,7 +6166,7 @@ def test_api_progress_pending_images_db_error_is_ignored(monkeypatch, fake_user)
 
 def test_api_progress_project_query_db_error(monkeypatch, fake_user):
     def route_execute(sql, _params, _fetch):
-        if "SELECT images_processed, images_total, status FROM projects" in sql:
+        if "SELECT * FROM projects WHERE id" in sql:
             raise app_module.DatabaseError("boom")
         raise AssertionError(f"Unexpected SQL: {sql}")
 
@@ -6461,7 +6471,7 @@ def test_project_rerun_inference_csrf_fail(monkeypatch, fake_user):
 
 def test_project_rerun_inference_project_not_found(monkeypatch, fake_user):
     def route_execute(sql, _params, _fetch):
-        if "FROM projects WHERE id = %s AND user_id = %s" in sql:
+        if "SELECT * FROM projects WHERE id = %s AND user_id = %s" in sql:
             return []
         raise AssertionError(f"Unexpected SQL: {sql}")
 
@@ -6477,7 +6487,7 @@ def test_project_rerun_inference_settings_unchanged_noop(monkeypatch, fake_user)
     calls = {"reset_sql_seen": False}
 
     def route_execute(sql, _params, _fetch):
-        if "FROM projects WHERE id = %s AND user_id = %s" in sql:
+        if "SELECT * FROM projects WHERE id = %s AND user_id = %s" in sql:
             return [
                 {
                     "id": 1,
@@ -6511,7 +6521,7 @@ def test_project_rerun_inference_successful_reset_with_affected_faces(monkeypatc
     executed_sql = []
 
     def route_execute(sql, _params, _fetch):
-        if "FROM projects WHERE id = %s AND user_id = %s" in sql:
+        if "SELECT * FROM projects WHERE id = %s AND user_id = %s" in sql:
             return [
                 {
                     "id": 1,
@@ -6550,7 +6560,7 @@ def test_project_rerun_inference_null_last_inference_values_still_resets(monkeyp
     executed_sql = []
 
     def route_execute(sql, _params, _fetch):
-        if "FROM projects WHERE id = %s AND user_id = %s" in sql:
+        if "SELECT * FROM projects WHERE id = %s AND user_id = %s" in sql:
             return [
                 {
                     "id": 1,
@@ -6588,11 +6598,7 @@ def test_project_rerun_inference_null_last_inference_values_still_resets(monkeyp
 
 def test_project_rerun_inference_no_faces_to_reset(monkeypatch, fake_user):
     def route_execute(sql, _params, _fetch):
-        if (
-            "last_inference_threshold" in sql
-            and "last_inference_min_confirmed" in sql
-            and "AS human_confirmed" not in sql
-        ):
+        if "SELECT * FROM projects WHERE id = %s AND user_id = %s" in sql:
             return [
                 {
                     "id": 1,
@@ -6629,11 +6635,7 @@ def test_project_rerun_inference_no_faces_to_reset(monkeypatch, fake_user):
 
 def test_project_rerun_inference_db_error(monkeypatch, fake_user):
     def route_execute(sql, _params, _fetch):
-        if (
-            "last_inference_threshold" in sql
-            and "last_inference_min_confirmed" in sql
-            and "AS human_confirmed" not in sql
-        ):
+        if "SELECT * FROM projects WHERE id = %s AND user_id = %s" in sql:
             return [
                 {
                     "id": 1,
@@ -7491,7 +7493,7 @@ def test_project_rerun_inference_db_error_loading_project_returns_500(monkeypatc
                     "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
                 }
             ]
-        if "FROM projects WHERE id = %s AND user_id = %s" in sql:
+        if "SELECT * FROM projects WHERE id = %s AND user_id = %s" in sql:
             raise DatabaseError("load failed")
         return ()
 
@@ -7517,11 +7519,7 @@ def test_project_rerun_inference_ignores_wake_file_oserror(monkeypatch):
                     "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
                 }
             ]
-        if (
-            "last_inference_threshold" in sql
-            and "last_inference_min_confirmed" in sql
-            and "AS human_confirmed" not in sql
-        ):
+        if "SELECT * FROM projects WHERE id = %s AND user_id = %s" in sql:
             return [
                 {
                     "id": 1,
@@ -7560,11 +7558,7 @@ def test_project_rerun_inference_ignores_stats_query_db_error(monkeypatch):
                     "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
                 }
             ]
-        if (
-            "last_inference_threshold" in sql
-            and "last_inference_min_confirmed" in sql
-            and "AS human_confirmed" not in sql
-        ):
+        if "SELECT * FROM projects WHERE id = %s AND user_id = %s" in sql:
             return [
                 {
                     "id": 1,

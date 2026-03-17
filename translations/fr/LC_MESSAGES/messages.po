@@ -6,7 +6,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: WikiVisage BETA\n"
 "Report-Msgid-Bugs-To: EMAIL@ADDRESS\n"
-"POT-Creation-Date: 2026-03-16 16:03+0100\n"
+"POT-Creation-Date: 2026-03-17 20:27+0000\n"
 "PO-Revision-Date: 2026-03-07 17:00+0100\n"
 "Last-Translator: WikiVisage Translator\n"
 "Language: fr\n"
@@ -15,74 +15,74 @@ msgstr ""
 "MIME-Version: 1.0\n"
 "Content-Type: text/plain; charset=utf-8\n"
 "Content-Transfer-Encoding: 8bit\n"
-"Generated-By: Babel 2.18.0\n"
+"Generated-By: Babel 2.10.3\n"
 
-#: app.py:316
+#: app.py:335
 msgid "Please log in to continue."
 msgstr "Veuillez vous connecter pour continuer."
 
-#: app.py:677
+#: app.py:696
 msgid "Invalid OAuth state. Please try again."
 msgstr "État OAuth invalide. Veuillez réessayer."
 
-#: app.py:690
+#: app.py:709
 msgid "Authentication failed. Please try again."
 msgstr "L'authentification a échoué. Veuillez réessayer."
 
-#: app.py:704
+#: app.py:723
 msgid "Could not retrieve your profile. Please try again."
 msgstr "Impossible de récupérer votre profil. Veuillez réessayer."
 
-#: app.py:711
+#: app.py:730
 msgid "Invalid profile data received."
 msgstr "Données de profil invalides reçues."
 
-#: app.py:718
+#: app.py:737
 msgid "Access is currently restricted to approved testers."
 msgstr "L'accès est actuellement réservé aux testeurs approuvés."
 
-#: app.py:760
+#: app.py:779
 msgid "Database error. Please try again."
 msgstr "Erreur de base de données. Veuillez réessayer."
 
-#: app.py:785
+#: app.py:804
 msgid "You have been logged out."
 msgstr "Vous avez été déconnecté."
 
-#: app.py:837
+#: app.py:896
 msgid "Failed to load projects."
 msgstr "Échec du chargement des projets."
 
-#: app.py:1023 app.py:1534 app.py:1702 app.py:1785 app.py:2049 app.py:2219
-#: app.py:2355 app.py:2581 app.py:2682 app.py:2815 app.py:2845
+#: app.py:1085 app.py:1575 app.py:1738 app.py:1816 app.py:2072 app.py:2226
+#: app.py:2359 app.py:2752 app.py:2853 app.py:2978 app.py:3008
 msgid "Invalid CSRF token"
 msgstr "Jeton CSRF invalide"
 
-#: app.py:1034
+#: app.py:1096
 msgid "Wikidata Q-ID must start with 'Q' (e.g., Q42)."
 msgstr "Le Q-ID Wikidata doit commencer par 'Q' (ex : Q42)."
 
-#: app.py:1036
+#: app.py:1098
 msgid "Commons category is required."
 msgstr "La catégorie Commons est requise."
 
-#: app.py:1041 app.py:2592
+#: app.py:1103 app.py:2763
 msgid "Distance threshold must be between 0.1 and 1.0."
 msgstr "Le seuil de distance doit être compris entre 0,1 et 1,0."
 
-#: app.py:1043 app.py:2594
+#: app.py:1105 app.py:2765
 msgid "Distance threshold must be a number."
 msgstr "Le seuil de distance doit être un nombre."
 
-#: app.py:1049 app.py:2600
+#: app.py:1111 app.py:2771
 msgid "Minimum confirmed must be at least 1."
 msgstr "Le nombre minimum de confirmations doit être d'au moins 1."
 
-#: app.py:1051 app.py:2602
+#: app.py:1113 app.py:2773
 msgid "Minimum confirmed must be a whole number."
 msgstr "Le nombre minimum de confirmations doit être un nombre entier."
 
-#: app.py:1059
+#: app.py:1120
 #, python-format
 msgid ""
 "The Wikidata entity %(qid)s is not an instance of human (Q5). Only human "
@@ -91,20 +91,20 @@ msgstr ""
 "L'entité Wikidata %(qid)s n'est pas une instance d'humain (Q5). Seules "
 "les entités humaines sont prises en charge."
 
-#: app.py:1069
+#: app.py:1130
 #, python-format
 msgid "The Commons category \"%(category)s\" does not exist."
 msgstr "La catégorie Commons \"%(category)s\" n'existe pas."
 
-#: app.py:1094
+#: app.py:1156
 msgid "A project with this Q-ID and category already exists."
 msgstr "Un projet avec ce Q-ID et cette catégorie existe déjà."
 
-#: app.py:1128
+#: app.py:1190
 msgid "Project created successfully!"
 msgstr "Projet créé avec succès !"
 
-#: app.py:1169
+#: app.py:1229
 msgid ""
 "A previously deleted project with this Q-ID and category is still being "
 "cleaned up. Please try again in a minute."
@@ -112,53 +112,53 @@ msgstr ""
 "Un projet précédemment supprimé avec ce Q-ID et cette catégorie est "
 "encore en cours de nettoyage. Veuillez réessayer dans une minute."
 
-#: app.py:1176
+#: app.py:1237
 msgid "Failed to create project. Please try again."
 msgstr "Échec de la création du projet. Veuillez réessayer."
 
-#: app.py:1542 app.py:1804 app.py:2055 app.py:2228
+#: app.py:1583 app.py:1835 app.py:2078 app.py:2235
 msgid "Missing required fields"
 msgstr "Champs obligatoires manquants"
 
-#: app.py:1548 app.py:1814 app.py:2063 app.py:2237
+#: app.py:1589 app.py:1845 app.py:2086 app.py:2244
 msgid "Invalid field values"
 msgstr "Valeurs de champ invalides"
 
-#: app.py:1559 app.py:1726 app.py:1842
+#: app.py:1595 app.py:1757 app.py:1865
 msgid "Image not found or access denied"
 msgstr "Image non trouvée ou accès refusé"
 
-#: app.py:1561 app.py:1728 app.py:1844 app.py:2081 app.py:2110 app.py:2128
-#: app.py:2268 app.py:2366 app.py:2389 app.py:2412 app.py:2440 app.py:2463
-#: app.py:2491
+#: app.py:1597 app.py:1759 app.py:1867 app.py:2104 app.py:2125 app.py:2135
+#: app.py:2272 app.py:2367 app.py:2388 app.py:2411 app.py:2434 app.py:2455
+#: app.py:2487 app.py:2544 app.py:2602 app.py:2668
 msgid "Database error"
 msgstr "Erreur de base de données"
 
-#: app.py:1634
+#: app.py:1670
 msgid "Invalid face ID"
 msgstr "ID de visage invalide"
 
-#: app.py:1691
+#: app.py:1727
 msgid "Failed to save classification"
 msgstr "Échec de l'enregistrement de la classification"
 
-#: app.py:1706 app.py:1715
+#: app.py:1742 app.py:1751
 msgid "Nothing to undo"
 msgstr "Rien à annuler"
 
-#: app.py:1773
+#: app.py:1804
 msgid "Failed to undo classification"
 msgstr "Échec de l'annulation de la classification"
 
-#: app.py:1817 app.py:2240
+#: app.py:1848 app.py:2247
 msgid "Invalid bounding box dimensions"
 msgstr "Dimensions de la boîte englobante invalides"
 
-#: app.py:1829 app.py:2252
+#: app.py:1857 app.py:2256
 msgid "Bounding box out of allowed range"
 msgstr "La boîte englobante est hors de la plage autorisée"
 
-#: app.py:1864 app.py:2291
+#: app.py:1886 app.py:2294
 msgid ""
 "Could not compute face encoding for the selected region. Try drawing a "
 "slightly larger box."
@@ -166,53 +166,53 @@ msgstr ""
 "Impossible de calculer l'encodage du visage pour la région sélectionnée. "
 "Essayez de dessiner une boîte légèrement plus grande."
 
-#: app.py:1950 app.py:2338
+#: app.py:1973 app.py:2342
 msgid "Failed to download image from Commons"
 msgstr "Échec du téléchargement de l'image depuis Commons"
 
-#: app.py:1953 app.py:2341
+#: app.py:1976 app.py:2345
 msgid "Failed to save face"
 msgstr "Échec de l'enregistrement du visage"
 
-#: app.py:1956 app.py:2344
+#: app.py:1979 app.py:2348
 msgid "Failed to process face region"
 msgstr "Échec du traitement de la région du visage"
 
-#: app.py:2079 app.py:2266
+#: app.py:2102 app.py:2270
 msgid "Face not found or access denied"
 msgstr "Visage non trouvé ou accès refusé"
 
-#: app.py:2133
+#: app.py:2140
 msgid "OAuth token expired. Please log in again."
 msgstr "Le jeton OAuth a expiré. Veuillez vous reconnecter."
 
-#: app.py:2138
+#: app.py:2145
 msgid "Failed to remove SDC claim from Commons. The face was not reclassified."
 msgstr ""
 "Échec de la suppression de la déclaration SDC de Commons. Le visage n'a "
 "pas été reclassifié."
 
-#: app.py:2194
+#: app.py:2201
 msgid "This face has already been reviewed by another user"
 msgstr "Ce visage a déjà été examiné par un autre utilisateur"
 
-#: app.py:2198
+#: app.py:2205
 msgid "Failed to save reclassification"
 msgstr "Échec de l'enregistrement de la reclassification"
 
-#: app.py:2364 app.py:2438 app.py:2489
+#: app.py:2365 app.py:2432 app.py:2485 app.py:2666
 msgid "Project not found or access denied"
 msgstr "Projet non trouvé ou accès refusé"
 
-#: app.py:2606
+#: app.py:2777
 msgid "Invalid status."
 msgstr "Statut invalide."
 
-#: app.py:2632
+#: app.py:2803
 msgid "Settings updated."
 msgstr "Paramètres mis à jour."
 
-#: app.py:2651 app.py:2778
+#: app.py:2821 app.py:2940
 #, python-format
 msgid ""
 "Warning: You currently have %(confirmed)d/%(min)d human-confirmed target "
@@ -222,7 +222,7 @@ msgstr ""
 "cibles confirmés par un humain. L'inférence autonome ne s'exécutera pas "
 "tant que ce seuil ne sera pas atteint."
 
-#: app.py:2661 app.py:2788
+#: app.py:2831 app.py:2950
 #, python-format
 msgid ""
 "Tip: You have %(count)d bootstrapped matches from existing Commons "
@@ -233,17 +233,17 @@ msgstr ""
 "déclarations depicts existantes sur Commons. Approuvez-les dans les "
 "Résultats du Modèle pour les compter comme confirmées par un humain."
 
-#: app.py:2673
+#: app.py:2844
 msgid "Failed to update settings."
 msgstr "Échec de la mise à jour des paramètres."
 
-#: app.py:2705
+#: app.py:2869
 msgid "Settings have not changed since the last inference run. No re-run needed."
 msgstr ""
 "Les paramètres n'ont pas changé depuis la dernière exécution de "
 "l'inférence. Aucune ré-exécution nécessaire."
 
-#: app.py:2735
+#: app.py:2898
 #, python-format
 msgid ""
 "Reset %(num)d model-classified faces. The worker will re-classify them on"
@@ -252,11 +252,11 @@ msgstr ""
 "%(num)d visages classifiés par le modèle ont été réinitialisés. Le worker"
 " les reclassifiera au prochain cycle."
 
-#: app.py:2748
+#: app.py:2911
 msgid "No model-classified faces to reset."
 msgstr "Aucun visage classifié par le modèle à réinitialiser."
 
-#: app.py:2768
+#: app.py:2930
 #, python-format
 msgid ""
 "You have %(confirmed)d/%(min)d human-confirmed target faces — inference "
@@ -265,43 +265,47 @@ msgstr ""
 "Vous avez %(confirmed)d/%(min)d visages cibles confirmés par un humain — "
 "l'inférence s'exécutera au prochain cycle du worker."
 
-#: app.py:2799
+#: app.py:2962
 msgid "Failed to re-run inference."
 msgstr "Échec de la relance de l'inférence."
 
-#: app.py:2824
+#: app.py:2987
 msgid "Project deleted."
 msgstr "Projet supprimé."
 
-#: app.py:2826
+#: app.py:2989
 msgid "Project not found."
 msgstr "Projet non trouvé."
 
-#: app.py:2829
+#: app.py:2992
 msgid "Failed to delete project."
 msgstr "Échec de la suppression du projet."
 
-#: app.py:2854
+#: app.py:3017
 msgid "Settings saved."
 msgstr "Paramètres enregistrés."
 
-#: app.py:2857
+#: app.py:3020
 msgid "Failed to save settings."
 msgstr "Échec de l'enregistrement des paramètres."
 
-#: app.py:2902
+#: app.py:3065
 msgid "Failed to load leaderboard."
 msgstr "Échec du chargement du classement."
 
-#: app.py:2979
+#: app.py:3136
+msgid "Bad request"
+msgstr "Mauvaise requête"
+
+#: app.py:3143
 msgid "Page not found"
 msgstr "Page non trouvée"
 
-#: app.py:2989
+#: app.py:3153
 msgid "Rate limit exceeded. Please try again later."
 msgstr "Limite de débit dépassée. Veuillez réessayer plus tard."
 
-#: app.py:3000
+#: app.py:3164
 msgid "Internal server error"
 msgstr "Erreur interne du serveur"
 
@@ -321,7 +325,7 @@ msgstr ""
 "Vos contributions seront toujours comptabilisées, mais votre nom "
 "n'apparaîtra pas dans le classement public."
 
-#: templates/account_settings.html:84 templates/project_settings.html:55
+#: templates/account_settings.html:91 templates/project_settings.html:55
 msgid "Save Settings"
 msgstr "Enregistrer les paramètres"
 
@@ -339,7 +343,7 @@ msgid "Leaderboard"
 msgstr "Classement"
 
 #: templates/base.html:336 templates/dashboard.html:197
-#: templates/project_detail.html:402 templates/project_settings.html:3
+#: templates/project_detail.html:500 templates/project_settings.html:3
 msgid "Settings"
 msgstr "Paramètres"
 
@@ -363,11 +367,12 @@ msgstr ""
 "Le processus d'arrière-plan semble être hors ligne. Le traitement des "
 "images et la détection des visages sont en pause."
 
-#: templates/base.html:358 templates/base.html:364 templates/base.html:421
+#: templates/base.html:358 templates/base.html:364 templates/base.html:422
+#: templates/project_detail.html:580
 msgid "Close"
 msgstr "Fermer"
 
-#: templates/base.html:379
+#: templates/base.html:380
 msgid ""
 "This site uses a cookie to remember your language preference. The session"
 " cookie is required for the site to function."
@@ -375,19 +380,19 @@ msgstr ""
 "Ce site utilise un cookie pour mémoriser votre préférence linguistique. "
 "Le cookie de session est requis pour le fonctionnement du site."
 
-#: templates/base.html:381
+#: templates/base.html:382
 msgid "Accept"
 msgstr "Accepter"
 
-#: templates/base.html:382
+#: templates/base.html:383
 msgid "Decline"
 msgstr "Refuser"
 
-#: templates/base.html:428
+#: templates/base.html:429
 msgid "Install"
 msgstr "Installer"
 
-#: templates/base.html:676
+#: templates/base.html:697
 msgid ""
 "Classify faces on the go! Tap Share, then \"Add to Home Screen\" to get "
 "the app."
@@ -395,7 +400,7 @@ msgstr ""
 "Classez des visages en déplacement ! Appuyez sur Partager, puis \"Sur "
 "l'écran d'accueil\" pour obtenir l'app."
 
-#: templates/base.html:690
+#: templates/base.html:711
 msgid ""
 "Classify faces faster! Add WikiVisage to your home screen for instant, "
 "full-screen access."
@@ -403,7 +408,7 @@ msgstr ""
 "Classez des visages plus vite ! Ajoutez WikiVisage à votre écran "
 "d'accueil pour un accès instantané en plein écran."
 
-#: templates/base.html:703
+#: templates/base.html:724
 msgid ""
 "Classify faces on the go! Tap your browser menu and choose \"Install\" to"
 " get the app."
@@ -415,30 +420,30 @@ msgstr ""
 msgid "Classify"
 msgstr "Classer"
 
-#: templates/classify.html:272 templates/classify.html:305
-#: templates/classify.html:323 templates/project_settings.html:8
+#: templates/classify.html:289 templates/classify.html:322
+#: templates/classify.html:340 templates/project_settings.html:8
 msgid "Back to Project"
 msgstr "Retour au projet"
 
-#: templates/classify.html:275
+#: templates/classify.html:292
 #, python-format
 msgid "%(num)d model rejection to review"
 msgid_plural "%(num)d model rejections to review"
 msgstr[0] "%(num)d rejet du modèle à examiner"
 msgstr[1] "%(num)d rejets du modèle à examiner"
 
-#: templates/classify.html:279
+#: templates/classify.html:296
 #, python-format
 msgid "%(num)d image remaining"
 msgid_plural "%(num)d images remaining"
 msgstr[0] "%(num)d image restante"
 msgstr[1] "%(num)d images restantes"
 
-#: templates/classify.html:289
+#: templates/classify.html:306
 msgid "All Classified!"
 msgstr "Tout est classé !"
 
-#: templates/classify.html:290
+#: templates/classify.html:307
 msgid ""
 "No more unclassified faces. However, the model rejected some faces you "
 "might want to review."
@@ -446,41 +451,41 @@ msgstr ""
 "Plus de visages non classés. Cependant, le modèle a rejeté certains "
 "visages que vous pourriez vouloir examiner."
 
-#: templates/classify.html:292
+#: templates/classify.html:309
 #, python-format
 msgid "%(num)d image with model-rejected faces to review."
 msgid_plural "%(num)d images with model-rejected faces to review."
 msgstr[0] "%(num)d image avec des visages rejetés par le modèle à examiner."
 msgstr[1] "%(num)d images avec des visages rejetés par le modèle à examiner."
 
-#: templates/classify.html:296 templates/classify.html:315
+#: templates/classify.html:313 templates/classify.html:332
 #, python-format
 msgid "%(num)d skipped image."
 msgid_plural "%(num)d skipped images."
 msgstr[0] "%(num)d image ignorée."
 msgstr[1] "%(num)d images ignorées."
 
-#: templates/classify.html:299 templates/classify.html:318
+#: templates/classify.html:316 templates/classify.html:335
 msgid "Show skipped"
 msgstr "Afficher les images ignorées"
 
-#: templates/classify.html:304
+#: templates/classify.html:321
 msgid "Review Model Rejections"
 msgstr "Examiner les rejets du modèle"
 
-#: templates/classify.html:310
+#: templates/classify.html:327
 msgid "All Caught Up!"
 msgstr "Tout est à jour !"
 
-#: templates/classify.html:311
+#: templates/classify.html:328
 msgid "No more faces to classify for this project right now."
 msgstr "Plus de visages à classer pour ce projet pour le moment."
 
-#: templates/classify.html:330
+#: templates/classify.html:347
 msgid "Model Review"
 msgstr "Examen du modèle"
 
-#: templates/classify.html:331
+#: templates/classify.html:348
 msgid ""
 "The model classified these faces as not matching. Confirm or correct "
 "below."
@@ -488,136 +493,137 @@ msgstr ""
 "Le modèle a classé ces visages comme ne correspondant pas. Confirmez ou "
 "corrigez ci-dessous."
 
-#: templates/classify.html:341
+#: templates/classify.html:358
 msgid "Click on the face if it actually is"
 msgstr "Cliquez sur le visage s'il s'agit bien de"
 
-#: templates/classify.html:341
+#: templates/classify.html:358
 msgid ", or press \"None\" to confirm the model's rejection."
 msgstr ", ou appuyez sur \"Aucun\" pour confirmer le rejet du modèle."
 
-#: templates/classify.html:343
+#: templates/classify.html:360
 msgid "Click on the face of"
 msgstr "Cliquez sur le visage de"
 
-#: templates/classify.html:343
+#: templates/classify.html:360
 msgid ", or press \"None\" if they are not in this photo."
 msgstr ", ou appuyez sur \"Aucun\" s'il n'est pas sur cette photo."
 
-#: templates/classify.html:346
+#: templates/classify.html:363
 msgid "The model says this is not"
 msgstr "Le modèle dit que ce n'est pas"
 
-#: templates/classify.html:346
+#: templates/classify.html:363
 msgid ". Is that correct?"
 msgstr ". Est-ce correct ?"
 
-#: templates/classify.html:350
+#: templates/classify.html:367
 msgid "Draw a box around a missed face"
 msgstr "Dessiner un cadre autour d'un visage manqué"
 
-#: templates/classify.html:350 templates/classify.html:422
+#: templates/classify.html:367 templates/classify.html:440
 msgid "+ Add Missing Face"
 msgstr "+ Ajouter un visage manquant"
 
-#: templates/classify.html:351
+#: templates/classify.html:368
 msgid "Click and drag on the image to draw a face box. Press Esc to cancel."
 msgstr ""
 "Cliquez et faites glisser sur l'image pour dessiner un cadre de visage. "
 "Appuyez sur Échap pour annuler.Cliquez et faites glisser sur l'image pour"
 " dessiner une boîte de visage. Appuyez sur Échap pour annuler."
 
-#: templates/classify.html:357
+#: templates/classify.html:374
 msgid "Image to classify"
 msgstr "Image à classifier"
 
-#: templates/classify.html:365 templates/classify.html:395
+#: templates/classify.html:381 templates/classify.html:383
+#: templates/classify.html:413
 #, python-format
 msgid "Face %(num)d"
 msgstr "Visage %(num)d"
 
-#: templates/classify.html:375 templates/classify.html:378
-#: templates/classify.html:384
+#: templates/classify.html:393 templates/classify.html:396
+#: templates/classify.html:402
 msgid "Yes"
 msgstr "Oui"
 
-#: templates/classify.html:375
+#: templates/classify.html:393
 msgid "Override Model"
 msgstr "Passer outre le modèle"
 
-#: templates/classify.html:376 templates/classify.html:379
-#: templates/classify.html:385
+#: templates/classify.html:394 templates/classify.html:397
+#: templates/classify.html:403
 msgid "No"
 msgstr "Non"
 
-#: templates/classify.html:376
+#: templates/classify.html:394
 msgid "Confirm Rejection"
 msgstr "Confirmer le rejet"
 
-#: templates/classify.html:378
+#: templates/classify.html:396
 msgid "Target"
 msgstr "Cible"
 
-#: templates/classify.html:379 templates/project_detail.html:321
+#: templates/classify.html:397 templates/project_detail.html:419
 msgid "Not Target"
 msgstr "Pas la cible"
 
-#: templates/classify.html:381 templates/classify.html:386
-#: templates/classify.html:392 templates/classify.html:397
+#: templates/classify.html:399 templates/classify.html:404
+#: templates/classify.html:410 templates/classify.html:415
 msgid "Skip"
 msgstr "Ignorer"
 
-#: templates/classify.html:387 templates/classify.html:398
+#: templates/classify.html:405 templates/classify.html:416
 msgid "Undo"
 msgstr "Annuler"
 
-#: templates/classify.html:391
+#: templates/classify.html:409
 msgid "None of These"
 msgstr "Aucun de ceux-là"
 
-#: templates/classify.html:396
+#: templates/classify.html:414
 msgid "None"
 msgstr "Aucun"
 
-#: templates/classify.html:404
+#: templates/classify.html:422
 msgid "Undo Last"
 msgstr "Annuler le dernier"
 
-#: templates/classify.html:410 templates/classify.html:415
-#: templates/project_detail.html:523
+#: templates/classify.html:428 templates/classify.html:433
+#: templates/project_detail.html:596
 msgid "Saving..."
 msgstr "Enregistrement..."
 
-#: templates/classify.html:416
+#: templates/classify.html:434
 msgid "Undoing..."
 msgstr "Annulation..."
 
-#: templates/classify.html:417
+#: templates/classify.html:435
 msgid "Failed to undo. Please try again."
 msgstr "Échec de l'annulation. Veuillez réessayer."
 
-#: templates/classify.html:418
+#: templates/classify.html:436
 msgid "Detecting face..."
 msgstr "Détection du visage..."
 
-#: templates/classify.html:419
+#: templates/classify.html:437
 msgid "An error occurred while saving. Please try again."
 msgstr "Une erreur s'est produite lors de l'enregistrement. Veuillez réessayer."
 
-#: templates/classify.html:420
+#: templates/classify.html:438
 msgid "Failed to add manual face. Please try again."
 msgstr "Échec de l'ajout manuel du visage. Veuillez réessayer."
 
-#: templates/classify.html:421
+#: templates/classify.html:439
 msgid "Cancel Drawing"
 msgstr "Annuler le dessin"
 
-#: templates/classify.html:423
+#: templates/classify.html:441
 #, python-brace-format
 msgid "Error: {message}"
 msgstr "Erreur : {message}"
 
-#: templates/classify.html:424
+#: templates/classify.html:442
 msgid "Unknown error"
 msgstr "Erreur inconnue"
 
@@ -634,17 +640,17 @@ msgstr "Nouveau projet"
 msgid "Category:"
 msgstr "Catégorie :"
 
-#: templates/dashboard.html:170 templates/project_detail.html:284
-#: templates/project_detail.html:1261
+#: templates/dashboard.html:170 templates/project_detail.html:382
+#: templates/project_detail.html:1519
 msgid "Waiting for worker"
 msgstr "En attente du processus"
 
-#: templates/dashboard.html:176 templates/project_detail.html:289
-#: templates/project_detail.html:1258
+#: templates/dashboard.html:176 templates/project_detail.html:387
+#: templates/project_detail.html:1516
 msgid "Complete"
 msgstr "Terminé"
 
-#: templates/dashboard.html:176 templates/project_detail.html:293
+#: templates/dashboard.html:176 templates/project_detail.html:391
 #, python-format
 msgid "%(num)d images processed"
 msgstr "%(num)d images traitées"
@@ -663,12 +669,12 @@ msgid "No faces classified yet"
 msgstr "Aucun visage classé pour le moment"
 
 #: templates/dashboard.html:208 templates/dashboard.html:210
-#: templates/project_detail.html:912
+#: templates/project_detail.html:1004
 msgid "Prev"
 msgstr "Précédent"
 
 #: templates/dashboard.html:226 templates/dashboard.html:228
-#: templates/project_detail.html:913
+#: templates/project_detail.html:1005
 msgid "Next"
 msgstr "Suivant"
 
@@ -789,8 +795,9 @@ msgid "Classified"
 msgstr "Classés"
 
 #: templates/leaderboard.html:80 templates/leaderboard.html:97
-msgid "SDC Tags"
-msgstr "Balises SDC"
+#: templates/project_detail.html:427
+msgid "SDC Written"
+msgstr "SDC envoy\\u00e9s"
 
 #: templates/leaderboard.html:84
 msgid "Contributors"
@@ -823,12 +830,12 @@ msgstr ""
 msgid "Log In"
 msgstr "Se connecter"
 
-#: templates/project_detail.html:278 templates/project_detail.html:288
-#: templates/project_detail.html:297
+#: templates/project_detail.html:376 templates/project_detail.html:386
+#: templates/project_detail.html:395
 msgid "Processing Progress"
 msgstr "Progression du traitement"
 
-#: templates/project_detail.html:280
+#: templates/project_detail.html:378
 msgid ""
 "The background worker hasn't discovered images in this category yet. This"
 " usually takes a minute or two after creating a project."
@@ -837,52 +844,48 @@ msgstr ""
 "catégorie. Cela prend généralement une minute ou deux après la création "
 "d'un projet."
 
-#: templates/project_detail.html:298
+#: templates/project_detail.html:396
 #, python-format
 msgid "%(done)d / %(total)d images"
 msgstr "%(done)d / %(total)d images"
 
-#: templates/project_detail.html:309
+#: templates/project_detail.html:407
 msgid "Project Statistics"
 msgstr "Statistiques du projet"
 
-#: templates/project_detail.html:313
+#: templates/project_detail.html:411
 msgid "Total Faces Found"
 msgstr "Total des visages trouvés"
 
-#: templates/project_detail.html:317
+#: templates/project_detail.html:415
 msgid "Target Matches"
 msgstr "Correspondances cibles"
 
-#: templates/project_detail.html:325
+#: templates/project_detail.html:423
 msgid "Unclassified"
 msgstr "Non classés"
 
-#: templates/project_detail.html:329
-msgid "SDC Written"
-msgstr "SDC écrit"
-
-#: templates/project_detail.html:333 templates/project_detail.html:421
+#: templates/project_detail.html:431 templates/project_detail.html:522
 msgid "SDC Pending"
 msgstr "SDC en attente"
 
-#: templates/project_detail.html:342
+#: templates/project_detail.html:440
 msgid "Classification Breakdown"
 msgstr "Répartition des classifications"
 
-#: templates/project_detail.html:346
+#: templates/project_detail.html:444
 msgid "By Human"
 msgstr "Par un humain"
 
-#: templates/project_detail.html:350
+#: templates/project_detail.html:448
 msgid "By Model"
 msgstr "Par le modèle"
 
-#: templates/project_detail.html:354
+#: templates/project_detail.html:452
 msgid "By Bootstrap"
 msgstr "Par Bootstrap"
 
-#: templates/project_detail.html:368
+#: templates/project_detail.html:466
 #, python-format
 msgid ""
 "%(num)d face waiting for model inference. The background worker will "
@@ -897,7 +900,7 @@ msgstr[1] ""
 "%(num)d visages en attente de l'inférence du modèle. Le processus d"
 "'arrière-plan les classera automatiquement dans la minute qui suit."
 
-#: templates/project_detail.html:372
+#: templates/project_detail.html:470
 #, python-format
 msgid ""
 "%(num)d unclassified face remaining, but none are currently eligible for "
@@ -912,7 +915,7 @@ msgstr[1] ""
 "%(num)d visages non classifiés restants, mais aucun n'est actuellement "
 "éligible pour l'inférence automatique du modèle."
 
-#: templates/project_detail.html:376
+#: templates/project_detail.html:474
 #, python-format
 msgid ""
 "The background worker is still processing images (%(pending)d image "
@@ -929,7 +932,7 @@ msgstr[1] ""
 "restantes). D'autres visages apparaîtront au fur et à mesure du "
 "traitement."
 
-#: templates/project_detail.html:380
+#: templates/project_detail.html:478
 #, python-format
 msgid ""
 "Cannot reach autonomous inference: even if all %(unclassified)d "
@@ -940,21 +943,21 @@ msgstr ""
 "%(unclassified)d visages non classés correspondent tous, vous auriez "
 "%(potential)d/%(min)d confirmés par un humain — en dessous du seuil."
 
-#: templates/project_detail.html:383
+#: templates/project_detail.html:481
 msgid "Lower the min_confirmed setting in"
 msgstr "Réduisez le paramètre min_confirmed dans"
 
-#: templates/project_detail.html:383 templates/project_settings.html:7
+#: templates/project_detail.html:481 templates/project_settings.html:7
 msgid "Project Settings"
 msgstr "Paramètres du projet"
 
-#: templates/project_detail.html:383
+#: templates/project_detail.html:481
 msgid "to proceed, or wait for the background worker to detect more faces."
 msgstr ""
 "pour continuer, ou attendez que le processus d'arrière-plan détecte plus "
 "de visages."
 
-#: templates/project_detail.html:387
+#: templates/project_detail.html:485
 #, python-format
 msgid ""
 "%(count)d unclassified faces remaining. Classify at least %(needed)d more"
@@ -965,7 +968,7 @@ msgstr ""
 "%(needed)d visages cibles pour activer l'inférence autonome "
 "(%(confirmed)d/%(min)d confirmés par un humain)."
 
-#: templates/project_detail.html:391
+#: templates/project_detail.html:489
 #, python-format
 msgid ""
 "Tip: You have %(count)d bootstrapped matches from existing Commons "
@@ -975,17 +978,18 @@ msgstr ""
 "Astuce : Vous avez %(count)d correspondances bootstrap provenant de "
 "déclarations depicts existantes sur Commons. Elles ont été autoclassées "
 "et peuvent être incorrectes — vérifiez-les dans les Résultats de "
-"classification ci-dessous pour les compter comme confirmées par un humain."
+"classification ci-dessous pour les compter comme confirmées par un "
+"humain."
 
-#: templates/project_detail.html:400
+#: templates/project_detail.html:498
 msgid "Start Classifying"
 msgstr "Commencer le classement"
 
-#: templates/project_detail.html:406
+#: templates/project_detail.html:504
 msgid "Classification Results"
 msgstr "Résultats de classification"
 
-#: templates/project_detail.html:408
+#: templates/project_detail.html:506
 #, python-format
 msgid ""
 "Faces classified by the model, bootstrap, or human review. Lower distance"
@@ -995,77 +999,69 @@ msgstr ""
 "distance plus faible = une correspondance plus proche de la cible. Seuil "
 ": %(threshold)s."
 
-#: templates/project_detail.html:412
+#: templates/project_detail.html:510
+msgid "Filter by result"
+msgstr "Filtrer par résultat"
+
+#: templates/project_detail.html:511 templates/project_detail.html:618
 msgid "All"
 msgstr "Tous"
 
-#: templates/project_detail.html:413
+#: templates/project_detail.html:512 templates/project_detail.html:619
 msgid "Matches"
 msgstr "Correspondances"
 
-#: templates/project_detail.html:414
+#: templates/project_detail.html:513 templates/project_detail.html:620
 msgid "Non-matches"
 msgstr "Non-correspondances"
 
-#: templates/project_detail.html:415 templates/project_detail.html:443
-#: templates/project_detail.html:535
+#: templates/project_detail.html:514 templates/project_detail.html:609
+#: templates/project_detail.html:632
 msgid "Rejected"
 msgstr "Rejeté"
 
-#: templates/project_detail.html:417
+#: templates/project_detail.html:516
+msgid "Filter by source"
+msgstr "Filtrer par source"
+
+#: templates/project_detail.html:517 templates/project_detail.html:621
+msgid "All sources"
+msgstr "Toutes les sources"
+
+#: templates/project_detail.html:518 templates/project_detail.html:622
 msgid "Model"
 msgstr "Modèle"
 
-#: templates/project_detail.html:418
+#: templates/project_detail.html:519 templates/project_detail.html:623
 msgid "Bootstrap"
 msgstr "Bootstrap"
 
-#: templates/project_detail.html:419
+#: templates/project_detail.html:520 templates/project_detail.html:624
 msgid "Human"
 msgstr "Humain"
 
-#: templates/project_detail.html:435
-msgid "Approve"
-msgstr "Approuver"
+#: templates/project_detail.html:523
+msgid "Sort results"
+msgstr "Trier les résultats"
 
-#: templates/project_detail.html:436
-msgid "Reject"
-msgstr "Rejeter"
+#: templates/project_detail.html:524
+msgid "Threshold: Low → High"
+msgstr "Seuil : Bas → Haut"
 
-#: templates/project_detail.html:437
-msgid "Edit bounding box"
-msgstr "Modifier la boîte englobante"
+#: templates/project_detail.html:525
+msgid "Threshold: High → Low"
+msgstr "Seuil : Haut → Bas"
 
-#: templates/project_detail.html:439
-msgid "Loading..."
-msgstr "Chargement..."
+#: templates/project_detail.html:530
+msgid "Gallery pagination"
+msgstr "Pagination de la galerie"
 
-#: templates/project_detail.html:443 templates/project_detail.html:534
-msgid "Verified"
-msgstr "Vérifié"
-
-#: templates/project_detail.html:443
-msgid "Match"
-msgstr "Correspondance"
-
-#: templates/project_detail.html:443
-msgid "Not target"
-msgstr "Pas la cible"
-
-#: templates/project_detail.html:446 templates/project_detail.html:537
-msgid "SDC pending"
-msgstr "SDC en attente"
-
-#: templates/project_detail.html:448
-msgid "Face distance from target centroid"
-msgstr "Distance du visage par rapport au centroïde cible"
-
-#: templates/project_detail.html:464 templates/project_detail.html:498
-#: templates/project_detail.html:1038
+#: templates/project_detail.html:537 templates/project_detail.html:571
+#: templates/project_detail.html:1299
 msgid "Send Edits to Wikimedia Commons"
 msgstr "Envoyer les modifications vers Wikimedia Commons"
 
-#: templates/project_detail.html:466
+#: templates/project_detail.html:539
 msgid ""
 "Write P180 depicts claims for all approved target faces that have not yet"
 " been written to Commons. Review the Classification Results above to "
@@ -1076,162 +1072,206 @@ msgstr ""
 "résultats de classification ci-dessus pour supprimer les faux positifs "
 "avant l'envoi."
 
-#: templates/project_detail.html:469
+#: templates/project_detail.html:542
 msgid "All structured data edits will be published under the"
 msgstr "Toutes les modifications de données structurées seront publiées sous la"
 
-#: templates/project_detail.html:474
+#: templates/project_detail.html:547
 #, python-format
 msgid "%(num)d face ready to send"
 msgid_plural "%(num)d faces ready to send"
 msgstr[0] "%(num)d visage prêt à être envoyé"
 msgstr[1] "%(num)d visages prêts à être envoyés"
 
-#: templates/project_detail.html:475
+#: templates/project_detail.html:548
 msgid "and"
 msgstr "et"
 
-#: templates/project_detail.html:476
+#: templates/project_detail.html:549
 #, python-format
 msgid "%(num)d ready to be removed."
 msgid_plural "%(num)d ready to be removed."
 msgstr[0] "%(num)d prêt à être supprimé."
 msgstr[1] "%(num)d prêts à être supprimés."
 
-#: templates/project_detail.html:480
+#: templates/project_detail.html:553
 #, python-format
 msgid "%(num)d face ready to send."
 msgid_plural "%(num)d faces ready to send."
 msgstr[0] "%(num)d visage prêt à être envoyé."
 msgstr[1] "%(num)d visages prêts à être envoyés."
 
-#: templates/project_detail.html:484
+#: templates/project_detail.html:557
 #, python-format
 msgid "%(num)d image ready to be removed."
 msgid_plural "%(num)d images ready to be removed."
 msgstr[0] "%(num)d image prête à être supprimée."
 msgstr[1] "%(num)d images prêtes à être supprimées."
 
-#: templates/project_detail.html:487 templates/project_detail.html:1035
+#: templates/project_detail.html:560 templates/project_detail.html:1296
 msgid "No pending faces to write. All approved faces have already been sent."
 msgstr ""
 "Aucun visage en attente d'envoi. Tous les visages approuvés ont déjà été "
 "envoyés."
 
-#: templates/project_detail.html:493
+#: templates/project_detail.html:566
 msgid "Starting..."
 msgstr "Démarrage..."
 
-#: templates/project_detail.html:506
+#: templates/project_detail.html:579
 msgid "Edit Bounding Box"
 msgstr "Modifier la boîte englobante"
 
-#: templates/project_detail.html:511
+#: templates/project_detail.html:584
 msgid "Click and drag on the image to draw a new bounding box."
 msgstr ""
 "Cliquez et faites glisser sur l'image pour dessiner une nouvelle boîte "
 "englobante."
 
-#: templates/project_detail.html:512
+#: templates/project_detail.html:585
 msgid "View on Commons"
 msgstr "Voir sur Commons"
 
-#: templates/project_detail.html:515
+#: templates/project_detail.html:588
 msgid "Full resolution"
 msgstr "Pleine résolution"
 
-#: templates/project_detail.html:520
+#: templates/project_detail.html:593
 msgid "Cancel"
 msgstr "Annuler"
 
-#: templates/project_detail.html:521
+#: templates/project_detail.html:594
 msgid "Save"
 msgstr "Enregistrer"
 
-#: templates/project_detail.html:536
+#: templates/project_detail.html:608 templates/project_detail.html:631
+msgid "Verified"
+msgstr "Vérifié"
+
+#: templates/project_detail.html:610
 msgid "human"
 msgstr "humain"
 
-#: templates/project_detail.html:538
+#: templates/project_detail.html:611 templates/project_detail.html:633
+msgid "SDC pending"
+msgstr "SDC en attente"
+
+#: templates/project_detail.html:612
 msgid "SDC claim was removed."
 msgstr "L'allégation SDC a été supprimée."
 
-#: templates/project_detail.html:539
+#: templates/project_detail.html:613
 msgid "SDC claim removal queued."
 msgstr "Suppression de l'allégation SDC mise en file d'attente."
 
-#: templates/project_detail.html:540
+#: templates/project_detail.html:614
 msgid "Error saving classification"
 msgstr "Erreur lors de l'enregistrement de la classification"
 
-#: templates/project_detail.html:541
+#: templates/project_detail.html:615
 msgid "Error saving new bounding box"
 msgstr "Erreur lors de l'enregistrement de la nouvelle boîte englobante"
 
-#: templates/project_detail.html:914
+#: templates/project_detail.html:625
+msgid "Approve"
+msgstr "Approuver"
+
+#: templates/project_detail.html:626
+msgid "Reject"
+msgstr "Rejeter"
+
+#: templates/project_detail.html:627
+msgid "Edit bounding box"
+msgstr "Modifier la boîte englobante"
+
+#: templates/project_detail.html:628
+msgid "Loading..."
+msgstr "Chargement..."
+
+#: templates/project_detail.html:629
+msgid "Match"
+msgstr "Correspondance"
+
+#: templates/project_detail.html:630
+msgid "Not target"
+msgstr "Pas la cible"
+
+#: templates/project_detail.html:634
+msgid "Face distance from target centroid"
+msgstr "Distance du visage par rapport au centroïde cible"
+
+#: templates/project_detail.html:635
+msgid "No classification results yet."
+msgstr "Aucun résultat de classification pour l'instant."
+
+#: templates/project_detail.html:636
+msgid "Failed to load results. Please try again."
+msgstr "Échec du chargement des résultats. Veuillez réessayer."
+
+#: templates/project_detail.html:1006
 #, python-brace-format
 msgid "Page {current} of {total}"
 msgstr "Page {current} sur {total}"
 
-#: templates/project_detail.html:1029
+#: templates/project_detail.html:1290
 msgid "Queued — waiting for background worker..."
 msgstr "En file d'attente — en attente du processus en arrière-plan..."
 
-#: templates/project_detail.html:1030
+#: templates/project_detail.html:1291
 msgid "Worker is writing claims..."
 msgstr "Le processus écrit les allégations..."
 
-#: templates/project_detail.html:1031
+#: templates/project_detail.html:1292
 msgid "Worker is removing claims..."
 msgstr "Le processus supprime les allégations..."
 
-#: templates/project_detail.html:1032
+#: templates/project_detail.html:1293
 #, python-brace-format
 msgid "{written} of {total} written..."
 msgstr "{written} sur {total} écrites..."
 
-#: templates/project_detail.html:1033
+#: templates/project_detail.html:1294
 msgid "Done!"
 msgstr "Terminé !"
 
-#: templates/project_detail.html:1034
+#: templates/project_detail.html:1295
 #, python-brace-format
 msgid "All {num} claims written successfully!"
 msgstr "Les {num} allégations ont toutes été écrites avec succès !"
 
-#: templates/project_detail.html:1036
+#: templates/project_detail.html:1297
 msgid "Failed to queue edits. Please try again."
 msgstr "Échec de la mise en file d'attente. Veuillez réessayer."
 
-#: templates/project_detail.html:1037
+#: templates/project_detail.html:1298
 #, python-brace-format
 msgid "Worker error: {error}"
 msgstr "Erreur du processus : {error}"
 
-#: templates/project_detail.html:1039
+#: templates/project_detail.html:1300
 msgid "Writing in progress..."
 msgstr "Écriture en cours..."
 
-#: templates/project_detail.html:1040
+#: templates/project_detail.html:1301
 #, python-brace-format
 msgid "{num} images ready to be removed"
 msgstr "{num} images prêtes à être supprimées"
 
-#: templates/project_detail.html:1041
+#: templates/project_detail.html:1302
 msgid "All edits completed successfully!"
 msgstr "Toutes les modifications ont été effectuées avec succès !"
 
-#: templates/project_detail.html:1259
+#: templates/project_detail.html:1517
 #, python-brace-format
 msgid "{done} / {total} images"
 msgstr "{done} / {total} images"
 
-#: templates/project_detail.html:1260
+#: templates/project_detail.html:1518
 #, python-brace-format
 msgid "{num} images processed"
 msgstr "{num} images traitées"
 
-#: templates/project_detail.html:1262
+#: templates/project_detail.html:1520
 #, python-brace-format
 msgid ""
 "The background worker is still processing images ({pending} image "
@@ -1241,7 +1281,7 @@ msgstr ""
 "restante). D'autres visages apparaîtront au fur et à mesure du "
 "traitement."
 
-#: templates/project_detail.html:1263
+#: templates/project_detail.html:1521
 #, python-brace-format
 msgid ""
 "The background worker is still processing images ({pending} images "

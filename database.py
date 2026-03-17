@@ -11,7 +11,7 @@ import time
 from collections.abc import Callable
 from contextlib import contextmanager
 from queue import Empty, Full, Queue
-from typing import Any
+from typing import Any, Literal, overload
 
 import pymysql
 from pymysql import InterfaceError, OperationalError
@@ -189,7 +189,7 @@ def _return_connection_to_pool(conn: pymysql.Connection) -> None:
         else:
             logger.debug("Connection already closed, not returning to pool")
     except Exception:
-        pass
+        logger.warning("Unexpected error returning connection to pool", exc_info=True)
 
 
 def _execute_with_retry(func: Callable[..., Any], *args, **kwargs) -> Any:
@@ -212,7 +212,7 @@ def _execute_with_retry(func: Callable[..., Any], *args, **kwargs) -> Any:
     for attempt in range(MAX_RETRIES):
         try:
             return func(*args, **kwargs)
-        except (OperationalError, InterfaceError) as e:
+        except (OperationalError, InterfaceError, PoolExhaustedError) as e:
             last_exception = e
             if attempt < MAX_RETRIES - 1:
                 backoff = INITIAL_BACKOFF * (2**attempt)
@@ -263,6 +263,16 @@ def get_connection(timeout: float = 30.0):
     finally:
         if conn:
             _return_connection_to_pool(conn)
+
+
+@overload
+def execute_query(
+    sql: str, params: tuple | dict | None = None, fetch: Literal[True] = True
+) -> list[dict[str, Any]]: ...
+
+
+@overload
+def execute_query(sql: str, params: tuple | dict | None = None, *, fetch: Literal[False]) -> int: ...
 
 
 def execute_query(

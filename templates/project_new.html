@@ -102,8 +102,22 @@ function checkCategory() {
                 .replace('{files}', files)
                 .replace('{subcats}', subcats);
             var tip = data.files > 2000 ? i18nCatInfo.tipLarge : data.files > 500 ? i18nCatInfo.tipMedium : i18nCatInfo.tipSmall;
-            var capWarning = data.files > 9000 ? '<br><span style="color: var(--warning); font-size: 0.8125rem;">' + i18nCatInfo.capNote + '</span>' : '';
-            infoDiv.innerHTML = line1 + '<br><span style="color: var(--text-muted); font-size: 0.8125rem;">' + tip + '</span>' + capWarning;
+            infoDiv.textContent = '';
+            infoDiv.appendChild(document.createTextNode(line1));
+            infoDiv.appendChild(document.createElement('br'));
+            var tipSpan = document.createElement('span');
+            tipSpan.style.color = 'var(--text-muted)';
+            tipSpan.style.fontSize = '0.8125rem';
+            tipSpan.textContent = tip;
+            infoDiv.appendChild(tipSpan);
+            if (data.files > 9000) {
+                infoDiv.appendChild(document.createElement('br'));
+                var capSpan = document.createElement('span');
+                capSpan.style.color = 'var(--warning)';
+                capSpan.style.fontSize = '0.8125rem';
+                capSpan.textContent = i18nCatInfo.capNote;
+                infoDiv.appendChild(capSpan);
+            }
         })
         .catch(function() {
             infoDiv.style.borderLeftColor = 'var(--danger)';
