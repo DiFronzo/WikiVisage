@@ -704,9 +704,8 @@ msgid "Face Not Found"
 msgstr "Face Not Found"
 
 #: templates/error.html:172
-#, fuzzy
 msgid "ERR_TARGET_ESCAPED_CLASSIFICATION"
-msgstr "Error saving classification"
+msgstr "ERR_TARGET_ESCAPED_CLASSIFICATION"
 
 #: templates/error.html:173
 msgid ""
