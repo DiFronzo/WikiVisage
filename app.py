@@ -2530,7 +2530,7 @@ def api_gallery(project_id: int):
 
     if sdc_filter == "sdc-pending":
         filter_clauses.append(
-            "((f.is_target = 1 AND f.sdc_written = 0 AND f.classified_by != 'bootstrap' AND i.bootstrapped = 0)"
+            "(f.is_target = 1 AND f.sdc_written = 0 AND f.classified_by != 'bootstrap' AND i.bootstrapped = 0"
             " OR f.sdc_removal_pending = 1)"
         )
 
