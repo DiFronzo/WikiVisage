@@ -2591,7 +2591,14 @@ def api_gallery(project_id: int):
             "  f.bbox_top, f.bbox_right, f.bbox_bottom, f.bbox_left, "
             "  f.sdc_written, f.sdc_removal_pending, f.classified_by_user_id, "
             "  i.file_title, i.commons_page_id, "
-            "  i.detection_width, i.detection_height, i.bootstrapped "
+            "  i.detection_width, i.detection_height, i.bootstrapped, "
+            "  EXISTS ("
+            "    SELECT 1 FROM faces f2 "
+            "    WHERE f2.image_id = f.image_id "
+            "      AND f2.id <> f.id "
+            "      AND f2.is_target = 1 "
+            "      AND f2.sdc_removal_pending = 0"
+            "  ) AS has_confirmed_target_sibling "
             "FROM faces f "
             "JOIN images i ON f.image_id = i.id "
             f"WHERE {where} "  # noqa: S608
@@ -2614,7 +2621,10 @@ def api_gallery(project_id: int):
             and face["sdc_written"] == 0
             and face["classified_by"] != "bootstrap"
             and face["bootstrapped"] == 0
-        ) or (face["sdc_removal_pending"] == 1)
+        ) or (
+            face["sdc_removal_pending"] == 1
+            and not face["has_confirmed_target_sibling"]
+        )
         if face["is_target"] == 0 and face["classified_by_user_id"]:
             result_type = "rejected"
         elif face["is_target"] == 1:
