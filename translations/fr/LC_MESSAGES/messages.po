@@ -708,14 +708,12 @@ msgid "Error"
 msgstr "Erreur"
 
 #: templates/error.html:171
-#, fuzzy
 msgid "Face Not Found"
-msgstr "Page non trouvée"
+msgstr "Visage introuvable"
 
 #: templates/error.html:172
-#, fuzzy
 msgid "ERR_TARGET_ESCAPED_CLASSIFICATION"
-msgstr "Erreur lors de l'enregistrement de la classification"
+msgstr "ERR_TARGET_ESCAPED_CLASSIFICATION"
 
 #: templates/error.html:173
 msgid ""
