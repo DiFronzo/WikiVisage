@@ -7689,9 +7689,5 @@ def test_sitemap_xml_returns_valid_xml():
     root = ET.fromstring(body)
     assert root.tag.endswith("urlset")
 
-    loc_texts = [
-        (elem.text or "")
-        for elem in root.iter()
-        if elem.tag.endswith("loc")
-    ]
+    loc_texts = [(elem.text or "") for elem in root.iter() if elem.tag.endswith("loc")]
     assert any("/leaderboard" in text for text in loc_texts)
