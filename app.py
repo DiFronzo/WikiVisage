@@ -3148,6 +3148,22 @@ def robots_txt():
     return "\n".join(lines), 200, {"Content-Type": "text/plain; charset=utf-8"}
 
 
+@app.route("/sitemap.xml")
+@limiter.exempt
+def sitemap_xml():
+    """Serve a minimal XML sitemap listing publicly crawlable pages."""
+    base = request.url_root.rstrip("/")
+    urls = ["/", "/leaderboard"]
+    xml_urls = "".join(f"<url><loc>{base}{path}</loc></url>" for path in urls)
+    xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+        f"{xml_urls}"
+        "</urlset>"
+    )
+    return xml, 200, {"Content-Type": "application/xml; charset=utf-8"}
+
+
 @app.route("/commons-thumb/<path:file_title>")
 @login_required
 def commons_thumb_route(file_title: str):

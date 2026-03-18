@@ -1,6 +1,6 @@
 [project]
 name = "wikivisage"
-version = "0.4.1"
+version = "0.4.2"
 requires-python = ">=3.11"
 
 [tool.ruff]
@@ -41,7 +41,7 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/*" = ["S101", "S105", "S106"]
+"tests/*" = ["S101", "S105", "S106", "S314"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
