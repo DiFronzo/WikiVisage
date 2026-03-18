@@ -2559,7 +2559,13 @@ def api_gallery(project_id: int):
                 "  SUM(CASE WHEN f.classified_by = 'model' AND f.classified_by_user_id IS NULL THEN 1 ELSE 0 END) AS source_model, "
                 "  SUM(CASE WHEN f.classified_by = 'bootstrap' AND f.classified_by_user_id IS NULL THEN 1 ELSE 0 END) AS source_bootstrap, "
                 "  SUM(CASE WHEN f.classified_by_user_id IS NOT NULL THEN 1 ELSE 0 END) AS source_human, "
-                "  SUM(CASE WHEN (f.is_target = 1 AND f.sdc_written = 0 AND f.classified_by != 'bootstrap' AND i.bootstrapped = 0) OR f.sdc_removal_pending = 1 THEN 1 ELSE 0 END) AS sdc_pending "
+                "  SUM(CASE WHEN (f.is_target = 1 AND f.sdc_written = 0 AND f.classified_by != 'bootstrap' AND i.bootstrapped = 0) "
+                "            OR (f.sdc_removal_pending = 1 AND NOT EXISTS ("
+                "                  SELECT 1 FROM faces f2 "
+                "                  WHERE f2.image_id = f.image_id "
+                "                    AND f2.is_target = 1 "
+                "                    AND f2.id != f.id"
+                "            )) THEN 1 ELSE 0 END) AS sdc_pending "
                 f"FROM faces f JOIN images i ON f.image_id = i.id WHERE {base_where}",  # noqa: S608
                 (project_id,),
             )
