@@ -285,6 +285,32 @@
     .project-header-text { min-width: 0; }
     .project-title { margin-bottom: 0.5rem; font-size: 2rem; font-size: clamp(1.5rem, 5vw, 3rem); }
     .project-links { color: var(--text-muted); }
+    .viewit-strip {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+        padding: 0.75rem 1rem;
+        margin-bottom: 1.5rem;
+        border-left: 3px solid var(--info);
+        background: rgba(59, 130, 246, 0.04);
+        font-size: 0.85rem;
+        color: var(--text-muted);
+    }
+    .viewit-strip img { height: 22px; flex-shrink: 0; }
+    .viewit-strip a { font-weight: 700; white-space: nowrap; }
+    .viewit-strip-close {
+        background: none;
+        border: none;
+        color: var(--text-muted);
+        font-size: 1.1rem;
+        line-height: 1;
+        cursor: pointer;
+        opacity: 0.5;
+        padding: 0 0.25rem;
+        margin-left: auto;
+        flex-shrink: 0;
+    }
+    .viewit-strip-close:hover { opacity: 1; }
     .project-status-badge { font-size: 1rem; padding: 0.5rem 1rem; }
     .text-muted-msg { color: var(--text-muted); margin-top: 1rem; margin-bottom: 0; }
     .progress-wrap-lg { height: 2.5rem; margin-top: 1.5rem; }
@@ -372,7 +398,7 @@
         <div class="project-header-text">
             <h1 class="project-title">{{ project.label or project.wikidata_qid }}</h1>
             <p class="project-links">
-                <a href="https://www.wikidata.org/wiki/{{ project.wikidata_qid }}" target="_blank" rel="noopener">{{ project.wikidata_qid }}</a> &bull; 
+                <a href="https://www.wikidata.org/wiki/{{ project.wikidata_qid }}" target="_blank" rel="noopener">{{ project.wikidata_qid }}</a> &bull;
                 <a href="https://commons.wikimedia.org/wiki/Category:{{ project.commons_category | urlencode }}" target="_blank" rel="noopener">Category:{{ project.commons_category }}</a>
             </p>
         </div>
@@ -381,6 +407,14 @@
         <span class="badge badge-{{ project.status }} project-status-badge">{{ project.status }}</span>
     </div>
 </div>
+
+<div class="viewit-strip" id="viewitStrip">
+    <img src="https://upload.wikimedia.org/wikipedia/commons/d/d0/View_it%21_Tool_%28transparent%29.png" alt="View it!" loading="lazy">
+    {{ _('View all related media on Commons with') }}
+    <a href="https://view-it.toolforge.org/?q={{ project.wikidata_qid }}&amp;utm_source=WikiVisage" target="_blank" rel="noopener">View it! &nearr;</a>
+    <button class="viewit-strip-close" aria-label="{{ _('Close') }}" onclick="this.parentElement.remove();try{localStorage.setItem('viewit_dismissed','1')}catch(e){}">&times;</button>
+</div>
+<script>try{if(localStorage.getItem('viewit_dismissed')==='1'){var s=document.getElementById('viewitStrip');if(s)s.remove()}}catch(e){}</script>
 
 <div class="card" id="progressCard">
     {% if project.images_total == 0 %}

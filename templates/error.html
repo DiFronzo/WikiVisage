@@ -2,13 +2,183 @@
 
 {% block title %}{{ _('Error') }} {{ code }} - WikiVisage BETA{% endblock %}
 
+{% block extra_head %}
+{% if code == 404 %}
+<style>
+.scanner-container {
+    position: relative;
+    width: 180px;
+    height: 180px;
+    margin: 0 auto 2rem auto;
+    border: 2px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+    background: rgba(0, 0, 0, 0.2);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.scanner-corners {
+    position: absolute;
+    top: 0; left: 0; right: 0; bottom: 0;
+    pointer-events: none;
+}
+.scanner-corners::before, .scanner-corners::after {
+    content: '';
+    position: absolute;
+    width: 20px;
+    height: 20px;
+    border: 3px solid var(--primary);
+}
+.scanner-corners::before {
+    top: 15px; left: 15px;
+    border-right: none;
+    border-bottom: none;
+}
+.scanner-corners::after {
+    bottom: 15px; right: 15px;
+    border-left: none;
+    border-top: none;
+}
+
+.scanner-corners-2 {
+    position: absolute;
+    top: 0; left: 0; right: 0; bottom: 0;
+    pointer-events: none;
+}
+.scanner-corners-2::before {
+    content: '';
+    position: absolute;
+    width: 20px;
+    height: 20px;
+    border: 3px solid var(--primary);
+    top: 15px; right: 15px;
+    border-left: none;
+    border-bottom: none;
+}
+.scanner-corners-2::after {
+    content: '';
+    position: absolute;
+    width: 20px;
+    height: 20px;
+    border: 3px solid var(--primary);
+    bottom: 15px; left: 15px;
+    border-right: none;
+    border-top: none;
+}
+
+.scanner-face {
+    width: 70px;
+    height: 90px;
+    border: 3px solid var(--text-muted);
+    border-radius: 50% 50% 50% 50% / 60% 60% 40% 40%;
+    position: relative;
+    opacity: 0.2;
+}
+.scanner-face::before, .scanner-face::after {
+    content: '';
+    position: absolute;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--text-muted);
+    top: 30px;
+}
+.scanner-face::before { left: 15px; }
+.scanner-face::after { right: 15px; }
+
+.scanner-mouth {
+    position: absolute;
+    width: 24px;
+    height: 6px;
+    border-bottom: 3px solid var(--text-muted);
+    border-radius: 50%;
+    bottom: 18px;
+    left: 20px;
+}
+
+.scanner-line {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 2px;
+    background: var(--danger);
+    box-shadow: 0 0 12px 3px var(--danger);
+    animation: scan 2.5s infinite ease-in-out;
+}
+
+@keyframes scan {
+    0% { top: 0%; opacity: 0; }
+    15% { opacity: 1; }
+    85% { opacity: 1; }
+    100% { top: 100%; opacity: 0; }
+}
+
+.error-title-404 {
+    color: var(--danger);
+    font-size: 3.5rem;
+    margin-bottom: 0.5rem;
+    border: none;
+    font-weight: 800;
+    line-height: 1;
+}
+
+.error-subtitle-404 {
+    color: var(--text-main);
+    font-size: 1.5rem;
+    margin-bottom: 1.5rem;
+    border: none;
+    font-weight: 500;
+}
+
+.terminal-text {
+    font-family: monospace;
+    background: rgba(0, 0, 0, 0.4);
+    padding: 0.75rem 1.25rem;
+    border-radius: 4px;
+    display: inline-block;
+    margin-bottom: 1.5rem;
+    border: 1px solid var(--border);
+    color: var(--danger);
+    font-size: 0.95rem;
+    letter-spacing: 1px;
+}
+
+.error-desc-404 {
+    color: var(--text-muted);
+    margin-bottom: 2.5rem;
+    font-size: 1.1rem;
+    line-height: 1.6;
+}
+</style>
+{% endif %}
+{% endblock %}
+
 {% block content %}
 <div class="card" style="text-align: center; padding: 4rem 2rem; max-width: 600px; margin: 2rem auto;">
-    <h1 style="color: var(--danger); font-size: 4rem; margin-bottom: 0.5rem; border: none;">{{ code }}</h1>
-    <h2 style="border: none; margin-bottom: 2rem;">{{ _('Something went wrong') }}</h2>
-    
-    <p style="font-size: 1.25rem; color: var(--text-main); margin-bottom: 3rem;">{{ message }}</p>
-    
-    <a href="{{ url_for('index') }}" class="btn btn-primary">{{ _('Go Back Home') }}</a>
+    {% if code == 404 %}
+        <div class="scanner-container">
+            <div class="scanner-corners"></div>
+            <div class="scanner-corners-2"></div>
+            <div class="scanner-face">
+                <div class="scanner-mouth"></div>
+            </div>
+            <div class="scanner-line"></div>
+        </div>
+        <h1 class="error-title-404">404</h1>
+        <h2 class="error-subtitle-404">{{ _('Face Not Found') }}</h2>
+        <div class="terminal-text">&gt; {{ _('ERR_TARGET_ESCAPED_CLASSIFICATION') }}</div>
+        <p class="error-desc-404">{{ _('The page you are looking for has eluded our detection algorithms. It might have been deleted, moved, or never existed.') }}<br><br><em>({{ message }})</em></p>
+        <a href="{{ url_for('index') }}" class="btn btn-primary">{{ _('Go Back Home') }}</a>
+    {% else %}
+        <h1 style="color: var(--danger); font-size: 4rem; margin-bottom: 0.5rem; border: none;">{{ code }}</h1>
+        <h2 style="border: none; margin-bottom: 2rem;">{{ _('Something went wrong') }}</h2>
+        
+        <p style="font-size: 1.25rem; color: var(--text-main); margin-bottom: 3rem;">{{ message }}</p>
+        
+        <a href="{{ url_for('index') }}" class="btn btn-primary">{{ _('Go Back Home') }}</a>
+    {% endif %}
 </div>
 {% endblock %}

@@ -7671,3 +7671,19 @@ def test_robots_txt_returns_plain_text():
     assert "Allow: /leaderboard" in body
     assert "Disallow: /" in body
     assert "Sitemap:" in body
+    assert "sitemap.xml" in body
+
+
+def test_sitemap_xml_returns_valid_xml():
+    flask_app.config["TESTING"] = True
+    client = flask_app.test_client()
+
+    response = client.get("/sitemap.xml")
+
+    assert response.status_code == 200
+    assert response.content_type == "application/xml; charset=utf-8"
+    body = response.data.decode()
+    assert '<?xml version="1.0"' in body
+    assert "<urlset" in body
+    assert "<url><loc>" in body
+    assert "/leaderboard</loc></url>" in body

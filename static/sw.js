@@ -15,6 +15,7 @@ const CACHE_NAME = "wikivisage-v1";
 const PRECACHE_URLS = [
   "/static/wikivisage-logo.svg",
   "/static/wikivisage-logo-notext.svg",
+  "/static/powered-by-toolforge.svg",
   "/static/icon-192.png",
   "/static/icon-512.png"
 ];
