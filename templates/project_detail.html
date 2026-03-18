@@ -29,6 +29,9 @@
         background: var(--bg);
     }
     .result-thumb img {
+        position: absolute;
+        top: 0;
+        left: 0;
         width: 100%;
         height: 100%;
         object-fit: contain;
@@ -301,6 +304,14 @@
     .info-text-muted { color: var(--text-muted); margin-bottom: 0; }
     .info-text-muted-tip { color: var(--text-muted); margin-top: 0.5rem; margin-bottom: 0; }
     .info-link { color: var(--primary); }
+    .inference-banner { margin-top: 2rem; border-color: var(--primary); background: rgba(20, 184, 166, 0.06); }
+    .inference-banner-row { display: flex; align-items: center; gap: 0.75rem; }
+    .inference-spinner { width: 1.25rem; height: 1.25rem; border: 3px solid var(--border); border-top-color: var(--primary); border-radius: 50%; animation: spin 0.8s linear infinite; flex-shrink: 0; }
+    .inference-done-icon { flex-shrink: 0; color: var(--success); font-size: 1.25rem; line-height: 1; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .inference-banner-text { font-weight: 700; margin-bottom: 0; color: var(--primary); }
+    .inference-banner-done { border-color: var(--success); background: rgba(34, 197, 94, 0.06); }
+    .inference-banner-done .inference-banner-text { color: var(--success); }
     .action-buttons { margin: 3rem 0; display: flex; gap: 1rem; flex-wrap: wrap; }
     .btn-lg { font-size: 1.25rem; }
     .results-description { color: var(--text-muted); margin-bottom: 1.5rem; }
@@ -427,7 +438,7 @@
         <div class="stat-label">{{ _('SDC Written') }}</div>
     </div>
 <div class="stat-box stat-box-purple" data-stat="sdc_pending">
-    <div class="stat-value" id="statSdcPending">{{ stats.sdc_pending or 0 }}</div>
+    <div class="stat-value" id="statSdcPending">{{ (stats.sdc_pending or 0) + (stats.sdc_removal_pending_faces or 0) }}</div>
         <div class="stat-label">{{ _('SDC Pending') }}</div>
     </div>
 </div>
@@ -490,6 +501,26 @@
     </p>
     {% endif %}
     {% endif %}
+</div>
+{% endif %}
+
+{% set inference_running = inference_eligible > 0 and human_confirmed >= project.min_confirmed %}
+{% set inference_done = inference_triggered and not inference_running %}
+{% if inference_running %}
+<div class="card inference-banner" id="inferenceBanner" role="status" aria-live="polite">
+    <div class="inference-banner-row">
+        <div class="inference-spinner" id="inferenceSpinner" aria-hidden="true"></div>
+        <p class="inference-banner-text" id="inferenceText">
+            {{ ngettext('Model inference in progress — %(num)d face remaining…', 'Model inference in progress — %(num)d faces remaining…', inference_eligible, num=inference_eligible) }}
+        </p>
+    </div>
+</div>
+{% elif inference_done %}
+<div class="card inference-banner inference-banner-done" id="inferenceBanner" role="status" aria-live="polite">
+    <div class="inference-banner-row">
+        <span class="inference-done-icon" aria-hidden="true">✓</span>
+        <p class="inference-banner-text">{{ _('Model inference complete.') }}</p>
+    </div>
 </div>
 {% endif %}
 
@@ -670,7 +701,7 @@
                 var isBootstrapped = card.dataset.bootstrapped === '1';
                 var sdcWritten = card.dataset.sdcWritten === '1';
                 var source = card.dataset.source;
-                var nowSdcPending = (isTarget === 1 && !sdcWritten && source !== 'bootstrap' && !isBootstrapped);
+                var nowSdcPending = (isTarget === 1 && !sdcWritten && source !== 'bootstrap' && !isBootstrapped) || data.sdc_removal_queued;
                 card.dataset.sdcPending = nowSdcPending ? '1' : '0';
                 var sdcBadge = card.querySelector('[data-sdc-badge]');
                 if (nowSdcPending && !sdcBadge) {
@@ -758,9 +789,9 @@
         var faceH = bboxBottom - bboxTop;
         if (faceW <= 0 || faceH <= 0) return;  // Invalid bbox
 
-        // Add 30% padding around the face (clamped to image bounds in detection space)
-        var padX = faceW * 0.3;
-        var padY = faceH * 0.3;
+        // Add 80% padding around the face (clamped to image bounds in detection space)
+        var padX = faceW * 0.8;
+        var padY = faceH * 0.8;
         var cropLeft = Math.max(0, bboxLeft - padX);
         var cropTop = Math.max(0, bboxTop - padY);
         var cropRight = Math.min(detW, bboxRight + padX);
@@ -1096,11 +1127,13 @@
             info.appendChild(sdcBadge);
         }
 
-        var distance = document.createElement('span');
-        distance.className = 'result-distance';
-        distance.title = i18nGallery.distance;
-        distance.textContent = face.confidence !== null ? face.confidence.toFixed(3) : '\u2014';
-        info.appendChild(distance);
+        if (!face.classified_by_user_id) {
+            var distance = document.createElement('span');
+            distance.className = 'result-distance';
+            distance.title = i18nGallery.distance;
+            distance.textContent = face.confidence !== null ? face.confidence.toFixed(3) : '\u2014';
+            info.appendChild(distance);
+        }
 
         var method = document.createElement('span');
         method.className = 'result-method';
@@ -1622,6 +1655,85 @@
 
         pollTimer = setInterval(pollProgress, 5000);
         pollProgress();
+    })();
+    {% endif %}
+
+    // --- Inference progress live polling ---
+    {% if inference_running %}
+    (function() {
+        var apiProgressUrl = {{ url_for('api_progress', project_id=project.id)|tojson }};
+        var inferenceTimer = null;
+        var inferencePollInFlight = false;
+        var lastEligible = {{ inference_eligible }};
+        var i18nInference = {
+            inProgressOne: {{ _('Model inference in progress — {num} face remaining…')|tojson }},
+            inProgressMany: {{ _('Model inference in progress — {num} faces remaining…')|tojson }},
+            done: {{ _('Model inference complete — {matches} new matches found.')|tojson }}
+        };
+        var initialByModel = {{ (stats.by_model or 0)|tojson }};
+
+        function pollInference() {
+            if (inferencePollInFlight) return;
+            inferencePollInFlight = true;
+            fetch(apiProgressUrl).then(function(r) {
+                if (!r.ok) throw new Error('HTTP ' + r.status);
+                return r.json();
+            }).then(function(data) {
+                var banner = document.getElementById('inferenceBanner');
+                if (!banner) return;
+
+                var fs = data.face_stats || {};
+                var eligible = data.inference_eligible || 0;
+                var textEl = document.getElementById('inferenceText');
+
+                // Update stat boxes live
+                var statMap = {
+                    'statTotalFaces': fs.total_faces,
+                    'statMatches': fs.confirmed_matches,
+                    'statNonMatches': fs.confirmed_non_matches,
+                    'statUnclassified': fs.unclassified,
+                    'statSdcWritten': fs.sdc_written,
+                    'statSdcPending': fs.sdc_pending,
+                    'statByHuman': fs.by_human,
+                    'statByModel': fs.by_model,
+                    'statByBootstrap': fs.by_bootstrap
+                };
+                for (var id in statMap) {
+                    var el = document.getElementById(id);
+                    if (el) el.textContent = statMap[id] || 0;
+                }
+
+                if (eligible > 0) {
+                    // Still running
+                    var msg = eligible === 1 ? i18nInference.inProgressOne : i18nInference.inProgressMany;
+                    if (textEl) textEl.textContent = msg.replace('{num}', eligible);
+                    lastEligible = eligible;
+                } else {
+                    // Inference complete
+                    clearInterval(inferenceTimer);
+                    inferenceTimer = null;
+                    var newMatches = Math.max(0, (fs.by_model || 0) - initialByModel);
+                    banner.classList.add('inference-banner-done');
+                    var spinner = document.getElementById('inferenceSpinner');
+                    if (spinner) spinner.outerHTML = '<span class="inference-done-icon" aria-hidden="true">✓</span>';
+                    if (textEl) textEl.textContent = i18nInference.done.replace('{matches}', newMatches);
+
+                    // Also hide the info banner if visible (no longer relevant)
+                    var infoBanner = document.getElementById('infoBanner');
+                    if (infoBanner) infoBanner.style.display = 'none';
+
+                    // Refresh gallery to show new model results
+                    if (typeof loadGalleryPage === 'function') loadGalleryPage(1);
+                }
+            }).catch(function(e) {
+                console.error('Inference poll error:', e);
+            }).finally(function() {
+                inferencePollInFlight = false;
+            });
+        }
+
+        inferenceTimer = setInterval(pollInference, 5000);
+        pollInference();
     })();
     {% endif %}
 </script>

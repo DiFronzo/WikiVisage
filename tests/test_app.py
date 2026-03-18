@@ -7655,3 +7655,19 @@ def test_main_guard_runs_app(monkeypatch):
     assert kwargs["debug"] is True
     assert kwargs["host"] == "0.0.0.0"
     assert kwargs["port"] == 8765
+
+
+def test_robots_txt_returns_plain_text():
+    flask_app.config["TESTING"] = True
+    client = flask_app.test_client()
+
+    response = client.get("/robots.txt")
+
+    assert response.status_code == 200
+    assert response.content_type == "text/plain; charset=utf-8"
+    body = response.data.decode()
+    assert "User-agent: *" in body
+    assert "Allow: /$" in body
+    assert "Allow: /leaderboard" in body
+    assert "Disallow: /" in body
+    assert "Sitemap:" in body
