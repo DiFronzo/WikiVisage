@@ -700,20 +700,20 @@ msgid "Error"
 msgstr "Error"
 
 #: templates/error.html:171
+#, fuzzy
 msgid "Face Not Found"
-msgstr "Face Not Found"
+msgstr "Page not found"
 
 #: templates/error.html:172
+#, fuzzy
 msgid "ERR_TARGET_ESCAPED_CLASSIFICATION"
-msgstr "ERR_TARGET_ESCAPED_CLASSIFICATION"
+msgstr "Error saving classification"
 
 #: templates/error.html:173
 msgid ""
 "The page you are looking for has eluded our detection algorithms. It "
 "might have been deleted, moved, or never existed."
 msgstr ""
-"The page you are looking for has eluded our detection algorithms. It "
-"might have been deleted, moved, or never existed."
 
 #: templates/error.html:174 templates/error.html:181
 msgid "Go Back Home"

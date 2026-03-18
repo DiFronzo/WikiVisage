@@ -708,12 +708,14 @@ msgid "Error"
 msgstr "Feil"
 
 #: templates/error.html:171
+#, fuzzy
 msgid "Face Not Found"
-msgstr "Ansikt ikke funnet"
+msgstr "Siden ble ikke funnet"
 
 #: templates/error.html:172
+#, fuzzy
 msgid "ERR_TARGET_ESCAPED_CLASSIFICATION"
-msgstr "ERR_TARGET_ESCAPED_CLASSIFICATION"
+msgstr "Feil ved lagring av klassifisering"
 
 #: templates/error.html:173
 msgid ""

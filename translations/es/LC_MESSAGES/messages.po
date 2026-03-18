@@ -709,8 +709,9 @@ msgid "Error"
 msgstr "Error"
 
 #: templates/error.html:171
+#, fuzzy
 msgid "Face Not Found"
-msgstr "Rostro no encontrado"
+msgstr "Página no encontrada"
 
 #: templates/error.html:172
 #, fuzzy

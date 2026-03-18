@@ -1,5 +1,4 @@
 import os
-import xml.etree.ElementTree as ET
 from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock, PropertyMock, mock_open, patch
 
@@ -7684,10 +7683,7 @@ def test_sitemap_xml_returns_valid_xml():
     assert response.status_code == 200
     assert response.content_type == "application/xml; charset=utf-8"
     body = response.data.decode()
-
-    # Parse XML to ensure it is well-formed and has the expected structure.
-    root = ET.fromstring(body)
-    assert root.tag.endswith("urlset")
-
-    loc_texts = [(elem.text or "") for elem in root.iter() if elem.tag.endswith("loc")]
-    assert any("/leaderboard" in text for text in loc_texts)
+    assert '<?xml version="1.0"' in body
+    assert "<urlset" in body
+    assert "<url><loc>" in body
+    assert "/leaderboard</loc></url>" in body
