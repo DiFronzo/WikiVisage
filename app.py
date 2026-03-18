@@ -2627,10 +2627,7 @@ def api_gallery(project_id: int):
             and face["sdc_written"] == 0
             and face["classified_by"] != "bootstrap"
             and face["bootstrapped"] == 0
-        ) or (
-            face["sdc_removal_pending"] == 1
-            and not face["has_confirmed_target_sibling"]
-        )
+        ) or (face["sdc_removal_pending"] == 1 and not face["has_confirmed_target_sibling"])
         if face["is_target"] == 0 and face["classified_by_user_id"]:
             result_type = "rejected"
         elif face["is_target"] == 1:
