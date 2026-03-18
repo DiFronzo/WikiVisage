@@ -712,9 +712,8 @@ msgid "Face Not Found"
 msgstr "Ansikt ikke funnet"
 
 #: templates/error.html:172
-#, fuzzy
 msgid "ERR_TARGET_ESCAPED_CLASSIFICATION"
-msgstr "Feil ved lagring av klassifisering"
+msgstr "ERR_TARGET_ESCAPED_CLASSIFICATION"
 
 #: templates/error.html:173
 msgid ""
