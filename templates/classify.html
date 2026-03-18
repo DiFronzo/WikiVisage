@@ -264,7 +264,6 @@
         box-shadow: 8px 8px 0px rgba(239, 68, 68, 0.5);
         color: white;
     }
-    .header-back { color: var(--text-muted); text-decoration: none; margin-right: 0.5rem; }
     .header-project-link { color: var(--text-main); text-decoration: none; }
     .badge-review { font-size: 1.1rem; padding: 0.6rem 0.9rem; background-color: var(--warning); color: var(--bg); }
     .badge-remaining { font-size: 1.25rem; padding: 0.75rem 1rem; }
@@ -286,7 +285,7 @@
 
 {% block content %}
 <div class="header-actions">
-    <h1><a href="{{ url_for('project_detail', project_id=project.id) }}" class="header-back" title="{{ _('Back to Project') }}" aria-label="{{ _('Back to Project') }}">&larr;</a><a href="{{ url_for('project_detail', project_id=project.id) }}" class="header-project-link">{{ project.label or project.wikidata_qid }}</a></h1>
+    <h1><a href="{{ url_for('project_detail', project_id=project.id) }}" class="header-project-link" title="{{ _('Back to Project') }}" aria-label="{{ _('Back to Project') }}">&larr; {{ project.label or project.wikidata_qid }}</a></h1>
     {% if reviewing_model %}
     <span class="badge badge-review">
         {{ ngettext('%(num)d model rejection to review', '%(num)d model rejections to review', model_review_count, num=model_review_count) }}
@@ -351,7 +350,7 @@
 
         {% set clean_title = image.file_title[5:] if image.file_title.startswith('File:') else image.file_title %}
 
-        <div class="face-info">{{ clean_title }}</div>
+        <div class="face-info"><a href="https://commons.wikimedia.org/wiki/{{ image.file_title | urlencode }}" target="_blank" rel="noopener" style="color: inherit; text-decoration: none;">{{ clean_title }}</a></div>
 
         {% if faces | length > 1 %}
             {% if reviewing_model %}

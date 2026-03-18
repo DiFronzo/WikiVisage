@@ -1348,6 +1348,8 @@ def project_detail(project_id: int):
     except DatabaseError:
         pass
 
+    inference_triggered = request.args.get("inference_triggered") == "1"
+
     return render_template(
         "project_detail.html",
         project=project,
@@ -1355,6 +1357,7 @@ def project_detail(project_id: int):
         gallery_total=gallery_total,
         pending_images=pending_images,
         inference_eligible=inference_eligible,
+        inference_triggered=inference_triggered,
     )
 
 
@@ -2527,7 +2530,8 @@ def api_gallery(project_id: int):
 
     if sdc_filter == "sdc-pending":
         filter_clauses.append(
-            "(f.is_target = 1 AND f.sdc_written = 0 AND f.classified_by != 'bootstrap' AND i.bootstrapped = 0)"
+            "((f.is_target = 1 AND f.sdc_written = 0 AND f.classified_by != 'bootstrap' AND i.bootstrapped = 0)"
+            " OR f.sdc_removal_pending = 1)"
         )
 
     where = base_where
@@ -2555,7 +2559,7 @@ def api_gallery(project_id: int):
                 "  SUM(CASE WHEN f.classified_by = 'model' AND f.classified_by_user_id IS NULL THEN 1 ELSE 0 END) AS source_model, "
                 "  SUM(CASE WHEN f.classified_by = 'bootstrap' AND f.classified_by_user_id IS NULL THEN 1 ELSE 0 END) AS source_bootstrap, "
                 "  SUM(CASE WHEN f.classified_by_user_id IS NOT NULL THEN 1 ELSE 0 END) AS source_human, "
-                "  SUM(CASE WHEN f.is_target = 1 AND f.sdc_written = 0 AND f.classified_by != 'bootstrap' AND i.bootstrapped = 0 THEN 1 ELSE 0 END) AS sdc_pending "
+                "  SUM(CASE WHEN (f.is_target = 1 AND f.sdc_written = 0 AND f.classified_by != 'bootstrap' AND i.bootstrapped = 0) OR f.sdc_removal_pending = 1 THEN 1 ELSE 0 END) AS sdc_pending "
                 f"FROM faces f JOIN images i ON f.image_id = i.id WHERE {base_where}",  # noqa: S608
                 (project_id,),
             )
@@ -2585,7 +2589,7 @@ def api_gallery(project_id: int):
         face_rows = execute_query(
             "SELECT f.id, f.image_id, f.is_target, f.confidence, f.classified_by, "
             "  f.bbox_top, f.bbox_right, f.bbox_bottom, f.bbox_left, "
-            "  f.sdc_written, f.classified_by_user_id, "
+            "  f.sdc_written, f.sdc_removal_pending, f.classified_by_user_id, "
             "  i.file_title, i.commons_page_id, "
             "  i.detection_width, i.detection_height, i.bootstrapped "
             "FROM faces f "
@@ -2610,7 +2614,7 @@ def api_gallery(project_id: int):
             and face["sdc_written"] == 0
             and face["classified_by"] != "bootstrap"
             and face["bootstrapped"] == 0
-        )
+        ) or (face["sdc_removal_pending"] == 1)
         if face["is_target"] == 0 and face["classified_by_user_id"]:
             result_type = "rejected"
         elif face["is_target"] == 1:
@@ -2690,7 +2694,7 @@ def api_progress(project_id: int):
             "  SUM(CASE WHEN f.is_target = 0 THEN 1 ELSE 0 END) AS confirmed_non_matches, "
             "  SUM(CASE WHEN f.is_target IS NULL THEN 1 ELSE 0 END) AS unclassified, "
             "  SUM(CASE WHEN f.sdc_written = 1 THEN 1 ELSE 0 END) AS sdc_written, "
-            "  SUM(CASE WHEN f.is_target = 1 AND f.sdc_written = 0 AND f.classified_by != 'bootstrap' AND i.bootstrapped = 0 THEN 1 ELSE 0 END) AS sdc_pending, "
+            "  SUM(CASE WHEN (f.is_target = 1 AND f.sdc_written = 0 AND f.classified_by != 'bootstrap' AND i.bootstrapped = 0) OR f.sdc_removal_pending = 1 THEN 1 ELSE 0 END) AS sdc_pending, "
             "  SUM(CASE WHEN f.classified_by_user_id IS NOT NULL THEN 1 ELSE 0 END) AS by_human, "
             "  SUM(CASE WHEN f.classified_by = 'model' AND f.classified_by_user_id IS NULL THEN 1 ELSE 0 END) AS by_model, "
             "  SUM(CASE WHEN f.classified_by = 'bootstrap' AND f.classified_by_user_id IS NULL THEN 1 ELSE 0 END) AS by_bootstrap "
@@ -2869,6 +2873,9 @@ def project_rerun_inference(project_id: int):
         flash(_("Settings have not changed since the last inference run. No re-run needed."), "info")
         return redirect(url_for("project_settings", project_id=project_id))
 
+    affected = 0
+    inference_will_run = False
+
     try:
 
         def _reset_inference(conn, cursor):
@@ -2926,6 +2933,7 @@ def project_rerun_inference(project_id: int):
             by_bootstrap = (stats[0]["by_bootstrap"] or 0) if stats else 0
             min_confirmed = int(project["min_confirmed"])
             if human_confirmed >= min_confirmed:
+                inference_will_run = True
                 flash(
                     _(
                         "You have %(confirmed)d/%(min)d human-confirmed target faces — "
@@ -2961,7 +2969,9 @@ def project_rerun_inference(project_id: int):
         logger.exception("Failed to reset model-classified faces")
         flash(_("Failed to re-run inference."), "error")
 
-    return redirect(url_for("project_settings", project_id=project_id))
+    if affected and inference_will_run:
+        return redirect(url_for("project_detail", project_id=project_id, inference_triggered="1"))
+    return redirect(url_for("project_detail", project_id=project_id))
 
 
 @app.route("/project/<int:project_id>/delete", methods=["POST"])
@@ -3108,6 +3118,21 @@ def health():
         return jsonify({"status": "unhealthy", "error": "database unavailable"}), 503
 
     return jsonify({"status": "unhealthy"}), 503
+
+
+@app.route("/robots.txt")
+@limiter.exempt
+def robots_txt():
+    """Serve robots.txt to override Toolforge default (Disallow: /)."""
+    lines = [
+        "User-agent: *",
+        "Allow: /$",
+        "Allow: /leaderboard",
+        "Disallow: /",
+        "",
+        f"Sitemap: {request.url_root}sitemap.xml",
+    ]
+    return "\n".join(lines), 200, {"Content-Type": "text/plain; charset=utf-8"}
 
 
 @app.route("/commons-thumb/<path:file_title>")
