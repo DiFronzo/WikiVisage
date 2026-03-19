@@ -1,4 +1,5 @@
 import os
+import xml.etree.ElementTree as ET
 from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock, PropertyMock, mock_open, patch
 
@@ -6,7 +7,6 @@ import numpy as np
 import pytest
 import requests
 from flask import Response, abort, g, session
-import xml.etree.ElementTree as ET
 
 from database import DatabaseError
 
