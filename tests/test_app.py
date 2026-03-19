@@ -6025,6 +6025,106 @@ def test_api_sdc_status_counts_query_db_error(monkeypatch, fake_user):
     assert response.get_json()["error"] == "Database error"
 
 
+# ── /api/stop-sdc/<id> ──────────────────────────────────────────────
+
+
+def test_api_stop_sdc_csrf_fail(monkeypatch, fake_user):
+    client = _make_authed_client(monkeypatch, fake_user)
+
+    response = client.post("/api/stop-sdc/1", data={"csrf_token": "wrong"})
+
+    assert response.status_code == 400
+    assert response.get_json()["error"] == "Invalid CSRF token"
+
+
+def test_api_stop_sdc_project_not_found(monkeypatch, fake_user):
+    def route_execute(sql, _params, _fetch):
+        if "SELECT * FROM projects WHERE id" in sql:
+            return []
+        raise AssertionError(f"Unexpected SQL: {sql}")
+
+    client = _make_authed_client(monkeypatch, fake_user, route_execute)
+    _set_csrf_chunk6(client)
+
+    response = client.post("/api/stop-sdc/123", data={"csrf_token": "testtoken"})
+
+    assert response.status_code == 404
+    assert "Project not found" in response.get_json()["error"]
+
+
+def test_api_stop_sdc_project_query_db_error(monkeypatch, fake_user):
+    def route_execute(sql, _params, _fetch):
+        if "SELECT * FROM projects WHERE id" in sql:
+            raise app_module.DatabaseError("boom")
+        raise AssertionError(f"Unexpected SQL: {sql}")
+
+    client = _make_authed_client(monkeypatch, fake_user, route_execute)
+    _set_csrf_chunk6(client)
+
+    response = client.post("/api/stop-sdc/1", data={"csrf_token": "testtoken"})
+
+    assert response.status_code == 500
+    assert response.get_json()["error"] == "Database error"
+
+
+def test_api_stop_sdc_not_in_progress(monkeypatch, fake_user):
+    def route_execute(sql, _params, _fetch):
+        if "SELECT * FROM projects WHERE id" in sql:
+            return [{"id": 1, "user_id": 1, "status": "active", "sdc_write_requested": 0}]
+        raise AssertionError(f"Unexpected SQL: {sql}")
+
+    client = _make_authed_client(monkeypatch, fake_user, route_execute)
+    _set_csrf_chunk6(client)
+
+    response = client.post("/api/stop-sdc/1", data={"csrf_token": "testtoken"})
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert payload["status"] == "ok"
+    assert payload["message"] == "not_in_progress"
+
+
+def test_api_stop_sdc_success(monkeypatch, fake_user):
+    updates = []
+
+    def route_execute(sql, params, fetch):
+        if "SELECT * FROM projects WHERE id" in sql:
+            return [{"id": 1, "user_id": 1, "status": "active", "sdc_write_requested": 1}]
+        if "UPDATE projects SET sdc_write_requested = 0" in sql:
+            updates.append(sql)
+            return 1
+        raise AssertionError(f"Unexpected SQL: {sql}")
+
+    client = _make_authed_client(monkeypatch, fake_user, route_execute)
+    _set_csrf_chunk6(client)
+
+    response = client.post("/api/stop-sdc/1", data={"csrf_token": "testtoken"})
+    payload = response.get_json()
+
+    assert response.status_code == 200
+    assert payload["status"] == "ok"
+    assert "message" not in payload
+    assert len(updates) == 1
+    assert "sdc_write_error = NULL" in updates[0]
+
+
+def test_api_stop_sdc_update_db_error(monkeypatch, fake_user):
+    def route_execute(sql, _params, _fetch):
+        if "SELECT * FROM projects WHERE id" in sql:
+            return [{"id": 1, "user_id": 1, "status": "active", "sdc_write_requested": 1}]
+        if "UPDATE projects SET sdc_write_requested = 0" in sql:
+            raise app_module.DatabaseError("boom")
+        raise AssertionError(f"Unexpected SQL: {sql}")
+
+    client = _make_authed_client(monkeypatch, fake_user, route_execute)
+    _set_csrf_chunk6(client)
+
+    response = client.post("/api/stop-sdc/1", data={"csrf_token": "testtoken"})
+
+    assert response.status_code == 500
+    assert response.get_json()["error"] == "Database error"
+
+
 def test_api_progress_project_not_found(monkeypatch, fake_user):
     def route_execute(sql, _params, _fetch):
         if "SELECT * FROM projects WHERE id" in sql:

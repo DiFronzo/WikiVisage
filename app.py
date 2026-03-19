@@ -796,6 +796,7 @@ def oauth_callback():
 
 
 @app.route("/logout", methods=["POST"])
+@login_required
 def logout():
     """Clear session and log out."""
     if not _validate_csrf():
@@ -2403,6 +2404,11 @@ def api_write_sdc(project_id: int):
     if write_count == 0 and removal_count == 0:
         return jsonify({"status": "ok", "pending": 0, "removal_pending": 0})
 
+    # Refresh token now so the worker has a valid one for API calls
+    token = _get_valid_token()
+    if token is None:
+        return jsonify({"error": _("Your session has expired. Please log out and log in again to re-authorize.")}), 401
+
     # Set the flag for the worker to pick up
     try:
         execute_query(
@@ -2467,6 +2473,37 @@ def api_sdc_status(project_id: int):
             "error": project["sdc_write_error"],
         }
     )
+
+
+@app.route("/api/stop-sdc/<int:project_id>", methods=["POST"])
+@login_required
+@limiter.limit("10 per minute")
+def api_stop_sdc(project_id: int):
+    """Cancel an in-progress SDC write.  Clears sdc_write_requested so the
+    worker stops at the next batch boundary."""
+    if not _validate_csrf():
+        return jsonify({"error": _("Invalid CSRF token")}), 400
+
+    try:
+        project = get_project_for_user(project_id, g.user["id"])
+        if not project:
+            return jsonify({"error": _("Project not found or access denied")}), 404
+    except DatabaseError:
+        return jsonify({"error": _("Database error")}), 500
+
+    if not project["sdc_write_requested"]:
+        return jsonify({"status": "ok", "message": "not_in_progress"})
+
+    try:
+        execute_query(
+            "UPDATE projects SET sdc_write_requested = 0, sdc_write_error = NULL WHERE id = %s",
+            (project_id,),
+            fetch=False,
+        )
+    except DatabaseError:
+        return jsonify({"error": _("Database error")}), 500
+
+    return jsonify({"status": "ok"})
 
 
 @app.route("/api/project/<int:project_id>/gallery", methods=["GET"])
