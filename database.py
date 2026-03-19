@@ -143,11 +143,24 @@ def _get_connection_from_pool(timeout: float = 30.0) -> pymysql.Connection:
         # Health check - reconnect if dead
         if not _is_connection_alive(conn):
             logger.warning("Retrieved dead connection from pool, creating new one")
+            # Create replacement BEFORE closing dead conn to avoid pool shrink
+            # if _create_connection() fails.
+            try:
+                new_conn = _create_connection()
+            except Exception:
+                # Replacement failed — return the dead conn to the pool so the
+                # pool slot isn't permanently lost, then re-raise.
+                try:
+                    _pool.put_nowait(conn)
+                except Full:
+                    pass
+                raise
+            # Replacement succeeded — now safe to close the dead one.
             try:
                 conn.close()
             except Exception:
                 pass
-            conn = _create_connection()
+            conn = new_conn
 
         return conn
 
@@ -187,18 +200,33 @@ def _return_connection_to_pool(conn: pymysql.Connection) -> None:
                 except Exception:
                     pass
         else:
-            logger.debug("Connection already closed, not returning to pool")
+            logger.debug("Connection closed, creating replacement to maintain pool size")
+            replacement = None
+            try:
+                replacement = _create_connection()
+                _pool.put_nowait(replacement)
+            except Full:
+                logger.debug("Pool full, discarding replacement connection")
+                if replacement:
+                    try:
+                        replacement.close()
+                    except Exception:
+                        pass
+            except Exception:
+                logger.warning("Failed to create replacement connection for pool", exc_info=True)
     except Exception:
         logger.warning("Unexpected error returning connection to pool", exc_info=True)
 
 
-def _execute_with_retry(func: Callable[..., Any], *args, **kwargs) -> Any:
+def _execute_with_retry(func: Callable[..., Any], *args, allow_retry: bool = True, **kwargs) -> Any:
     """
     Execute a function with exponential backoff retry logic.
 
     Args:
         func: The function to execute.
         *args: Positional arguments to pass to func.
+        allow_retry: If False, execute once without retrying (for write operations
+            where retrying could cause duplicate inserts).
         **kwargs: Keyword arguments to pass to func.
 
     Returns:
@@ -207,26 +235,26 @@ def _execute_with_retry(func: Callable[..., Any], *args, **kwargs) -> Any:
     Raises:
         DatabaseError: If all retries fail.
     """
+    max_attempts = MAX_RETRIES if allow_retry else 1
     last_exception: Exception | None = None
 
-    for attempt in range(MAX_RETRIES):
+    for attempt in range(max_attempts):
         try:
             return func(*args, **kwargs)
         except (OperationalError, InterfaceError, PoolExhaustedError) as e:
             last_exception = e
-            if attempt < MAX_RETRIES - 1:
+            if attempt < max_attempts - 1:
                 backoff = INITIAL_BACKOFF * (2**attempt)
                 logger.warning(
-                    f"Database operation failed (attempt {attempt + 1}/{MAX_RETRIES}): {e}. Retrying in {backoff}s..."
+                    f"Database operation failed (attempt {attempt + 1}/{max_attempts}): {e}. Retrying in {backoff}s..."
                 )
                 time.sleep(backoff)
             else:
-                logger.error(f"Database operation failed after {MAX_RETRIES} attempts: {e}")
+                logger.error(f"Database operation failed after {max_attempts} attempts: {e}")
 
     if last_exception is not None:
-        raise last_exception
-    else:
-        raise DatabaseError("Retry logic failed without capturing an exception")
+        raise DatabaseError(f"Database operation failed: {last_exception}") from last_exception
+    raise DatabaseError("Retry logic failed without capturing an exception")
 
 
 @contextmanager
@@ -259,6 +287,11 @@ def get_connection(timeout: float = 30.0):
                 conn.rollback()
             except Exception as rollback_error:
                 logger.error(f"Rollback failed: {rollback_error}")
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                conn = None
         raise
     finally:
         if conn:
@@ -351,7 +384,7 @@ def execute_insert(sql: str, params: tuple | dict | None = None) -> int:
             return cursor.lastrowid
 
     try:
-        return _execute_with_retry(_execute)
+        return _execute_with_retry(_execute, allow_retry=False)
     except Exception as e:
         logger.error(f"Insert execution failed: {sql[:100]}... Error: {e}")
         raise DatabaseError(f"Insert execution failed: {e}") from e
@@ -393,7 +426,7 @@ def execute_transaction(
             return result
 
     try:
-        return _execute_with_retry(_execute)
+        return _execute_with_retry(_execute, allow_retry=False)
     except Exception as e:
         logger.error(f"Transaction execution failed: {e}")
         raise DatabaseError(f"Transaction execution failed: {e}") from e

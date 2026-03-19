@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from dotenv import load_dotenv
@@ -67,6 +68,14 @@ MAX_IMAGES_PER_PROJECT = 9000
 
 # Maximum images the bootstrap (P180 seeding) will fetch — keeps slots free for untagged category images
 MAX_BOOTSTRAP_IMAGES = 1000
+
+OAUTH_CLIENT_ID = os.environ.get("OAUTH_CLIENT_ID", "")
+OAUTH_CLIENT_SECRET = os.environ.get("OAUTH_CLIENT_SECRET", "")
+OAUTH_TOKEN_URL = "https://meta.wikimedia.org/w/rest.php/oauth2/access_token"
+TOKEN_REFRESH_BUFFER = 300
+
+# Maximum number of token refresh retries per SDC write session
+MAX_TOKEN_RETRIES = 2
 
 
 # Non-image file extensions to skip during category traversal (video, audio)
@@ -165,6 +174,7 @@ def _api_request(
                 except (TypeError, ValueError):
                     retry_after = 5.0
                 logger.warning(f"Maxlag encountered (503). Sleeping for {retry_after} seconds.")
+                resp.close()
                 time.sleep(retry_after)
                 continue
 
@@ -181,6 +191,7 @@ def _api_request(
                         except (TypeError, ValueError):
                             retry_after = 5.0
                         logger.warning(f"Maxlag encountered (200). Sleeping for {retry_after} seconds.")
+                        resp.close()
                         time.sleep(retry_after)
                         continue
                 except ValueError:
@@ -249,6 +260,85 @@ def _get_csrf_token(access_token: str) -> str:
     except Exception as e:
         logger.error(f"Failed to get CSRF token: {e}")
         raise
+
+
+def _refresh_worker_token(user_id: int) -> str | None:
+    """Refresh an expired OAuth access token for SDC writes.
+
+    Reads refresh_token from DB, calls the OAuth token endpoint,
+    and updates the DB with the new credentials. Returns the new
+    access_token or None if refresh failed.
+    """
+    user_row = execute_query(
+        "SELECT access_token, refresh_token, token_expires_at FROM users WHERE id = %s",
+        (user_id,),
+        fetch=True,
+    )
+    if not user_row:
+        return None
+
+    user = user_row[0]
+    access_token = user["access_token"]
+    if isinstance(access_token, bytes):
+        access_token = access_token.decode("utf-8")
+    refresh_token = user.get("refresh_token", "")
+    if isinstance(refresh_token, bytes):
+        refresh_token = refresh_token.decode("utf-8")
+
+    expires_at = user.get("token_expires_at")
+    if expires_at:
+        if isinstance(expires_at, str):
+            expires_at = datetime.fromisoformat(expires_at)
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=UTC)
+        now = datetime.now(UTC)
+        if (expires_at - now).total_seconds() > TOKEN_REFRESH_BUFFER:
+            return access_token
+
+    if not refresh_token:
+        logger.error(f"No refresh token for user {user_id}, cannot refresh")
+        return None
+
+    logger.info(f"Refreshing access token for user {user_id} (worker)")
+    try:
+        resp = _get_session().post(
+            OAUTH_TOKEN_URL,
+            data={
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+                "client_id": OAUTH_CLIENT_ID,
+                "client_secret": OAUTH_CLIENT_SECRET,
+            },
+            headers={"User-Agent": USER_AGENT},
+            timeout=30,
+        )
+        try:
+            resp.raise_for_status()
+            new_token = resp.json()
+        finally:
+            resp.close()
+    except Exception:
+        logger.exception(f"Failed to refresh access token for user {user_id}")
+        return None
+
+    new_access = new_token.get("access_token")
+    if not new_access:
+        logger.error(f"Token refresh response missing access_token for user {user_id}")
+        return None
+
+    new_refresh = new_token.get("refresh_token", refresh_token)
+    new_expires_at = datetime.now(UTC) + timedelta(seconds=new_token.get("expires_in", 14400))
+
+    try:
+        execute_query(
+            "UPDATE users SET access_token = %s, refresh_token = %s, token_expires_at = %s WHERE id = %s",
+            (new_access, new_refresh, new_expires_at.strftime("%Y-%m-%d %H:%M:%S"), user_id),
+            fetch=False,
+        )
+    except DatabaseError:
+        logger.exception(f"Failed to persist refreshed token for user {user_id}")
+
+    return new_access
 
 
 def traverse_category(project: dict[str, Any]) -> int:
@@ -500,7 +590,6 @@ class FaceDetectPool:
         proc = multiprocessing.Process(
             target=_face_detect_worker_loop,
             args=(self._task_queue, self._result_queue, worker_id),
-            daemon=True,
         )
         proc.start()
         if worker_id < len(self._workers):
@@ -635,6 +724,14 @@ class FaceDetectPool:
         if self._dispatcher_thread is not None:
             self._dispatcher_thread.join(timeout=5)
 
+        # 5. Close and join multiprocessing queues to release OS resources
+        for q in (self._task_queue, self._result_queue):
+            try:
+                q.close()
+                q.join_thread()
+            except Exception:
+                pass
+
         with self._workers_lock:
             self._workers.clear()
         logger.info("Face detection subprocess pool shut down")
@@ -686,7 +783,22 @@ def _run_face_detection_fallback(
     proc.start()
     child_conn.close()
 
-    if parent_conn.poll(FACE_DETECT_TIMEOUT):
+    elapsed = 0.0
+    poll_slice = 2.0
+    got_result = False
+    while elapsed < FACE_DETECT_TIMEOUT:
+        if shutdown_requested:
+            parent_conn.close()
+            proc.kill()
+            proc.join(timeout=5)
+            raise InterruptedError("Worker shutting down during face detection")
+        wait = min(poll_slice, FACE_DETECT_TIMEOUT - elapsed)
+        if parent_conn.poll(wait):
+            got_result = True
+            break
+        elapsed += wait
+
+    if got_result:
         result = parent_conn.recv()
         parent_conn.close()
         proc.join(timeout=5)
@@ -864,7 +976,7 @@ def process_images(project: dict[str, Any]) -> int:
                 logger.error(f"Thread error processing {futures[future]}: {e}")
 
     batch_elapsed = time.monotonic() - batch_start
-    batch_size = len(pending_images) if isinstance(pending_images, list) else 0
+    batch_size = len(pending_images) if pending_images else 0
     per_image = batch_elapsed / batch_size if batch_size > 0 else 0
     logger.info(
         f"Batch complete: {processed_count}/{batch_size} images in {batch_elapsed:.1f}s "
@@ -1137,8 +1249,25 @@ def run_autonomous_inference(project: dict[str, Any]) -> int:
     # Load all confirmed encodings to compute centroid. Each encoding is 128 float64
     # values (1024 bytes). Even 10K confirmed faces = ~10 MB — well within Toolforge
     # memory limits. Batching would add complexity with no practical benefit.
-    confirmed_encodings = [np.frombuffer(row["encoding"], dtype=np.float64) for row in confirmed_rows]
-    centroid = np.mean(confirmed_encodings, axis=0)
+    confirmed_encodings = []
+    for row in confirmed_rows:
+        enc = row["encoding"]
+        if enc is None or len(enc) != 1024:
+            logger.warning(
+                f"Skipping confirmed face with invalid encoding length ({len(enc) if enc else 'None'} bytes)"
+            )
+            continue
+        confirmed_encodings.append(np.frombuffer(enc, dtype=np.float64))
+
+    if not confirmed_encodings:
+        logger.warning(f"Project {project['id']}: all confirmed encodings invalid, skipping inference")
+        return 0
+
+    try:
+        centroid = np.mean(confirmed_encodings, axis=0)
+    except Exception:
+        logger.exception(f"Project {project['id']}: failed to compute centroid")
+        return 0
     t_centroid = time.monotonic()
 
     # Select candidate faces for model classification. A face is eligible only if:
@@ -1160,7 +1289,7 @@ def run_autonomous_inference(project: dict[str, Any]) -> int:
         fetch=True,
     )
 
-    candidate_count = len(unclassified_rows) if isinstance(unclassified_rows, list) else 0
+    candidate_count = len(unclassified_rows) if unclassified_rows else 0
     logger.info(
         f"Project {project['id']}: {candidate_count} candidate faces for inference (non-bootstrap, no human edits)"
     )
@@ -1181,7 +1310,13 @@ def run_autonomous_inference(project: dict[str, Any]) -> int:
         if shutdown_requested:
             break
 
-        encoding = np.frombuffer(row["encoding"], dtype=np.float64)
+        enc = row["encoding"]
+        if enc is None or len(enc) != 1024:
+            logger.warning(
+                f"Skipping candidate face {row['id']} with invalid encoding ({len(enc) if enc else 'None'} bytes)"
+            )
+            continue
+        encoding = np.frombuffer(enc, dtype=np.float64)
         distance = face_recognition.face_distance([centroid], encoding)[0]
         face_distances.append((row["id"], row["image_id"], float(distance)))
 
@@ -1264,6 +1399,23 @@ def run_autonomous_inference(project: dict[str, Any]) -> int:
     return classified_count
 
 
+# Map Wikimedia API error codes to user-friendly messages
+_SDC_ERROR_MESSAGES: dict[str, str] = {
+    "permissiondenied": "Your account lacks edit permissions. Please re-register the OAuth consumer with the 'Edit existing pages' grant.",
+    "notloggedin": "Your session has expired. Please log in again.",
+    "badtoken": "Authentication token expired. Please try again or log in again.",
+    "protectedpage": "This page is protected and cannot be edited.",
+    "ratelimited": "Too many edits in a short period. Please wait and try again.",
+    "readonly": "The Wikimedia database is currently in read-only mode. Please try again later.",
+    "maxlag": "The Wikimedia servers are busy. Please try again later.",
+}
+
+
+def _sdc_error_message(error_code: str, error_info: str) -> str:
+    """Return a user-friendly error message for an SDC API error code."""
+    return _SDC_ERROR_MESSAGES.get(error_code, f"{error_code}: {error_info}")
+
+
 def write_sdc_claims(project: dict[str, Any]) -> int:
     """Write SDC P180 claims for all faces marked as target.
 
@@ -1271,27 +1423,19 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
     clears the flag when done (or sets sdc_write_error on failure).
     """
     project_id = project["id"]
+    user_id = project["user_id"]
     logger.info(f"Starting SDC writes for project {project_id}")
 
-    # Get user token
-    user_row = execute_query(
-        "SELECT access_token FROM users WHERE id = %s",
-        (project["user_id"],),
-        fetch=True,
-    )
-
-    if not user_row:
-        logger.error(f"User {project['user_id']} not found for SDC writes")
+    access_token = _refresh_worker_token(user_id)
+    if not access_token:
+        logger.error(f"Cannot obtain valid token for user {user_id}, aborting SDC writes")
         execute_query(
-            "UPDATE projects SET sdc_write_requested = 0, sdc_write_error = 'User not found' WHERE id = %s",
+            "UPDATE projects SET sdc_write_requested = 0, "
+            "sdc_write_error = 'Token expired or user not found. Please log in again.' WHERE id = %s",
             (project_id,),
             fetch=False,
         )
         return 0
-
-    access_token = user_row[0]["access_token"]
-    if isinstance(access_token, bytes):
-        access_token = access_token.decode("utf-8")
 
     try:
         csrf_token = _get_csrf_token(access_token)
@@ -1317,9 +1461,23 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
         return 0
 
     total_written = 0
+    token_retries = 0
     SDC_BATCH = 50  # Faces per DB fetch batch
 
     while not shutdown_requested:
+        # Check if user cancelled the write via the stop button
+        try:
+            cancel_check = execute_query(
+                "SELECT sdc_write_requested FROM projects WHERE id = %s",
+                (project_id,),
+                fetch=True,
+            )
+            if not cancel_check or cancel_check[0]["sdc_write_requested"] == 0:
+                logger.info(f"SDC write cancelled by user for project {project_id} ({total_written} written so far)")
+                return total_written
+        except DatabaseError:
+            pass  # Non-fatal: continue writing if we can't check
+
         # Fetch next batch of unwritten faces
         faces_to_write = execute_query(
             """
@@ -1335,7 +1493,7 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
             fetch=True,
         )
 
-        if not faces_to_write or not isinstance(faces_to_write, list) or len(faces_to_write) == 0:
+        if not faces_to_write:
             break
 
         for row in faces_to_write:
@@ -1419,20 +1577,41 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
                 if "error" in edit_json:
                     error_code = edit_json["error"].get("code")
                     error_info = edit_json["error"].get("info", "Unknown error")
-                    if error_code == "badtoken":
-                        # Refresh token and retry this face
+                    if error_code in ("badtoken", "permissiondenied", "notloggedin"):
+                        token_retries += 1
+                        if token_retries > MAX_TOKEN_RETRIES:
+                            msg = _sdc_error_message(error_code, error_info)
+                            logger.error(f"SDC token retry limit reached for project {project_id}: {error_code}")
+                            execute_query(
+                                "UPDATE projects SET sdc_write_requested = 0, sdc_write_error = %s WHERE id = %s",
+                                (msg, project_id),
+                                fetch=False,
+                            )
+                            return total_written
+                        # Try refreshing the access token first
+                        refreshed = _refresh_worker_token(user_id)
+                        if refreshed:
+                            access_token = refreshed
+                            claim_headers = {"Authorization": f"Bearer {access_token}"}
                         try:
                             csrf_token = _get_csrf_token(access_token)
                         except Exception:
-                            logger.error(f"Failed to refresh CSRF token for project {project_id}")
-                            break
+                            msg = _sdc_error_message(error_code, error_info)
+                            logger.error(f"Failed to refresh tokens for project {project_id}")
+                            execute_query(
+                                "UPDATE projects SET sdc_write_requested = 0, sdc_write_error = %s WHERE id = %s",
+                                (msg, project_id),
+                                fetch=False,
+                            )
+                            return total_written
                         continue
                     else:
                         # Any other API error — abort entire write
+                        msg = _sdc_error_message(error_code, error_info)
                         logger.error(f"SDC Write error for {mid}: {edit_json['error']}")
                         execute_query(
                             "UPDATE projects SET sdc_write_requested = 0, sdc_write_error = %s WHERE id = %s",
-                            (f"{error_code}: {error_info}", project_id),
+                            (msg, project_id),
                             fetch=False,
                         )
                         logger.info(
@@ -1463,9 +1642,23 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
     # --- P180 Removal Phase ---
     # Process faces with sdc_removal_pending=1 (rejected bootstrap faces)
     total_removed = 0
+    token_retries = 0
     REMOVAL_BATCH = 50
 
     while not shutdown_requested:
+        # Check if user cancelled the write via the stop button
+        try:
+            cancel_check = execute_query(
+                "SELECT sdc_write_requested FROM projects WHERE id = %s",
+                (project_id,),
+                fetch=True,
+            )
+            if not cancel_check or cancel_check[0]["sdc_write_requested"] == 0:
+                logger.info(f"SDC removal cancelled by user for project {project_id}")
+                break
+        except DatabaseError:
+            pass
+
         faces_to_remove = execute_query(
             """
             SELECT DISTINCT i.commons_page_id
@@ -1484,7 +1677,7 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
             fetch=True,
         )
 
-        if not faces_to_remove or not isinstance(faces_to_remove, list) or len(faces_to_remove) == 0:
+        if not faces_to_remove:
             break
 
         for row in faces_to_remove:
@@ -1511,7 +1704,7 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
                     (page_id, project_id),
                     fetch=True,
                 )
-                if not still_pending or not isinstance(still_pending, list):
+                if not still_pending:
                     logger.info(f"Skipping removal for M{page_id}: sibling approved since selection")
                     continue
 
@@ -1567,18 +1760,39 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
                 if "error" in remove_json:
                     error_code = remove_json["error"].get("code")
                     error_info = remove_json["error"].get("info", "Unknown error")
-                    if error_code == "badtoken":
+                    if error_code in ("badtoken", "permissiondenied", "notloggedin"):
+                        token_retries += 1
+                        if token_retries > MAX_TOKEN_RETRIES:
+                            msg = _sdc_error_message(error_code, error_info)
+                            logger.error(f"SDC token retry limit reached during removal for project {project_id}")
+                            execute_query(
+                                "UPDATE projects SET sdc_write_requested = 0, sdc_write_error = %s WHERE id = %s",
+                                (msg, project_id),
+                                fetch=False,
+                            )
+                            return total_written
+                        refreshed = _refresh_worker_token(user_id)
+                        if refreshed:
+                            access_token = refreshed
+                            claim_headers = {"Authorization": f"Bearer {access_token}"}
                         try:
                             csrf_token = _get_csrf_token(access_token)
                         except Exception:
-                            logger.error(f"Failed to refresh CSRF token for project {project_id}")
-                            break
+                            msg = _sdc_error_message(error_code, error_info)
+                            logger.error(f"Failed to refresh tokens during removal for project {project_id}")
+                            execute_query(
+                                "UPDATE projects SET sdc_write_requested = 0, sdc_write_error = %s WHERE id = %s",
+                                (msg, project_id),
+                                fetch=False,
+                            )
+                            return total_written
                         continue
                     else:
+                        msg = _sdc_error_message(error_code, error_info)
                         logger.error(f"SDC removal error for {mid}: {remove_json['error']}")
                         execute_query(
                             "UPDATE projects SET sdc_write_requested = 0, sdc_write_error = %s WHERE id = %s",
-                            (f"Removal {error_code}: {error_info}", project_id),
+                            (msg, project_id),
                             fetch=False,
                         )
                         logger.info(
@@ -1871,7 +2085,7 @@ def process_project(project: dict[str, Any], *, skip_discovery: bool = False) ->
                 (project_id,),
                 fetch=True,
             )
-            if not row or not isinstance(row, list):
+            if not row:
                 logger.info(f"Project {project_id} not found, stopping processing")
                 return False
 
@@ -1957,7 +2171,7 @@ def process_project(project: dict[str, Any], *, skip_discovery: bool = False) ->
                     (project["id"],),
                     fetch=True,
                 )
-                proj = fresh[0] if fresh and isinstance(fresh, list) else project
+                proj = fresh[0] if fresh else project
                 classified = run_autonomous_inference(proj)
                 if classified:
                     logger.info(f"Mid-processing inference classified {classified} faces")
@@ -1969,7 +2183,7 @@ def process_project(project: dict[str, Any], *, skip_discovery: bool = False) ->
             fresh = execute_query(
                 "SELECT * FROM projects WHERE id = %s AND status != 'deleted'", (project_id,), fetch=True
             )
-            if fresh and isinstance(fresh, list):
+            if fresh:
                 run_autonomous_inference(fresh[0])
             else:
                 run_autonomous_inference(project)
@@ -2054,7 +2268,7 @@ def main():
             "FROM projects p",
             fetch=True,
         )
-        if diag and isinstance(diag, list):
+        if diag:
             for row in diag:
                 logger.info(
                     f"Project {row['id']} ({row['wikidata_qid']}): "
@@ -2075,6 +2289,43 @@ def main():
                     fetch=False,
                 )
 
+                # ---- SDC writes FIRST (user-triggered, latency-sensitive) ----
+                # Process SDC write requests before the active pipeline so users
+                # don't wait minutes through crawl/detect/infer before their
+                # "Send Edits to Wikimedia Commons" request is serviced.
+                sdc_projects = _claim_sdc_projects()
+                if sdc_projects:
+                    logger.info(f"Claimed {len(sdc_projects)} SDC project(s) for writing")
+                for sdc_project in sdc_projects:
+                    if shutdown_requested:
+                        break
+                    # Refresh claim before starting potentially long SDC write
+                    try:
+                        execute_query(
+                            "UPDATE projects SET worker_claimed_at = NOW() WHERE id = %s AND worker_claimed_by = %s",
+                            (sdc_project["id"], _worker_id),
+                            fetch=False,
+                        )
+                    except DatabaseError:
+                        pass
+                    logger.info(f"Processing SDC write request for project {sdc_project['id']}")
+                    try:
+                        written = write_sdc_claims(sdc_project)
+                        logger.info(f"SDC write complete for project {sdc_project['id']}: {written} claims written")
+                    except Exception as e:
+                        logger.error(f"SDC write failed for project {sdc_project['id']}: {e}")
+                        # Clear the flag so it doesn't retry endlessly
+                        try:
+                            execute_query(
+                                "UPDATE projects SET sdc_write_requested = 0, sdc_write_error = %s WHERE id = %s",
+                                (str(e)[:1000], sdc_project["id"]),
+                                fetch=False,
+                            )
+                        except DatabaseError:
+                            pass
+                    finally:
+                        _release_project(sdc_project["id"])
+
                 # ---- Claim active projects (atomic, distributed-safe) ----
                 active_projects = _claim_active_projects(MAX_CONCURRENT_PROJECTS)
 
@@ -2083,14 +2334,7 @@ def main():
                 inference_projects = _claim_inference_projects(MAX_CONCURRENT_PROJECTS)
                 inference_only = [p for p in inference_projects if p["id"] not in active_ids]
 
-                # ---- Claim SDC write-requested projects ----
-                sdc_projects = _claim_sdc_projects()
-
-                logger.info(
-                    f"Poll: claimed {len(active_projects)} active, "
-                    f"{len(inference_only)} inference-only, "
-                    f"{len(sdc_projects)} SDC project(s)"
-                )
+                logger.info(f"Poll: claimed {len(active_projects)} active, {len(inference_only)} inference-only")
 
                 # Process active projects concurrently (claims released in wrapper).
                 # Each thread handles its own discovery (traverse_category + bootstrap)
@@ -2200,37 +2444,6 @@ def main():
                                     logger.info(f"Inference classified {classified} faces for project {project_id}")
                                 except Exception as e:
                                     logger.error(f"Inference failed for project {project_id}: {e}")
-
-                # Process SDC write requests (sequential — one project at a time, claim released after each)
-                for sdc_project in sdc_projects:
-                    if shutdown_requested:
-                        break
-                    # Refresh claim before starting potentially long SDC write
-                    try:
-                        execute_query(
-                            "UPDATE projects SET worker_claimed_at = NOW() WHERE id = %s AND worker_claimed_by = %s",
-                            (sdc_project["id"], _worker_id),
-                            fetch=False,
-                        )
-                    except DatabaseError:
-                        pass
-                    logger.info(f"Processing SDC write request for project {sdc_project['id']}")
-                    try:
-                        written = write_sdc_claims(sdc_project)
-                        logger.info(f"SDC write complete for project {sdc_project['id']}: {written} claims written")
-                    except Exception as e:
-                        logger.error(f"SDC write failed for project {sdc_project['id']}: {e}")
-                        # Clear the flag so it doesn't retry endlessly
-                        try:
-                            execute_query(
-                                "UPDATE projects SET sdc_write_requested = 0, sdc_write_error = %s WHERE id = %s",
-                                (str(e)[:1000], sdc_project["id"]),
-                                fetch=False,
-                            )
-                        except DatabaseError:
-                            pass
-                    finally:
-                        _release_project(sdc_project["id"])
 
                 # Hard-delete soft-deleted projects (FK CASCADE cleans images + faces).
                 # Archive leaderboard stats and delete atomically to prevent double-counting.
