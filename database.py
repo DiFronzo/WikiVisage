@@ -241,7 +241,7 @@ def _execute_with_retry(func: Callable[..., Any], *args, allow_retry: bool = Tru
     for attempt in range(max_attempts):
         try:
             return func(*args, **kwargs)
-        except (OperationalError, InterfaceError) as e:
+        except (OperationalError, InterfaceError, PoolExhaustedError) as e:
             last_exception = e
             if attempt < max_attempts - 1:
                 backoff = INITIAL_BACKOFF * (2**attempt)
