@@ -312,8 +312,11 @@ def _refresh_worker_token(user_id: int) -> str | None:
             headers={"User-Agent": USER_AGENT},
             timeout=30,
         )
-        resp.raise_for_status()
-        new_token = resp.json()
+        try:
+            resp.raise_for_status()
+            new_token = resp.json()
+        finally:
+            resp.close()
     except Exception:
         logger.exception(f"Failed to refresh access token for user {user_id}")
         return None
