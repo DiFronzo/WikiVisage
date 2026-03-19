@@ -1538,7 +1538,7 @@
         }).catch(function(e) {
             console.error(e);
             result.style.display = 'block';
-            sdcShowMessage(result, i18nSdc.sendError, 'var(--danger)');
+            sdcShowMessage(result, (e && e.error) ? e.error : i18nSdc.sendError, 'var(--danger)');
             btn.disabled = false;
             btn.textContent = i18nSdc.btnLabel;
         });
