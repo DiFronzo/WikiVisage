@@ -7315,7 +7315,7 @@ def test_api_category_info_marks_approximate_when_continue_in_subcategory_fetch(
     assert response.get_json()["approximate"] is True
 
 
-def test_project_new_duplicate_entry_detected_via_orig_error_code(monkeypatch):
+def test_project_new_duplicate_entry_detected_via_exception_cause(monkeypatch):
     captured = _capture_render_template_chunk4(monkeypatch)
 
     cause = Exception(1062, "Duplicate entry")
