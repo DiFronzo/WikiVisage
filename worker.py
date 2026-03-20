@@ -37,7 +37,7 @@ from requests.packages.urllib3.util.retry import Retry
 
 from config import WAKE_FILE_PATH
 from database import DatabaseError, close_pool, execute_query, execute_transaction, init_db
-from token_crypto import decrypt_token, encrypt_token
+from token_crypto import TokenDecryptionError, decrypt_token, encrypt_token
 
 # Configure Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
@@ -282,11 +282,23 @@ def _refresh_worker_token(user_id: int) -> str | None:
     access_token = user["access_token"]
     if isinstance(access_token, bytes):
         access_token = access_token.decode("utf-8")
-    access_token = decrypt_token(access_token)
+    try:
+        access_token = decrypt_token(access_token)
+    except TokenDecryptionError:
+        logger.error(
+            f"Cannot decrypt access token for user {user_id} — possible key rotation; skipping SDC writes for this user"
+        )
+        return None
     refresh_token = user.get("refresh_token", "")
     if isinstance(refresh_token, bytes):
         refresh_token = refresh_token.decode("utf-8")
-    refresh_token = decrypt_token(refresh_token)
+    try:
+        refresh_token = decrypt_token(refresh_token)
+    except TokenDecryptionError:
+        logger.error(
+            f"Cannot decrypt refresh token for user {user_id} — possible key rotation; skipping SDC writes for this user"
+        )
+        return None
 
     expires_at = user.get("token_expires_at")
     if expires_at:

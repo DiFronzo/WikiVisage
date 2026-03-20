@@ -114,6 +114,39 @@ class TestEncryptionEnabled:
         legacy_token = b"plaintext-legacy-token-bytes"
         assert _with_token_key.decrypt_token(legacy_token) == "plaintext-legacy-token-bytes"
 
+    def test_fernet_looking_token_wrong_key_raises(self, _with_token_key):
+        """Fernet-looking token encrypted with a different key raises TokenDecryptionError."""
+        from cryptography.fernet import Fernet
+
+        # Encrypt using a brand-new, different key
+        other_key = Fernet.generate_key()
+        other_fernet = Fernet(other_key)
+        encrypted_with_other_key = other_fernet.encrypt(b"ya29.a0AfH6SMBx_example_token").decode("utf-8")
+        # The loaded module uses a *different* key, so decryption must fail closed
+        with pytest.raises(_with_token_key.TokenDecryptionError):
+            _with_token_key.decrypt_token(encrypted_with_other_key)
+
+    def test_fernet_looking_token_wrong_key_logs_warning(self, _with_token_key, caplog):
+        """A warning is logged when a Fernet-looking token cannot be decrypted."""
+        import logging
+
+        from cryptography.fernet import Fernet
+
+        other_key = Fernet.generate_key()
+        other_fernet = Fernet(other_key)
+        encrypted_with_other_key = other_fernet.encrypt(b"some-oauth-token").decode("utf-8")
+        with caplog.at_level(logging.WARNING, logger="token_crypto"):
+            with pytest.raises(_with_token_key.TokenDecryptionError):
+                _with_token_key.decrypt_token(encrypted_with_other_key)
+        assert any("key rotation" in r.message or "decrypted" in r.message for r in caplog.records)
+
+    def test_corrupted_fernet_token_raises(self, _with_token_key):
+        """Corrupted ciphertext that looks like Fernet must raise TokenDecryptionError."""
+        # Build a string that starts with the Fernet prefix but is garbage
+        corrupted = "gAAAAABxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        with pytest.raises(_with_token_key.TokenDecryptionError):
+            _with_token_key.decrypt_token(corrupted)
+
 
 # --- Invalid key ---
 
@@ -129,3 +162,22 @@ class TestInvalidKey:
     def test_decrypt_passthrough_on_bad_key(self, _with_bad_key):
         token = "my-oauth-token"
         assert _with_bad_key.decrypt_token(token) == token
+
+
+# --- _looks_like_fernet helper ---
+
+
+class TestLooksLikeFernet:
+    def test_fernet_ciphertext_detected(self, _with_token_key):
+        token = "ya29.a0AfH6SMBx_example_token"
+        encrypted = _with_token_key.encrypt_token(token)
+        assert _with_token_key._looks_like_fernet(encrypted) is True
+
+    def test_plaintext_not_detected(self, _with_token_key):
+        assert _with_token_key._looks_like_fernet("plaintext-legacy-token") is False
+
+    def test_empty_string_not_detected(self, _with_token_key):
+        assert _with_token_key._looks_like_fernet("") is False
+
+    def test_gAAA_prefix_detected(self, _with_token_key):
+        assert _with_token_key._looks_like_fernet("gAAAAABxxxxxxxx") is True
