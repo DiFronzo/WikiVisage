@@ -877,7 +877,17 @@
 
             function removeAllPets() {
                 var clones = document.querySelectorAll(".jimmy-pet-clone");
-                for (var i = 0; i < clones.length; i++) clones[i].remove();
+                for (var i = 0; i < clones.length; i++) {
+                    if (clones[i]._wanderTimer) {
+                        clearTimeout(clones[i]._wanderTimer);
+                        clones[i]._wanderTimer = null;
+                    }
+                    clones[i].remove();
+                }
+                if (initPet && initPet._wanderTimer) {
+                    clearTimeout(initPet._wanderTimer);
+                    initPet._wanderTimer = null;
+                }
                 initPet.style.display = "none";
             }
 
