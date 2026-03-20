@@ -55,7 +55,7 @@ from database import (
     execute_transaction,
     init_db,
 )
-from token_crypto import decrypt_token, encrypt_token
+from token_crypto import TokenDecryptionError, decrypt_token, encrypt_token
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -267,6 +267,10 @@ def before_request() -> None:
                     logger.warning(f"Session revoked for user not on whitelist: {g.user['wiki_username']}")
                     session.clear()
                     g.user = None
+        except TokenDecryptionError:
+            logger.warning("Token decryption failed for user %s — clearing session to force re-auth", user_id)
+            session.clear()
+            g.user = None
         except DatabaseError:
             logger.exception("Failed to load user from session")
             session.clear()
