@@ -473,7 +473,7 @@ def set_security_headers(response):
         "default-src 'self'; "
         "script-src 'self' 'unsafe-inline'; "
         "style-src 'self' 'unsafe-inline'; "
-        "img-src 'self' https://upload.wikimedia.org data:; "
+        "img-src 'self' https://*.wikimedia.org data:; "
         "connect-src 'self'; "
         "font-src 'self'; "
         "frame-ancestors 'none'"
