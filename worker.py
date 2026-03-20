@@ -1149,28 +1149,28 @@ def bootstrap_from_sparql(project: dict[str, Any]) -> int:
 
                             # Auto-classify single unclassified faces as target
                             # matches (same logic as _process_single_image).
-                            face_count_row = execute_query(
-                                "SELECT COUNT(*) AS cnt FROM faces WHERE image_id = %s AND superseded_by IS NULL",
-                                (image_id,),
+                            # Perform this in a single conditional UPDATE to avoid a per-image COUNT query.
+                            auto = execute_query(
+                                "UPDATE faces "
+                                "SET is_target = 1, classified_by = 'bootstrap' "
+                                "WHERE image_id = %s "
+                                "AND is_target IS NULL "
+                                "AND superseded_by IS NULL "
+                                "AND (SELECT COUNT(*) FROM faces "
+                                "     WHERE image_id = %s AND superseded_by IS NULL) = 1",
+                                (image_id, image_id),
+                                fetch=False,
                             )
-                            total_faces = face_count_row[0]["cnt"] if face_count_row else 0
-                            if total_faces == 1:
-                                auto = execute_query(
-                                    "UPDATE faces SET is_target = 1, classified_by = 'bootstrap' "
-                                    "WHERE image_id = %s AND is_target IS NULL AND superseded_by IS NULL",
-                                    (image_id,),
+                            if auto:
+                                execute_query(
+                                    "UPDATE projects SET faces_confirmed = faces_confirmed + %s WHERE id = %s",
+                                    (auto, project["id"]),
                                     fetch=False,
                                 )
-                                if auto:
-                                    execute_query(
-                                        "UPDATE projects SET faces_confirmed = faces_confirmed + %s WHERE id = %s",
-                                        (auto, project["id"]),
-                                        fetch=False,
-                                    )
-                                    logger.info(
-                                        f"Bootstrap auto-classified {auto} face(s) on "
-                                        f"already-processed image {image_id} as target"
-                                    )
+                                logger.info(
+                                    f"Bootstrap auto-classified {auto} face(s) on "
+                                    f"already-processed image {image_id} as target"
+                                )
                 else:
                     # Enforce global image cap before inserting new images
                     if inserted_count >= remaining_global:
