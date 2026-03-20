@@ -18,6 +18,7 @@ import logging
 import math
 import os
 import random
+import re
 import secrets
 import time
 from datetime import UTC, datetime, timedelta
@@ -1222,22 +1223,27 @@ def project_new():
             Return True if the given database exception represents a MySQL
             duplicate-entry (error code 1062) condition.
             """
-            # SQLAlchemy-style wrappers often expose the underlying DB-API error
-            # via an `orig` attribute.
-            orig = getattr(db_exc, "orig", None)
-            if orig is not None and getattr(orig, "args", None):
+            # database.py wraps PyMySQL exceptions via `raise DatabaseError(...) from e`.
+            # The original PyMySQL IntegrityError is available as __cause__ with
+            # args = (1062, "Duplicate entry '...' for key '...'").
+            cause = getattr(db_exc, "__cause__", None)
+            if cause is not None and getattr(cause, "args", None):
                 try:
-                    return int(orig.args[0]) == 1062
+                    return int(cause.args[0]) == 1062
                 except (ValueError, TypeError, IndexError):
                     pass
-            # Fall back to checking the exception's own args, as used by many
-            # MySQL DB-API drivers where args[0] is the numeric error code.
+            # Fall back to checking the exception's own args.
             if getattr(db_exc, "args", None):
                 try:
                     return int(db_exc.args[0]) == 1062
                 except (ValueError, TypeError, IndexError):
                     pass
-            return False
+            # Last resort: check the string representation.
+            # Require both word-boundary match on "1062" and the literal
+            # "Duplicate entry" substring to avoid false positives from
+            # error messages that incidentally contain the digits 1062.
+            exc_str = str(db_exc)
+            return bool(re.search(r"\b1062\b", exc_str)) and "Duplicate entry" in exc_str
 
         if _is_duplicate_entry_error(exc):
             logger.info("Project creation blocked by pending soft-deleted row: %s", exc)

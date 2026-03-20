@@ -1020,24 +1020,12 @@ def bootstrap_from_sparql(project: dict[str, Any]) -> int:
     since commons-query.wikimedia.org requires OAuth cookie authentication
     that is impractical for automated tools.
 
-    Only inserts/flags image rows with bootstrapped=1. Face detection and
-    encoding storage are deferred to process_images / _process_single_image.
-    Single-face bootstrapped images are auto-classified as target matches
-    during face detection (see _process_single_image). Multi-face bootstrapped
-    images require manual classification via the classify UI.
+    Runs on every poll cycle (not just the first time). Newly discovered images
+    that already have P180 on Commons are flagged with bootstrapped=1.
+    Already-processed single-face images are auto-classified as target matches.
+    Multi-face images (pending or processed) are left for manual classification.
     """
     logger.info(f"Attempting bootstrap for project {project['id']} with QID {project['wikidata_qid']}")
-
-    # Check if project already has confirmed target faces (use actual count, not
-    # the unreliable faces_confirmed counter)
-    count_row = execute_query(
-        "SELECT COUNT(*) AS cnt FROM faces f "
-        "JOIN images i ON f.image_id = i.id "
-        "WHERE i.project_id = %s AND f.is_target = 1 AND f.superseded_by IS NULL",
-        (project["id"],),
-    )
-    if count_row and count_row[0]["cnt"] > 0:
-        return 0
 
     # Enforce global image cap (same as traverse_category)
     existing_count_rows = execute_query(
@@ -1055,10 +1043,11 @@ def bootstrap_from_sparql(project: dict[str, Any]) -> int:
     remaining_global = MAX_IMAGES_PER_PROJECT - existing_count
 
     qid = project["wikidata_qid"]
+    category = project["commons_category"]
     search_params: dict[str, Any] = {
         "action": "query",
         "list": "search",
-        "srsearch": f"haswbstatement:P180={qid}",
+        "srsearch": f'haswbstatement:P180={qid} deepcat:"{category}"',
         "srnamespace": "6",
         "srlimit": "50",
         "format": "json",
@@ -1129,15 +1118,61 @@ def bootstrap_from_sparql(project: dict[str, Any]) -> int:
                 )
 
                 if exists:
-                    # Image already known — just flag it as bootstrapped if pending
-                    if exists[0]["status"] == "pending":
-                        affected = execute_query(
-                            "UPDATE images SET bootstrapped = 1 WHERE id = %s AND bootstrapped != 1",
-                            (exists[0]["id"],),
+                    image_id = exists[0]["id"]
+                    img_status = exists[0]["status"]
+
+                    # Flag as bootstrapped regardless of current status
+                    affected = execute_query(
+                        "UPDATE images SET bootstrapped = 1 WHERE id = %s AND bootstrapped != 1",
+                        (image_id,),
+                        fetch=False,
+                    )
+                    if affected:
+                        flagged_count += 1
+
+                    # For already-processed images with faces, always run the
+                    # reconciliation logic when we find the image via P180,
+                    # regardless of whether the bootstrapped flag changed.
+                    if img_status == "processed":
+                        # Mark any human/model-classified target faces as
+                        # sdc_written since P180 already exists on Commons.
+                        marked = execute_query(
+                            "UPDATE faces SET sdc_written = 1 "
+                            "WHERE image_id = %s AND is_target = 1 AND sdc_written = 0 "
+                            "AND superseded_by IS NULL",
+                            (image_id,),
                             fetch=False,
                         )
-                        if affected:
-                            flagged_count += 1
+                        if marked:
+                            logger.info(
+                                f"Bootstrap marked {marked} already-classified face(s) "
+                                f"as sdc_written on image {image_id} (P180 exists on Commons)"
+                            )
+
+                        # Auto-classify single unclassified faces as target
+                        # matches (same logic as _process_single_image).
+                        # Perform this in a single conditional UPDATE to avoid a per-image COUNT query.
+                        auto = execute_query(
+                            "UPDATE faces "
+                            "SET is_target = 1, classified_by = 'bootstrap' "
+                            "WHERE image_id = %s "
+                            "AND is_target IS NULL "
+                            "AND superseded_by IS NULL "
+                            "AND (SELECT COUNT(*) FROM faces "
+                            "     WHERE image_id = %s AND superseded_by IS NULL) = 1",
+                            (image_id, image_id),
+                            fetch=False,
+                        )
+                        if auto:
+                            execute_query(
+                                "UPDATE projects SET faces_confirmed = faces_confirmed + %s WHERE id = %s",
+                                (auto, project["id"]),
+                                fetch=False,
+                            )
+                            logger.info(
+                                f"Bootstrap auto-classified {auto} face(s) on "
+                                f"already-processed image {image_id} as target"
+                            )
                 else:
                     # Enforce global image cap before inserting new images
                     if inserted_count >= remaining_global:
@@ -1501,7 +1536,7 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
         # Fetch next batch of unwritten faces
         faces_to_write = execute_query(
             """
-            SELECT f.id as face_id, i.commons_page_id
+            SELECT f.id as face_id, i.id as image_id, i.commons_page_id
             FROM faces f
             JOIN images i ON f.image_id = i.id
             WHERE i.project_id = %s AND f.is_target = 1 AND f.sdc_written = 0
@@ -1594,6 +1629,12 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
                     execute_query(
                         "UPDATE faces SET sdc_written = 1 WHERE id = %s",
                         (face_id,),
+                        fetch=False,
+                    )
+                    image_id = row["image_id"]
+                    execute_query(
+                        "UPDATE images SET bootstrapped = 1 WHERE id = %s AND bootstrapped = 0",
+                        (image_id,),
                         fetch=False,
                     )
                     total_written += 1
@@ -2411,7 +2452,36 @@ def main():
                     fetch=False,
                 )
 
-                # ---- SDC writes FIRST (user-triggered, latency-sensitive) ----
+                # ---- Purge soft-deleted projects FIRST (quick, unblocks re-creation) ----
+                try:
+
+                    def _archive_and_purge(conn: Any, cursor: Any) -> int:
+                        cursor.execute(
+                            "INSERT INTO user_stats (user_id, classifications, sdc_tags) "
+                            "SELECT f.classified_by_user_id, "
+                            "  COUNT(*), "
+                            "  COUNT(CASE WHEN f.sdc_written = 1 THEN 1 END) "
+                            "FROM faces f "
+                            "INNER JOIN images i ON i.id = f.image_id "
+                            "INNER JOIN projects p ON p.id = i.project_id "
+                            "WHERE p.status = 'deleted' "
+                            "  AND f.classified_by_user_id IS NOT NULL "
+                            "  AND f.superseded_by IS NULL "
+                            "GROUP BY f.classified_by_user_id "
+                            "ON DUPLICATE KEY UPDATE "
+                            "  classifications = classifications + VALUES(classifications), "
+                            "  sdc_tags = sdc_tags + VALUES(sdc_tags)",
+                        )
+                        cursor.execute("DELETE FROM projects WHERE status = 'deleted'")
+                        return cursor.rowcount
+
+                    deleted = execute_transaction(_archive_and_purge)
+                    if deleted:
+                        logger.info(f"Purged {deleted} soft-deleted project(s)")
+                except DatabaseError as exc:
+                    logger.warning("Failed to purge soft-deleted projects: %s", exc)
+
+                # ---- SDC writes (user-triggered, latency-sensitive) ----
                 # Process SDC write requests before the active pipeline so users
                 # don't wait minutes through crawl/detect/infer before their
                 # "Send Edits to Wikimedia Commons" request is serviced.
@@ -2566,37 +2636,6 @@ def main():
                                     logger.info(f"Inference classified {classified} faces for project {project_id}")
                                 except Exception as e:
                                     logger.error(f"Inference failed for project {project_id}: {e}")
-
-                # Hard-delete soft-deleted projects (FK CASCADE cleans images + faces).
-                # Archive leaderboard stats and delete atomically to prevent double-counting.
-                if not shutdown_requested:
-                    try:
-
-                        def _archive_and_purge(conn: Any, cursor: Any) -> int:
-                            cursor.execute(
-                                "INSERT INTO user_stats (user_id, classifications, sdc_tags) "
-                                "SELECT f.classified_by_user_id, "
-                                "  COUNT(*), "
-                                "  COUNT(CASE WHEN f.sdc_written = 1 THEN 1 END) "
-                                "FROM faces f "
-                                "INNER JOIN images i ON i.id = f.image_id "
-                                "INNER JOIN projects p ON p.id = i.project_id "
-                                "WHERE p.status = 'deleted' "
-                                "  AND f.classified_by_user_id IS NOT NULL "
-                                "  AND f.superseded_by IS NULL "
-                                "GROUP BY f.classified_by_user_id "
-                                "ON DUPLICATE KEY UPDATE "
-                                "  classifications = classifications + VALUES(classifications), "
-                                "  sdc_tags = sdc_tags + VALUES(sdc_tags)",
-                            )
-                            cursor.execute("DELETE FROM projects WHERE status = 'deleted'")
-                            return cursor.rowcount
-
-                        deleted = execute_transaction(_archive_and_purge)
-                        if deleted:
-                            logger.info(f"Purged {deleted} soft-deleted project(s)")
-                    except DatabaseError as exc:
-                        logger.warning("Failed to purge soft-deleted projects: %s", exc)
 
                 # Add random jitter (0–15s) so multiple workers desynchronize
                 # and don't all race to claim the same projects every cycle.
