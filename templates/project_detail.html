@@ -1213,6 +1213,7 @@
 
     function closeBboxModal() {
         document.getElementById('bboxModal').classList.remove('active');
+        document.getElementById('modalLoading').classList.remove('active');
         /* Clear image so a stale photo is never shown when reopening. */
         var img = document.getElementById('modalImg');
         img.onload = null;
