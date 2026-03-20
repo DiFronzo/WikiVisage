@@ -7361,7 +7361,7 @@ def test_project_new_duplicate_entry_detected_via_orig_error_code(monkeypatch):
     assert any("still being cleaned up" in msg for _cat, msg in _flashes_tail(client))
 
 
-def test_project_new_duplicate_error_with_non_numeric_orig_args_falls_back(monkeypatch):
+def test_project_new_duplicate_error_with_non_numeric_cause_args_falls_back(monkeypatch):
     captured = _capture_render_template_chunk4(monkeypatch)
 
     cause = Exception("not-a-number")
