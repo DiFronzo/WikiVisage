@@ -7318,11 +7318,9 @@ def test_api_category_info_marks_approximate_when_continue_in_subcategory_fetch(
 def test_project_new_duplicate_entry_detected_via_orig_error_code(monkeypatch):
     captured = _capture_render_template_chunk4(monkeypatch)
 
-    class _Orig:
-        args = (1062,)
-
+    cause = Exception(1062, "Duplicate entry")
     db_exc = DatabaseError("duplicate")
-    db_exc.orig = _Orig()  # type: ignore[attr-defined]
+    db_exc.__cause__ = cause
 
     def _execute_query(sql, params=None, fetch=True):
         del params, fetch
@@ -7366,11 +7364,9 @@ def test_project_new_duplicate_entry_detected_via_orig_error_code(monkeypatch):
 def test_project_new_duplicate_error_with_non_numeric_orig_args_falls_back(monkeypatch):
     captured = _capture_render_template_chunk4(monkeypatch)
 
-    class _Orig:
-        args = ("not-a-number",)
-
+    cause = Exception("not-a-number")
     db_exc = DatabaseError("insert failed")
-    db_exc.orig = _Orig()  # type: ignore[attr-defined]
+    db_exc.__cause__ = cause
 
     def _execute_query(sql, params=None, fetch=True):
         del params, fetch

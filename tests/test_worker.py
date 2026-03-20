@@ -5,7 +5,7 @@ os.environ.setdefault("TOOL_TOOLSDB_PASSWORD", "testpass")
 os.environ.setdefault("WIKIVISAGE_DB_NAME", "testdb")
 os.environ.setdefault("TOOL_TOOLSDB_HOST", "localhost")
 
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 
@@ -22,6 +22,7 @@ with patch("database.init_db"):
         _release_all_claims,
         _release_project,
         run_autonomous_inference,
+        write_sdc_claims,
     )
 
 
@@ -783,3 +784,52 @@ def test_infer_and_release_releases_even_on_exception():
             pass
 
     mock_release.assert_called_once_with(21)
+
+
+def test_write_sdc_marks_image_bootstrapped_on_idempotency_hit():
+    """When P180 already exists on Commons, write_sdc_claims sets bootstrapped=1 on the image."""
+    project = {"id": 5, "user_id": 1, "wikidata_qid": "Q42"}
+
+    existing_claim_response = {"claims": {"P180": [{"mainsnak": {"datavalue": {"value": {"id": "Q42"}}}}]}}
+
+    db_calls = []
+
+    def mock_execute_query(sql, params=None, fetch=True):
+        db_calls.append((sql.strip(), params))
+        if "sdc_write_requested" in sql and "SELECT" in sql:
+            return [{"sdc_write_requested": 1}]
+        if "SELECT f.id as face_id" in sql:
+            if not any("UPDATE faces SET sdc_written" in c[0] for c in db_calls):
+                return [{"face_id": 100, "image_id": 200, "commons_page_id": 9999}]
+            return []
+        if "UPDATE faces SET sdc_written" in sql:
+            return 1
+        if "UPDATE images SET bootstrapped" in sql:
+            return 1
+        if "UPDATE projects SET sdc_write_requested = 0" in sql:
+            return 1
+        return []
+
+    mock_api_resp = MagicMock()
+    mock_api_resp.json.return_value = existing_claim_response
+
+    with (
+        patch("worker.execute_query", side_effect=mock_execute_query),
+        patch("worker._refresh_worker_token", return_value="fake-token"),
+        patch("worker._get_csrf_token", return_value="fake-csrf"),
+        patch("worker._api_request", return_value=mock_api_resp),
+        patch("worker.shutdown_requested", False),
+    ):
+        result = write_sdc_claims(project)
+
+    assert result == 1
+
+    # Verify sdc_written=1 was set on the face
+    face_updates = [(sql, p) for sql, p in db_calls if "UPDATE faces SET sdc_written" in sql]
+    assert len(face_updates) == 1
+    assert face_updates[0][1] == (100,)
+
+    # Verify bootstrapped=1 was set on the image
+    img_updates = [(sql, p) for sql, p in db_calls if "UPDATE images SET bootstrapped" in sql]
+    assert len(img_updates) == 1
+    assert img_updates[0][1] == (200,)
