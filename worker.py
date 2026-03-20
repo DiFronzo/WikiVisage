@@ -1537,6 +1537,50 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
                 claim_resp = _api_request(COMMONS_API_URL, params=claim_params, headers=claim_headers)
                 claim_data = claim_resp.json()
 
+                if "error" in claim_data:
+                    error_code = claim_data["error"].get("code", "unknown")
+                    error_info = claim_data["error"].get("info", "Unknown error")
+                    if error_code in ("badtoken", "permissiondenied", "notloggedin", "mwoauth-invalid-authorization"):
+                        token_retries += 1
+                        if token_retries > MAX_TOKEN_RETRIES:
+                            msg = _sdc_error_message(error_code, error_info)
+                            logger.error(
+                                f"SDC token retry limit reached during idempotency check for project {project_id}: "
+                                f"{error_code}"
+                            )
+                            execute_query(
+                                "UPDATE projects SET sdc_write_requested = 0, sdc_write_error = %s WHERE id = %s",
+                                (msg, project_id),
+                                fetch=False,
+                            )
+                            return total_written
+                        logger.warning(f"Auth error on wbgetclaims for {mid}: {error_code}, refreshing token")
+                        refreshed = _refresh_worker_token(user_id)
+                        if refreshed:
+                            access_token = refreshed
+                            claim_headers = {"Authorization": f"Bearer {access_token}"}
+                        try:
+                            csrf_token = _get_csrf_token(access_token)
+                        except Exception:
+                            msg = _sdc_error_message(error_code, error_info)
+                            logger.error(f"Failed to refresh tokens for project {project_id}")
+                            execute_query(
+                                "UPDATE projects SET sdc_write_requested = 0, sdc_write_error = %s WHERE id = %s",
+                                (msg, project_id),
+                                fetch=False,
+                            )
+                            return total_written
+                        continue
+                    else:
+                        msg = _sdc_error_message(error_code, error_info)
+                        logger.error(f"SDC idempotency check error for {mid}: {claim_data['error']}")
+                        execute_query(
+                            "UPDATE projects SET sdc_write_requested = 0, sdc_write_error = %s WHERE id = %s",
+                            (msg, project_id),
+                            fetch=False,
+                        )
+                        return total_written
+
                 already_exists = False
                 claims = claim_data.get("claims", {}).get("P180", [])
                 for claim in claims:
@@ -1546,6 +1590,7 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
                         break
 
                 if already_exists:
+                    logger.info(f"SDC P180 claim for {qid} already exists on {mid}, marking face {face_id} as written")
                     execute_query(
                         "UPDATE faces SET sdc_written = 1 WHERE id = %s",
                         (face_id,),
@@ -1639,6 +1684,13 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
                         )
                         return total_written
 
+                if not edit_json.get("success"):
+                    logger.warning(
+                        f"SDC write for face {face_id} on {mid} returned unexpected response "
+                        f"(no 'success' key): {json.dumps(edit_json)[:500]}"
+                    )
+
+                logger.info(f"SDC P180 claim for {qid} written to {mid} (face {face_id})")
                 execute_query(
                     "UPDATE faces SET sdc_written = 1 WHERE id = %s",
                     (face_id,),
@@ -1739,6 +1791,53 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
                 claim_resp = _api_request(COMMONS_API_URL, params=claim_params, headers=claim_headers)
                 claim_data = claim_resp.json()
 
+                if "error" in claim_data:
+                    error_code = claim_data["error"].get("code", "unknown")
+                    error_info = claim_data["error"].get("info", "Unknown error")
+                    if error_code in ("badtoken", "permissiondenied", "notloggedin", "mwoauth-invalid-authorization"):
+                        token_retries += 1
+                        if token_retries > MAX_TOKEN_RETRIES:
+                            msg = _sdc_error_message(error_code, error_info)
+                            logger.error(
+                                f"SDC token retry limit reached during removal idempotency check "
+                                f"for project {project_id}: {error_code}"
+                            )
+                            execute_query(
+                                "UPDATE projects SET sdc_write_requested = 0, sdc_write_error = %s WHERE id = %s",
+                                (msg, project_id),
+                                fetch=False,
+                            )
+                            return total_written
+                        logger.warning(f"Auth error on wbgetclaims (removal) for {mid}: {error_code}, refreshing token")
+                        refreshed = _refresh_worker_token(user_id)
+                        if refreshed:
+                            access_token = refreshed
+                            claim_headers = {"Authorization": f"Bearer {access_token}"}
+                        try:
+                            csrf_token = _get_csrf_token(access_token)
+                        except Exception:
+                            msg = _sdc_error_message(error_code, error_info)
+                            logger.error(f"Failed to refresh tokens during removal for project {project_id}")
+                            execute_query(
+                                "UPDATE projects SET sdc_write_requested = 0, sdc_write_error = %s WHERE id = %s",
+                                (msg, project_id),
+                                fetch=False,
+                            )
+                            return total_written
+                        continue
+                    else:
+                        msg = _sdc_error_message(error_code, error_info)
+                        logger.error(f"SDC removal idempotency check error for {mid}: {claim_data['error']}")
+                        execute_query(
+                            "UPDATE projects SET sdc_write_requested = 0, sdc_write_error = %s WHERE id = %s",
+                            (msg, project_id),
+                            fetch=False,
+                        )
+                        logger.info(
+                            f"SDC removals aborted for project {project_id}: {total_removed} removed before error"
+                        )
+                        return total_written
+
                 claims = claim_data.get("claims", {}).get("P180", [])
                 target_guid = None
                 for claim in claims:
@@ -1748,6 +1847,7 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
                         break
 
                 if not target_guid:
+                    logger.info(f"P180 claim for {qid} not found on {mid}, clearing removal flag")
                     execute_query(
                         "UPDATE faces f JOIN images i ON f.image_id = i.id "
                         "SET f.sdc_removal_pending = 0 "
@@ -1819,6 +1919,8 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
                             f"SDC removals aborted for project {project_id}: {total_removed} removed before error"
                         )
                         return total_written
+
+                logger.info(f"SDC removal succeeded for {mid} (project {project_id}): removed claim {target_guid}")
 
                 execute_query(
                     "UPDATE faces f JOIN images i ON f.image_id = i.id "
