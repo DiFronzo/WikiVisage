@@ -18,6 +18,7 @@ import logging
 import math
 import os
 import random
+import re
 import secrets
 import time
 from datetime import UTC, datetime, timedelta
@@ -1238,7 +1239,11 @@ def project_new():
                 except (ValueError, TypeError, IndexError):
                     pass
             # Last resort: check the string representation.
-            return "1062" in str(db_exc)
+            # Require both word-boundary match on "1062" and the literal
+            # "Duplicate entry" substring to avoid false positives from
+            # error messages that incidentally contain the digits 1062.
+            exc_str = str(db_exc)
+            return bool(re.search(r"\b1062\b", exc_str)) and "Duplicate entry" in exc_str
 
         if _is_duplicate_entry_error(exc):
             logger.info("Project creation blocked by pending soft-deleted row: %s", exc)
