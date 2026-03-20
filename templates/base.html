@@ -198,6 +198,7 @@
         .flash.warning { border-color: var(--warning); color: var(--warning); }
         .flash.info { border-color: var(--info); color: var(--info); }
 
+        nav:has(+ .system-banner) { margin-bottom: 0; }
         .system-banner {
             background-color: color-mix(in srgb, var(--warning) 12%, var(--bg));
             border-bottom: 2px solid var(--warning);
@@ -211,6 +212,7 @@
             align-items: center;
             justify-content: center;
             gap: 1rem;
+            margin-bottom: 3rem;
         }
         .banner-close {
             background: none;
@@ -270,7 +272,95 @@
         }
         .stat-value { font-size: 2rem; font-weight: 900; color: var(--primary); line-height: 1; margin-bottom: 0.5rem; white-space: nowrap; }
         .stat-label { font-size: 0.75rem; text-transform: uppercase; color: var(--text-muted); font-weight: 700; letter-spacing: 0.05em; }
-        
+
+        /* Shared stat-box enhancements (used by project_detail + leaderboard) */
+        .stat-box { --stat-color: var(--text-muted); }
+        .stat-box-success { --stat-color: var(--success); }
+        .stat-box-danger { --stat-color: var(--danger); }
+        .stat-box-warning { --stat-color: var(--warning); }
+        .stat-box-info { --stat-color: var(--info); }
+        .stat-box-purple { --stat-color: #a855f7; }
+        .stat-box-primary { --stat-color: var(--primary); }
+
+        .stat-box {
+            position: relative;
+            background: linear-gradient(180deg, var(--surface) 0%, var(--bg) 100%);
+            box-shadow: 4px 4px 0 rgba(0,0,0,0.3);
+            transition: transform 0.2s ease, box-shadow 0.2s ease, border-color 0.2s ease;
+            animation: stat-entrance 0.6s cubic-bezier(0.16, 1, 0.3, 1) backwards;
+            z-index: 1;
+            overflow: hidden;
+        }
+
+        .stat-box::before {
+            content: '';
+            position: absolute;
+            top: 0; left: 0; width: 100%; height: 3px;
+            background: var(--stat-color);
+            opacity: 0.7;
+        }
+
+        .stat-box::after {
+            content: '';
+            position: absolute;
+            inset: 0;
+            background: radial-gradient(circle at top right, color-mix(in srgb, var(--stat-color) 15%, transparent), transparent 70%);
+            pointer-events: none;
+            z-index: 1;
+        }
+
+        .stat-box:hover {
+            transform: translate(-4px, -4px);
+            box-shadow: 8px 8px 0px color-mix(in srgb, var(--stat-color) 40%, rgba(0,0,0,0.8));
+        }
+
+        .stat-value {
+            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+            font-variant-numeric: tabular-nums;
+            font-size: 2.5rem;
+            letter-spacing: -0.05em;
+            text-shadow: 0 0 20px color-mix(in srgb, var(--stat-color) 40%, transparent);
+            animation: data-readout 3s infinite alternate;
+            position: relative;
+        }
+
+        .stat-label {
+            font-weight: 900;
+            letter-spacing: 0.1em;
+            position: relative;
+        }
+
+        .stats-grid .stat-box:nth-child(1) { animation-delay: 0.05s; }
+        .stats-grid .stat-box:nth-child(2) { animation-delay: 0.10s; }
+        .stats-grid .stat-box:nth-child(3) { animation-delay: 0.15s; }
+        .stats-grid .stat-box:nth-child(4) { animation-delay: 0.20s; }
+        .stats-grid .stat-box:nth-child(5) { animation-delay: 0.25s; }
+        .stats-grid .stat-box:nth-child(6) { animation-delay: 0.30s; }
+
+        .breakdown-grid .stat-box:nth-child(1) { animation-delay: 0.1s; }
+        .breakdown-grid .stat-box:nth-child(2) { animation-delay: 0.2s; }
+        .breakdown-grid .stat-box:nth-child(3) { animation-delay: 0.3s; }
+
+        @keyframes stat-entrance {
+            0% { opacity: 0; transform: translateY(20px) scale(0.95); }
+            100% { opacity: 1; transform: translateY(0) scale(1); }
+        }
+
+        @keyframes data-readout {
+            0%, 100% { opacity: 0.85; }
+            50% { opacity: 1; }
+        }
+
+        @keyframes scanline {
+            0% { background-position: 0 0; }
+            100% { background-position: 0 400px; }
+        }
+
+        @media (max-width: 600px) {
+            .stat-value { font-size: 2rem; }
+            .stat-label { font-size: 0.7rem; }
+        }
+
         .header-actions { display: flex; justify-content: space-between; align-items: center; margin-bottom: 2rem; flex-wrap: wrap; gap: 1rem; }
 
         @keyframes pulse { 0%, 100% { opacity: 0.1; } 50% { opacity: 0.25; } }
@@ -731,6 +821,88 @@
 
             window.addEventListener("appinstalled", function() {
                 banner.style.display = "none";
+            });
+        })();
+    </script>
+    <script>
+        /* Konami Code easter egg: ↑ ↑ ↓ ↓ ← → ← → B A */
+        (function() {
+            var SEQ = ['ArrowUp','ArrowUp','ArrowDown','ArrowDown','ArrowLeft','ArrowRight','ArrowLeft','ArrowRight','b','a'];
+            var pos = 0;
+
+            function onKey(e) {
+                var key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+                if (key === SEQ[pos]) {
+                    pos++;
+                    if (pos === SEQ.length) {
+                        pos = 0;
+                        console.log('Secret Unlocked!');
+                        fireConfetti();
+                    }
+                } else {
+                    pos = key === SEQ[0] ? 1 : 0;
+                }
+            }
+
+            function fireConfetti() {
+                var canvas = document.createElement('canvas');
+                canvas.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:99999';
+                canvas.width = window.innerWidth;
+                canvas.height = window.innerHeight;
+                document.body.appendChild(canvas);
+                var ctx = canvas.getContext('2d');
+
+                var COLORS = ['#14b8a6','#f59e0b','#ef4444','#3b82f6','#10b981','#f8fafc','#a855f7'];
+                var pieces = [];
+                for (var i = 0; i < 150; i++) {
+                    pieces.push({
+                        x: Math.random() * canvas.width,
+                        y: Math.random() * canvas.height * -1,
+                        w: 4 + Math.random() * 6,
+                        h: 8 + Math.random() * 8,
+                        color: COLORS[Math.floor(Math.random() * COLORS.length)],
+                        vx: (Math.random() - 0.5) * 6,
+                        vy: 2 + Math.random() * 4,
+                        rot: Math.random() * Math.PI * 2,
+                        rv: (Math.random() - 0.5) * 0.2,
+                        drift: Math.random() * 0.02
+                    });
+                }
+
+                var frame;
+                var t = 0;
+                function tick() {
+                    t++;
+                    ctx.clearRect(0, 0, canvas.width, canvas.height);
+                    var alive = false;
+                    for (var i = 0; i < pieces.length; i++) {
+                        var p = pieces[i];
+                        p.x += p.vx + Math.sin(t * p.drift) * 0.5;
+                        p.y += p.vy;
+                        p.vy += 0.04;
+                        p.rot += p.rv;
+                        if (p.y < canvas.height + 20) alive = true;
+                        ctx.save();
+                        ctx.translate(p.x, p.y);
+                        ctx.rotate(p.rot);
+                        ctx.fillStyle = p.color;
+                        ctx.fillRect(-p.w / 2, -p.h / 2, p.w, p.h);
+                        ctx.restore();
+                    }
+                    if (alive) {
+                        frame = requestAnimationFrame(tick);
+                    } else {
+                        cancelAnimationFrame(frame);
+                        canvas.remove();
+                    }
+                }
+                frame = requestAnimationFrame(tick);
+            }
+
+            document.addEventListener('keydown', onKey);
+            window.addEventListener('beforeunload', function cleanup() {
+                document.removeEventListener('keydown', onKey);
+                window.removeEventListener('beforeunload', cleanup);
             });
         })();
     </script>

@@ -233,6 +233,9 @@
         margin: 2rem 0 1rem;
         flex-wrap: wrap;
     }
+    .pagination:empty {
+        display: none;
+    }
     .pagination button, .pagination span {
         display: inline-flex;
         align-items: center;
@@ -415,19 +418,95 @@
     .results-filters .filter-select:hover { transform: translate(-2px, -2px); box-shadow: var(--shadow-hover); }
     .results-filters .filter-select:focus { outline: none; border-color: var(--primary); }
     .results-filters .results-filter { white-space: nowrap; }
-    .sdc-section { border-color: var(--primary); background: rgba(59, 130, 246, 0.05); margin-top: 4rem; }
-    .sdc-title { color: var(--primary); margin-bottom: 0.5rem; }
+    /* --- REDESIGN CSS: SDC Write Section --- */
+    .sdc-section {
+        position: relative;
+        overflow: hidden;
+        border: 2px solid var(--info);
+        background: linear-gradient(135deg, var(--surface) 0%, color-mix(in srgb, var(--info) 8%, var(--bg)) 100%);
+        box-shadow: 6px 6px 0px rgba(59, 130, 246, 0.2);
+        margin-top: 4rem;
+        animation: stat-entrance 0.6s cubic-bezier(0.16, 1, 0.3, 1) backwards;
+        animation-delay: 0.4s;
+    }
+
+    .sdc-section::before {
+        content: '';
+        position: absolute;
+        inset: 0;
+        background: repeating-linear-gradient(
+            0deg,
+            transparent,
+            transparent 2px,
+            rgba(59, 130, 246, 0.04) 2px,
+            rgba(59, 130, 246, 0.04) 4px
+        );
+        pointer-events: none;
+        z-index: 1;
+        animation: scanline 20s linear infinite;
+    }
+
+    .sdc-section::after {
+        content: '';
+        position: absolute;
+        top: 0; right: 0; bottom: 0; left: 0;
+        pointer-events: none;
+        background:
+            linear-gradient(var(--info), var(--info)) top left / 15px 3px no-repeat,
+            linear-gradient(var(--info), var(--info)) top left / 3px 15px no-repeat,
+            linear-gradient(var(--info), var(--info)) top right / 15px 3px no-repeat,
+            linear-gradient(var(--info), var(--info)) top right / 3px 15px no-repeat,
+            linear-gradient(var(--info), var(--info)) bottom left / 15px 3px no-repeat,
+            linear-gradient(var(--info), var(--info)) bottom left / 3px 15px no-repeat,
+            linear-gradient(var(--info), var(--info)) bottom right / 15px 3px no-repeat,
+            linear-gradient(var(--info), var(--info)) bottom right / 3px 15px no-repeat;
+        z-index: 2;
+    }
+
+    .sdc-section > * {
+        position: relative;
+        z-index: 3;
+    }
+
+    .sdc-title {
+        color: var(--info);
+        margin-bottom: 0.5rem;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+        letter-spacing: 0.08em;
+        text-shadow: 0 0 20px rgba(59, 130, 246, 0.4);
+    }
     .sdc-description { color: var(--text-muted); margin-bottom: 1.5rem; }
     .sdc-license { color: var(--text-muted); font-size: 0.85rem; margin-bottom: 1.5rem; }
-    .sdc-license a { color: var(--primary); }
+    .sdc-license a { color: var(--info); text-decoration: none; border-bottom: 1px solid rgba(59, 130, 246, 0.3); transition: border-color 0.2s; }
+    .sdc-license a:hover { border-color: var(--info); }
     .sdc-status-wrap { margin-bottom: 1rem; }
-    .sdc-status-text { font-weight: 700; }
+    .sdc-status-text {
+        font-weight: 700;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+        font-variant-numeric: tabular-nums;
+        letter-spacing: 0.03em;
+    }
     .sdc-status-muted { color: var(--text-muted); }
     .sdc-progress-area { display: none; margin-bottom: 1rem; }
     .sdc-progress-bar-wrap { height: 2rem; }
     .sdc-progress-text { font-size: 0.85rem; }
     .sdc-result-area { display: none; margin-bottom: 1rem; }
     .sdc-actions { display: flex; flex-wrap: wrap; gap: 1rem; align-items: center; margin-top: 0.5rem; }
+    .sdc-actions .btn:disabled,
+    .sdc-actions .btn[disabled] {
+        background-color: var(--border);
+        border-color: var(--border);
+        color: var(--text-muted);
+        cursor: not-allowed;
+        box-shadow: none;
+        opacity: 0.6;
+        transform: none;
+    }
+    .sdc-actions .btn:disabled:hover,
+    .sdc-actions .btn[disabled]:hover {
+        transform: none;
+        box-shadow: none;
+    }
     .sdc-stop-btn {
         animation: sdc-stop-in 0.25s cubic-bezier(0.34, 1.56, 0.64, 1) both;
     }
@@ -443,6 +522,118 @@
     .sdc-note { display: none; padding: 0 0.75rem 0.75rem; font-size: 0.65rem; color: var(--danger); }
     .gallery-error { color: var(--danger); }
     .gallery-empty { color: var(--text-muted); }
+
+    /* Progress Card */
+    #progressCard {
+        position: relative;
+        overflow: hidden;
+        border: 2px solid var(--primary);
+        background: linear-gradient(135deg, var(--surface) 0%, var(--bg) 100%);
+        box-shadow: var(--shadow);
+    }
+    
+    #progressCard::before {
+        content: '';
+        position: absolute;
+        inset: 0;
+        background: repeating-linear-gradient(
+            0deg,
+            transparent,
+            transparent 2px,
+            rgba(20, 184, 166, 0.04) 2px,
+            rgba(20, 184, 166, 0.04) 4px
+        );
+        pointer-events: none;
+        z-index: 1;
+        animation: scanline 20s linear infinite;
+    }
+    
+    #progressCard::after {
+        content: '';
+        position: absolute;
+        top: 0; right: 0; bottom: 0; left: 0;
+        pointer-events: none;
+        background: 
+            linear-gradient(var(--primary), var(--primary)) top left / 15px 3px no-repeat,
+            linear-gradient(var(--primary), var(--primary)) top left / 3px 15px no-repeat,
+            linear-gradient(var(--primary), var(--primary)) top right / 15px 3px no-repeat,
+            linear-gradient(var(--primary), var(--primary)) top right / 3px 15px no-repeat,
+            linear-gradient(var(--primary), var(--primary)) bottom left / 15px 3px no-repeat,
+            linear-gradient(var(--primary), var(--primary)) bottom left / 3px 15px no-repeat,
+            linear-gradient(var(--primary), var(--primary)) bottom right / 15px 3px no-repeat,
+            linear-gradient(var(--primary), var(--primary)) bottom right / 3px 15px no-repeat;
+        z-index: 2;
+    }
+
+    #progressCard > * {
+        position: relative;
+        z-index: 3;
+    }
+
+    /* Progress Bar Enhancement */
+    .progress-wrap {
+        border: 2px solid var(--border);
+        box-shadow: inset 0 0 10px rgba(0,0,0,0.8);
+        background-color: var(--bg);
+    }
+    
+    .progress-bar {
+        position: relative;
+        background-image: linear-gradient(
+            -45deg,
+            rgba(255, 255, 255, 0.15) 25%,
+            transparent 25%,
+            transparent 50%,
+            rgba(255, 255, 255, 0.15) 50%,
+            rgba(255, 255, 255, 0.15) 75%,
+            transparent 75%,
+            transparent
+        );
+        background-size: 1.5rem 1.5rem;
+        animation: progress-shimmer 1.5s linear infinite;
+        box-shadow: 0 0 15px rgba(20, 184, 166, 0.5);
+    }
+    
+    .progress-bar::after {
+        content: '';
+        position: absolute;
+        top: 0; right: 0; bottom: 0;
+        width: 4px;
+        background: #fff;
+        box-shadow: -2px 0 10px rgba(255,255,255,0.8), 0 0 15px var(--primary);
+    }
+
+    .progress-text {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+        letter-spacing: 0.15em;
+        text-shadow: 1px 1px 0 rgba(0,0,0,0.8);
+        font-size: 1.1rem;
+    }
+
+    /* Animations Details */
+    @keyframes progress-shimmer {
+        0% { background-position: 0 0; }
+        100% { background-position: 1.5rem 0; }
+    }
+    
+    /* Mobile overrides */
+    @media (max-width: 600px) {
+        .stats-grid {
+            grid-template-columns: repeat(2, 1fr);
+            gap: 1rem;
+        }
+        .breakdown-grid {
+            grid-template-columns: repeat(3, 1fr);
+            gap: 0.5rem;
+        }
+        .breakdown-grid .stat-value { font-size: 1.5rem; }
+        .breakdown-grid .stat-label { font-size: 0.6rem; letter-spacing: 0; }
+        #progressCard { padding: 1.5rem; }
+        .sdc-section { padding: 1.5rem; }
+        .sdc-title { font-size: 1rem; letter-spacing: 0.04em; }
+        .progress-text { font-size: 0.75rem; letter-spacing: 0.05em; }
+        .sdc-progress-text { font-size: 0.7rem; letter-spacing: 0.03em; }
+    }
 </style>
 {% endblock %}
 
@@ -804,6 +995,7 @@
                 if (methodLabel) methodLabel.textContent = i18nReclassify.human;
                 
                 // Update SDC pending state
+                var wasSdcPending = card.dataset.sdcPending === '1';
                 var isBootstrapped = card.dataset.bootstrapped === '1';
                 var sdcWritten = card.dataset.sdcWritten === '1';
                 var source = card.dataset.source;
@@ -819,6 +1011,16 @@
                 } else if (!nowSdcPending && sdcBadge) {
                     sdcBadge.remove();
                 }
+
+                // Adjust statSdcPending count and sync button state
+                var pendingEl = document.getElementById('statSdcPending');
+                if (pendingEl) {
+                    var count = parseInt(pendingEl.textContent, 10) || 0;
+                    if (nowSdcPending && !wasSdcPending) count++;
+                    else if (!nowSdcPending && wasSdcPending) count = Math.max(0, count - 1);
+                    pendingEl.textContent = count;
+                }
+                syncSdcButtonState();
 
                 var sdcNote = card.querySelector('.sdc-note');
                 if (data.sdc_removed) {
@@ -1463,7 +1665,8 @@
         stopBtn: {{ _('Stop Upload')|tojson }},
         stopping: {{ _('Stopping...')|tojson }},
         stopped: {{ _('Upload stopped by user. {written} claims were written before stopping.')|tojson }},
-        stopError: {{ _('Failed to stop upload. Please try again.')|tojson }}
+        stopError: {{ _('Failed to stop upload. Please try again.')|tojson }},
+        queuedInfo: {{ _('Your edits have been queued. You do not need to stay on this page — the background worker will process them automatically.')|tojson }}
     };
 
     var sdcInitialPending = {{ (stats.sdc_pending or 0)|tojson }};
@@ -1472,6 +1675,16 @@
     var sdcPollErrors = 0;
     var SDC_POLL_BASE_INTERVAL = 5000;
     var SDC_POLL_MAX_INTERVAL = 60000;
+
+    // Sync SDC write button disabled state with current pending counts.
+    // Called after reclassification and live stat updates.
+    function syncSdcButtonState() {
+        var btn = document.getElementById('sdcWriteBtn');
+        if (!btn || btn.textContent === i18nSdc.btnInProgress) return;
+        var el = document.getElementById('statSdcPending');
+        var pending = el ? parseInt(el.textContent, 10) || 0 : 0;
+        btn.disabled = (pending === 0);
+    }
 
     // Helper: safely set message text without innerHTML
     function sdcShowMessage(container, text, color) {
@@ -1533,6 +1746,8 @@
             progressBar.style.width = '0%';
             progressText.textContent = i18nSdc.queued;
             status.style.display = 'none';
+            result.style.display = 'block';
+            sdcShowMessage(result, i18nSdc.queuedInfo, 'var(--primary)');
             document.getElementById('sdcStopBtn').style.display = '';
             startSdcPolling();
         }).catch(function(e) {
@@ -1632,21 +1847,24 @@
             var written = data.written || 0;
             var pending = data.pending || 0;
             var removalPending = data.removal_pending || 0;
-            var total = written + pending;
             var removalsDone = (sdcInitialRemoval || 0) - removalPending;
             if (removalsDone < 0) removalsDone = 0;
-            var totalWork = total + (sdcInitialRemoval || 0);
-            var totalDone = written + removalsDone;
-            var pct = Math.min(100, Math.round(totalDone / (totalWork || 1) * 100));
+
+            // Session-relative counts: how many were written/removed THIS session
+            var sessionWritten = (sdcInitialPending || 0) - pending;
+            if (sessionWritten < 0) sessionWritten = 0;
+            var sessionTotal = (sdcInitialPending || 0) + (sdcInitialRemoval || 0);
+            var sessionDone = sessionWritten + removalsDone;
+            var pct = Math.min(100, Math.round(sessionDone / (sessionTotal || 1) * 100));
 
             if (data.in_progress) {
                 // Worker is actively writing
                 progress.style.display = 'block';
                 progressBar.style.width = pct + '%';
-                if (written > 0 && pending > 0) {
+                if (sessionWritten > 0 && pending > 0) {
                     progressText.textContent = i18nSdc.written
-                        .replace('{written}', written)
-                        .replace('{total}', total);
+                        .replace('{written}', sessionWritten)
+                        .replace('{total}', sdcInitialPending || 0);
                 } else if (pending === 0 && removalPending > 0) {
                     progressText.textContent = i18nSdc.removing;
                 } else {
@@ -1664,17 +1882,19 @@
                 stopSdcPolling();
                 stopBtn.style.display = 'none';
                 progress.style.display = 'block';
-                progressBar.style.width = '100%';
-                progressText.textContent = i18nSdc.done;
 
                 if (data.error) {
                     // Worker encountered an error
+                    progressBar.style.width = pct + '%';
+                    progressText.textContent = i18nSdc.workerError.replace('{error}', data.error);
                     result.style.display = 'block';
                     sdcShowMessage(result, i18nSdc.workerError.replace('{error}', data.error), 'var(--danger)');
                     btn.disabled = false;
                     btn.textContent = i18nSdc.btnLabel;
                 } else if (pending === 0 && removalPending === 0) {
                     // All done successfully
+                    progressBar.style.width = '100%';
+                    progressText.textContent = i18nSdc.done;
                     result.style.display = 'block';
                     sdcShowMessage(result, i18nSdc.allDone, 'var(--success)');
                     status.style.display = 'block';
@@ -1683,8 +1903,11 @@
                     btn.textContent = i18nSdc.btnLabel;
                 } else {
                     // Finished but some faces still pending (user stopped or partial success)
+                    progressBar.style.width = pct + '%';
+                    progressText.textContent = sessionWritten + ' / ' + (sdcInitialPending || 0);
+                    progress.style.display = 'block';
                     result.style.display = 'block';
-                    var stoppedMsg = i18nSdc.stopped.replace('{written}', written);
+                    var stoppedMsg = i18nSdc.stopped.replace('{written}', sessionWritten);
                     sdcShowMessage(result, stoppedMsg, 'var(--text-muted)');
                     btn.disabled = false;
                     btn.textContent = i18nSdc.btnLabel;
@@ -1778,6 +2001,7 @@
                 bar.style.transition = 'width 0.3s ease';
 
                 updateStats(data.face_stats);
+                syncSdcButtonState();
 
                 if (data.complete) {
                     bar.style.width = '100%';
@@ -1884,6 +2108,7 @@
                     var el = document.getElementById(id);
                     if (el) el.textContent = statMap[id] || 0;
                 }
+                syncSdcButtonState();
 
                 if (eligible > 0) {
                     // Still running

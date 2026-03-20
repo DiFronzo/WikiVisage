@@ -37,6 +37,7 @@ from requests.packages.urllib3.util.retry import Retry
 
 from config import WAKE_FILE_PATH
 from database import DatabaseError, close_pool, execute_query, execute_transaction, init_db
+from token_crypto import decrypt_token, encrypt_token
 
 # Configure Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
@@ -281,9 +282,11 @@ def _refresh_worker_token(user_id: int) -> str | None:
     access_token = user["access_token"]
     if isinstance(access_token, bytes):
         access_token = access_token.decode("utf-8")
+    access_token = decrypt_token(access_token)
     refresh_token = user.get("refresh_token", "")
     if isinstance(refresh_token, bytes):
         refresh_token = refresh_token.decode("utf-8")
+    refresh_token = decrypt_token(refresh_token)
 
     expires_at = user.get("token_expires_at")
     if expires_at:
@@ -332,7 +335,12 @@ def _refresh_worker_token(user_id: int) -> str | None:
     try:
         execute_query(
             "UPDATE users SET access_token = %s, refresh_token = %s, token_expires_at = %s WHERE id = %s",
-            (new_access, new_refresh, new_expires_at.strftime("%Y-%m-%d %H:%M:%S"), user_id),
+            (
+                encrypt_token(new_access),
+                encrypt_token(new_refresh),
+                new_expires_at.strftime("%Y-%m-%d %H:%M:%S"),
+                user_id,
+            ),
             fetch=False,
         )
     except DatabaseError:

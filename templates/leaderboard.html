@@ -6,10 +6,60 @@
 
 {% block extra_head %}
 <style>
+    /* --- Leaderboard Card --- */
+    .leaderboard-card {
+        position: relative;
+        overflow: hidden;
+        border: 2px solid var(--primary);
+        background: linear-gradient(135deg, var(--surface) 0%, var(--bg) 100%);
+        box-shadow: var(--shadow);
+        padding: 0;
+        animation: stat-entrance 0.6s cubic-bezier(0.16, 1, 0.3, 1) backwards;
+        animation-delay: 0.25s;
+    }
+
+    .leaderboard-card::before {
+        content: '';
+        position: absolute;
+        inset: 0;
+        background: repeating-linear-gradient(
+            0deg,
+            transparent,
+            transparent 2px,
+            rgba(20, 184, 166, 0.04) 2px,
+            rgba(20, 184, 166, 0.04) 4px
+        );
+        pointer-events: none;
+        z-index: 1;
+        animation: scanline 20s linear infinite;
+    }
+
+    .leaderboard-card::after {
+        content: '';
+        position: absolute;
+        top: 0; right: 0; bottom: 0; left: 0;
+        pointer-events: none;
+        background:
+            linear-gradient(var(--primary), var(--primary)) top left / 15px 3px no-repeat,
+            linear-gradient(var(--primary), var(--primary)) top left / 3px 15px no-repeat,
+            linear-gradient(var(--primary), var(--primary)) top right / 15px 3px no-repeat,
+            linear-gradient(var(--primary), var(--primary)) top right / 3px 15px no-repeat,
+            linear-gradient(var(--primary), var(--primary)) bottom left / 15px 3px no-repeat,
+            linear-gradient(var(--primary), var(--primary)) bottom left / 3px 15px no-repeat,
+            linear-gradient(var(--primary), var(--primary)) bottom right / 15px 3px no-repeat,
+            linear-gradient(var(--primary), var(--primary)) bottom right / 3px 15px no-repeat;
+        z-index: 2;
+    }
+
+    .leaderboard-card > * {
+        position: relative;
+        z-index: 3;
+    }
+
+    /* --- Leaderboard Table --- */
     .leaderboard-table {
         width: 100%;
         border-collapse: collapse;
-        margin-top: 2rem;
     }
     .leaderboard-table th {
         text-align: left;
@@ -17,46 +67,74 @@
         font-size: 0.75rem;
         text-transform: uppercase;
         letter-spacing: 0.1em;
-        color: var(--text-muted);
+        color: var(--primary);
         border-bottom: 2px solid var(--border);
         font-weight: 800;
         white-space: nowrap;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
     }
     .leaderboard-table th.num {
         text-align: right;
     }
     .leaderboard-table td {
         padding: 1rem 1.5rem;
-        border-bottom: 1px solid var(--border);
+        border-bottom: 1px solid color-mix(in srgb, var(--border) 50%, transparent);
         font-weight: 600;
     }
     .leaderboard-table td.num {
         text-align: right;
         font-variant-numeric: tabular-nums;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+        letter-spacing: 0.03em;
     }
-    .leaderboard-table tr:hover td {
-        background-color: var(--surface);
+    .leaderboard-table tbody tr {
+        transition: background-color 0.15s ease;
+    }
+    .leaderboard-table tbody tr:hover td {
+        background-color: color-mix(in srgb, var(--primary) 5%, transparent);
+    }
+    .leaderboard-table tbody tr:last-child td {
+        border-bottom: none;
     }
     .rank {
-        color: var(--text-muted);
-        font-weight: 800;
+        font-weight: 900;
         min-width: 2rem;
         display: inline-block;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+        color: var(--text-muted);
     }
-    .rank-1 { color: #fbbf24; }
-    .rank-2 { color: #94a3b8; }
-    .rank-3 { color: #d97706; }
+    .rank-1 { color: #fbbf24; text-shadow: 0 0 12px rgba(251, 191, 36, 0.5); }
+    .rank-2 { color: #94a3b8; text-shadow: 0 0 12px rgba(148, 163, 184, 0.4); }
+    .rank-3 { color: #d97706; text-shadow: 0 0 12px rgba(217, 119, 6, 0.4); }
     .username-link {
         color: var(--text-main);
         font-weight: 800;
+        text-decoration: none;
+        transition: color 0.15s ease;
     }
     .username-link:hover {
         color: var(--primary);
+    }
+    .total-col {
+        color: var(--primary);
+        font-weight: 900;
+        text-shadow: 0 0 15px color-mix(in srgb, var(--primary) 30%, transparent);
     }
     .table-scroll {
         overflow-x: auto;
         -webkit-overflow-scrolling: touch;
     }
+
+    /* --- Empty State Card --- */
+    .empty-leaderboard {
+        position: relative;
+        overflow: hidden;
+        border: 2px solid var(--border);
+        background: linear-gradient(135deg, var(--surface) 0%, var(--bg) 100%);
+        text-align: center;
+        padding: 4rem 2rem;
+    }
+
     @media (max-width: 600px) {
         .leaderboard-table th,
         .leaderboard-table td {
@@ -73,22 +151,22 @@
 <h1>{{ _('Leaderboard') }}</h1>
 
 <div class="stats-grid" style="margin-bottom: 3rem; grid-template-columns: repeat(3, 1fr);">
-    <div class="stat-box">
+    <div class="stat-box stat-box-success">
         <div class="stat-value">{{ totals.classifications }}</div>
         <div class="stat-label">{{ _('Classified') }}</div>
     </div>
-    <div class="stat-box">
+    <div class="stat-box stat-box-info">
         <div class="stat-value">{{ totals.sdc_tags }}</div>
         <div class="stat-label">{{ _('SDC Written') }}</div>
     </div>
-    <div class="stat-box">
+    <div class="stat-box stat-box-primary">
         <div class="stat-value">{{ rows | length }}</div>
         <div class="stat-label">{{ _('Contributors') }}</div>
     </div>
 </div>
 
 {% if rows %}
-<div class="card" style="padding: 0; overflow: hidden;">
+<div class="card leaderboard-card">
     <div class="table-scroll">
     <table class="leaderboard-table">
         <thead>
@@ -114,7 +192,7 @@
                 </td>
                 <td class="num">{{ row.classifications }}</td>
                 <td class="num">{{ row.sdc_tags }}</td>
-                <td class="num" style="color: var(--primary); font-weight: 900;">
+                <td class="num total-col">
                     {{ row.classifications + row.sdc_tags }}
                 </td>
             </tr>
@@ -124,7 +202,7 @@
     </div>
 </div>
 {% else %}
-<div class="card" style="text-align: center; padding: 4rem 2rem;">
+<div class="card empty-leaderboard">
     <h2 style="border: none;">{{ _('No contributions yet') }}</h2>
     <p style="color: var(--text-muted); margin-bottom: 2rem;">
         {{ _('Start classifying faces in a project to appear on the leaderboard.') }}
