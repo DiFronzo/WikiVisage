@@ -55,6 +55,7 @@ from database import (
     execute_transaction,
     init_db,
 )
+from token_crypto import TokenDecryptionError, decrypt_token, encrypt_token
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -258,6 +259,7 @@ def before_request() -> None:
                 for _tk in ("access_token", "refresh_token"):
                     if isinstance(g.user.get(_tk), bytes):
                         g.user[_tk] = g.user[_tk].decode("utf-8")
+                    g.user[_tk] = decrypt_token(g.user[_tk])
                 # Enforce whitelist on every request (not just login).
                 # Fail-closed: empty whitelist = deny all (prevents bypass if both sources fail).
                 allowed = _load_whitelist()
@@ -265,6 +267,10 @@ def before_request() -> None:
                     logger.warning(f"Session revoked for user not on whitelist: {g.user['wiki_username']}")
                     session.clear()
                     g.user = None
+        except TokenDecryptionError:
+            logger.warning("Token decryption failed for user %s — clearing session to force re-auth", user_id)
+            session.clear()
+            g.user = None
         except DatabaseError:
             logger.exception("Failed to load user from session")
             session.clear()
@@ -382,8 +388,8 @@ def _refresh_access_token(user: dict[str, Any]) -> dict[str, Any] | None:
         execute_query(
             "UPDATE users SET access_token = %s, refresh_token = %s, token_expires_at = %s WHERE id = %s",
             (
-                new_token["access_token"],
-                new_token.get("refresh_token", user["refresh_token"]),
+                encrypt_token(new_token["access_token"]),
+                encrypt_token(new_token.get("refresh_token", user["refresh_token"])),
                 new_expires_at.strftime("%Y-%m-%d %H:%M:%S"),
                 user["id"],
             ),
@@ -467,6 +473,15 @@ def set_security_headers(response):
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
     response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline'; "
+        "style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' https://*.wikimedia.org data:; "
+        "connect-src 'self'; "
+        "font-src 'self'; "
+        "frame-ancestors 'none'"
+    )
     return response
 
 
@@ -750,8 +765,8 @@ def oauth_callback():
                 "refresh_token = %s, token_expires_at = %s WHERE wiki_user_id = %s",
                 (
                     wiki_username,
-                    token["access_token"],
-                    token.get("refresh_token", ""),
+                    encrypt_token(token["access_token"]),
+                    encrypt_token(token.get("refresh_token", "")),
                     expires_at_str,
                     wiki_user_id,
                 ),
@@ -765,8 +780,8 @@ def oauth_callback():
                 (
                     wiki_user_id,
                     wiki_username,
-                    token["access_token"],
-                    token.get("refresh_token", ""),
+                    encrypt_token(token["access_token"]),
+                    encrypt_token(token.get("refresh_token", "")),
                     expires_at_str,
                 ),
                 fetch=False,

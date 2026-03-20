@@ -317,8 +317,22 @@
     .review-banner-desc { color: var(--text-muted); font-size: 0.9rem; margin-left: 0.5rem; }
     .undo-wrap { margin-top: 1rem; text-align: center; }
 
+    /* Desktop short screens: compress vertical spacing so image is visible without scroll */
+    @media (min-width: 601px) and (max-height: 900px) {
+        nav:not(:has(+ .system-banner)) { margin-bottom: 1rem !important; }
+        .header-actions { margin-bottom: 0.5rem; }
+        .header-actions h1 { margin-bottom: 0; }
+        .face-info { margin-bottom: 0.5rem; }
+        .classify-hint { margin-bottom: 0.5rem; }
+        .manual-controls { margin-bottom: 0.5rem; }
+        .image-wrapper { margin-bottom: 0.75rem; }
+        .image-wrapper img { max-height: calc(100vh - 21rem); }
+        .hotkey-hints { margin-top: 0.5rem; }
+        .undo-wrap { margin-top: 0.5rem; }
+    }
+
     @media (max-width: 600px) {
-        nav { margin-bottom: 1rem !important; }
+        nav:not(:has(+ .system-banner)) { margin-bottom: 1rem !important; }
         
         .header-actions { margin-bottom: 0.75rem; display: flex; flex-direction: column; align-items: flex-start; gap: 0.5rem; }
         .header-actions h1 { font-size: 1.1rem; margin: 0; line-height: 1.2; }

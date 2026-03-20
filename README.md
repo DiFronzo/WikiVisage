@@ -86,6 +86,7 @@ Active learning facial recognition for Wikimedia Commons. Train an ML model to r
 WikiVisage/
 ├── app.py               # Flask app: OAuth, routes, classification API
 ├── worker.py            # Background ML pipeline: crawl, detect, infer, write (multi-instance)
+├── token_crypto.py      # Fernet encrypt/decrypt helpers for OAuth tokens at rest
 ├── database.py          # MariaDB connection pool with retry logic
 ├── schema.sql           # Database schema (7 tables + indices)
 ├── migrate.py           # Idempotent migration script with --reset flag
@@ -124,6 +125,9 @@ toolforge envvars create OAUTH_REDIRECT_URI     "https://<toolname>.toolforge.or
 
 # Flask
 toolforge envvars create FLASK_SECRET_KEY "$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+
+# Token encryption (optional — tokens stored as plaintext if unset)
+toolforge envvars create WIKIVISAGE_TOKEN_KEY "$(python3 -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())')"
 ```
 
 ### 2) 🗄️ Create database

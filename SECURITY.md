@@ -57,12 +57,13 @@ The following are **out of scope**:
 ## Security Measures in Place
 
 - OAuth 2.0 with Wikimedia (access + refresh tokens, stored as VARBINARY in DB)
+- Token encryption at rest: OAuth tokens can be Fernet-encrypted via `WIKIVISAGE_TOKEN_KEY` env var (AES-128-CBC + HMAC-SHA256). Opt-in; legacy plaintext tokens are handled gracefully.
 - CSRF tokens on all POST routes
 - Whitelist enforcement on every request
 - Open redirect protection on login
 - Parameterized SQL queries (no string interpolation of values)
 - Rate limiting on sensitive endpoints
-- Security headers (`X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`, `Permissions-Policy`)
+- Security headers (`Content-Security-Policy`, `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`, `Permissions-Policy`)
 - Input validation on bounding box coordinates
 - Image download size cap (50 MB) and pixel dimension validation
 - Distributed worker locking (`SELECT … FOR UPDATE`) with stale-claim expiry

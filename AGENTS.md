@@ -10,6 +10,7 @@ Active-learning Flask app for Wikimedia Commons. Users classify faces via yes/no
 WikiVisage/
 ├── app.py              # Flask web app: OAuth, routes, classification API (~2750 lines)
 ├── worker.py           # Background ML pipeline: crawl, detect, infer (~1880 lines)
+├── token_crypto.py     # Fernet encrypt/decrypt helpers for OAuth tokens at rest (~82 lines)
 ├── database.py         # MariaDB connection pool with retry logic (~485 lines)
 ├── schema.sql          # DDL for 6 tables: users, sessions, projects, images, faces, worker_heartbeat
 ├── migrate.py          # Idempotent schema migration with --reset flag (~333 lines)
@@ -25,12 +26,13 @@ WikiVisage/
 │   ├── nb/LC_MESSAGES/ # Norwegian Bokmål
 │   ├── es/LC_MESSAGES/ # Spanish
 │   └── fr/LC_MESSAGES/ # French
-├── tests/              # Hybrid test suite: 56 unit + 33 integration tests
+├── tests/              # Hybrid test suite: 74 unit + 33 integration tests
 │   ├── __init__.py
 │   ├── conftest.py     # Integration fixture infrastructure (~450 lines)
 │   ├── test_app.py     # 29 unit + 11 integration tests (~615 lines)
 │   ├── test_database.py # 9 unit + 9 integration tests (~235 lines)
 │   ├── test_migrate.py # 13 unit + 8 integration tests (~471 lines)
+│   ├── test_token_crypto.py # 18 unit tests (~120 lines)
 │   └── test_worker.py  # 5 unit + 5 integration tests (~473 lines)
 ├── templates/          # Jinja2 templates (9 files, all extend base.html)
 │   ├── base.html       # Layout: nav, flash messages, CSS variables. Blocks: title, extra_head, content
@@ -203,6 +205,7 @@ worker_heartbeat (single-row: id=1, last_seen DATETIME)
 - `WIKIVISAGE_WORKER_POLL_INTERVAL` — Default: `60` seconds
 - `WIKIVISAGE_WORKER_MAX_PROJECTS` — Default: `3` (concurrent projects processed by worker)
 - `WIKIVISAGE_WORKER_IMAGE_THREADS` — Default: `4` (parallel image download/detection threads per project)
+- `WIKIVISAGE_TOKEN_KEY` — Fernet key for encrypting OAuth tokens at rest. If unset, tokens are stored as plaintext (backward compatible). Generate with: `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`
 - `OAUTHLIB_INSECURE_TRANSPORT=1` — Required for local dev (OAuth over HTTP)
 
 ## Conventions
@@ -236,7 +239,8 @@ worker_heartbeat (single-row: id=1, last_seen DATETIME)
 - Rate limiting: Global 200/hour default. `10/min` on `api_manual_face` and `api_update_face_bbox`. Uses `memory://` storage (per-process, acceptable for single-worker Toolforge gunicorn).
 - CSRF: All POST routes protected via Flask-Session tokens.
 - Bbox validation: All face bounding box inputs validated against `MAX_BBOX_PX` and `MIN_BBOX_AREA`.
-- Security headers set on all responses: `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `X-XSS-Protection: 1; mode=block`.
+- Security headers set on all responses: `Content-Security-Policy`, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `X-XSS-Protection: 1; mode=block`.
+- Token encryption at rest: OAuth access/refresh tokens can be Fernet-encrypted in the DB via `WIKIVISAGE_TOKEN_KEY` env var (opt-in). Handled by `token_crypto.py`. Decryption gracefully falls back to plaintext for legacy tokens.
 - SDC writes include `maxlag=5` parameter for Wikimedia API compliance.
 
 ### Error handling
@@ -307,11 +311,11 @@ Each face encoding is 1024 bytes (128 float64). Even 10K faces ~ 10MB. No RAM co
 
 ## Testing
 
-Hybrid test suite: **56 unit tests** (run in CI) + **33 integration tests** (require local Docker MariaDB).
+Hybrid test suite: **74 unit tests** (run in CI) + **33 integration tests** (require local Docker MariaDB).
 
 ### Architecture
 
-- **Unit tests**: Pure mocks, no DB. Run everywhere (CI, local). Cover thumb snapping, URL safety, CSRF validation, error classes, migration parsing, route logic.
+- **Unit tests**: Pure mocks, no DB. Run everywhere (CI, local). Cover thumb snapping, URL safety, CSRF validation, error classes, migration parsing, route logic, token encryption.
 - **Integration tests**: Hit a real MariaDB via Docker. Marked with `@pytest.mark.integration`. Skipped in CI (GitHub Actions) — only run locally when `WIKIVISAGE_TEST_DB=1` is set.
 - **Test DB**: `wikiface_test` — created fresh per pytest session, dropped on teardown. Never touches `wikiface_dev`.
 - **Config**: `pyproject.toml` has `testpaths = ["tests"]`, `pythonpath = ["."]`, and integration marker.
@@ -323,8 +327,9 @@ Hybrid test suite: **56 unit tests** (run in CI) + **33 integration tests** (req
 | `test_app.py` | 29 | 11 | 40 |
 | `test_database.py` | 9 | 9 | 18 |
 | `test_migrate.py` | 13 | 8 | 21 |
+| `test_token_crypto.py` | 18 | 0 | 18 |
 | `test_worker.py` | 5 | 5 | 10 |
-| **Total** | **56** | **33** | **89** |
+| **Total** | **74** | **33** | **107** |
 
 ### Commands
 

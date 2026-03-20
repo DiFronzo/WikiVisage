@@ -65,6 +65,7 @@ The landing page and `/health` endpoint work without OAuth. See [test-local.md](
 |---|---|
 | `app.py` | Flask web app: OAuth, routes, classification API |
 | `worker.py` | Background ML pipeline: crawl, detect, infer, write SDC (multi-instance) |
+| `token_crypto.py` | Fernet encrypt/decrypt helpers for OAuth tokens at rest |
 | `database.py` | MariaDB connection pool with retry logic |
 | `schema.sql` | DDL for 7 tables + indexes |
 | `migrate.py` | Idempotent schema migrations with `--reset` flag |
@@ -100,7 +101,8 @@ The landing page and `/health` endpoint work without OAuth. See [test-local.md](
 - All POST routes require CSRF tokens.
 - All face bounding box inputs are validated against `MAX_BBOX_PX` and `MIN_BBOX_AREA`.
 - Rate limiting: global 200/hour default, 10/min on bbox endpoints.
-- Security headers set on all responses: `X-Content-Type-Options`, `X-Frame-Options`. (`X-XSS-Protection` is deprecated and not used.)
+- Security headers set on all responses: `Content-Security-Policy`, `X-Content-Type-Options`, `X-Frame-Options`.
+- OAuth tokens can be encrypted at rest via `WIKIVISAGE_TOKEN_KEY` env var (Fernet). See `token_crypto.py`.
 - Never store secrets in code. Use environment variables.
 
 ## Internationalization (i18n)

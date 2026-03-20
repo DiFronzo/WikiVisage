@@ -55,6 +55,10 @@ toolforge envvars create OAUTH_REDIRECT_URI    "https://wikivisage.toolforge.org
 
 # Flask secret key (generate a strong random one)
 toolforge envvars create FLASK_SECRET_KEY      "$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+
+# Token encryption (optional — encrypts OAuth tokens at rest in the DB)
+# If unset, tokens are stored as plaintext (backward compatible)
+toolforge envvars create WIKIVISAGE_TOKEN_KEY  "$(python3 -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())')"
 ```
 
 Verify with:
