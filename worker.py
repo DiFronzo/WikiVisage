@@ -1130,47 +1130,49 @@ def bootstrap_from_sparql(project: dict[str, Any]) -> int:
                     if affected:
                         flagged_count += 1
 
-                        # For already-processed images with faces:
-                        if img_status == "processed":
-                            # Mark any human/model-classified target faces as
-                            # sdc_written since P180 already exists on Commons.
-                            marked = execute_query(
-                                "UPDATE faces SET sdc_written = 1 "
-                                "WHERE image_id = %s AND is_target = 1 AND sdc_written = 0 "
-                                "AND superseded_by IS NULL",
-                                (image_id,),
-                                fetch=False,
+                    # For already-processed images with faces, always run the
+                    # reconciliation logic when we find the image via P180,
+                    # regardless of whether the bootstrapped flag changed.
+                    if img_status == "processed":
+                        # Mark any human/model-classified target faces as
+                        # sdc_written since P180 already exists on Commons.
+                        marked = execute_query(
+                            "UPDATE faces SET sdc_written = 1 "
+                            "WHERE image_id = %s AND is_target = 1 AND sdc_written = 0 "
+                            "AND superseded_by IS NULL",
+                            (image_id,),
+                            fetch=False,
+                        )
+                        if marked:
+                            logger.info(
+                                f"Bootstrap marked {marked} already-classified face(s) "
+                                f"as sdc_written on image {image_id} (P180 exists on Commons)"
                             )
-                            if marked:
-                                logger.info(
-                                    f"Bootstrap marked {marked} already-classified face(s) "
-                                    f"as sdc_written on image {image_id} (P180 exists on Commons)"
-                                )
 
-                            # Auto-classify single unclassified faces as target
-                            # matches (same logic as _process_single_image).
-                            # Perform this in a single conditional UPDATE to avoid a per-image COUNT query.
-                            auto = execute_query(
-                                "UPDATE faces "
-                                "SET is_target = 1, classified_by = 'bootstrap' "
-                                "WHERE image_id = %s "
-                                "AND is_target IS NULL "
-                                "AND superseded_by IS NULL "
-                                "AND (SELECT COUNT(*) FROM faces "
-                                "     WHERE image_id = %s AND superseded_by IS NULL) = 1",
-                                (image_id, image_id),
+                        # Auto-classify single unclassified faces as target
+                        # matches (same logic as _process_single_image).
+                        # Perform this in a single conditional UPDATE to avoid a per-image COUNT query.
+                        auto = execute_query(
+                            "UPDATE faces "
+                            "SET is_target = 1, classified_by = 'bootstrap' "
+                            "WHERE image_id = %s "
+                            "AND is_target IS NULL "
+                            "AND superseded_by IS NULL "
+                            "AND (SELECT COUNT(*) FROM faces "
+                            "     WHERE image_id = %s AND superseded_by IS NULL) = 1",
+                            (image_id, image_id),
+                            fetch=False,
+                        )
+                        if auto:
+                            execute_query(
+                                "UPDATE projects SET faces_confirmed = faces_confirmed + %s WHERE id = %s",
+                                (auto, project["id"]),
                                 fetch=False,
                             )
-                            if auto:
-                                execute_query(
-                                    "UPDATE projects SET faces_confirmed = faces_confirmed + %s WHERE id = %s",
-                                    (auto, project["id"]),
-                                    fetch=False,
-                                )
-                                logger.info(
-                                    f"Bootstrap auto-classified {auto} face(s) on "
-                                    f"already-processed image {image_id} as target"
-                                )
+                            logger.info(
+                                f"Bootstrap auto-classified {auto} face(s) on "
+                                f"already-processed image {image_id} as target"
+                            )
                 else:
                     # Enforce global image cap before inserting new images
                     if inserted_count >= remaining_global:
