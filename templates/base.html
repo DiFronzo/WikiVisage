@@ -841,13 +841,38 @@
             var reEgg = document.getElementById("re-egg");
             if (!initPet) return;
 
+            function hasCookieConsent() {
+                // Respect global "no cookies" flag used elsewhere (e.g., "?nocookie=1").
+                try {
+                    return !/[?&]nocookie=1(?:&|$)/.test(window.location.search);
+                } catch (e) {
+                    return true;
+                }
+            }
+
             function getPetCookie() {
-                var m = document.cookie.match(/(?:^|; )jimmy_pet=([^;]*)/);
-                return m ? m[1] : null;
+                if (hasCookieConsent()) {
+                    var m = document.cookie.match(/(?:^|; )jimmy_pet=([^;]*)/);
+                    return m ? m[1] : null;
+                }
+                if (window.localStorage) {
+                    return window.localStorage.getItem("jimmy_pet");
+                }
+                return null;
             }
 
             function setPetCookie(val) {
-                document.cookie = "jimmy_pet=" + val + ";path=/;max-age=31536000;SameSite=Lax";
+                if (hasCookieConsent()) {
+                    document.cookie = "jimmy_pet=" + val + ";path=/;max-age=31536000;SameSite=Lax";
+                    return;
+                }
+                if (window.localStorage) {
+                    if (val === null) {
+                        window.localStorage.removeItem("jimmy_pet");
+                    } else {
+                        window.localStorage.setItem("jimmy_pet", val);
+                    }
+                }
             }
 
             function removeAllPets() {
