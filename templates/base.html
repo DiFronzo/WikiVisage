@@ -461,7 +461,7 @@
 
     <footer>
         <div class="container">
-            <p><a href="https://github.com/DiFronzo/WikiVisage" target="_blank" rel="noopener">WikiVisage v{{ app_version }}</a> &mdash; &copy; 2026 User:Premeditated</p>
+            <p><a href="https://github.com/DiFronzo/WikiVisage" target="_blank" rel="noopener">WikiVisage v{{ app_version }}</a> &mdash; &copy; 2026 User:Premeditated <a href="#" id="re-egg" style="display:none;text-decoration:none" title="{{ _('Bring back the pet') }}" aria-label="{{ _('Bring back the pet') }}">&#x1F423;</a></p>
             <img src="{{ url_for('static', filename='powered-by-toolforge.svg') }}" alt="Powered by Toolforge" width="155" height="50" style="margin-top: 0.75rem; height: 50px;">
         </div>
     </footer>
@@ -822,6 +822,206 @@
             window.addEventListener("appinstalled", function() {
                 banner.style.display = "none";
             });
+        })();
+    </script>
+
+    <!-- Screen pet easter egg -->
+    <div id="jimmy-pet-init" style="position:fixed;bottom:0;cursor:pointer;z-index:50;transition:transform 0.3s ease;transform:translateY(75%);display:none"
+         aria-hidden="true">
+        <button id="jimmy-pet-close" style="position:absolute;top:-8px;right:-8px;width:22px;height:22px;background:var(--surface);color:var(--text-muted);border:2px solid var(--border);font-size:14px;line-height:1;cursor:pointer;z-index:51;display:none;align-items:center;justify-content:center;padding:0" aria-label="Dismiss">&times;</button>
+        <img src="{{ url_for('static', filename='jimmy-pet.png') }}" alt="" width="80" draggable="false"
+             title="Photo: Gus Freedman, CC BY-SA 2.5" style="display:block;">
+    </div>
+    <script>
+        (function() {
+            if (window.matchMedia("(max-width: 600px)").matches) return;
+            var petSrc = {{ url_for('static', filename='jimmy-pet.png')|tojson }};
+            var initPet = document.getElementById("jimmy-pet-init");
+            var closeBtn = document.getElementById("jimmy-pet-close");
+            var reEgg = document.getElementById("re-egg");
+            if (!initPet) return;
+
+            function hasCookieConsent() {
+                // Respect global "no cookies" flag used elsewhere (e.g., "?nocookie=1").
+                try {
+                    return !/[?&]nocookie=1(?:&|$)/.test(window.location.search);
+                } catch (e) {
+                    return true;
+                }
+            }
+
+            function getPetCookie() {
+                if (hasCookieConsent()) {
+                    var m = document.cookie.match(/(?:^|; )jimmy_pet=([^;]*)/);
+                    return m ? m[1] : null;
+                }
+                if (window.localStorage) {
+                    return window.localStorage.getItem("jimmy_pet");
+                }
+                return null;
+            }
+
+            function setPetCookie(val) {
+                if (hasCookieConsent()) {
+                    document.cookie = "jimmy_pet=" + val + ";path=/;max-age=31536000;SameSite=Lax";
+                    return;
+                }
+                if (window.localStorage) {
+                    if (val === null) {
+                        window.localStorage.removeItem("jimmy_pet");
+                    } else {
+                        window.localStorage.setItem("jimmy_pet", val);
+                    }
+                }
+            }
+
+            function removeAllPets() {
+                var clones = document.querySelectorAll(".jimmy-pet-clone");
+                for (var i = 0; i < clones.length; i++) {
+                    if (clones[i]._wanderTimer) {
+                        clearTimeout(clones[i]._wanderTimer);
+                        clones[i]._wanderTimer = null;
+                    }
+                    clones[i].remove();
+                }
+                if (initPet && initPet._wanderTimer) {
+                    clearTimeout(initPet._wanderTimer);
+                    initPet._wanderTimer = null;
+                }
+                initPet.style.display = "none";
+            }
+
+            function showInitPet() {
+                initPet.style.left = (20 + Math.random() * 60) + "%";
+                initPet.style.bottom = "0";
+                initPet.style.top = "auto";
+                initPet.style.transform = "translateY(75%)";
+                initPet.style.display = "block";
+            }
+
+            if (reEgg) {
+                reEgg.addEventListener("click", function(e) {
+                    e.preventDefault();
+                    setPetCookie("on");
+                    reEgg.style.display = "none";
+                    removeAllPets();
+                    showInitPet();
+                    initPet.style.transition = "transform 0.3s ease";
+                    bindPet(initPet);
+                });
+            }
+
+            if (getPetCookie() === "off") {
+                if (reEgg) reEgg.style.display = "inline";
+                return;
+            }
+            showInitPet();
+
+            closeBtn.addEventListener("click", function(e) {
+                e.stopPropagation();
+                setPetCookie("off");
+                removeAllPets();
+                if (reEgg) reEgg.style.display = "inline";
+            });
+
+            initPet.addEventListener("mouseenter", function() { if (isPeeking(initPet)) closeBtn.style.display = "flex"; });
+            initPet.addEventListener("mouseleave", function() { closeBtn.style.display = "none"; });
+
+            function spawnPet(x, y) {
+                var el = document.createElement("div");
+                el.className = "jimmy-pet-clone";
+                el.style.cssText = "position:fixed;cursor:pointer;z-index:50;transition:all 0.8s cubic-bezier(0.34,1.56,0.64,1);";
+                el.style.left = x + "px";
+                el.style.top = y + "px";
+                el.style.transform = "scale(0)";
+                el.setAttribute("aria-hidden", "true");
+                var img = document.createElement("img");
+                img.src = petSrc;
+                img.alt = "";
+                img.width = 80;
+                img.draggable = false;
+                img.style.display = "block";
+                img.title = "Photo: Gus Freedman, CC BY-SA 2.5";
+                el.appendChild(img);
+                document.body.appendChild(el);
+                requestAnimationFrame(function() {
+                    requestAnimationFrame(function() { el.style.transform = "scale(1)"; });
+                });
+                bindPet(el);
+                startWandering(el);
+                return el;
+            }
+
+            function jumpTo(el) {
+                var w = window.innerWidth - 100, h = window.innerHeight - 120;
+                el.style.bottom = "auto";
+                el.style.transform = "none";
+                el.style.left = Math.max(0, Math.random() * w) + "px";
+                el.style.top = Math.max(0, Math.random() * h) + "px";
+            }
+
+            function fleeMouse(el) {
+                var rect = el.getBoundingClientRect();
+                var cx = rect.left + rect.width / 2;
+                var cy = rect.top + rect.height / 2;
+                var w = window.innerWidth - 100, h = window.innerHeight - 120;
+                var angle = Math.random() * Math.PI * 2;
+                var dist = 60 + Math.random() * 90;
+                var nx = cx + Math.cos(angle) * dist;
+                var ny = cy + Math.sin(angle) * dist;
+                nx = Math.max(0, Math.min(w, nx));
+                ny = Math.max(0, Math.min(h, ny));
+                el.style.bottom = "auto";
+                el.style.left = nx + "px";
+                el.style.top = ny + "px";
+                el.style.transform = "scale(" + (Math.random() > 0.5 ? "-1" : "1") + ", 1)";
+            }
+
+            function startWandering(el) {
+                function wander() {
+                    if (!document.body.contains(el)) return;
+                    var w = window.innerWidth - 100, h = window.innerHeight - 120;
+                    var rect = el.getBoundingClientRect();
+                    var dx = (Math.random() - 0.5) * 500;
+                    var dy = (Math.random() - 0.5) * 500;
+                    var nx = Math.max(0, Math.min(w, rect.left + dx));
+                    var ny = Math.max(0, Math.min(h, rect.top + dy));
+                    el.style.bottom = "auto";
+                    el.style.left = nx + "px";
+                    el.style.top = ny + "px";
+                    el._wanderTimer = setTimeout(wander, 3000 + Math.random() * 4000);
+                }
+                el._wanderTimer = setTimeout(wander, 2000 + Math.random() * 3000);
+            }
+
+            function isPeeking(el) {
+                return el.id === "jimmy-pet-init" && (el.style.bottom === "0px" || el.style.bottom === "0");
+            }
+
+            function bindPet(el) {
+                el.addEventListener("click", function(e) {
+                    e.stopPropagation();
+                    if (el.id === "jimmy-pet-init") {
+                        closeBtn.style.display = "none";
+                        startWandering(el);
+                    }
+                    jumpTo(el);
+                    var w = window.innerWidth - 100, h = window.innerHeight - 120;
+                    spawnPet(Math.max(0, Math.random() * w), Math.max(0, Math.random() * h));
+                });
+                el.addEventListener("mouseenter", function() {
+                    if (isPeeking(el)) {
+                        el.style.transform = "translateY(60%)";
+                    } else {
+                        fleeMouse(el);
+                    }
+                });
+                el.addEventListener("mouseleave", function() {
+                    if (isPeeking(el)) el.style.transform = "translateY(75%)";
+                });
+            }
+
+            bindPet(initPet);
         })();
     </script>
 
