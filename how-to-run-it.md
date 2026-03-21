@@ -59,6 +59,11 @@ toolforge envvars create FLASK_SECRET_KEY      "$(python3 -c 'import secrets; pr
 # Token encryption (optional — encrypts OAuth tokens at rest in the DB)
 # If unset, tokens are stored as plaintext (backward compatible)
 toolforge envvars create WIKIVISAGE_TOKEN_KEY  "$(python3 -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())')"
+
+# Redis for shared rate limiting (optional — falls back to in-memory if unavailable)
+# Default: redis://redis.svc.tools.eqiad1.wikimedia.cloud:6379
+# Only needed if you want to customize the Redis URL
+# toolforge envvars create WIKIVISAGE_REDIS_URL "redis://redis.svc.tools.eqiad1.wikimedia.cloud:6379"
 ```
 
 Verify with:
@@ -110,7 +115,7 @@ toolforge jobs run migrate \
   --mem 512Mi
 ```
 
-This creates all 7 tables (`users`, `sessions`, `projects`, `images`, `faces`, `user_stats`, `worker_heartbeat`) and their indexes. Safe to re-run — migrations are idempotent.
+This creates all 9 tables (`users`, `sessions`, `projects`, `images`, `faces`, `user_stats`, `sdc_claims`, `project_members`, `worker_heartbeat`) and their indexes. Safe to re-run — migrations are idempotent.
 
 Check the migration completed:
 
@@ -335,4 +340,4 @@ toolforge build show
 
 - Verify credentials: `toolforge envvars list`
 - Verify the database exists: `mariadb --defaults-file=$HOME/replica.my.cnf -h tools.db.svc.wikimedia.cloud -e "SHOW DATABASES LIKE '%wikiface%'"`
-- Check that migration has run: look for 7 tables in the database
+- Check that migration has run: look for 9 tables in the database

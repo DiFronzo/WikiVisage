@@ -8,12 +8,12 @@ Active-learning Flask app for Wikimedia Commons. Users classify faces via yes/no
 
 ```
 WikiVisage/
-├── app.py              # Flask web app: OAuth, routes, classification API (~2750 lines)
-├── worker.py           # Background ML pipeline: crawl, detect, infer (~1880 lines)
+├── app.py              # Flask web app: OAuth, routes, classification API (~3440 lines)
+├── worker.py           # Background ML pipeline: crawl, detect, infer (~2760 lines)
 ├── token_crypto.py     # Fernet encrypt/decrypt helpers for OAuth tokens at rest (~82 lines)
 ├── database.py         # MariaDB connection pool with retry logic (~485 lines)
-├── schema.sql          # DDL for 6 tables: users, sessions, projects, images, faces, worker_heartbeat
-├── migrate.py          # Idempotent schema migration with --reset flag (~333 lines)
+├── schema.sql          # DDL for 9 tables: users, sessions, projects, images, faces, user_stats, sdc_claims, project_members, worker_heartbeat
+├── migrate.py          # Idempotent schema migration with --reset flag (~430 lines)
 ├── whitelist.txt       # Allowed usernames (one per line, checked on every request)
 ├── pyproject.toml      # Project config: Ruff linter/formatter rules, pytest config, markers
 ├── requirements.txt    # Python 3.11+, dlib-bin fork (no source compilation)
@@ -26,14 +26,14 @@ WikiVisage/
 │   ├── nb/LC_MESSAGES/ # Norwegian Bokmål
 │   ├── es/LC_MESSAGES/ # Spanish
 │   └── fr/LC_MESSAGES/ # French
-├── tests/              # Hybrid test suite: 74 unit + 33 integration tests
+├── tests/              # Hybrid test suite: 470 unit + 34 integration tests
 │   ├── __init__.py
 │   ├── conftest.py     # Integration fixture infrastructure (~450 lines)
-│   ├── test_app.py     # 29 unit + 11 integration tests (~615 lines)
+│   ├── test_app.py     # 395 unit + 11 integration tests (~7800 lines)
 │   ├── test_database.py # 9 unit + 9 integration tests (~235 lines)
-│   ├── test_migrate.py # 13 unit + 8 integration tests (~471 lines)
-│   ├── test_token_crypto.py # 18 unit tests (~120 lines)
-│   └── test_worker.py  # 5 unit + 5 integration tests (~473 lines)
+│   ├── test_migrate.py # 15 unit + 8 integration tests (~471 lines)
+│   ├── test_token_crypto.py # 25 unit tests (~120 lines)
+│   └── test_worker.py  # 26 unit + 6 integration tests (~473 lines)
 ├── templates/          # Jinja2 templates (9 files, all extend base.html)
 │   ├── base.html       # Layout: nav, flash messages, CSS variables. Blocks: title, extra_head, content
 │   ├── classify.html   # Active learning UI: face image, yes/no/skip/none buttons, keyboard shortcuts, undo
@@ -68,7 +68,7 @@ Flask app served by gunicorn via app factory (`create_app()`). Handles OAuth 2.0
 - Rate limiting via Flask-Limiter (global 200/hour default, 10/min on bbox endpoints)
 - Security headers: `X-Content-Type-Options`, `X-Frame-Options`, `X-XSS-Protection`
 
-**Routes (21 total):**
+**Routes (22 total):**
 | Route | Method | Purpose |
 |-------|--------|---------|
 | `/` | GET | Landing page |
@@ -76,9 +76,9 @@ Flask app served by gunicorn via app factory (`create_app()`). Handles OAuth 2.0
 | `/login` | GET | OAuth 2.0 redirect to Wikimedia |
 | `/auth/callback` | GET | OAuth token exchange |
 | `/logout` | POST | End session (CSRF protected) |
-| `/dashboard` | GET | User's project list (paginated) |
-| `/project/new` | GET/POST | Create project (QID + Commons category, validates P31=Q5 and category existence) |
-| `/project/<id>` | GET | Project stats, classification breakdown, model results gallery with approve/reject/edit-bbox |
+| `/dashboard` | GET | User's project list (paginated), includes collaborator count badges |
+| `/project/new` | GET/POST | Create project (QID + Commons category, validates P31=Q5 and category existence). Detects cross-user duplicates and offers join option |
+| `/project/<id>` | GET | Project stats, classification breakdown, model results gallery with approve/reject/edit-bbox, collaborator count badge |
 | `/project/<id>/classify` | GET | Active learning face classification UI |
 | `/project/<id>/classify/clear-skips` | POST | Reset skipped faces for this session |
 | `/api/classify` | POST | Submit face classification (yes/no/none) |
@@ -88,13 +88,25 @@ Flask app served by gunicorn via app factory (`create_app()`). Handles OAuth 2.0
 | `/api/update-face-bbox` | POST | Redraw face bounding box from Model Results (rate limited: 10/min) |
 | `/api/write-sdc/<id>` | POST | Queue P180 depicts claims for writing by background worker (sets flag, returns immediately) |
 | `/api/sdc-status/<id>` | GET | Poll SDC write progress (written/pending counts, in_progress flag) |
-| `/project/<id>/settings` | GET/POST | Edit project params |
+| `/project/<id>/settings` | GET/POST | Edit project params, view member list (owner-only) |
+| `/project/<id>/settings/remove-member` | POST | Remove a member from the project (owner-only, CSRF protected) |
 | `/project/<id>/delete` | POST | Delete project |
 | `/leaderboard` | GET | Top classifiers |
 | `/health` | GET | Health check (JSON) |
 | `/commons-thumb/<path>` | GET | Redirect to Commons thumbnail URL (standard step sizes enforced) |
 
 **Error handlers:** 400, 403, 404, 500 — all render `error.html`.
+
+**Access control helpers (membership-aware):**
+- `get_project_for_actor(project_id, user_id)` — Fetches a project if the user is the owner OR a member via `project_members`. Used by `project_detail`, `classify`, `api_sdc_status`, `api_gallery`, `api_progress`. Returns project dict or `None` (→ 404).
+- `verify_image_access(image_id, project_id, user_id)` — Verifies that an image belongs to a project accessible by the user (owner or member). Used by `api_classify`, `api_undo_classify`, `api_manual_face`. Returns image dict or `None` (→ 403).
+
+**Project join flow (`/project/new` POST):**
+1. User submits QID + Commons category.
+2. Own-duplicate check: if the user already has this exact project, redirect to it.
+3. Cross-user duplicate check: if ANOTHER user has a project with the same QID + category, show join/create-anyway options.
+4. Join: inserts into `project_members` and redirects to the existing project.
+5. Create anyway: creates a new independent project for the user.
 
 ### Worker (worker.py)
 
@@ -156,6 +168,18 @@ users 1──N projects 1──N images 1──N faces
                                 images:
                                        +-- bootstrapped: 1=image found via P180 bootstrap
 
+project_members (project_id, user_id, role, joined_at)
+  +-- Tracks additional collaborators beyond the project owner
+  +-- role: 'owner' | 'member' (default 'member')
+  +-- PK: (project_id, user_id) — composite, no duplicates
+  +-- FKs cascade on DELETE from projects and users
+
+sdc_claims (commons_page_id, wikidata_qid, project_id, face_id, claimed_at, written_at)
+  +-- Cross-project deduplication: UNIQUE(commons_page_id, wikidata_qid)
+  +-- Prevents two projects writing the same P180 claim to the same Commons page
+  +-- Worker does INSERT IGNORE — first project to claim wins
+  +-- written_at set when API write succeeds
+
 worker_heartbeat (single-row: id=1, last_seen DATETIME)
 ```
 
@@ -206,6 +230,7 @@ worker_heartbeat (single-row: id=1, last_seen DATETIME)
 - `WIKIVISAGE_WORKER_MAX_PROJECTS` — Default: `3` (concurrent projects processed by worker)
 - `WIKIVISAGE_WORKER_IMAGE_THREADS` — Default: `4` (parallel image download/detection threads per project)
 - `WIKIVISAGE_TOKEN_KEY` — Fernet key for encrypting OAuth tokens at rest. If unset, tokens are stored as plaintext (backward compatible). Generate with: `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`
+- `WIKIVISAGE_REDIS_URL` — Redis URL for shared rate limiter storage. Default: `redis://redis.svc.tools.eqiad1.wikimedia.cloud:6379`. Falls back to `memory://` if Redis is unreachable. Key prefix: `wikivisage:`.
 - `OAUTHLIB_INSECURE_TRANSPORT=1` — Required for local dev (OAuth over HTTP)
 
 ## Conventions
@@ -236,7 +261,7 @@ worker_heartbeat (single-row: id=1, last_seen DATETIME)
 ### Security
 - Whitelist enforcement: `whitelist.txt` checked on every request via `@before_request`. Blocks non-whitelisted users after login.
 - Open redirect protection: `_is_safe_url()` validates all redirect targets.
-- Rate limiting: Global 200/hour default. `10/min` on `api_manual_face` and `api_update_face_bbox`. Uses `memory://` storage (per-process, acceptable for single-worker Toolforge gunicorn).
+- Rate limiting: Global 200/hour default. `10/min` on `api_manual_face` and `api_update_face_bbox`. Uses Redis for shared storage across gunicorn workers (`WIKIVISAGE_REDIS_URL`). Falls back to `memory://` if Redis is unreachable.
 - CSRF: All POST routes protected via Flask-Session tokens.
 - Bbox validation: All face bounding box inputs validated against `MAX_BBOX_PX` and `MIN_BBOX_AREA`.
 - Security headers set on all responses: `Content-Security-Policy`, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `X-XSS-Protection: 1; mode=block`.
@@ -311,7 +336,7 @@ Each face encoding is 1024 bytes (128 float64). Even 10K faces ~ 10MB. No RAM co
 
 ## Testing
 
-Hybrid test suite: **74 unit tests** (run in CI) + **33 integration tests** (require local Docker MariaDB).
+Hybrid test suite: **470 unit tests** (run in CI) + **34 integration tests** (require local Docker MariaDB).
 
 ### Architecture
 
@@ -324,12 +349,12 @@ Hybrid test suite: **74 unit tests** (run in CI) + **33 integration tests** (req
 
 | File | Unit | Integration | Total |
 |------|------|-------------|-------|
-| `test_app.py` | 29 | 11 | 40 |
+| `test_app.py` | 395 | 11 | 406 |
 | `test_database.py` | 9 | 9 | 18 |
-| `test_migrate.py` | 13 | 8 | 21 |
-| `test_token_crypto.py` | 18 | 0 | 18 |
-| `test_worker.py` | 5 | 5 | 10 |
-| **Total** | **74** | **33** | **107** |
+| `test_migrate.py` | 15 | 8 | 23 |
+| `test_token_crypto.py` | 25 | 0 | 25 |
+| `test_worker.py` | 26 | 6 | 32 |
+| **Total** | **470** | **34** | **504** |
 
 ### Commands
 

@@ -25,7 +25,17 @@ logger = logging.getLogger(__name__)
 SCHEMA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "schema.sql")
 
 # Drop order respects foreign key dependencies (children first).
-_ALL_TABLES = ["faces", "images", "projects", "sessions", "user_stats", "worker_heartbeat", "users"]
+_ALL_TABLES = [
+    "sdc_claims",
+    "project_members",
+    "faces",
+    "images",
+    "projects",
+    "sessions",
+    "user_stats",
+    "worker_heartbeat",
+    "users",
+]
 
 
 def load_schema(path: str) -> list[str]:
@@ -295,6 +305,34 @@ _ALTER_MIGRATIONS = [
         "Add composite index on faces(image_id, is_target, superseded_by) for classification queries",
         "ALTER TABLE faces ADD INDEX idx_faces_image_target_superseded (image_id, is_target, superseded_by)",
     ),
+    (
+        "Create sdc_claims table for cross-project SDC deduplication",
+        "CREATE TABLE IF NOT EXISTS sdc_claims ("
+        "  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,"
+        "  commons_page_id BIGINT UNSIGNED NOT NULL COMMENT 'MediaWiki page ID on Commons',"
+        "  wikidata_qid VARCHAR(20) NOT NULL COMMENT 'e.g. Q42',"
+        "  project_id BIGINT UNSIGNED NOT NULL COMMENT 'Project that claimed this write',"
+        "  face_id BIGINT UNSIGNED NOT NULL COMMENT 'Face that triggered this write',"
+        "  claimed_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+        "  written_at DATETIME NULL COMMENT 'When the API write succeeded',"
+        "  UNIQUE INDEX idx_sdc_claims_page_qid (commons_page_id, wikidata_qid),"
+        "  INDEX idx_sdc_claims_project (project_id),"
+        "  CONSTRAINT fk_sdc_claims_project FOREIGN KEY (project_id) REFERENCES projects (id) ON DELETE CASCADE,"
+        "  CONSTRAINT fk_sdc_claims_face FOREIGN KEY (face_id) REFERENCES faces (id) ON DELETE CASCADE"
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
+    ),
+    (
+        "Create project_members table for multi-user collaboration",
+        "CREATE TABLE IF NOT EXISTS project_members ("
+        "  project_id BIGINT UNSIGNED NOT NULL,"
+        "  user_id BIGINT UNSIGNED NOT NULL,"
+        "  role ENUM('owner', 'member') NOT NULL DEFAULT 'member',"
+        "  joined_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,"
+        "  PRIMARY KEY (project_id, user_id),"
+        "  CONSTRAINT fk_pm_project FOREIGN KEY (project_id) REFERENCES projects (id) ON DELETE CASCADE,"
+        "  CONSTRAINT fk_pm_user FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE"
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
+    ),
 ]
 
 
@@ -337,6 +375,8 @@ def verify_tables() -> None:
         "faces",
         "user_stats",
         "worker_heartbeat",
+        "sdc_claims",
+        "project_members",
     ]
 
     init_db(pool_size=1)

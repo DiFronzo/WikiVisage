@@ -163,6 +163,11 @@
                         </p>
                         
                         <span class="badge badge-{{ project.status }}">{{ project.status }}</span>
+                        {% if member_counts.get(project.id, 0) > 0 %}
+                            <span class="badge" style="background: var(--surface); border: 1px solid var(--border); color: var(--text-muted); font-size: 0.7rem;">
+                                {{ ngettext('%(num)d collaborator', '%(num)d collaborators', member_counts[project.id], num=member_counts[project.id]) }}
+                            </span>
+                        {% endif %}
                         
                         {% if project.images_total == 0 %}
                             <div class="dash-status">

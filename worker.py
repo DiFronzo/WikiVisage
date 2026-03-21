@@ -346,17 +346,54 @@ def _refresh_worker_token(user_id: int) -> str | None:
     new_refresh = new_token.get("refresh_token", refresh_token)
     new_expires_at = datetime.now(UTC) + timedelta(seconds=new_token.get("expires_in", 14400))
 
+    # Optimistic concurrency: only update if no other process refreshed first.
+    # The old expires_at acts as a compare-and-swap guard.
+    old_expires_str = expires_at.strftime("%Y-%m-%d %H:%M:%S") if expires_at else None
+
     try:
-        execute_query(
-            "UPDATE users SET access_token = %s, refresh_token = %s, token_expires_at = %s WHERE id = %s",
-            (
-                encrypt_token(new_access),
-                encrypt_token(new_refresh),
-                new_expires_at.strftime("%Y-%m-%d %H:%M:%S"),
-                user_id,
-            ),
-            fetch=False,
-        )
+        if old_expires_str:
+            rowcount = execute_query(
+                "UPDATE users SET access_token = %s, refresh_token = %s, token_expires_at = %s "
+                "WHERE id = %s AND token_expires_at = %s",
+                (
+                    encrypt_token(new_access),
+                    encrypt_token(new_refresh),
+                    new_expires_at.strftime("%Y-%m-%d %H:%M:%S"),
+                    user_id,
+                    old_expires_str,
+                ),
+                fetch=False,
+            )
+        else:
+            rowcount = execute_query(
+                "UPDATE users SET access_token = %s, refresh_token = %s, token_expires_at = %s WHERE id = %s",
+                (
+                    encrypt_token(new_access),
+                    encrypt_token(new_refresh),
+                    new_expires_at.strftime("%Y-%m-%d %H:%M:%S"),
+                    user_id,
+                ),
+                fetch=False,
+            )
+
+        if rowcount == 0 and old_expires_str:
+            # Another process already refreshed — re-read from DB
+            logger.info(f"Token already refreshed by another process for user {user_id}")
+            fresh = execute_query(
+                "SELECT access_token FROM users WHERE id = %s",
+                (user_id,),
+                fetch=True,
+            )
+            if fresh:
+                fresh_token = fresh[0]["access_token"]
+                if isinstance(fresh_token, bytes):
+                    fresh_token = fresh_token.decode("utf-8")
+                try:
+                    return decrypt_token(fresh_token)
+                except TokenDecryptionError:
+                    logger.error(f"Cannot decrypt fresh token for user {user_id}")
+                    return None
+            return None
     except DatabaseError:
         logger.exception(f"Failed to persist refreshed token for user {user_id}")
 
@@ -1571,6 +1608,27 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
             mid = f"M{page_id}"
 
             try:
+                # Cross-project dedup: claim this page+qid pair before making the API call.
+                # INSERT IGNORE returns rowcount=0 if another project already claimed it.
+                claim_rows = execute_query(
+                    "INSERT IGNORE INTO sdc_claims (commons_page_id, wikidata_qid, project_id, face_id) "
+                    "VALUES (%s, %s, %s, %s)",
+                    (page_id, qid, project_id, face_id),
+                    fetch=False,
+                )
+                if claim_rows == 0:
+                    logger.info(
+                        f"SDC claim for {qid} on M{page_id} already claimed by another project, "
+                        f"marking face {face_id} as written"
+                    )
+                    execute_query(
+                        "UPDATE faces SET sdc_written = 1 WHERE id = %s",
+                        (face_id,),
+                        fetch=False,
+                    )
+                    total_written += 1
+                    continue
+
                 # Idempotency check
                 claim_params = {
                     "action": "wbgetclaims",
@@ -1640,6 +1698,12 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
                     execute_query(
                         "UPDATE faces SET sdc_written = 1 WHERE id = %s",
                         (face_id,),
+                        fetch=False,
+                    )
+                    execute_query(
+                        "UPDATE sdc_claims SET written_at = NOW() "
+                        "WHERE commons_page_id = %s AND wikidata_qid = %s AND written_at IS NULL",
+                        (page_id, qid),
                         fetch=False,
                     )
                     image_id = row["image_id"]
@@ -1746,6 +1810,11 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
                 execute_query(
                     "UPDATE faces SET sdc_written = 1 WHERE id = %s",
                     (face_id,),
+                    fetch=False,
+                )
+                execute_query(
+                    "UPDATE sdc_claims SET written_at = NOW() WHERE commons_page_id = %s AND wikidata_qid = %s",
+                    (page_id, qid),
                     fetch=False,
                 )
                 total_written += 1

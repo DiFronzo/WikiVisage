@@ -645,6 +645,11 @@
         {% endif %}
         <div class="project-header-text">
             <h1 class="project-title">{{ project.label or project.wikidata_qid }}</h1>
+            {% if member_count > 0 %}
+                <span class="badge" style="background: var(--surface); border: 1px solid var(--border); color: var(--text-muted); font-size: 0.7rem;">
+                    {{ ngettext('%(num)d collaborator', '%(num)d collaborators', member_count, num=member_count) }}
+                </span>
+            {% endif %}
             <p class="project-links">
                 <a href="https://www.wikidata.org/wiki/{{ project.wikidata_qid }}" target="_blank" rel="noopener">{{ project.wikidata_qid }}</a> &bull;
                 <a href="https://commons.wikimedia.org/wiki/Category:{{ project.commons_category | urlencode }}" target="_blank" rel="noopener">Category:{{ project.commons_category }}</a>

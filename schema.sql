@@ -152,6 +152,46 @@ CREATE TABLE IF NOT EXISTS user_stats (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 
+-- SDC claims table: cross-project deduplication of P180 depicts claims.
+-- Ensures that only one project writes a given P180 claim per Commons page,
+-- even when multiple projects target the same Wikidata entity.
+CREATE TABLE IF NOT EXISTS sdc_claims (
+    id              BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    commons_page_id BIGINT UNSIGNED NOT NULL COMMENT 'MediaWiki page ID on Commons',
+    wikidata_qid    VARCHAR(20)     NOT NULL COMMENT 'e.g. Q42',
+    project_id      BIGINT UNSIGNED NOT NULL COMMENT 'Project that claimed this write',
+    face_id         BIGINT UNSIGNED NOT NULL COMMENT 'Face that triggered this write',
+    claimed_at      DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    written_at      DATETIME        NULL COMMENT 'When the API write succeeded',
+
+    UNIQUE INDEX idx_sdc_claims_page_qid (commons_page_id, wikidata_qid),
+    INDEX idx_sdc_claims_project (project_id),
+
+    CONSTRAINT fk_sdc_claims_project
+        FOREIGN KEY (project_id) REFERENCES projects (id) ON DELETE CASCADE,
+    CONSTRAINT fk_sdc_claims_face
+        FOREIGN KEY (face_id) REFERENCES faces (id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+
+-- Project members table: allows multiple users to collaborate on a project.
+-- The project owner is always in users.id via projects.user_id. This table
+-- tracks additional members who joined the project.
+CREATE TABLE IF NOT EXISTS project_members (
+    project_id  BIGINT UNSIGNED NOT NULL,
+    user_id     BIGINT UNSIGNED NOT NULL,
+    role        ENUM('owner', 'member') NOT NULL DEFAULT 'member',
+    joined_at   DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    PRIMARY KEY (project_id, user_id),
+
+    CONSTRAINT fk_pm_project
+        FOREIGN KEY (project_id) REFERENCES projects (id) ON DELETE CASCADE,
+    CONSTRAINT fk_pm_user
+        FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+
 -- Worker heartbeat table: single-row table tracking when the background worker last ran.
 -- Used by the web app to detect worker downtime and display a banner.
 CREATE TABLE IF NOT EXISTS worker_heartbeat (

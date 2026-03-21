@@ -47,7 +47,14 @@
             </div>
 
             <div style="margin-top: 2rem;">
+                {% if existing_project %}
+                <div style="display: flex; gap: 0.75rem; flex-wrap: wrap;">
+                    <button type="submit" name="action" value="join" class="btn btn-primary" style="flex: 1;">{{ _('Join Existing Project') }}</button>
+                    <button type="submit" name="action" value="create_anyway" class="btn" style="flex: 1;">{{ _('Create My Own') }}</button>
+                </div>
+                {% else %}
                 <button type="submit" class="btn btn-primary" style="width: 100%;">{{ _('Create Project') }}</button>
+                {% endif %}
             </div>
         </form>
     </div>

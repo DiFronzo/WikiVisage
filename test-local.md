@@ -44,6 +44,8 @@ export OAUTH_CLIENT_ID=""
 export OAUTH_CLIENT_SECRET=""
 export OAUTH_REDIRECT_URI="http://localhost:8000/auth/callback"
 export OAUTHLIB_INSECURE_TRANSPORT=1
+# Optional: skip whitelist enforcement for local dev
+export WIKIVISAGE_WHITELIST_LOCAL=1
 # Optional: encrypt OAuth tokens at rest (leave unset for plaintext)
 # export WIKIVISAGE_TOKEN_KEY="$(python3 -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())')"
 ```
@@ -54,7 +56,7 @@ export OAUTHLIB_INSECURE_TRANSPORT=1
 python migrate.py
 ```
 
-This creates all 7 tables (`users`, `sessions`, `projects`, `images`, `faces`, `user_stats`, `worker_heartbeat`) and their indexes. Safe to re-run.
+This creates all 9 tables (`users`, `sessions`, `projects`, `images`, `faces`, `user_stats`, `sdc_claims`, `project_members`, `worker_heartbeat`) and their indexes. Safe to re-run.
 
 ## 5. Run the Web App
 

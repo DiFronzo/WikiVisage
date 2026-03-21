@@ -67,7 +67,7 @@ The landing page and `/health` endpoint work without OAuth. See [test-local.md](
 | `worker.py` | Background ML pipeline: crawl, detect, infer, write SDC (multi-instance) |
 | `token_crypto.py` | Fernet encrypt/decrypt helpers for OAuth tokens at rest |
 | `database.py` | MariaDB connection pool with retry logic |
-| `schema.sql` | DDL for 7 tables + indexes |
+| `schema.sql` | DDL for 9 tables + indexes |
 | `migrate.py` | Idempotent schema migrations with `--reset` flag |
 | `templates/` | Jinja2 templates (9 files, all extend `base.html`) |
 | `translations/` | i18n files (en, nb, es, fr) |
@@ -100,7 +100,7 @@ The landing page and `/health` endpoint work without OAuth. See [test-local.md](
 
 - All POST routes require CSRF tokens.
 - All face bounding box inputs are validated against `MAX_BBOX_PX` and `MIN_BBOX_AREA`.
-- Rate limiting: global 200/hour default, 10/min on bbox endpoints.
+- Rate limiting: global 200/hour default, 10/min on bbox endpoints. Uses Redis for shared storage across gunicorn workers (`WIKIVISAGE_REDIS_URL`), falls back to in-memory if unavailable.
 - Security headers set on all responses: `Content-Security-Policy`, `X-Content-Type-Options`, `X-Frame-Options`.
 - OAuth tokens can be encrypted at rest via `WIKIVISAGE_TOKEN_KEY` env var (Fernet). See `token_crypto.py`.
 - Never store secrets in code. Use environment variables.
@@ -154,7 +154,7 @@ pybabel compile -d translations
 4. Run `python migrate.py` to verify it applies cleanly.
 5. Migrations must be safe to run repeatedly without error.
 
-Currently 7 tables: `users`, `sessions`, `projects`, `images`, `faces`, `user_stats`, `worker_heartbeat`.
+Currently 9 tables: `users`, `sessions`, `projects`, `images`, `faces`, `user_stats`, `sdc_claims`, `project_members`, `worker_heartbeat`.
 
 ## Testing
 
