@@ -1609,7 +1609,7 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
 
             try:
                 # Cross-project dedup: claim this page+qid pair before making the API call.
-                # INSERT IGNORE returns rowcount=0 if another project already claimed it.
+                # INSERT IGNORE returns rowcount=0 when a row already exists.
                 claim_rows = execute_query(
                     "INSERT IGNORE INTO sdc_claims (commons_page_id, wikidata_qid, project_id, face_id) "
                     "VALUES (%s, %s, %s, %s)",
@@ -1617,17 +1617,71 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
                     fetch=False,
                 )
                 if claim_rows == 0:
-                    logger.info(
-                        f"SDC claim for {qid} on M{page_id} already claimed by another project, "
-                        f"marking face {face_id} as written"
+                    # INSERT was a no-op: a row already exists for this page+qid.
+                    # Inspect it before deciding whether to skip, retry, or reclaim.
+                    existing_claim = execute_query(
+                        "SELECT project_id, written_at, claimed_at FROM sdc_claims "
+                        "WHERE commons_page_id = %s AND wikidata_qid = %s",
+                        (page_id, qid),
+                        fetch=True,
                     )
-                    execute_query(
-                        "UPDATE faces SET sdc_written = 1 WHERE id = %s",
-                        (face_id,),
-                        fetch=False,
-                    )
-                    total_written += 1
-                    continue
+                    if not existing_claim:
+                        # Row vanished between INSERT and SELECT (e.g. cascade delete).
+                        # Skip this face; it will be retried next write cycle.
+                        logger.warning(
+                            f"SDC claim row missing for {qid} on M{page_id} after INSERT IGNORE, "
+                            f"skipping face {face_id}"
+                        )
+                        continue
+
+                    existing = existing_claim[0]
+
+                    if existing["written_at"] is not None:
+                        # The claim was already successfully written to Commons.
+                        # Safe to mark this face as done.
+                        logger.info(
+                            f"SDC claim for {qid} on M{page_id} already written "
+                            f"(written_at={existing['written_at']}), marking face {face_id} as written"
+                        )
+                        execute_query(
+                            "UPDATE faces SET sdc_written = 1 WHERE id = %s",
+                            (face_id,),
+                            fetch=False,
+                        )
+                        total_written += 1
+                        continue
+
+                    if int(existing["project_id"]) == int(project_id):
+                        # Same project owns this claim but hasn't written it yet
+                        # (e.g. a previous write attempt failed mid-way).
+                        # Fall through to the write logic below.
+                        logger.info(
+                            f"SDC claim for {qid} on M{page_id} previously claimed by this project, "
+                            f"retrying write for face {face_id}"
+                        )
+                    else:
+                        # A different project holds the claim with written_at IS NULL.
+                        # Try to reclaim if the claim is stale (crashed/abandoned worker).
+                        reclaimed = execute_query(
+                            "UPDATE sdc_claims SET project_id = %s, face_id = %s, claimed_at = NOW() "
+                            "WHERE commons_page_id = %s AND wikidata_qid = %s "
+                            "AND written_at IS NULL "
+                            "AND claimed_at < NOW() - INTERVAL %s MINUTE",
+                            (project_id, face_id, page_id, qid, CLAIM_EXPIRY_MINUTES),
+                            fetch=False,
+                        )
+                        if reclaimed == 0:
+                            # Another project holds a fresh, non-stale claim — skip for now.
+                            logger.info(
+                                f"SDC claim for {qid} on M{page_id} held by project "
+                                f"{existing['project_id']} (claimed_at={existing['claimed_at']}), "
+                                f"skipping face {face_id} this cycle"
+                            )
+                            continue
+                        logger.info(
+                            f"Reclaimed stale SDC claim for {qid} on M{page_id} "
+                            f"from project {existing['project_id']} for face {face_id}"
+                        )
 
                 # Idempotency check
                 claim_params = {
