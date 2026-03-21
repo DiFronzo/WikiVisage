@@ -333,6 +333,28 @@ _ALTER_MIGRATIONS = [
         "  CONSTRAINT fk_pm_user FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE"
         ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
     ),
+    (
+        "Add status column to project_members for ban support",
+        "ALTER TABLE project_members ADD COLUMN status ENUM('active', 'banned') NOT NULL DEFAULT 'active' AFTER role",
+    ),
+    (
+        "Add allow_collaborators column to projects",
+        "ALTER TABLE projects ADD COLUMN allow_collaborators TINYINT(1) NOT NULL DEFAULT 1 "
+        "COMMENT '1=other users can join this project, 0=join disabled' AFTER sdc_write_error",
+    ),
+    (
+        "Drop allow_collaborators column from projects (replaced by invite_code)",
+        "ALTER TABLE projects DROP COLUMN allow_collaborators",
+    ),
+    (
+        "Add invite_code column to projects for invite-based joining",
+        "ALTER TABLE projects ADD COLUMN invite_code VARCHAR(8) NULL DEFAULT NULL "
+        "COMMENT 'Unique code for others to join this project' AFTER sdc_write_error",
+    ),
+    (
+        "Add unique index on invite_code",
+        "ALTER TABLE projects ADD UNIQUE INDEX idx_projects_invite_code (invite_code)",
+    ),
 ]
 
 
@@ -341,6 +363,7 @@ def _apply_alter_migrations() -> None:
     IDEMPOTENT_ERROR_CODES = {
         1060,  # ER_DUP_FIELDNAME — column already exists
         1061,  # ER_DUP_KEYNAME — index/key already exists
+        1091,  # ER_CANT_DROP_FIELD_OR_KEY — column/key doesn't exist (already dropped)
         1826,  # ER_DUP_CONSTRAINT_NAME — FK constraint already exists
     }
     logger.info(f"Applying {len(_ALTER_MIGRATIONS)} incremental migrations")

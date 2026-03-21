@@ -693,6 +693,10 @@ def _snap_thumb_width(width: int) -> int:
     return _THUMB_STEPS[-1]
 
 
+def _generate_invite_code() -> str:
+    return secrets.token_urlsafe(6)[:8]
+
+
 def commons_thumb_url(file_title: str, width: int = 330) -> str:
     """Build a Wikimedia Commons thumbnail URL for any file type.
 
@@ -889,7 +893,7 @@ def get_project_for_actor(project_id: int, user_id: int, *, require_owner: bool 
         return get_project_for_user(project_id, user_id)
     rows = execute_query(
         "SELECT p.* FROM projects p "
-        "LEFT JOIN project_members pm ON pm.project_id = p.id AND pm.user_id = %s "
+        "LEFT JOIN project_members pm ON pm.project_id = p.id AND pm.user_id = %s AND pm.status = 'active' "
         "WHERE p.id = %s AND p.status != 'deleted' AND (p.user_id = %s OR pm.user_id IS NOT NULL)",
         (user_id, project_id, user_id),
     )
@@ -918,7 +922,7 @@ def verify_image_access(image_id: int, project_id: int, user_id: int) -> dict | 
     rows = execute_query(
         "SELECT i.id, i.file_title FROM images i "
         "JOIN projects p ON i.project_id = p.id "
-        "LEFT JOIN project_members pm ON pm.project_id = p.id AND pm.user_id = %s "
+        "LEFT JOIN project_members pm ON pm.project_id = p.id AND pm.user_id = %s AND pm.status = 'active' "
         "WHERE i.id = %s AND p.id = %s AND p.status != 'deleted' "
         "AND (p.user_id = %s OR pm.user_id IS NOT NULL)",
         (user_id, image_id, project_id, user_id),
@@ -967,7 +971,7 @@ def dashboard():
     try:
         count_row = execute_query(
             "SELECT COUNT(DISTINCT p.id) AS cnt FROM projects p "
-            "LEFT JOIN project_members pm ON pm.project_id = p.id AND pm.user_id = %s "
+            "LEFT JOIN project_members pm ON pm.project_id = p.id AND pm.user_id = %s AND pm.status = 'active' "
             "WHERE (p.user_id = %s OR pm.user_id IS NOT NULL) AND p.status != 'deleted'",
             (g.user["id"], g.user["id"]),
         )
@@ -983,7 +987,7 @@ def dashboard():
     try:
         projects = execute_query(
             "SELECT DISTINCT p.* FROM projects p "
-            "LEFT JOIN project_members pm ON pm.project_id = p.id AND pm.user_id = %s "
+            "LEFT JOIN project_members pm ON pm.project_id = p.id AND pm.user_id = %s AND pm.status = 'active' "
             "WHERE (p.user_id = %s OR pm.user_id IS NOT NULL) AND p.status != 'deleted' "
             "ORDER BY p.updated_at DESC LIMIT %s OFFSET %s",
             (g.user["id"], g.user["id"], PROJECTS_PER_PAGE, offset),
@@ -1001,7 +1005,7 @@ def dashboard():
             placeholders = ", ".join(["%s"] * len(project_ids))
             count_rows = execute_query(
                 f"SELECT project_id, COUNT(*) AS cnt FROM project_members "
-                f"WHERE project_id IN ({placeholders}) GROUP BY project_id",
+                f"WHERE project_id IN ({placeholders}) AND status = 'active' GROUP BY project_id",
                 tuple(project_ids),
             )
             for row in count_rows:
@@ -1033,6 +1037,7 @@ def dashboard():
         "dashboard.html",
         projects=projects,
         member_counts=member_counts,
+        current_user_id=g.user["id"],
         page=page,
         total_pages=total_pages,
         total_projects=total,
@@ -1280,7 +1285,7 @@ def project_new():
     except DatabaseError:
         logger.exception("Failed to check for duplicate project")
 
-    # Cross-user duplicate: offer to join an existing project instead of creating a new one
+    # Cross-user duplicate: inform user if another project exists for same QID + category
     action = request.form.get("action", "create")
     try:
         other_project = execute_query(
@@ -1292,33 +1297,19 @@ def project_new():
         )
         if other_project:
             op = other_project[0]
-            already_member = execute_query(
-                "SELECT 1 FROM project_members WHERE project_id = %s AND user_id = %s",
+            existing_membership = execute_query(
+                "SELECT status FROM project_members WHERE project_id = %s AND user_id = %s",
                 (op["id"], g.user["id"]),
             )
-            if already_member:
+            is_banned = existing_membership and existing_membership[0]["status"] == "banned"
+            if existing_membership and not is_banned:
                 flash(_("You are already a member of this project."), "info")
                 return redirect(url_for("project_detail", project_id=op["id"]))
-            if action == "join":
-                execute_query(
-                    "INSERT IGNORE INTO project_members (project_id, user_id, role) VALUES (%s, %s, 'member')",
-                    (op["id"], g.user["id"]),
-                    fetch=False,
-                )
-                flash(
-                    _(
-                        'Joined %(username)s\'s project "%(label)s" successfully!',
-                        username=op["wiki_username"],
-                        label=op["label"] or op["id"],
-                    ),
-                    "success",
-                )
-                return redirect(url_for("project_detail", project_id=op["id"]))
-            if action != "create_anyway":
+            if not is_banned and action != "create_anyway":
                 flash(
                     _(
                         "%(username)s already has a project for this Q-ID and category. "
-                        "You can join their project or create your own.",
+                        "You can ask them for an invite code to join, or create your own.",
                         username=op["wiki_username"],
                     ),
                     "info",
@@ -1344,8 +1335,8 @@ def project_new():
 
         execute_query(
             "INSERT INTO projects (user_id, wikidata_qid, commons_category, label, "
-            "distance_threshold, min_confirmed, p18_thumb_url) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+            "distance_threshold, min_confirmed, p18_thumb_url, invite_code) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
             (
                 g.user["id"],
                 wikidata_qid,
@@ -1354,6 +1345,7 @@ def project_new():
                 distance_threshold,
                 min_confirmed,
                 p18_thumb_url,
+                _generate_invite_code(),
             ),
             fetch=False,
         )
@@ -1527,7 +1519,7 @@ def project_detail(project_id: int):
     member_count = 0
     try:
         mc_row = execute_query(
-            "SELECT COUNT(*) AS cnt FROM project_members WHERE project_id = %s",
+            "SELECT COUNT(*) AS cnt FROM project_members WHERE project_id = %s AND status = 'active'",
             (project_id,),
         )
         member_count = mc_row[0]["cnt"] if mc_row else 0
@@ -1535,6 +1527,8 @@ def project_detail(project_id: int):
         pass  # Non-critical
 
     inference_triggered = request.args.get("inference_triggered") == "1"
+
+    is_owner = project["user_id"] == g.user["id"]
 
     return render_template(
         "project_detail.html",
@@ -1545,6 +1539,7 @@ def project_detail(project_id: int):
         pending_images=pending_images,
         inference_eligible=inference_eligible,
         inference_triggered=inference_triggered,
+        is_owner=is_owner,
     )
 
 
@@ -2293,7 +2288,7 @@ def api_reclassify():
             "FROM faces f "
             "JOIN images i ON f.image_id = i.id "
             "JOIN projects p ON i.project_id = p.id "
-            "LEFT JOIN project_members pm ON pm.project_id = p.id AND pm.user_id = %s "
+            "LEFT JOIN project_members pm ON pm.project_id = p.id AND pm.user_id = %s AND pm.status = 'active' "
             "WHERE f.id = %s AND (p.user_id = %s OR pm.user_id IS NOT NULL) "
             "AND f.superseded_by IS NULL AND p.status != 'deleted'",
             (g.user["id"], face_id, g.user["id"]),
@@ -2463,7 +2458,7 @@ def api_update_face_bbox():
             "FROM faces f "
             "JOIN images i ON f.image_id = i.id "
             "JOIN projects p ON i.project_id = p.id "
-            "LEFT JOIN project_members pm ON pm.project_id = p.id AND pm.user_id = %s "
+            "LEFT JOIN project_members pm ON pm.project_id = p.id AND pm.user_id = %s AND pm.status = 'active' "
             "WHERE f.id = %s AND (p.user_id = %s OR pm.user_id IS NOT NULL) "
             "AND f.superseded_by IS NULL AND p.status != 'deleted'",
             (g.user["id"], face_id, g.user["id"]),
@@ -2560,9 +2555,9 @@ def api_write_sdc(project_id: int):
     if not _validate_csrf():
         return jsonify({"error": _("Invalid CSRF token")}), 400
 
-    # Verify project ownership
+    # Verify project access (owner or member)
     try:
-        project = get_project_for_user(project_id, g.user["id"])
+        project = get_project_for_actor(project_id, g.user["id"])
         if not project:
             return jsonify({"error": _("Project not found or access denied")}), 404
     except DatabaseError:
@@ -2683,7 +2678,7 @@ def api_stop_sdc(project_id: int):
         return jsonify({"error": _("Invalid CSRF token")}), 400
 
     try:
-        project = get_project_for_user(project_id, g.user["id"])
+        project = get_project_for_actor(project_id, g.user["id"])
         if not project:
             return jsonify({"error": _("Project not found or access denied")}), 404
     except DatabaseError:
@@ -3002,11 +2997,11 @@ def project_settings(project_id: int):
         members = []
         try:
             members = execute_query(
-                "SELECT pm.user_id, pm.role, pm.joined_at, u.wiki_username "
+                "SELECT pm.user_id, pm.role, pm.status, pm.joined_at, u.wiki_username "
                 "FROM project_members pm "
                 "JOIN users u ON pm.user_id = u.id "
                 "WHERE pm.project_id = %s "
-                "ORDER BY pm.joined_at ASC",
+                "ORDER BY pm.status ASC, pm.joined_at ASC",
                 (project_id,),
             )
         except DatabaseError:
@@ -3103,7 +3098,7 @@ def project_settings(project_id: int):
         except DatabaseError:
             logger.debug("Non-critical: failed to fetch stats after settings update for project %s", project_id)
 
-        return redirect(url_for("project_detail", project_id=project_id))
+        return redirect(url_for("project_settings", project_id=project_id))
     except DatabaseError:
         logger.exception("Failed to update project settings")
         flash(_("Failed to update settings."), "error")
@@ -3143,12 +3138,12 @@ def project_remove_member(project_id: int):
 
     try:
         affected = execute_query(
-            "DELETE FROM project_members WHERE project_id = %s AND user_id = %s",
+            "UPDATE project_members SET status = 'banned' WHERE project_id = %s AND user_id = %s AND status = 'active'",
             (project_id, member_user_id),
             fetch=False,
         )
         if affected:
-            flash(_("Member removed."), "success")
+            flash(_("Member removed and banned from rejoining."), "success")
         else:
             flash(_("Member not found."), "error")
     except DatabaseError:
@@ -3156,6 +3151,165 @@ def project_remove_member(project_id: int):
         flash(_("Failed to remove member."), "error")
 
     return redirect(url_for("project_settings", project_id=project_id))
+
+
+@app.route("/project/<int:project_id>/settings/unban-member", methods=["POST"])
+@login_required
+def project_unban_member(project_id: int):
+    """Unban a member so they can rejoin the project (owner-only)."""
+    if not _validate_csrf():
+        abort(400, _("Invalid CSRF token"))
+
+    try:
+        project = get_project_for_user(project_id, g.user["id"])
+    except DatabaseError:
+        abort(500)
+
+    if not project:
+        abort(404)
+
+    member_user_id = request.form.get("member_user_id")
+    if not member_user_id:
+        flash(_("No member specified."), "error")
+        return redirect(url_for("project_settings", project_id=project_id))
+
+    try:
+        member_user_id = int(member_user_id)
+    except (ValueError, TypeError):
+        flash(_("Invalid member."), "error")
+        return redirect(url_for("project_settings", project_id=project_id))
+
+    try:
+        affected = execute_query(
+            "DELETE FROM project_members WHERE project_id = %s AND user_id = %s AND status = 'banned'",
+            (project_id, member_user_id),
+            fetch=False,
+        )
+        if affected:
+            flash(_("Member unbanned."), "success")
+        else:
+            flash(_("Member not found."), "error")
+    except DatabaseError:
+        logger.exception("Failed to unban member from project %s", project_id)
+        flash(_("Failed to unban member."), "error")
+
+    return redirect(url_for("project_settings", project_id=project_id))
+
+
+@app.route("/project/<int:project_id>/invite-code", methods=["POST"])
+@login_required
+def project_invite_code(project_id: int):
+    if not _validate_csrf():
+        abort(400, _("Invalid CSRF token"))
+
+    try:
+        project = get_project_for_user(project_id, g.user["id"])
+    except DatabaseError:
+        abort(500)
+
+    if not project:
+        abort(404)
+
+    action = request.form.get("action")
+
+    if action == "generate":
+        code = _generate_invite_code()
+        try:
+            execute_query(
+                "UPDATE projects SET invite_code = %s WHERE id = %s AND user_id = %s",
+                (code, project_id, g.user["id"]),
+                fetch=False,
+            )
+            flash(_("Invite code generated."), "success")
+        except DatabaseError:
+            logger.exception("Failed to generate invite code for project %s", project_id)
+            flash(_("Failed to generate invite code."), "error")
+    elif action == "revoke":
+        try:
+            execute_query(
+                "UPDATE projects SET invite_code = NULL WHERE id = %s AND user_id = %s",
+                (project_id, g.user["id"]),
+                fetch=False,
+            )
+            flash(_("Invite code revoked."), "success")
+        except DatabaseError:
+            logger.exception("Failed to revoke invite code for project %s", project_id)
+            flash(_("Failed to revoke invite code."), "error")
+    else:
+        flash(_("Invalid action."), "error")
+
+    return redirect(url_for("project_settings", project_id=project_id))
+
+
+@app.route("/join", methods=["POST"])
+@login_required
+def project_join():
+    if not _validate_csrf():
+        abort(400, _("Invalid CSRF token"))
+
+    code = (request.form.get("invite_code") or "").strip()
+    if not code:
+        flash(_("Please enter an invite code."), "error")
+        return redirect(url_for("dashboard"))
+
+    try:
+        project = execute_query(
+            "SELECT p.id, p.label, p.user_id, u.wiki_username FROM projects p "
+            "JOIN users u ON p.user_id = u.id "
+            "WHERE p.invite_code = %s AND p.status != 'deleted' LIMIT 1",
+            (code,),
+        )
+    except DatabaseError:
+        logger.exception("Failed to look up invite code")
+        flash(_("Something went wrong. Please try again."), "error")
+        return redirect(url_for("dashboard"))
+
+    if not project:
+        flash(_("Invalid invite code."), "error")
+        return redirect(url_for("dashboard"))
+
+    proj = project[0]
+
+    if proj["user_id"] == g.user["id"]:
+        flash(_("You are the owner of this project."), "info")
+        return redirect(url_for("project_detail", project_id=proj["id"]))
+
+    try:
+        existing = execute_query(
+            "SELECT status FROM project_members WHERE project_id = %s AND user_id = %s",
+            (proj["id"], g.user["id"]),
+        )
+    except DatabaseError:
+        logger.exception("Failed to check membership for project %s", proj["id"])
+        flash(_("Something went wrong. Please try again."), "error")
+        return redirect(url_for("dashboard"))
+
+    if existing:
+        if existing[0]["status"] == "banned":
+            flash(_("You have been banned from this project."), "error")
+            return redirect(url_for("dashboard"))
+        flash(_("You are already a member of this project."), "info")
+        return redirect(url_for("project_detail", project_id=proj["id"]))
+
+    try:
+        execute_query(
+            "INSERT INTO project_members (project_id, user_id, role) VALUES (%s, %s, 'member')",
+            (proj["id"], g.user["id"]),
+            fetch=False,
+        )
+        flash(
+            _(
+                'Joined %(username)s\'s project "%(label)s" successfully!',
+                username=proj["wiki_username"],
+                label=proj["label"] or proj["id"],
+            ),
+            "success",
+        )
+        return redirect(url_for("project_detail", project_id=proj["id"]))
+    except DatabaseError:
+        logger.exception("Failed to join project %s", proj["id"])
+        flash(_("Failed to join project."), "error")
+        return redirect(url_for("dashboard"))
 
 
 @app.route("/project/<int:project_id>/rerun-inference", methods=["POST"])

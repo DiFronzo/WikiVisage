@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS projects (
     last_inference_min_confirmed INT UNSIGNED NULL COMMENT 'min_confirmed used in last inference run',
     sdc_write_requested TINYINT(1)      NOT NULL DEFAULT 0 COMMENT '1=user requested SDC writes, worker picks up',
     sdc_write_error     VARCHAR(1024)   NULL COMMENT 'Error message from last SDC write attempt',
+    invite_code         VARCHAR(8)       NULL DEFAULT NULL COMMENT 'Unique code for others to join this project',
     worker_claimed_by   VARCHAR(255)    NULL COMMENT 'Worker instance ID that claimed this project',
     worker_claimed_at   DATETIME        NULL COMMENT 'When the worker claimed this project',
     created_at          DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -65,6 +66,7 @@ CREATE TABLE IF NOT EXISTS projects (
     INDEX idx_projects_status_claim (status, worker_claimed_by, worker_claimed_at),
     INDEX idx_projects_sdc_claim (sdc_write_requested, worker_claimed_by, worker_claimed_at),
     UNIQUE INDEX idx_projects_user_qid_cat (user_id, wikidata_qid, commons_category),
+    UNIQUE INDEX idx_projects_invite_code (invite_code),
 
     CONSTRAINT fk_projects_user
         FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
@@ -181,6 +183,7 @@ CREATE TABLE IF NOT EXISTS project_members (
     project_id  BIGINT UNSIGNED NOT NULL,
     user_id     BIGINT UNSIGNED NOT NULL,
     role        ENUM('owner', 'member') NOT NULL DEFAULT 'member',
+    status      ENUM('active', 'banned') NOT NULL DEFAULT 'active',
     joined_at   DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
     PRIMARY KEY (project_id, user_id),

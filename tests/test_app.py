@@ -2865,6 +2865,43 @@ def test_project_new_duplicate_check_db_error_continues_to_create(monkeypatch):
     assert len(insert_calls) == 1
 
 
+def test_project_new_join_while_banned_creates_own_project(monkeypatch):
+    fake_user = _fake_user_chunk3()
+    insert_calls = []
+
+    def _handler(sql, params, fetch):
+        if "SELECT id FROM projects" in sql and "user_id = %s" in sql:
+            return ()
+        if "u.wiki_username" in sql:
+            return [{"id": 42, "label": "Existing Project", "wiki_username": "OtherUser"}]
+        if "SELECT status FROM project_members" in sql:
+            return [{"status": "banned"}]
+        if "DELETE FROM projects" in sql:
+            return 0
+        if "INSERT" in sql:
+            insert_calls.append(params)
+            return 1
+        raise AssertionError(f"Unexpected SQL: {sql}")
+
+    monkeypatch.setattr(app_module, "_is_human_entity", lambda _qid: True)
+    monkeypatch.setattr(app_module, "_commons_category_exists", lambda _category: True)
+    monkeypatch.setattr(app_module, "_fetch_p18_thumb_url", lambda _qid: "thumb")
+    monkeypatch.setattr(app_module, "_fetch_wikidata_label", lambda _qid: "Label")
+    monkeypatch.setattr("builtins.open", MagicMock())
+
+    client, _ = _make_authenticated_client_chunk3(monkeypatch, _user_aware_execute(fake_user, _handler))
+    _set_csrf_chunk3(client)
+
+    response = client.post(
+        "/project/new",
+        data={"csrf_token": "testtoken", "wikidata_qid": "Q42", "commons_category": "People"},
+    )
+
+    assert response.status_code == 302
+    assert response.headers["Location"].endswith("/dashboard")
+    assert len(insert_calls) == 1
+
+
 def test_project_new_successful_creation_with_label_fetch_and_p18(monkeypatch):
     fake_user = _fake_user_chunk3()
     insert_calls = []
@@ -5835,7 +5872,7 @@ def test_api_write_sdc_csrf_fail(monkeypatch, fake_user):
 
 def test_api_write_sdc_project_not_found(monkeypatch, fake_user):
     def route_execute(sql, _params, _fetch):
-        if "SELECT * FROM projects WHERE id" in sql:
+        if "FROM projects p LEFT JOIN project_members" in sql:
             return []
         raise AssertionError(f"Unexpected SQL: {sql}")
 
@@ -5850,7 +5887,7 @@ def test_api_write_sdc_project_not_found(monkeypatch, fake_user):
 
 def test_api_write_sdc_project_query_db_error(monkeypatch, fake_user):
     def route_execute(sql, _params, _fetch):
-        if "SELECT * FROM projects WHERE id" in sql:
+        if "FROM projects p LEFT JOIN project_members" in sql:
             raise app_module.DatabaseError("boom")
         raise AssertionError(f"Unexpected SQL: {sql}")
 
@@ -5865,7 +5902,7 @@ def test_api_write_sdc_project_query_db_error(monkeypatch, fake_user):
 
 def test_api_write_sdc_pending_query_db_error(monkeypatch, fake_user):
     def route_execute(sql, _params, _fetch):
-        if "SELECT * FROM projects WHERE id" in sql:
+        if "FROM projects p LEFT JOIN project_members" in sql:
             return [{"id": 1, "user_id": 1, "status": "active", "sdc_write_requested": 0}]
         if "AS write_cnt" in sql and "AS removal_cnt" in sql:
             raise app_module.DatabaseError("boom")
@@ -5882,7 +5919,7 @@ def test_api_write_sdc_pending_query_db_error(monkeypatch, fake_user):
 
 def test_api_write_sdc_already_requested(monkeypatch, fake_user):
     def route_execute(sql, _params, _fetch):
-        if "SELECT * FROM projects WHERE id" in sql:
+        if "FROM projects p LEFT JOIN project_members" in sql:
             return [{"id": 1, "user_id": 1, "status": "active", "sdc_write_requested": 1}]
         if "AS write_cnt" in sql and "AS removal_cnt" in sql:
             return [{"write_cnt": 5, "removal_cnt": 2}]
@@ -5905,7 +5942,7 @@ def test_api_write_sdc_no_pending_writes(monkeypatch, fake_user):
     updates = []
 
     def route_execute(sql, _params, fetch):
-        if "SELECT * FROM projects WHERE id" in sql:
+        if "FROM projects p LEFT JOIN project_members" in sql:
             return [{"id": 1, "user_id": 1, "status": "active", "sdc_write_requested": 0}]
         if "AS write_cnt" in sql and "AS removal_cnt" in sql:
             return [{"write_cnt": 0, "removal_cnt": 0}]
@@ -5928,7 +5965,7 @@ def test_api_write_sdc_successful_flag_set(monkeypatch, fake_user):
     update_calls = []
 
     def route_execute(sql, _params, _fetch):
-        if "SELECT * FROM projects WHERE id" in sql:
+        if "FROM projects p LEFT JOIN project_members" in sql:
             return [{"id": 1, "user_id": 1, "status": "active", "sdc_write_requested": 0}]
         if "AS write_cnt" in sql and "AS removal_cnt" in sql:
             return [{"write_cnt": 3, "removal_cnt": 1}]
@@ -5951,7 +5988,7 @@ def test_api_write_sdc_successful_flag_set(monkeypatch, fake_user):
 
 def test_api_write_sdc_update_db_error(monkeypatch, fake_user):
     def route_execute(sql, _params, _fetch):
-        if "SELECT * FROM projects WHERE id" in sql:
+        if "FROM projects p LEFT JOIN project_members" in sql:
             return [{"id": 1, "user_id": 1, "status": "active", "sdc_write_requested": 0}]
         if "AS write_cnt" in sql and "AS removal_cnt" in sql:
             return [{"write_cnt": 7, "removal_cnt": 0}]
@@ -5970,7 +6007,7 @@ def test_api_write_sdc_update_db_error(monkeypatch, fake_user):
 
 def test_api_write_sdc_wakeup_file_oserror_ignored(monkeypatch, fake_user):
     def route_execute(sql, _params, _fetch):
-        if "SELECT * FROM projects WHERE id" in sql:
+        if "FROM projects p LEFT JOIN project_members" in sql:
             return [{"id": 1, "user_id": 1, "status": "active", "sdc_write_requested": 0}]
         if "AS write_cnt" in sql and "AS removal_cnt" in sql:
             return [{"write_cnt": 1, "removal_cnt": 0}]
@@ -6070,7 +6107,7 @@ def test_api_stop_sdc_csrf_fail(monkeypatch, fake_user):
 
 def test_api_stop_sdc_project_not_found(monkeypatch, fake_user):
     def route_execute(sql, _params, _fetch):
-        if "SELECT * FROM projects WHERE id" in sql:
+        if "FROM projects p LEFT JOIN project_members" in sql:
             return []
         raise AssertionError(f"Unexpected SQL: {sql}")
 
@@ -6085,7 +6122,7 @@ def test_api_stop_sdc_project_not_found(monkeypatch, fake_user):
 
 def test_api_stop_sdc_project_query_db_error(monkeypatch, fake_user):
     def route_execute(sql, _params, _fetch):
-        if "SELECT * FROM projects WHERE id" in sql:
+        if "FROM projects p LEFT JOIN project_members" in sql:
             raise app_module.DatabaseError("boom")
         raise AssertionError(f"Unexpected SQL: {sql}")
 
@@ -6100,7 +6137,7 @@ def test_api_stop_sdc_project_query_db_error(monkeypatch, fake_user):
 
 def test_api_stop_sdc_not_in_progress(monkeypatch, fake_user):
     def route_execute(sql, _params, _fetch):
-        if "SELECT * FROM projects WHERE id" in sql:
+        if "FROM projects p LEFT JOIN project_members" in sql:
             return [{"id": 1, "user_id": 1, "status": "active", "sdc_write_requested": 0}]
         raise AssertionError(f"Unexpected SQL: {sql}")
 
@@ -6119,7 +6156,7 @@ def test_api_stop_sdc_success(monkeypatch, fake_user):
     updates = []
 
     def route_execute(sql, params, fetch):
-        if "SELECT * FROM projects WHERE id" in sql:
+        if "FROM projects p LEFT JOIN project_members" in sql:
             return [{"id": 1, "user_id": 1, "status": "active", "sdc_write_requested": 1}]
         if "UPDATE projects SET sdc_write_requested = 0" in sql:
             updates.append(sql)
@@ -6141,7 +6178,7 @@ def test_api_stop_sdc_success(monkeypatch, fake_user):
 
 def test_api_stop_sdc_update_db_error(monkeypatch, fake_user):
     def route_execute(sql, _params, _fetch):
-        if "SELECT * FROM projects WHERE id" in sql:
+        if "FROM projects p LEFT JOIN project_members" in sql:
             return [{"id": 1, "user_id": 1, "status": "active", "sdc_write_requested": 1}]
         if "UPDATE projects SET sdc_write_requested = 0" in sql:
             raise app_module.DatabaseError("boom")
@@ -6530,7 +6567,7 @@ def test_project_settings_successful_update_redirects(monkeypatch, fake_user):
     )
 
     assert response.status_code == 302
-    assert response.headers["Location"].endswith("/project/1")
+    assert response.headers["Location"].endswith("/project/1/settings")
     assert len(updates) == 1
 
 
@@ -7811,8 +7848,20 @@ def test_robots_txt_returns_plain_text():
 def test_project_settings_get_shows_members_list(monkeypatch, fake_user):
     project = _project_settings_base_row()
     members = [
-        {"user_id": 5, "role": "member", "joined_at": datetime(2025, 1, 10, 12, 0, 0), "wiki_username": "Alice"},
-        {"user_id": 8, "role": "member", "joined_at": datetime(2025, 2, 15, 9, 30, 0), "wiki_username": "Bob"},
+        {
+            "user_id": 5,
+            "role": "member",
+            "joined_at": datetime(2025, 1, 10, 12, 0, 0),
+            "wiki_username": "Alice",
+            "status": "active",
+        },
+        {
+            "user_id": 8,
+            "role": "member",
+            "joined_at": datetime(2025, 2, 15, 9, 30, 0),
+            "wiki_username": "Bob",
+            "status": "active",
+        },
     ]
 
     def route_execute(sql, _params, _fetch):
@@ -7870,13 +7919,13 @@ def test_project_settings_get_members_db_error_returns_empty(monkeypatch, fake_u
 
 def test_remove_member_success(monkeypatch, fake_user):
     project = _project_settings_base_row()
-    deleted = {"called": False}
+    banned = {"called": False}
 
     def route_execute(sql, params, fetch):
         if "SELECT * FROM projects WHERE id = %s AND user_id = %s" in sql:
             return [project.copy()]
-        if "DELETE FROM project_members" in sql:
-            deleted["called"] = True
+        if "UPDATE project_members SET status = 'banned'" in sql:
+            banned["called"] = True
             assert params == (1, 5)
             return 1
         raise AssertionError(f"Unexpected SQL: {sql}")
@@ -7891,9 +7940,9 @@ def test_remove_member_success(monkeypatch, fake_user):
 
     assert response.status_code == 302
     assert "/project/1/settings" in response.headers["Location"]
-    assert deleted["called"] is True
+    assert banned["called"] is True
     flashes = _flashes_chunk6(client)
-    assert any("removed" in msg.lower() for _cat, msg in flashes)
+    assert any("banned" in msg.lower() for _cat, msg in flashes)
 
 
 def test_remove_member_csrf_fail(monkeypatch, fake_user):
@@ -7995,7 +8044,7 @@ def test_remove_member_not_found_in_db(monkeypatch, fake_user):
     def route_execute(sql, _params, fetch):
         if "SELECT * FROM projects WHERE id = %s AND user_id = %s" in sql:
             return [project.copy()]
-        if "DELETE FROM project_members" in sql:
+        if "UPDATE project_members SET status = 'banned'" in sql:
             return 0
         raise AssertionError(f"Unexpected SQL: {sql}")
 
@@ -8018,8 +8067,8 @@ def test_remove_member_db_error(monkeypatch, fake_user):
     def route_execute(sql, _params, _fetch):
         if "SELECT * FROM projects WHERE id = %s AND user_id = %s" in sql:
             return [project.copy()]
-        if "DELETE FROM project_members" in sql:
-            raise app_module.DatabaseError("delete failed")
+        if "UPDATE project_members SET status = 'banned'" in sql:
+            raise app_module.DatabaseError("ban failed")
         raise AssertionError(f"Unexpected SQL: {sql}")
 
     client = _make_authed_client(monkeypatch, fake_user, route_execute)
@@ -8033,6 +8082,426 @@ def test_remove_member_db_error(monkeypatch, fake_user):
     assert response.status_code == 302
     flashes = _flashes_chunk6(client)
     assert any("failed" in msg.lower() for _cat, msg in flashes)
+
+
+def test_unban_member_success(monkeypatch, fake_user):
+    project = _project_settings_base_row()
+    unbanned = {"called": False}
+
+    def route_execute(sql, params, fetch):
+        if "SELECT * FROM projects WHERE id = %s AND user_id = %s" in sql:
+            return [project.copy()]
+        if "DELETE FROM project_members" in sql and "status = 'banned'" in sql:
+            unbanned["called"] = True
+            assert params == (1, 5)
+            return 1
+        raise AssertionError(f"Unexpected SQL: {sql}")
+
+    client = _make_authed_client(monkeypatch, fake_user, route_execute)
+    _set_csrf_chunk6(client)
+
+    response = client.post(
+        "/project/1/settings/unban-member",
+        data={"csrf_token": "testtoken", "member_user_id": "5"},
+    )
+
+    assert response.status_code == 302
+    assert "/project/1/settings" in response.headers["Location"]
+    assert unbanned["called"] is True
+    flashes = _flashes_chunk6(client)
+    assert any("unbanned" in msg.lower() for _cat, msg in flashes)
+
+
+def test_unban_member_not_found(monkeypatch, fake_user):
+    project = _project_settings_base_row()
+
+    def route_execute(sql, _params, fetch):
+        if "SELECT * FROM projects WHERE id = %s AND user_id = %s" in sql:
+            return [project.copy()]
+        if "DELETE FROM project_members" in sql and "status = 'banned'" in sql:
+            return 0
+        raise AssertionError(f"Unexpected SQL: {sql}")
+
+    client = _make_authed_client(monkeypatch, fake_user, route_execute)
+    _set_csrf_chunk6(client)
+
+    response = client.post(
+        "/project/1/settings/unban-member",
+        data={"csrf_token": "testtoken", "member_user_id": "99"},
+    )
+
+    assert response.status_code == 302
+    flashes = _flashes_chunk6(client)
+    assert any("not found" in msg.lower() for _cat, msg in flashes)
+
+
+def test_unban_member_csrf_fail(monkeypatch, fake_user):
+    client = _make_authed_client(monkeypatch, fake_user)
+    _set_csrf_chunk6(client, "expected")
+
+    response = client.post(
+        "/project/1/settings/unban-member",
+        data={"csrf_token": "wrong", "member_user_id": "5"},
+    )
+
+    assert response.status_code == 400
+    assert b"Invalid CSRF token" in response.data
+
+
+def test_unban_member_project_not_found(monkeypatch, fake_user):
+    def route_execute(sql, _params, _fetch):
+        if "SELECT * FROM projects WHERE id = %s AND user_id = %s" in sql:
+            return []
+        raise AssertionError(f"Unexpected SQL: {sql}")
+
+    client = _make_authed_client(monkeypatch, fake_user, route_execute)
+    _set_csrf_chunk6(client)
+
+    response = client.post(
+        "/project/1/settings/unban-member",
+        data={"csrf_token": "testtoken", "member_user_id": "5"},
+    )
+
+    assert response.status_code == 404
+
+
+def test_unban_member_db_error(monkeypatch, fake_user):
+    project = _project_settings_base_row()
+
+    def route_execute(sql, _params, _fetch):
+        if "SELECT * FROM projects WHERE id = %s AND user_id = %s" in sql:
+            return [project.copy()]
+        if "DELETE FROM project_members" in sql and "status = 'banned'" in sql:
+            raise app_module.DatabaseError("unban failed")
+        raise AssertionError(f"Unexpected SQL: {sql}")
+
+    client = _make_authed_client(monkeypatch, fake_user, route_execute)
+    _set_csrf_chunk6(client)
+
+    response = client.post(
+        "/project/1/settings/unban-member",
+        data={"csrf_token": "testtoken", "member_user_id": "5"},
+    )
+
+    assert response.status_code == 302
+    flashes = _flashes_chunk6(client)
+    assert any("failed" in msg.lower() for _cat, msg in flashes)
+
+
+def test_invite_code_generate(monkeypatch, fake_user):
+    project = _project_settings_base_row()
+    update_calls = []
+
+    def route_execute(sql, params, fetch):
+        if "SELECT * FROM projects WHERE id = %s AND user_id = %s" in sql:
+            return [project.copy()]
+        if "UPDATE projects SET invite_code" in sql:
+            update_calls.append(params)
+            return 1
+        raise AssertionError(f"Unexpected SQL: {sql}")
+
+    client = _make_authed_client(monkeypatch, fake_user, route_execute)
+    _set_csrf_chunk6(client)
+
+    response = client.post(
+        "/project/1/invite-code",
+        data={"csrf_token": "testtoken", "action": "generate"},
+    )
+
+    assert response.status_code == 302
+    assert response.headers["Location"].endswith("/project/1/settings")
+    assert len(update_calls) == 1
+    assert update_calls[0][0] is not None
+    assert len(update_calls[0][0]) == 8
+    flashes = _flashes_chunk6(client)
+    assert any("generated" in msg.lower() for _cat, msg in flashes)
+
+
+def test_invite_code_revoke(monkeypatch, fake_user):
+    project = _project_settings_base_row()
+    update_calls = []
+
+    def route_execute(sql, params, fetch):
+        if "SELECT * FROM projects WHERE id = %s AND user_id = %s" in sql:
+            return [project.copy()]
+        if "UPDATE projects SET invite_code = NULL" in sql:
+            update_calls.append(params)
+            return 1
+        raise AssertionError(f"Unexpected SQL: {sql}")
+
+    client = _make_authed_client(monkeypatch, fake_user, route_execute)
+    _set_csrf_chunk6(client)
+
+    response = client.post(
+        "/project/1/invite-code",
+        data={"csrf_token": "testtoken", "action": "revoke"},
+    )
+
+    assert response.status_code == 302
+    assert len(update_calls) == 1
+    flashes = _flashes_chunk6(client)
+    assert any("revoked" in msg.lower() for _cat, msg in flashes)
+
+
+def test_invite_code_invalid_action(monkeypatch, fake_user):
+    project = _project_settings_base_row()
+
+    def route_execute(sql, _params, _fetch):
+        if "SELECT * FROM projects WHERE id = %s AND user_id = %s" in sql:
+            return [project.copy()]
+        raise AssertionError(f"Unexpected SQL: {sql}")
+
+    client = _make_authed_client(monkeypatch, fake_user, route_execute)
+    _set_csrf_chunk6(client)
+
+    response = client.post(
+        "/project/1/invite-code",
+        data={"csrf_token": "testtoken", "action": "bogus"},
+    )
+
+    assert response.status_code == 302
+    flashes = _flashes_chunk6(client)
+    assert any("invalid" in msg.lower() for _cat, msg in flashes)
+
+
+def test_invite_code_project_not_found(monkeypatch, fake_user):
+    def route_execute(sql, _params, _fetch):
+        if "SELECT * FROM projects WHERE id = %s AND user_id = %s" in sql:
+            return []
+        raise AssertionError(f"Unexpected SQL: {sql}")
+
+    client = _make_authed_client(monkeypatch, fake_user, route_execute)
+    _set_csrf_chunk6(client)
+
+    response = client.post(
+        "/project/1/invite-code",
+        data={"csrf_token": "testtoken", "action": "generate"},
+    )
+
+    assert response.status_code == 404
+
+
+def test_invite_code_csrf_fail(monkeypatch, fake_user):
+    client = _make_authed_client(monkeypatch, fake_user)
+
+    response = client.post("/project/1/invite-code", data={"csrf_token": "wrong"})
+
+    assert response.status_code == 400
+
+
+def test_invite_code_generate_db_error(monkeypatch, fake_user):
+    project = _project_settings_base_row()
+
+    def route_execute(sql, _params, _fetch):
+        if "SELECT * FROM projects WHERE id = %s AND user_id = %s" in sql:
+            return [project.copy()]
+        if "UPDATE projects SET invite_code" in sql:
+            raise app_module.DatabaseError("boom")
+        raise AssertionError(f"Unexpected SQL: {sql}")
+
+    client = _make_authed_client(monkeypatch, fake_user, route_execute)
+    _set_csrf_chunk6(client)
+
+    response = client.post(
+        "/project/1/invite-code",
+        data={"csrf_token": "testtoken", "action": "generate"},
+    )
+
+    assert response.status_code == 302
+    flashes = _flashes_chunk6(client)
+    assert any("failed" in msg.lower() for _cat, msg in flashes)
+
+
+def test_join_by_code_success(monkeypatch, fake_user):
+    insert_calls = []
+
+    def route_execute(sql, params, fetch):
+        if "WHERE p.invite_code = %s" in sql:
+            return [{"id": 42, "label": "Cool Project", "user_id": 99, "wiki_username": "Alice"}]
+        if "SELECT status FROM project_members" in sql:
+            return ()
+        if "INSERT INTO project_members" in sql:
+            insert_calls.append(params)
+            return 1
+        raise AssertionError(f"Unexpected SQL: {sql}")
+
+    client = _make_authed_client(monkeypatch, fake_user, route_execute)
+    _set_csrf_chunk6(client)
+
+    response = client.post(
+        "/join",
+        data={"csrf_token": "testtoken", "invite_code": "ABC12345"},
+    )
+
+    assert response.status_code == 302
+    assert "/project/42" in response.headers["Location"]
+    assert len(insert_calls) == 1
+    flashes = _flashes_chunk6(client)
+    assert any("joined" in msg.lower() for _cat, msg in flashes)
+
+
+def test_join_by_code_invalid_code(monkeypatch, fake_user):
+    def route_execute(sql, _params, _fetch):
+        if "WHERE p.invite_code = %s" in sql:
+            return ()
+        raise AssertionError(f"Unexpected SQL: {sql}")
+
+    client = _make_authed_client(monkeypatch, fake_user, route_execute)
+    _set_csrf_chunk6(client)
+
+    response = client.post(
+        "/join",
+        data={"csrf_token": "testtoken", "invite_code": "BADCODE1"},
+    )
+
+    assert response.status_code == 302
+    assert response.headers["Location"].endswith("/dashboard")
+    flashes = _flashes_chunk6(client)
+    assert any("invalid" in msg.lower() for _cat, msg in flashes)
+
+
+def test_join_by_code_empty_code(monkeypatch, fake_user):
+    client = _make_authed_client(monkeypatch, fake_user)
+    _set_csrf_chunk6(client)
+
+    response = client.post(
+        "/join",
+        data={"csrf_token": "testtoken", "invite_code": ""},
+    )
+
+    assert response.status_code == 302
+    assert response.headers["Location"].endswith("/dashboard")
+    flashes = _flashes_chunk6(client)
+    assert any("enter" in msg.lower() for _cat, msg in flashes)
+
+
+def test_join_by_code_banned_user(monkeypatch, fake_user):
+    def route_execute(sql, _params, _fetch):
+        if "WHERE p.invite_code = %s" in sql:
+            return [{"id": 42, "label": "Cool Project", "user_id": 99, "wiki_username": "Alice"}]
+        if "SELECT status FROM project_members" in sql:
+            return [{"status": "banned"}]
+        raise AssertionError(f"Unexpected SQL: {sql}")
+
+    client = _make_authed_client(monkeypatch, fake_user, route_execute)
+    _set_csrf_chunk6(client)
+
+    response = client.post(
+        "/join",
+        data={"csrf_token": "testtoken", "invite_code": "ABC12345"},
+    )
+
+    assert response.status_code == 302
+    assert response.headers["Location"].endswith("/dashboard")
+    flashes = _flashes_chunk6(client)
+    assert any("banned" in msg.lower() for _cat, msg in flashes)
+
+
+def test_join_by_code_already_member(monkeypatch, fake_user):
+    def route_execute(sql, _params, _fetch):
+        if "WHERE p.invite_code = %s" in sql:
+            return [{"id": 42, "label": "Cool Project", "user_id": 99, "wiki_username": "Alice"}]
+        if "SELECT status FROM project_members" in sql:
+            return [{"status": "active"}]
+        raise AssertionError(f"Unexpected SQL: {sql}")
+
+    client = _make_authed_client(monkeypatch, fake_user, route_execute)
+    _set_csrf_chunk6(client)
+
+    response = client.post(
+        "/join",
+        data={"csrf_token": "testtoken", "invite_code": "ABC12345"},
+    )
+
+    assert response.status_code == 302
+    assert "/project/42" in response.headers["Location"]
+    flashes = _flashes_chunk6(client)
+    assert any("already" in msg.lower() for _cat, msg in flashes)
+
+
+def test_join_by_code_owner(monkeypatch, fake_user):
+    def route_execute(sql, _params, _fetch):
+        if "WHERE p.invite_code = %s" in sql:
+            return [{"id": 42, "label": "My Project", "user_id": 1, "wiki_username": "tester"}]
+        raise AssertionError(f"Unexpected SQL: {sql}")
+
+    client = _make_authed_client(monkeypatch, fake_user, route_execute)
+    _set_csrf_chunk6(client)
+
+    response = client.post(
+        "/join",
+        data={"csrf_token": "testtoken", "invite_code": "ABC12345"},
+    )
+
+    assert response.status_code == 302
+    assert "/project/42" in response.headers["Location"]
+    flashes = _flashes_chunk6(client)
+    assert any("owner" in msg.lower() for _cat, msg in flashes)
+
+
+def test_join_by_code_csrf_fail(monkeypatch, fake_user):
+    client = _make_authed_client(monkeypatch, fake_user)
+
+    response = client.post("/join", data={"csrf_token": "wrong"})
+
+    assert response.status_code == 400
+
+
+def test_join_by_code_db_error_on_lookup(monkeypatch, fake_user):
+    def route_execute(sql, _params, _fetch):
+        if "WHERE p.invite_code = %s" in sql:
+            raise app_module.DatabaseError("lookup failed")
+        raise AssertionError(f"Unexpected SQL: {sql}")
+
+    client = _make_authed_client(monkeypatch, fake_user, route_execute)
+    _set_csrf_chunk6(client)
+
+    response = client.post(
+        "/join",
+        data={"csrf_token": "testtoken", "invite_code": "ABC12345"},
+    )
+
+    assert response.status_code == 302
+    assert response.headers["Location"].endswith("/dashboard")
+    flashes = _flashes_chunk6(client)
+    assert any("wrong" in msg.lower() for _cat, msg in flashes)
+
+
+def test_project_settings_shows_banned_members(monkeypatch, fake_user):
+    project = _project_settings_base_row()
+    members = [
+        {
+            "user_id": 5,
+            "role": "member",
+            "joined_at": datetime(2025, 1, 10, 12, 0, 0),
+            "wiki_username": "Alice",
+            "status": "active",
+        },
+        {
+            "user_id": 8,
+            "role": "member",
+            "joined_at": datetime(2025, 2, 15, 9, 30, 0),
+            "wiki_username": "Eve",
+            "status": "banned",
+        },
+    ]
+
+    def route_execute(sql, _params, _fetch):
+        if "SELECT * FROM projects" in sql:
+            return [project.copy()]
+        if "project_members" in sql and "JOIN users" in sql:
+            return members
+        raise AssertionError(f"Unexpected SQL: {sql}")
+
+    client = _make_authed_client(monkeypatch, fake_user, route_execute)
+
+    response = client.get("/project/1/settings")
+
+    assert response.status_code == 200
+    assert b"Alice" in response.data
+    assert b"Eve" in response.data
+    assert b"Banned" in response.data
+    assert b"Unban" in response.data
 
 
 def test_dashboard_member_counts_passed_to_template(monkeypatch):

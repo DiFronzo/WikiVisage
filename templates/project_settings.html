@@ -58,10 +58,45 @@
     </form>
 </div>
 
+<div class="card" style="max-width: 600px; margin: 3rem auto 0; text-align: center;">
+    <label style="font-weight: 700; font-size: 0.875rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--primary); display: block; margin-bottom: 2rem;">{{ _('Invite Code') }}</label>
+    {% if project.invite_code %}
+    <div style="margin-bottom: 1.5rem;">
+        <code style="display: inline-block; font-size: clamp(1.5rem, 5vw, 2.5rem); letter-spacing: clamp(0.1em, 2vw, 0.2em); padding: clamp(0.75rem, 2vw, 1.25rem) clamp(1rem, 3vw, 2.5rem); border: 3px solid var(--primary); background: var(--bg); color: var(--primary); font-weight: 700; user-select: all; box-shadow: 6px 6px 0px var(--primary); white-space: nowrap;">{{ project.invite_code }}</code>
+    </div>
+    <div class="help-text" style="margin-bottom: 2.5rem; font-size: 1rem;">{{ _('Share this code with others to let them join your project.') }}</div>
+    
+    <div style="display: flex; justify-content: center; gap: 1rem; flex-wrap: wrap; border-top: 2px solid var(--border); padding-top: 1.5rem;">
+        <form method="POST" action="{{ url_for('project_invite_code', project_id=project.id) }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <input type="hidden" name="action" value="generate">
+            <button type="submit" class="btn btn-sm" style="border-color: var(--primary); color: var(--primary); background: transparent; cursor: pointer; box-shadow: 3px 3px 0px var(--primary);">{{ _('Regenerate') }}</button>
+        </form>
+        <form method="POST" action="{{ url_for('project_invite_code', project_id=project.id) }}" onsubmit="return confirm(REVOKE_CODE_MSG);">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <input type="hidden" name="action" value="revoke">
+            <button type="submit" class="btn btn-sm" style="border-color: var(--danger); color: var(--danger); background: transparent; cursor: pointer; box-shadow: 3px 3px 0px var(--danger);">{{ _('Revoke Code') }}</button>
+        </form>
+    </div>
+    {% else %}
+    <div style="padding: 2.5rem 1rem; border: 2px dashed var(--border); background: var(--bg);">
+        <div class="help-text" style="margin-bottom: 1.5rem; font-size: 1rem;">{{ _('Invite code has been revoked. Regenerate to allow new members to join.') }}</div>
+        <form method="POST" action="{{ url_for('project_invite_code', project_id=project.id) }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <input type="hidden" name="action" value="generate">
+            <button type="submit" class="btn" style="border-color: var(--primary); background: var(--primary); color: var(--bg); cursor: pointer; box-shadow: 4px 4px 0px var(--border);">{{ _('Regenerate') }}</button>
+        </form>
+    </div>
+    {% endif %}
+</div>
+
 <div class="card" style="max-width: 600px; margin: 3rem auto 0;">
     <h3>{{ _('Project Members') }}</h3>
-    {% if members %}
-    <table style="width: 100%; border-collapse: collapse; margin-top: 1rem;">
+    {% set active_members = members|selectattr('status', 'equalto', 'active')|list %}
+    {% set banned_members = members|selectattr('status', 'equalto', 'banned')|list %}
+    {% if active_members %}
+    <div style="overflow-x: auto; -webkit-overflow-scrolling: touch;">
+    <table style="width: 100%; border-collapse: collapse; margin-top: 1rem; min-width: 28rem;">
         <thead>
             <tr style="border-bottom: 2px solid var(--border); text-align: left;">
                 <th style="padding: 0.5rem 0.75rem; color: var(--text-muted); font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em;">{{ _('Username') }}</th>
@@ -71,7 +106,7 @@
             </tr>
         </thead>
         <tbody>
-            {% for member in members %}
+            {% for member in active_members %}
             <tr style="border-bottom: 1px solid var(--border);">
                 <td style="padding: 0.5rem 0.75rem;">{{ member.wiki_username }}</td>
                 <td style="padding: 0.5rem 0.75rem;"><span class="badge">{{ member.role }}</span></td>
@@ -89,8 +124,33 @@
             {% endfor %}
         </tbody>
     </table>
+    </div>
     {% else %}
     <p style="color: var(--text-muted); margin-top: 1rem;">{{ _('No members have joined this project yet.') }}</p>
+    {% endif %}
+
+    {% if banned_members %}
+    <h4 style="margin-top: 2rem; color: var(--danger);">{{ _('Banned') }}</h4>
+    <div style="overflow-x: auto; -webkit-overflow-scrolling: touch;">
+    <table style="width: 100%; border-collapse: collapse; margin-top: 0.5rem; min-width: 20rem;">
+        <tbody>
+            {% for member in banned_members %}
+            <tr style="border-bottom: 1px solid var(--border);">
+                <td style="padding: 0.5rem 0.75rem; color: var(--text-muted);">{{ member.wiki_username }}</td>
+                <td style="padding: 0.5rem 0.75rem; text-align: right;">
+                    {% if is_owner %}
+                    <form method="POST" action="{{ url_for('project_unban_member', project_id=project.id) }}" style="display: inline;" onsubmit="return confirm(UNBAN_MEMBER_MSG.replace('{username}', {{ member.wiki_username|tojson }}));">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                        <input type="hidden" name="member_user_id" value="{{ member.user_id }}">
+                        <button type="submit" class="btn btn-sm" style="border-color: var(--primary); color: var(--primary); padding: 0.25rem 0.5rem; font-size: 0.75rem;">{{ _('Unban') }}</button>
+                    </form>
+                    {% endif %}
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    </div>
     {% endif %}
 </div>
 
@@ -115,7 +175,9 @@
 <script>
 var DELETE_CONFIRM_MSG = {{ _('Are you absolutely sure you want to delete this project? This cannot be undone.')|tojson }};
 var RERUN_CONFIRM_MSG = {{ _('This will reset all model-classified faces. The worker will reclassify them on the next cycle. Continue?')|tojson }};
-var REMOVE_MEMBER_MSG = {{ _('Remove {username} from this project?')|tojson }};
+var REMOVE_MEMBER_MSG = {{ _('Remove and ban {username} from this project?')|tojson }};
+var UNBAN_MEMBER_MSG = {{ _('Unban {username} and allow them to rejoin?')|tojson }};
+var REVOKE_CODE_MSG = {{ _('Revoke the invite code? Existing members will not be affected, but no new members can join with this code.')|tojson }};
 function confirmDelete(e) {
     if (!confirm(DELETE_CONFIRM_MSG)) {
         e.preventDefault();

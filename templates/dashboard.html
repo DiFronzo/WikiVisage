@@ -4,6 +4,162 @@
 
 {% block extra_head %}
 <style>
+    .dash-header-wrapper {
+        margin-bottom: 4rem;
+    }
+    .header-actions.dash-header-inner {
+        margin-bottom: 0 !important;
+    }
+    .hero-btn {
+        padding: 1rem 2rem !important;
+        font-size: 1.125rem !important;
+        box-shadow: 4px 4px 0px var(--border);
+        transition: all 0.15s ease;
+    }
+    .hero-btn:hover {
+        transform: translate(-2px, -2px);
+        box-shadow: 6px 6px 0px var(--primary);
+    }
+    .hero-btn:active {
+        transform: translate(2px, 2px);
+        box-shadow: 2px 2px 0px var(--primary);
+    }
+
+    .toggle-join-btn {
+        background: transparent;
+        color: var(--text-muted);
+        border-color: var(--text-muted);
+        border-style: dashed;
+        transition: all 0.2s ease;
+    }
+    .toggle-join-btn:hover, .toggle-join-btn.open {
+        color: var(--text-main);
+        border-color: var(--text-main);
+        border-style: solid;
+        background: var(--surface);
+    }
+
+    .join-drawer {
+        display: grid;
+        grid-template-rows: 0fr;
+        transition: grid-template-rows 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+        overflow: hidden;
+    }
+    .join-drawer.open {
+        grid-template-rows: 1fr;
+    }
+    .join-drawer-inner {
+        min-height: 0;
+        display: flex;
+        justify-content: flex-start;
+        padding-top: 1.5rem;
+        opacity: 0;
+        transform: translateY(-10px);
+        transition: opacity 0.2s ease, transform 0.2s ease;
+    }
+    .join-drawer.open .join-drawer-inner {
+        opacity: 1;
+        transform: translateY(0);
+        transition: opacity 0.3s ease 0.1s, transform 0.3s cubic-bezier(0.4, 0, 0.2, 1) 0.1s;
+    }
+
+    .join-strip {
+        width: 28rem;
+        max-width: 100%;
+    }
+    .join-form {
+        display: flex;
+        align-items: flex-end;
+        width: 100%;
+        margin: 0;
+    }
+    .join-prompt {
+        color: var(--primary);
+        font-family: monospace;
+        font-size: 1.5rem;
+        font-weight: 900;
+        padding-right: 0.75rem;
+        padding-bottom: 0.35rem;
+        line-height: 1;
+        user-select: none;
+    }
+    .join-input-group {
+        flex: 1;
+        display: flex;
+        align-items: flex-end;
+        border-bottom: 4px solid var(--border);
+        position: relative;
+        padding-bottom: 0.25rem;
+    }
+    .join-input-group::after {
+        content: '';
+        position: absolute;
+        bottom: -4px;
+        left: 0;
+        width: 1rem;
+        height: 4px;
+        background: var(--primary);
+        transition: width 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+    .join-form:focus-within .join-input-group::after {
+        width: 100%;
+    }
+    .join-input {
+        flex: 1;
+        min-width: 0;
+        width: 10ch;
+        background: transparent;
+        border: none;
+        outline: none;
+        color: var(--text-main);
+        font-family: monospace;
+        font-size: 1.125rem;
+        letter-spacing: 0.15em;
+        line-height: 1;
+        padding: 0 0.5rem 0.1rem 0;
+    }
+    .join-input::placeholder {
+        color: var(--text-muted);
+        opacity: 0.4;
+        font-size: 0.875rem;
+        letter-spacing: 0.05em;
+    }
+    .join-btn {
+        margin: 0 0 0.25rem 0.75rem;
+        flex-shrink: 0;
+        border-color: var(--primary);
+        background: var(--bg);
+        color: var(--primary);
+        box-shadow: -4px 4px 0px var(--primary);
+        transform: translate(4px, -4px);
+        position: relative;
+        z-index: 1;
+        transition: all 0.15s ease;
+        padding: 0.75rem 1.5rem !important; /* Size up the submit button */
+        font-size: 1rem !important;
+    }
+    .join-btn:hover {
+        background: var(--primary);
+        color: var(--bg);
+        transform: translate(2px, -2px);
+        box-shadow: -2px 2px 0px var(--border);
+    }
+    .join-btn:active {
+        transform: translate(0px, 0px);
+        box-shadow: 0px 0px 0px var(--border);
+    }
+    @media (max-width: 600px) {
+        .join-strip { width: 100%; }
+        .join-btn {
+            margin-left: 0.25rem;
+            transform: translate(0, 0);
+            box-shadow: none;
+        }
+        .join-btn:hover {
+            transform: translate(0, 0);
+            box-shadow: none;
+        }
+    }
     .dash-card-inner {
         display: flex;
         gap: 1.5rem;
@@ -135,10 +291,51 @@
 {% endblock %}
 
 {% block content %}
-<div class="header-actions">
-    <h1>{{ _('Welcome, %(username)s', username=g.user.wiki_username) }}</h1>
-    <a href="{{ url_for('project_new') }}" class="btn btn-primary">{{ _('New Project') }}</a>
+<div class="dash-header-wrapper">
+    <div class="header-actions dash-header-inner">
+        <h1>{{ _('Welcome, %(username)s', username=g.user.wiki_username) }}</h1>
+        <div style="display: flex; gap: 1.25rem; align-items: center; flex-wrap: wrap;">
+            <button type="button" class="btn toggle-join-btn" id="toggleJoinBtn">{{ _('Join Project') }}</button>
+            <a href="{{ url_for('project_new') }}" class="btn btn-primary hero-btn">{{ _('New Project') }}</a>
+        </div>
+    </div>
+    
+    <div class="join-drawer" id="joinDrawer">
+        <div class="join-drawer-inner">
+            <div class="join-strip">
+                <form method="POST" action="{{ url_for('project_join') }}" class="join-form">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                    <span class="join-prompt">&gt;</span>
+                    <div class="join-input-group">
+                        <input type="text" name="invite_code" class="join-input" id="joinInputEl" placeholder="{{ _('Enter invite code') }}" maxlength="8" required autocomplete="off" spellcheck="false">
+                        <button type="submit" class="btn join-btn">{{ _('Join') }}</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
 </div>
+
+<script>
+    document.addEventListener('DOMContentLoaded', function() {
+        const toggleBtn = document.getElementById('toggleJoinBtn');
+        const drawer = document.getElementById('joinDrawer');
+        const input = document.getElementById('joinInputEl');
+        
+        toggleBtn.addEventListener('click', function() {
+            const isOpen = drawer.classList.contains('open');
+            if (isOpen) {
+                drawer.classList.remove('open');
+                toggleBtn.classList.remove('open');
+            } else {
+                drawer.classList.add('open');
+                toggleBtn.classList.add('open');
+                // Wait for the slide animation to reveal before focusing
+                setTimeout(() => input.focus(), 250);
+            }
+        });
+    });
+</script>
 
 {% if projects %}
     <div class="grid">
@@ -199,7 +396,11 @@
                         
                         <div style="display: flex; gap: 0.5rem; flex-wrap: wrap;">
                             <a href="{{ url_for('classify', project_id=project.id) }}" class="btn btn-primary btn-sm">{{ _('Classify') }}</a>
+                            {% if project.user_id == current_user_id %}
                             <a href="{{ url_for('project_settings', project_id=project.id) }}" class="btn btn-sm">{{ _('Settings') }}</a>
+                            {% else %}
+                            <span class="btn btn-sm" style="opacity: 0.4; cursor: not-allowed; pointer-events: none;">{{ _('Settings') }}</span>
+                            {% endif %}
                         </div>
                     </div>
                 </div>
