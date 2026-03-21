@@ -7481,7 +7481,93 @@ def test_project_new_duplicate_error_with_non_numeric_cause_args_falls_back(monk
     assert any("Failed to create project. Please try again." in msg for _cat, msg in _flashes_tail(client))
 
 
-def test_api_reclassify_reraises_unexpected_value_error(monkeypatch):
+def _make_project_new_base_execute(insert_side_effect):
+    """Return an execute_query stub for /project/new that calls insert_side_effect on INSERT."""
+
+    def _execute_query(sql, params=None, fetch=True):
+        del params, fetch
+        if "FROM users WHERE id = %s" in sql:
+            return [
+                {
+                    "id": 1,
+                    "wiki_user_id": 123,
+                    "wiki_username": "tester",
+                    "access_token": "token",
+                    "refresh_token": "refresh",
+                    "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
+                }
+            ]
+        if "SELECT id FROM projects" in sql:
+            return []
+        if "u.wiki_username" in sql:
+            return ()
+        if "DELETE FROM projects" in sql:
+            return 0
+        if "INSERT INTO projects" in sql:
+            return insert_side_effect()
+        raise AssertionError(sql)
+
+    return _execute_query
+
+
+def test_project_new_invite_code_collision_retries_and_succeeds(monkeypatch):
+    """First INSERT raises invite_code collision; second attempt succeeds."""
+    call_count = {"n": 0}
+
+    def _insert():
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            cause = Exception(1062, "Duplicate entry 'ABCD1234' for key 'idx_projects_invite_code'")
+            exc = DatabaseError("dup invite_code")
+            exc.__cause__ = cause
+            raise exc
+        return 1
+
+    monkeypatch.setattr(app_module, "_is_human_entity", lambda _qid: True)
+    monkeypatch.setattr(app_module, "_commons_category_exists", lambda _category: True)
+    monkeypatch.setattr(app_module, "_fetch_p18_thumb_url", lambda _qid: None)
+    monkeypatch.setattr(app_module, "_fetch_wikidata_label", lambda _qid: "Label")
+
+    client, _ = _auth_client_chunk4(monkeypatch, _make_project_new_base_execute(_insert))
+    _set_csrf_chunk4(client)
+
+    response = client.post(
+        "/project/new",
+        data={"csrf_token": "testtoken", "wikidata_qid": "Q42", "commons_category": "People"},
+    )
+
+    assert response.status_code == 302
+    assert call_count["n"] == 2
+    assert any("successfully" in msg.lower() for _cat, msg in _flashes_tail(client))
+
+
+def test_project_new_invite_code_collision_fails_after_max_retries(monkeypatch):
+    """All retry attempts raise invite_code collisions; shows 'Failed to create project'."""
+    captured = _capture_render_template_chunk4(monkeypatch)
+
+    def _insert():
+        cause = Exception(1062, "Duplicate entry 'ABCD1234' for key 'idx_projects_invite_code'")
+        exc = DatabaseError("dup invite_code")
+        exc.__cause__ = cause
+        raise exc
+
+    monkeypatch.setattr(app_module, "_is_human_entity", lambda _qid: True)
+    monkeypatch.setattr(app_module, "_commons_category_exists", lambda _category: True)
+    monkeypatch.setattr(app_module, "_fetch_p18_thumb_url", lambda _qid: None)
+    monkeypatch.setattr(app_module, "_fetch_wikidata_label", lambda _qid: "Label")
+
+    client, _ = _auth_client_chunk4(monkeypatch, _make_project_new_base_execute(_insert))
+    _set_csrf_chunk4(client)
+
+    response = client.post(
+        "/project/new",
+        data={"csrf_token": "testtoken", "wikidata_qid": "Q42", "commons_category": "People"},
+    )
+
+    assert response.status_code == 200
+    assert captured["template"] == "project_new.html"
+    assert any("Failed to create project" in msg for _cat, msg in _flashes_tail(client))
+
     def _execute_query(sql, params=None, fetch=True):
         del params, fetch
         if "FROM users WHERE id = %s" in sql:
@@ -8312,7 +8398,85 @@ def test_invite_code_generate_db_error(monkeypatch, fake_user):
     assert any("failed" in msg.lower() for _cat, msg in flashes)
 
 
-def test_join_by_code_success(monkeypatch, fake_user):
+def _make_invite_code_collision_error():
+    """Build a DatabaseError that looks like a MySQL 1062 on the invite_code index."""
+    cause = Exception(1062, "Duplicate entry 'ABCD1234' for key 'idx_projects_invite_code'")
+    exc = app_module.DatabaseError("duplicate invite_code")
+    exc.__cause__ = cause
+    return exc
+
+
+def test_is_invite_code_collision_true():
+    exc = _make_invite_code_collision_error()
+    assert app_module._is_invite_code_collision(exc)
+
+
+def test_is_invite_code_collision_false_wrong_key():
+    cause = Exception(1062, "Duplicate entry '...' for key 'idx_projects_user_qid_cat'")
+    exc = app_module.DatabaseError("duplicate project")
+    exc.__cause__ = cause
+    assert not app_module._is_invite_code_collision(exc)
+
+
+def test_is_invite_code_collision_false_not_1062():
+    cause = Exception(1064, "Syntax error")
+    exc = app_module.DatabaseError("syntax error")
+    exc.__cause__ = cause
+    assert not app_module._is_invite_code_collision(exc)
+
+
+def test_invite_code_generate_retries_on_collision(monkeypatch, fake_user):
+    """First UPDATE raises an invite_code collision; second attempt succeeds."""
+    project = _project_settings_base_row()
+    call_count = {"n": 0}
+
+    def route_execute(sql, _params, _fetch):
+        if "SELECT * FROM projects WHERE id = %s AND user_id = %s" in sql:
+            return [project.copy()]
+        if "UPDATE projects SET invite_code" in sql:
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise _make_invite_code_collision_error()
+            return 1
+        raise AssertionError(f"Unexpected SQL: {sql}")
+
+    client = _make_authed_client(monkeypatch, fake_user, route_execute)
+    _set_csrf_chunk6(client)
+
+    response = client.post(
+        "/project/1/invite-code",
+        data={"csrf_token": "testtoken", "action": "generate"},
+    )
+
+    assert response.status_code == 302
+    assert call_count["n"] == 2
+    flashes = _flashes_chunk6(client)
+    assert any("generated" in msg.lower() for _cat, msg in flashes)
+
+
+def test_invite_code_generate_fails_after_max_retries(monkeypatch, fake_user):
+    """All retry attempts raise invite_code collisions; route shows failure flash."""
+    project = _project_settings_base_row()
+
+    def route_execute(sql, _params, _fetch):
+        if "SELECT * FROM projects WHERE id = %s AND user_id = %s" in sql:
+            return [project.copy()]
+        if "UPDATE projects SET invite_code" in sql:
+            raise _make_invite_code_collision_error()
+        raise AssertionError(f"Unexpected SQL: {sql}")
+
+    client = _make_authed_client(monkeypatch, fake_user, route_execute)
+    _set_csrf_chunk6(client)
+
+    response = client.post(
+        "/project/1/invite-code",
+        data={"csrf_token": "testtoken", "action": "generate"},
+    )
+
+    assert response.status_code == 302
+    flashes = _flashes_chunk6(client)
+    assert any("failed" in msg.lower() for _cat, msg in flashes)
+
     insert_calls = []
 
     def route_execute(sql, params, fetch):

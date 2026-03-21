@@ -693,8 +693,43 @@ def _snap_thumb_width(width: int) -> int:
     return _THUMB_STEPS[-1]
 
 
+_MAX_INVITE_CODE_RETRIES = 5
+
+
 def _generate_invite_code() -> str:
     return secrets.token_urlsafe(6)[:8]
+
+
+def _is_mysql_1062(exc: Exception) -> bool:
+    """Return True if *exc* (or its __cause__) is a MySQL 1062 (ER_DUP_ENTRY) error."""
+    for candidate in (getattr(exc, "__cause__", None), exc):
+        if candidate is None:
+            continue
+        args = getattr(candidate, "args", None)
+        if args:
+            try:
+                if int(args[0]) == 1062:
+                    return True
+            except (ValueError, TypeError, IndexError):
+                pass
+    # Last resort: require both 1062 and "Duplicate entry" to avoid false positives
+    # from error messages that incidentally contain the digits 1062.
+    exc_str = str(exc)
+    return bool(re.search(r"\b1062\b", exc_str)) and "Duplicate entry" in exc_str
+
+
+def _is_invite_code_collision(exc: Exception) -> bool:
+    """Return True if *exc* is a MySQL 1062 error on the invite_code UNIQUE index."""
+    if not _is_mysql_1062(exc):
+        return False
+    # Also verify the collision is specifically on the invite_code index.
+    for candidate in (getattr(exc, "__cause__", None), exc):
+        if candidate is None:
+            continue
+        args = getattr(candidate, "args", None)
+        if args and len(args) > 1 and "invite_code" in str(args[1]):
+            return True
+    return "invite_code" in str(exc)
 
 
 def commons_thumb_url(file_title: str, width: int = 330) -> str:
@@ -1333,22 +1368,32 @@ def project_new():
         if not label:
             label = _fetch_wikidata_label(wikidata_qid) or ""
 
-        execute_query(
-            "INSERT INTO projects (user_id, wikidata_qid, commons_category, label, "
-            "distance_threshold, min_confirmed, p18_thumb_url, invite_code) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
-            (
-                g.user["id"],
-                wikidata_qid,
-                commons_category,
-                label,
-                distance_threshold,
-                min_confirmed,
-                p18_thumb_url,
-                _generate_invite_code(),
-            ),
-            fetch=False,
-        )
+        invite_code = _generate_invite_code()
+        for _attempt in range(_MAX_INVITE_CODE_RETRIES):
+            try:
+                execute_query(
+                    "INSERT INTO projects (user_id, wikidata_qid, commons_category, label, "
+                    "distance_threshold, min_confirmed, p18_thumb_url, invite_code) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                    (
+                        g.user["id"],
+                        wikidata_qid,
+                        commons_category,
+                        label,
+                        distance_threshold,
+                        min_confirmed,
+                        p18_thumb_url,
+                        invite_code,
+                    ),
+                    fetch=False,
+                )
+                break
+            except DatabaseError as _exc:
+                if _is_invite_code_collision(_exc) and _attempt < _MAX_INVITE_CODE_RETRIES - 1:
+                    logger.debug("invite_code collision on attempt %d, retrying", _attempt + 1)
+                    invite_code = _generate_invite_code()
+                else:
+                    raise
         flash(_("Project created successfully!"), "success")
 
         # Signal the worker to wake up and process the new project immediately
@@ -1363,34 +1408,13 @@ def project_new():
         # MySQL error 1062 (ER_DUP_ENTRY) means a soft-deleted row with the same
         # user_id + wikidata_qid + commons_category still exists.  The background
         # worker will hard-delete it on the next poll cycle (≤60 s).
-        def _is_duplicate_entry_error(db_exc: Exception) -> bool:
-            """
-            Return True if the given database exception represents a MySQL
-            duplicate-entry (error code 1062) condition.
-            """
-            # database.py wraps PyMySQL exceptions via `raise DatabaseError(...) from e`.
-            # The original PyMySQL IntegrityError is available as __cause__ with
-            # args = (1062, "Duplicate entry '...' for key '...'").
-            cause = getattr(db_exc, "__cause__", None)
-            if cause is not None and getattr(cause, "args", None):
-                try:
-                    return int(cause.args[0]) == 1062
-                except (ValueError, TypeError, IndexError):
-                    pass
-            # Fall back to checking the exception's own args.
-            if getattr(db_exc, "args", None):
-                try:
-                    return int(db_exc.args[0]) == 1062
-                except (ValueError, TypeError, IndexError):
-                    pass
-            # Last resort: check the string representation.
-            # Require both word-boundary match on "1062" and the literal
-            # "Duplicate entry" substring to avoid false positives from
-            # error messages that incidentally contain the digits 1062.
-            exc_str = str(db_exc)
-            return bool(re.search(r"\b1062\b", exc_str)) and "Duplicate entry" in exc_str
-
-        if _is_duplicate_entry_error(exc):
+        if _is_invite_code_collision(exc):
+            # The retry loop exhausted all _MAX_INVITE_CODE_RETRIES attempts to find
+            # a unique invite code and re-raised the last collision — treat as a
+            # generic creation failure (extremely unlikely in practice).
+            logger.exception("Failed to create project: invite_code collision after all retries")
+            flash(_("Failed to create project. Please try again."), "error")
+        elif _is_mysql_1062(exc):
             logger.info("Project creation blocked by pending soft-deleted row: %s", exc)
             flash(
                 _(
@@ -3210,16 +3234,27 @@ def project_invite_code(project_id: int):
 
     if action == "generate":
         code = _generate_invite_code()
-        try:
-            execute_query(
-                "UPDATE projects SET invite_code = %s WHERE id = %s AND user_id = %s",
-                (code, project_id, g.user["id"]),
-                fetch=False,
-            )
-            flash(_("Invite code generated."), "success")
-        except DatabaseError:
-            logger.exception("Failed to generate invite code for project %s", project_id)
-            flash(_("Failed to generate invite code."), "error")
+        for _attempt in range(_MAX_INVITE_CODE_RETRIES):
+            try:
+                execute_query(
+                    "UPDATE projects SET invite_code = %s WHERE id = %s AND user_id = %s",
+                    (code, project_id, g.user["id"]),
+                    fetch=False,
+                )
+                flash(_("Invite code generated."), "success")
+                break
+            except DatabaseError as exc:
+                if _is_invite_code_collision(exc) and _attempt < _MAX_INVITE_CODE_RETRIES - 1:
+                    logger.debug(
+                        "invite_code collision on attempt %d for project %s, retrying",
+                        _attempt + 1,
+                        project_id,
+                    )
+                    code = _generate_invite_code()
+                else:
+                    logger.exception("Failed to generate invite code for project %s", project_id)
+                    flash(_("Failed to generate invite code."), "error")
+                    break
     elif action == "revoke":
         try:
             execute_query(
