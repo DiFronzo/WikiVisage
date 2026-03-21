@@ -2135,10 +2135,6 @@ def api_manual_face():
                     ),
                 )
                 new_face_id = cursor.lastrowid
-                cursor.execute(
-                    "UPDATE projects SET faces_confirmed = faces_confirmed + 1 WHERE id = %s",
-                    (project_id,),
-                )
 
             return new_face_id, review_confirmed_ids
 
