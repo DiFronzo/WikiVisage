@@ -1244,6 +1244,15 @@ def bootstrap_from_sparql(project: dict[str, Any]) -> int:
                             fetch=False,
                         )
 
+            # Stop paginating once the insertion cap is reached — avoids
+            # expensive per-result DB lookups across further pages.
+            if inserted_count >= insertion_cap:
+                logger.info(
+                    f"Bootstrap reached insertion cap ({insertion_cap}) for project {project['id']}, "
+                    f"stopping pagination (inserted={inserted_count}, flagged={flagged_count})"
+                )
+                break
+
             # Paginate: check for continuation token
             continuation = data.get("continue", {})
             sr_offset = continuation.get("sroffset")
