@@ -833,3 +833,217 @@ def test_write_sdc_marks_image_bootstrapped_on_idempotency_hit():
     img_updates = [(sql, p) for sql, p in db_calls if "UPDATE images SET bootstrapped" in sql]
     assert len(img_updates) == 1
     assert img_updates[0][1] == (200,)
+
+
+def test_write_sdc_insert_ignore_zero_written_at_not_null():
+    """When INSERT IGNORE returns 0 and existing claim has written_at set, mark face as written."""
+    from datetime import datetime
+
+    project = {"id": 5, "user_id": 1, "wikidata_qid": "Q42"}
+    db_calls = []
+
+    def mock_execute_query(sql, params=None, fetch=True):
+        db_calls.append((sql.strip(), params))
+        if "sdc_write_requested" in sql and "SELECT" in sql:
+            return [{"sdc_write_requested": 1}]
+        if "SELECT f.id as face_id" in sql:
+            if not any("UPDATE faces SET sdc_written" in c[0] for c in db_calls):
+                return [{"face_id": 100, "image_id": 200, "commons_page_id": 9999}]
+            return []
+        if "INSERT IGNORE INTO sdc_claims" in sql:
+            return 0  # duplicate row
+        if "SELECT project_id, written_at, claimed_at FROM sdc_claims" in sql:
+            return [{"project_id": 99, "written_at": datetime(2025, 1, 1), "claimed_at": datetime(2025, 1, 1)}]
+        if "UPDATE faces SET sdc_written" in sql:
+            return 1
+        if "UPDATE projects SET sdc_write_requested = 0" in sql:
+            return 1
+        return 0
+
+    with (
+        patch("worker.execute_query", side_effect=mock_execute_query),
+        patch("worker._refresh_worker_token", return_value="fake-token"),
+        patch("worker._get_csrf_token", return_value="fake-csrf"),
+        patch("worker._api_request"),
+        patch("worker.shutdown_requested", False),
+    ):
+        result = write_sdc_claims(project)
+
+    assert result == 1
+
+    # Verify sdc_written=1 was set on the face
+    face_updates = [(sql, p) for sql, p in db_calls if "UPDATE faces SET sdc_written" in sql]
+    assert len(face_updates) == 1
+    assert face_updates[0][1] == (100,)
+
+    # No API call should have been made
+    api_calls = [c for c in db_calls if "wbgetclaims" in str(c)]
+    assert len(api_calls) == 0
+
+
+def test_write_sdc_insert_ignore_zero_same_project_retries_write():
+    """When INSERT IGNORE returns 0 and same project owns the claim, fall through to write."""
+    project = {"id": 5, "user_id": 1, "wikidata_qid": "Q42"}
+    db_calls = []
+
+    def mock_execute_query(sql, params=None, fetch=True):
+        db_calls.append((sql.strip(), params))
+        if "sdc_write_requested" in sql and "SELECT" in sql:
+            return [{"sdc_write_requested": 1}]
+        if "SELECT f.id as face_id" in sql:
+            if not any("UPDATE faces SET sdc_written" in c[0] for c in db_calls):
+                return [{"face_id": 100, "image_id": 200, "commons_page_id": 9999}]
+            return []
+        if "INSERT IGNORE INTO sdc_claims" in sql:
+            return 0  # duplicate row
+        if "SELECT project_id, written_at, claimed_at FROM sdc_claims" in sql:
+            # Same project (id=5) owns the claim, not yet written
+            return [{"project_id": 5, "written_at": None, "claimed_at": None}]
+        if "UPDATE faces SET sdc_written" in sql:
+            return 1
+        if "UPDATE sdc_claims SET written_at" in sql:
+            return 1
+        if "UPDATE projects SET sdc_write_requested = 0" in sql:
+            return 1
+        return 0
+
+    no_claims_response = {"claims": {}}
+    write_response = {"success": 1}
+
+    api_responses = [no_claims_response, write_response]
+    call_count = [0]
+
+    def mock_api_side_effect(*args, **kwargs):
+        resp = MagicMock()
+        resp.json.return_value = api_responses[call_count[0] % len(api_responses)]
+        call_count[0] += 1
+        return resp
+
+    with (
+        patch("worker.execute_query", side_effect=mock_execute_query),
+        patch("worker._refresh_worker_token", return_value="fake-token"),
+        patch("worker._get_csrf_token", return_value="fake-csrf"),
+        patch("worker._api_request", side_effect=mock_api_side_effect),
+        patch("worker.shutdown_requested", False),
+        patch("worker.time.sleep"),
+    ):
+        result = write_sdc_claims(project)
+
+    assert result == 1
+
+    # Verify sdc_written=1 was set on the face (write actually happened)
+    face_updates = [(sql, p) for sql, p in db_calls if "UPDATE faces SET sdc_written" in sql]
+    assert len(face_updates) == 1
+
+    # Verify written_at was updated in sdc_claims
+    sdc_updates = [(sql, p) for sql, p in db_calls if "UPDATE sdc_claims SET written_at" in sql]
+    assert len(sdc_updates) == 1
+
+
+def test_write_sdc_insert_ignore_zero_other_project_fresh_skips():
+    """When INSERT IGNORE returns 0 and another project holds a fresh claim, skip the face."""
+    project = {"id": 5, "user_id": 1, "wikidata_qid": "Q42"}
+    db_calls = []
+
+    def mock_execute_query(sql, params=None, fetch=True):
+        db_calls.append((sql.strip(), params))
+        if "sdc_write_requested" in sql and "SELECT" in sql:
+            return [{"sdc_write_requested": 1}]
+        if "SELECT f.id as face_id" in sql:
+            # Return the face once, then empty to end the loop
+            face_query_calls = [c for c in db_calls if "SELECT f.id as face_id" in c[0]]
+            if len(face_query_calls) == 1:
+                return [{"face_id": 100, "image_id": 200, "commons_page_id": 9999}]
+            return []
+        if "INSERT IGNORE INTO sdc_claims" in sql:
+            return 0  # duplicate row
+        if "SELECT project_id, written_at, claimed_at FROM sdc_claims" in sql:
+            # Another project (id=99) holds a fresh claim
+            return [{"project_id": 99, "written_at": None, "claimed_at": None}]
+        if "UPDATE sdc_claims SET project_id" in sql:
+            # Reclaim attempt fails (fresh claim held by other project)
+            return 0
+        if "UPDATE projects SET sdc_write_requested = 0" in sql:
+            return 1
+        return 0
+
+    with (
+        patch("worker.execute_query", side_effect=mock_execute_query),
+        patch("worker._refresh_worker_token", return_value="fake-token"),
+        patch("worker._get_csrf_token", return_value="fake-csrf"),
+        patch("worker._api_request"),
+        patch("worker.shutdown_requested", False),
+    ):
+        result = write_sdc_claims(project)
+
+    # Face was skipped — no write happened
+    assert result == 0
+
+    # Verify face was NOT marked as written
+    face_updates = [(sql, p) for sql, p in db_calls if "UPDATE faces SET sdc_written" in sql]
+    assert len(face_updates) == 0
+
+    # Verify reclaim was attempted
+    reclaim_attempts = [(sql, p) for sql, p in db_calls if "UPDATE sdc_claims SET project_id" in sql]
+    assert len(reclaim_attempts) == 1
+
+
+def test_write_sdc_insert_ignore_zero_other_project_stale_reclaims():
+    """When INSERT IGNORE returns 0 and another project holds a stale claim, reclaim and write."""
+    project = {"id": 5, "user_id": 1, "wikidata_qid": "Q42"}
+    db_calls = []
+
+    def mock_execute_query(sql, params=None, fetch=True):
+        db_calls.append((sql.strip(), params))
+        if "sdc_write_requested" in sql and "SELECT" in sql:
+            return [{"sdc_write_requested": 1}]
+        if "SELECT f.id as face_id" in sql:
+            if not any("UPDATE faces SET sdc_written" in c[0] for c in db_calls):
+                return [{"face_id": 100, "image_id": 200, "commons_page_id": 9999}]
+            return []
+        if "INSERT IGNORE INTO sdc_claims" in sql:
+            return 0  # duplicate row
+        if "SELECT project_id, written_at, claimed_at FROM sdc_claims" in sql:
+            # Another project (id=99) holds the claim, not yet written
+            return [{"project_id": 99, "written_at": None, "claimed_at": None}]
+        if "UPDATE sdc_claims SET project_id" in sql:
+            # Reclaim succeeds (stale claim)
+            return 1
+        if "UPDATE faces SET sdc_written" in sql:
+            return 1
+        if "UPDATE sdc_claims SET written_at" in sql:
+            return 1
+        if "UPDATE projects SET sdc_write_requested = 0" in sql:
+            return 1
+        return 0
+
+    no_claims_response = {"claims": {}}
+    write_response = {"success": 1}
+    api_responses = [no_claims_response, write_response]
+    call_count = [0]
+
+    def mock_api_side_effect(*args, **kwargs):
+        resp = MagicMock()
+        resp.json.return_value = api_responses[call_count[0] % len(api_responses)]
+        call_count[0] += 1
+        return resp
+
+    with (
+        patch("worker.execute_query", side_effect=mock_execute_query),
+        patch("worker._refresh_worker_token", return_value="fake-token"),
+        patch("worker._get_csrf_token", return_value="fake-csrf"),
+        patch("worker._api_request", side_effect=mock_api_side_effect),
+        patch("worker.shutdown_requested", False),
+        patch("worker.time.sleep"),
+    ):
+        result = write_sdc_claims(project)
+
+    assert result == 1
+
+    # Verify reclaim was attempted and succeeded
+    reclaim_attempts = [(sql, p) for sql, p in db_calls if "UPDATE sdc_claims SET project_id" in sql]
+    assert len(reclaim_attempts) == 1
+
+    # Verify face was marked as written after reclaim + API write
+    face_updates = [(sql, p) for sql, p in db_calls if "UPDATE faces SET sdc_written" in sql]
+    assert len(face_updates) == 1
