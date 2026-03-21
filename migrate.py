@@ -338,15 +338,6 @@ _ALTER_MIGRATIONS = [
         "ALTER TABLE project_members ADD COLUMN status ENUM('active', 'banned') NOT NULL DEFAULT 'active' AFTER role",
     ),
     (
-        "Add allow_collaborators column to projects",
-        "ALTER TABLE projects ADD COLUMN allow_collaborators TINYINT(1) NOT NULL DEFAULT 1 "
-        "COMMENT '1=other users can join this project, 0=join disabled' AFTER sdc_write_error",
-    ),
-    (
-        "Drop allow_collaborators column from projects (replaced by invite_code)",
-        "ALTER TABLE projects DROP COLUMN allow_collaborators",
-    ),
-    (
         "Add invite_code column to projects for invite-based joining",
         "ALTER TABLE projects ADD COLUMN invite_code VARCHAR(8) NULL DEFAULT NULL "
         "COMMENT 'Unique code for others to join this project' AFTER sdc_write_error",
