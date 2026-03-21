@@ -579,14 +579,19 @@
         var scaleX = img.clientWidth / refW;
         var scaleY = img.clientHeight / refH;
 
+        /* When the image is centered (margin: 0 auto) inside a wider wrapper,
+           account for the horizontal offset so boxes align with the image. */
+        var imgOffsetLeft = img.offsetLeft;
+        var imgOffsetTop = img.offsetTop;
+
         boxes.forEach(function(box) {
             var t = parseInt(box.dataset.bboxTop);
             var r = parseInt(box.dataset.bboxRight);
             var b = parseInt(box.dataset.bboxBottom);
             var l = parseInt(box.dataset.bboxLeft);
 
-            box.style.left   = (l * scaleX) + 'px';
-            box.style.top    = (t * scaleY) + 'px';
+            box.style.left   = (l * scaleX + imgOffsetLeft) + 'px';
+            box.style.top    = (t * scaleY + imgOffsetTop) + 'px';
             box.style.width  = ((r - l) * scaleX) + 'px';
             box.style.height = ((b - t) * scaleY) + 'px';
             box.style.display = 'block';
@@ -848,10 +853,12 @@
         var scaleX = refW / img.clientWidth;
         var scaleY = refH / img.clientHeight;
 
-        var bboxLeft   = Math.round(x1 * scaleX);
-        var bboxTop    = Math.round(y1 * scaleY);
-        var bboxRight  = Math.round(x2 * scaleX);
-        var bboxBottom = Math.round(y2 * scaleY);
+        /* Subtract image offset so drawn coordinates are relative to the image,
+           not the wrapper (matters when the image is centered in a wider wrapper). */
+        var bboxLeft   = Math.round((x1 - img.offsetLeft) * scaleX);
+        var bboxTop    = Math.round((y1 - img.offsetTop) * scaleY);
+        var bboxRight  = Math.round((x2 - img.offsetLeft) * scaleX);
+        var bboxBottom = Math.round((y2 - img.offsetTop) * scaleY);
 
         submitManualFace(bboxTop, bboxRight, bboxBottom, bboxLeft);
     }

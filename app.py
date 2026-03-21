@@ -1959,8 +1959,9 @@ def api_manual_face():
             else:
                 cursor.execute(
                     "INSERT INTO faces "
-                    "(image_id, encoding, bbox_top, bbox_right, bbox_bottom, bbox_left) "
-                    "VALUES (%s, %s, %s, %s, %s, %s)",
+                    "(image_id, encoding, bbox_top, bbox_right, bbox_bottom, bbox_left, "
+                    "is_target, classified_by, classified_by_user_id) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, 1, 'human', %s)",
                     (
                         image_id,
                         encoding_bytes,
@@ -1968,9 +1969,14 @@ def api_manual_face():
                         bbox_right,
                         bbox_bottom,
                         bbox_left,
+                        g.user["id"],
                     ),
                 )
                 new_face_id = cursor.lastrowid
+                cursor.execute(
+                    "UPDATE projects SET faces_confirmed = faces_confirmed + 1 WHERE id = %s",
+                    (project_id,),
+                )
 
             return new_face_id, review_confirmed_ids
 
