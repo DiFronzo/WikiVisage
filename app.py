@@ -110,9 +110,9 @@ _whitelist_cache_time: float = 0.0
 def _parse_whitelist(text: str) -> set[str]:
     """Parse whitelist text into a set of usernames (NFKC-normalized)."""
     return {
-        unicodedata.normalize("NFKC", line.strip())
+        unicodedata.normalize("NFKC", s)
         for line in text.splitlines()
-        if line.strip() and not line.startswith("#")
+        if (s := line.strip()) and not s.startswith("#")
     }
 
 
