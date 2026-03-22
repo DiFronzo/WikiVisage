@@ -175,7 +175,7 @@ msgstr "Bounding box out of allowed range"
 
 #: app.py:2093
 msgid "Too many face IDs in dismiss list"
-msgstr ""
+msgstr "Too many face IDs in dismiss list"
 
 #: app.py:2123 app.py:2548
 msgid ""
