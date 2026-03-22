@@ -1014,8 +1014,10 @@ def process_images(project: dict[str, Any]) -> int:
     this avoids the worker spending all its time on bootstrap downloads while
     category-discovered images wait.  The cap uses the same ratios as the old
     insertion cap (BOOTSTRAP_TARGET_RATIO / BOOTSTRAP_MAX_RATIO) but is
-    enforced here instead of in bootstrap_from_sparql so that ALL P180 images
-    get inserted into the database for correct SDC-pending bookkeeping.
+    enforced here instead of in bootstrap_from_sparql so that eligible P180
+    images are inserted into the database (subject to the global
+    MAX_IMAGES_PER_PROJECT cap and file-type filtering) for correct
+    SDC-pending bookkeeping.
     """
     project_id = project["id"]
     logger.info(f"Processing images for project {project_id}")
