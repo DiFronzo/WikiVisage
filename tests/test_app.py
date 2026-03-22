@@ -5081,7 +5081,62 @@ def test_api_manual_face_success_normal_insert(monkeypatch):
         assert sess["last_classify"]["manual_face_ids"] == [99]
 
 
-def test_api_manual_face_success_review_mode_insert(monkeypatch):
+def test_api_manual_face_dismiss_faces_on_normal_insert(monkeypatch):
+    """When dismiss_face_ids is sent, the API marks those faces as non-target
+    in the same transaction, preventing the image from reappearing."""
+    executed_sqls = []
+
+    def _route_query(sql):
+        if "FROM images i " in sql:
+            return [{"id": 10, "file_title": "File:Face.jpg"}]
+        return []
+
+    def _transaction(fn):
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_cursor.lastrowid = 99
+        mock_cursor.rowcount = 1
+
+        original_execute = mock_cursor.execute
+
+        def tracking_execute(sql, params=None):
+            executed_sqls.append((sql, params))
+            return original_execute(sql, params)
+
+        mock_cursor.execute = tracking_execute
+        return fn(mock_conn, mock_cursor)
+
+    client, _ = _authed_client(monkeypatch, route_execute_query=_route_query)
+    monkeypatch.setattr(app_module, "_download_image", lambda *_a, **_k: b"image-bytes")
+    monkeypatch.setattr(app_module, "execute_transaction", _transaction)
+
+    fake_encoding = np.random.rand(128).astype(np.float64)
+    mock_fr = _build_face_recognition_mock(encodings=[fake_encoding])
+
+    import json
+
+    with patch.dict("sys.modules", {"face_recognition": mock_fr}):
+        resp = client.post(
+            "/api/manual-face",
+            data=_manual_face_form(dismiss_face_ids=json.dumps([5, 7])),
+        )
+
+    assert resp.status_code == 200
+    assert resp.get_json() == {"status": "ok"}
+
+    dismiss_sqls = [(sql, params) for sql, params in executed_sqls if "UPDATE faces SET is_target = 0" in sql]
+    assert len(dismiss_sqls) == 1
+    sql, params = dismiss_sqls[0]
+    assert "id IN (%s,%s)" in sql
+    # params: (user_id, face_id_1, face_id_2, image_id)
+    assert params[1] == 5
+    assert params[2] == 7
+
+    with client.session_transaction() as sess:
+        assert sess["last_classify"]["face_ids"] == [5, 7]
+        assert sess["last_classify"]["was_review"] is False
+        assert sess["last_classify"]["manual_face_ids"] == [99]
+
     def _route_query(sql):
         if "FROM images i " in sql:
             return [{"id": 10, "file_title": "File:Face.jpg"}]

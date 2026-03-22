@@ -67,10 +67,13 @@ MAX_IMAGE_PIXELS = 100_000_000
 # Maximum images per project — stops category traversal once this limit is reached
 MAX_IMAGES_PER_PROJECT = 9000
 
-# Dynamic bootstrap sizing — scales with category tag density
+# Bootstrap processing cap — limits how many bootstrap images process_images() will
+# download/detect per project.  All P180 images are inserted into the DB by
+# bootstrap_from_sparql (no insertion cap), but processing is throttled here so
+# the worker doesn't spend all its time on bootstrap downloads.
 BOOTSTRAP_TARGET_RATIO = 0.10  # Base: ~10% of MAX_IMAGES_PER_PROJECT (900 for 9000 limit)
 BOOTSTRAP_MAX_RATIO = 0.40  # Ceiling: never exceed 40% even for heavily-tagged categories
-MIN_BOOTSTRAP_IMAGES = 100  # Floor: always allow at least 100 bootstrap inserts
+MIN_BOOTSTRAP_IMAGES = 100  # Floor: always process at least 100 bootstrap images
 
 OAUTH_CLIENT_ID = os.environ.get("OAUTH_CLIENT_ID", "")
 OAUTH_CLIENT_SECRET = os.environ.get("OAUTH_CLIENT_SECRET", "")
@@ -970,6 +973,15 @@ def _process_single_image(
                     (auto_classified, project_id),
                     fetch=False,
                 )
+                # Mark as sdc_written — this image already has P180 on Commons,
+                # so there's nothing to write.  Prevents showing as SDC pending.
+                execute_query(
+                    "UPDATE faces SET sdc_written = 1 "
+                    "WHERE image_id = %s AND is_target = 1 AND classified_by = 'bootstrap' "
+                    "AND sdc_written = 0 AND superseded_by IS NULL",
+                    (img_id,),
+                    fetch=False,
+                )
                 logger.info(f"Auto-classified {auto_classified} face(s) on bootstrapped image {img_id} as target")
 
         t_db = time.monotonic()
@@ -995,14 +1007,75 @@ def _process_single_image(
 
 
 def process_images(project: dict[str, Any]) -> int:
-    """Download images, detect faces, and extract embeddings using parallel threads."""
-    logger.info(f"Processing images for project {project['id']}")
+    """Download images, detect faces, and extract embeddings using parallel threads.
 
-    pending_images = execute_query(
-        "SELECT id, file_title, bootstrapped FROM images WHERE project_id = %s AND status = 'pending' LIMIT %s",
-        (project["id"], BATCH_SIZE),
+    Non-bootstrap images are processed first (no cap).  Bootstrap images are
+    processed up to a dynamic cap based on the project's total image count —
+    this avoids the worker spending all its time on bootstrap downloads while
+    category-discovered images wait.  The cap uses the same ratios as the old
+    insertion cap (BOOTSTRAP_TARGET_RATIO / BOOTSTRAP_MAX_RATIO) but is
+    enforced here instead of in bootstrap_from_sparql so that ALL P180 images
+    get inserted into the database for correct SDC-pending bookkeeping.
+    """
+    project_id = project["id"]
+    logger.info(f"Processing images for project {project_id}")
+
+    # --- Compute how many bootstrap images we're allowed to process ----------
+    stats = execute_query(
+        "SELECT "
+        "  SUM(CASE WHEN bootstrapped = 1 AND status != 'pending' THEN 1 ELSE 0 END) AS bs_done, "
+        "  COUNT(*) AS total "
+        "FROM images WHERE project_id = %s",
+        (project_id,),
         fetch=True,
     )
+    bs_already_processed = int(stats[0]["bs_done"] or 0) if stats else 0
+    total_images = int(stats[0]["total"] or 0) if stats else 0
+
+    # Dynamic cap mirrors the old bootstrap_from_sparql sizing logic
+    base_cap = int(MAX_IMAGES_PER_PROJECT * BOOTSTRAP_TARGET_RATIO)
+    max_cap = int(MAX_IMAGES_PER_PROJECT * BOOTSTRAP_MAX_RATIO)
+    # Scale linearly based on how bootstrap-heavy the project is
+    if total_images > 0:
+        bs_total = execute_query(
+            "SELECT COUNT(*) AS cnt FROM images WHERE project_id = %s AND bootstrapped = 1",
+            (project_id,),
+            fetch=True,
+        )
+        bs_count = int(bs_total[0]["cnt"] or 0) if bs_total else 0
+        bs_ratio = bs_count / total_images
+        if bs_ratio > 0.5:
+            scale = min(bs_ratio, 1.0)
+            bootstrap_cap = int(base_cap + (max_cap - base_cap) * (scale - 0.5) * 2)
+        else:
+            bootstrap_cap = base_cap
+    else:
+        bootstrap_cap = base_cap
+    bootstrap_cap = max(MIN_BOOTSTRAP_IMAGES, bootstrap_cap)
+    bootstrap_remaining = max(0, bootstrap_cap - bs_already_processed)
+
+    # --- Build the batch: non-bootstrap first, then bootstrap ----------------
+    non_bs = execute_query(
+        "SELECT id, file_title, bootstrapped FROM images "
+        "WHERE project_id = %s AND status = 'pending' AND bootstrapped = 0 "
+        "LIMIT %s",
+        (project_id, BATCH_SIZE),
+        fetch=True,
+    )
+    pending_images = list(non_bs) if non_bs else []
+
+    remaining_slots = BATCH_SIZE - len(pending_images)
+    bs_to_fetch = min(remaining_slots, bootstrap_remaining) if remaining_slots > 0 else 0
+    if bs_to_fetch > 0:
+        bs = execute_query(
+            "SELECT id, file_title, bootstrapped FROM images "
+            "WHERE project_id = %s AND status = 'pending' AND bootstrapped = 1 "
+            "LIMIT %s",
+            (project_id, bs_to_fetch),
+            fetch=True,
+        )
+        if bs:
+            pending_images.extend(bs)
 
     if not pending_images:
         return 0
@@ -1020,7 +1093,7 @@ def process_images(project: dict[str, Any]) -> int:
                 img_row["id"],
                 img_row["file_title"],
                 bootstrapped=bool(img_row.get("bootstrapped")),
-                project_id=project["id"],
+                project_id=project_id,
             )
             futures[future] = img_row["file_title"]
 
@@ -1045,7 +1118,7 @@ def process_images(project: dict[str, Any]) -> int:
     # Update project stats
     execute_query(
         "UPDATE projects SET images_processed = (SELECT COUNT(*) FROM images WHERE project_id = %s AND status IN ('processed', 'error', 'enriched')) WHERE id = %s",
-        (project["id"], project["id"]),
+        (project_id, project_id),
         fetch=False,
     )
 
@@ -1088,7 +1161,7 @@ def bootstrap_from_sparql(project: dict[str, Any]) -> int:
         "list": "search",
         "srsearch": f'haswbstatement:P180={qid} deepcat:"{category}"',
         "srnamespace": "6",
-        "srlimit": "1000",
+        "srlimit": "max",
         "format": "json",
     }
 
@@ -1096,8 +1169,6 @@ def bootstrap_from_sparql(project: dict[str, Any]) -> int:
         flagged_count = 0
         inserted_count = 0
         results_seen = 0
-        total_tagged: int | None = None  # Will be set from first API response's totalhits
-        insertion_cap = remaining_global  # Dynamic cap computed after first response; defaults to global cap
 
         while True:
             if shutdown_requested:
@@ -1116,27 +1187,6 @@ def bootstrap_from_sparql(project: dict[str, Any]) -> int:
 
             if not results:
                 break
-
-            # Compute dynamic insertion cap from first API response
-            if total_tagged is None:
-                total_tagged = int(data.get("query", {}).get("searchinfo", {}).get("totalhits", 0))
-                tag_density = total_tagged / max(existing_count, 1) if existing_count > 0 else 0.0
-
-                # Dynamic cap: base 10% of project capacity, scales up with tag density
-                base_cap = int(MAX_IMAGES_PER_PROJECT * BOOTSTRAP_TARGET_RATIO)
-                if tag_density > 0.5:
-                    max_cap = int(MAX_IMAGES_PER_PROJECT * BOOTSTRAP_MAX_RATIO)
-                    scale = min(tag_density, 1.0)
-                    insertion_cap = int(base_cap + (max_cap - base_cap) * (scale - 0.5) * 2)
-                else:
-                    insertion_cap = base_cap
-
-                insertion_cap = max(MIN_BOOTSTRAP_IMAGES, min(insertion_cap, remaining_global))
-                logger.info(
-                    f"Bootstrap dynamic sizing for project {project['id']}: "
-                    f"total_tagged={total_tagged}, existing_images={existing_count}, "
-                    f"tag_density={tag_density:.2f}, insertion_cap={insertion_cap}"
-                )
 
             for result in results:
                 if shutdown_requested:
@@ -1165,7 +1215,8 @@ def bootstrap_from_sparql(project: dict[str, Any]) -> int:
                     img_status = exists[0]["status"]
 
                     # Flag as bootstrapped regardless of current status —
-                    # no cap on flagging existing images (prevents false SDC pending)
+                    # ensures all P180 images are marked so they don't show
+                    # as SDC pending in the UI.
                     affected = execute_query(
                         "UPDATE images SET bootstrapped = 1 WHERE id = %s AND bootstrapped != 1",
                         (image_id,),
@@ -1218,9 +1269,10 @@ def bootstrap_from_sparql(project: dict[str, Any]) -> int:
                                 f"already-processed image {image_id} as target"
                             )
                 else:
-                    # New image not in category — insert as pending + bootstrapped
-                    # Subject to dynamic insertion cap
-                    if inserted_count >= insertion_cap or inserted_count >= remaining_global:
+                    # New image not in category — insert as pending + bootstrapped.
+                    # All P180 images are inserted (no cap here); the processing
+                    # cap is enforced in process_images() instead.
+                    if inserted_count >= remaining_global:
                         continue
 
                     affected = execute_query(
@@ -1244,15 +1296,6 @@ def bootstrap_from_sparql(project: dict[str, Any]) -> int:
                             fetch=False,
                         )
 
-            # Stop paginating once the insertion cap is reached — avoids
-            # expensive per-result DB lookups across further pages.
-            if inserted_count >= insertion_cap:
-                logger.info(
-                    f"Bootstrap reached insertion cap ({insertion_cap}) for project {project['id']}, "
-                    f"stopping pagination (inserted={inserted_count}, flagged={flagged_count})"
-                )
-                break
-
             # Paginate: check for continuation token
             continuation = data.get("continue", {})
             sr_offset = continuation.get("sroffset")
@@ -1260,8 +1303,7 @@ def bootstrap_from_sparql(project: dict[str, Any]) -> int:
                 break
             search_params["sroffset"] = sr_offset
             logger.info(
-                f"Bootstrap pagination: offset {sr_offset} "
-                f"(flagged={flagged_count}, inserted={inserted_count}/{insertion_cap})"
+                f"Bootstrap pagination: offset {sr_offset} (flagged={flagged_count}, inserted={inserted_count})"
             )
 
         if flagged_count > 0:
@@ -1274,7 +1316,7 @@ def bootstrap_from_sparql(project: dict[str, Any]) -> int:
             logger.info(
                 f"Bootstrap flagged {flagged_count} images for project {project['id']}"
                 f" ({inserted_count} new inserts, {flagged_count - inserted_count} existing flagged,"
-                f" insertion_cap={insertion_cap}, scanned={results_seen})"
+                f" scanned={results_seen})"
             )
 
         return flagged_count

@@ -14,6 +14,7 @@ with Path(__file__).parent.joinpath("pyproject.toml").open("rb") as _f:
 
 import hashlib
 import io
+import json
 import logging
 import math
 import os
@@ -2070,6 +2071,18 @@ def api_manual_face():
     # In review mode, user is drawing a face the model missed — auto-classify
     is_review_mode = request.form.get("reviewing_model") == "1"
 
+    # In normal classify mode, dismiss currently displayed faces as non-target
+    dismiss_face_ids: list[int] = []
+    if not is_review_mode:
+        dismiss_raw = request.form.get("dismiss_face_ids", "")
+        if dismiss_raw:
+            try:
+                parsed = json.loads(dismiss_raw)
+                if isinstance(parsed, list):
+                    dismiss_face_ids = [int(fid) for fid in parsed]
+            except (json.JSONDecodeError, ValueError, TypeError):
+                pass
+
     try:
         img = verify_image_access(image_id, project_id, g.user["id"])
         if not img:
@@ -2160,6 +2173,17 @@ def api_manual_face():
                 )
                 new_face_id = cursor.lastrowid
 
+                # Dismiss currently displayed faces as non-target so the image
+                # doesn't reappear in the classify queue endlessly.
+                if dismiss_face_ids:
+                    placeholders = ",".join(["%s"] * len(dismiss_face_ids))
+                    cursor.execute(
+                        "UPDATE faces SET is_target = 0, classified_by = 'human', "
+                        f"classified_by_user_id = %s WHERE id IN ({placeholders}) "
+                        "AND image_id = %s AND is_target IS NULL AND superseded_by IS NULL",
+                        (g.user["id"], *dismiss_face_ids, image_id),
+                    )
+
             return new_face_id, review_confirmed_ids
 
         new_face_id, review_confirmed_ids = execute_transaction(_insert_manual_face)
@@ -2174,7 +2198,7 @@ def api_manual_face():
                 "project_id": project_id,
                 "image_id": image_id,
                 "action": "manual_face",
-                "face_ids": review_confirmed_ids,
+                "face_ids": review_confirmed_ids if is_review_mode else dismiss_face_ids,
                 "manual_face_ids": [new_face_id],
                 "was_review": is_review_mode,
             }

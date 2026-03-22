@@ -874,7 +874,11 @@
         if (isDrawing) isDrawing = false;
     });
 
+    var submittingManualFace = false;
+
     function submitManualFace(top, right, bottom, left) {
+        if (submittingManualFace) return;
+        submittingManualFace = true;
         var overlay = document.getElementById('loadingOverlay');
         overlay.style.display = 'flex';
         overlay.textContent = i18n.detectingFace;
@@ -890,6 +894,10 @@
         {% if reviewing_model %}
         formData.append('reviewing_model', '1');
         {% endif %}
+        /* Send IDs of currently displayed faces so the API can mark them as
+           non-target — prevents the same image from reappearing endlessly. */
+        var dismissIds = [{% for face in faces %}{{ face.face_id }}{% if not loop.last %},{% endif %}{% endfor %}];
+        formData.append('dismiss_face_ids', JSON.stringify(dismissIds));
 
         fetch('{{ url_for("api_manual_face") }}', {
             method: 'POST',
@@ -905,6 +913,7 @@
                 alert(i18n.errorPrefix.replace('{message}', result.data.error || i18n.unknownError));
                 overlay.style.display = 'none';
                 removeDrawRect();
+                submittingManualFace = false;
             } else {
                 window.location.reload();
             }
@@ -914,6 +923,7 @@
             alert(i18n.errorManualFace);
             overlay.style.display = 'none';
             removeDrawRect();
+            submittingManualFace = false;
         });
     }
 </script>
