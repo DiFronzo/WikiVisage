@@ -398,9 +398,7 @@ def test_process_images_caps_bootstrap_when_already_processed():
         count = process_images(project)
 
     assert count == 0
-    assert not bootstrap_pending_queried, (
-        "Bootstrap pending query should not be executed when cap is already met"
-    )
+    assert not bootstrap_pending_queried, "Bootstrap pending query should not be executed when cap is already met"
 
 
 import pytest
