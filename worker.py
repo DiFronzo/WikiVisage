@@ -2319,12 +2319,21 @@ def _claim_inference_projects(max_count: int) -> list[dict[str, Any]]:
         return []
 
 
-def _claim_sdc_projects() -> list[dict[str, Any]]:
-    """Atomically claim projects that have pending SDC write requests."""
+def _claim_sdc_projects() -> tuple[list[dict[str, Any]], set[int]]:
+    """Atomically claim projects that have pending SDC write requests.
 
-    def _txn(conn: Any, cursor: Any) -> list[dict[str, Any]]:
+    Returns:
+        A tuple of ``(projects, pre_claimed_ids)`` where *pre_claimed_ids* is
+        the set of project IDs that were **already** claimed by this worker
+        before this call (i.e. for active/inference processing).  Callers must
+        **not** release those claims when SDC writing finishes, as another
+        thread may still be processing them.
+    """
+
+    def _txn(conn: Any, cursor: Any) -> tuple[list[dict[str, Any]], set[int]]:
         cursor.execute(
-            "SELECT p.id FROM projects p "
+            "SELECT p.id, (p.worker_claimed_by = %s) AS already_claimed "
+            "FROM projects p "
             "WHERE p.sdc_write_requested = 1 AND p.status != 'deleted' "
             "AND (p.worker_claimed_by IS NULL "
             "     OR p.worker_claimed_by = %s "
@@ -2332,13 +2341,14 @@ def _claim_sdc_projects() -> list[dict[str, Any]]:
             "ORDER BY COALESCE(p.worker_claimed_at, '1970-01-01') ASC "
             "LIMIT %s "
             "FOR UPDATE",
-            (_worker_id, CLAIM_EXPIRY_MINUTES, MAX_CONCURRENT_PROJECTS),
+            (_worker_id, _worker_id, CLAIM_EXPIRY_MINUTES, MAX_CONCURRENT_PROJECTS),
         )
         rows = cursor.fetchall()
         if not rows:
-            return []
+            return [], set()
 
         ids = [r["id"] for r in rows]
+        pre_claimed_ids = {r["id"] for r in rows if r["already_claimed"]}
         placeholders = ", ".join(["%s"] * len(ids))
         cursor.execute(
             f"UPDATE projects SET worker_claimed_by = %s, worker_claimed_at = NOW() WHERE id IN ({placeholders})",
@@ -2349,16 +2359,16 @@ def _claim_sdc_projects() -> list[dict[str, Any]]:
             f"SELECT p.* FROM projects p WHERE p.id IN ({placeholders})",
             ids,
         )
-        return list(cursor.fetchall())
+        return list(cursor.fetchall()), pre_claimed_ids
 
     try:
-        result = execute_transaction(_txn)
+        result, pre_claimed_ids = execute_transaction(_txn)
         if result:
             logger.info(f"Claimed {len(result)} SDC project(s): {[p['id'] for p in result]}")
-        return result
+        return result, pre_claimed_ids
     except DatabaseError:
         logger.exception("Failed to claim SDC projects")
-        return []
+        return [], set()
 
 
 def _process_sdc_writes() -> int:
@@ -2368,7 +2378,7 @@ def _process_sdc_writes() -> int:
     Safe to call from any point in the main loop (top-of-cycle,
     mid-cycle wake handler, inference loop).
     """
-    sdc_projects = _claim_sdc_projects()
+    sdc_projects, pre_claimed_ids = _claim_sdc_projects()
     if not sdc_projects:
         return 0
     logger.info(f"Claimed {len(sdc_projects)} SDC project(s) for writing")
@@ -2402,7 +2412,11 @@ def _process_sdc_writes() -> int:
             except DatabaseError:
                 pass
         finally:
-            _release_project(sdc_project["id"])
+            # Only release the claim if it was newly acquired for SDC writing.
+            # Pre-existing claims (from active/inference processing) must not be
+            # cleared here, as another thread may still be using them.
+            if sdc_project["id"] not in pre_claimed_ids:
+                _release_project(sdc_project["id"])
     return total_written
 
 

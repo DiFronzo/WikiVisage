@@ -711,24 +711,27 @@ def test_claim_inference_projects_returns_empty_on_db_error():
 
 
 def test_claim_sdc_projects_success():
-    """_claim_sdc_projects returns whatever the transaction closure produces."""
+    """_claim_sdc_projects returns (projects, pre_claimed_ids) from the transaction."""
     fake_projects = [{"id": 7, "sdc_write_requested": 1}]
+    fake_pre_claimed = set()
 
-    with patch("worker.execute_transaction", return_value=fake_projects) as mock_txn:
-        result = _claim_sdc_projects()
+    with patch("worker.execute_transaction", return_value=(fake_projects, fake_pre_claimed)) as mock_txn:
+        projects, pre_claimed_ids = _claim_sdc_projects()
 
-    assert result == fake_projects
+    assert projects == fake_projects
+    assert pre_claimed_ids == fake_pre_claimed
     mock_txn.assert_called_once()
 
 
 def test_claim_sdc_projects_returns_empty_on_db_error():
-    """_claim_sdc_projects swallows DatabaseError and returns []."""
+    """_claim_sdc_projects swallows DatabaseError and returns ([], set())."""
     from database import DatabaseError
 
     with patch("worker.execute_transaction", side_effect=DatabaseError("boom")):
-        result = _claim_sdc_projects()
+        projects, pre_claimed_ids = _claim_sdc_projects()
 
-    assert result == []
+    assert projects == []
+    assert pre_claimed_ids == set()
 
 
 def test_release_project_issues_correct_query():
