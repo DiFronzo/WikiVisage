@@ -91,6 +91,7 @@ OAUTH_REDIRECT_URI = os.environ.get("OAUTH_REDIRECT_URI", "")
 # Shared constants
 MAX_BBOX_PX = 10000  # Maximum bounding box coordinate value
 MIN_BBOX_AREA = 100  # Minimum bounding box area in pixels (10×10)
+MAX_DISMISS_FACE_IDS = 100  # Maximum number of face IDs accepted in a single dismiss request
 PROJECTS_PER_PAGE = 25
 MAX_CATEGORY_TRAVERSAL = 50  # Max subcategories to visit in BFS
 CATEGORY_API_TIMEOUT = 8  # Seconds for category info API calls
@@ -2079,6 +2080,8 @@ def api_manual_face():
             try:
                 parsed = json.loads(dismiss_raw)
                 if isinstance(parsed, list):
+                    if len(parsed) > MAX_DISMISS_FACE_IDS:
+                        return jsonify({"error": _("Too many face IDs in dismiss list")}), 400
                     dismiss_face_ids = [int(fid) for fid in parsed]
             except (json.JSONDecodeError, ValueError, TypeError):
                 pass
