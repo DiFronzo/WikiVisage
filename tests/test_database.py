@@ -1,3 +1,5 @@
+from queue import Queue
+
 import pytest
 
 import database
@@ -104,11 +106,130 @@ def test_return_connection_to_pool_with_none_pool_closes_connection(monkeypatch)
             self.closed = True
 
     conn = DummyConnection()
+    pc = database._PooledConnection(conn)
     monkeypatch.setattr(database, "_pool", None)
 
-    database._return_connection_to_pool(conn)
+    database._return_connection_to_pool(pc)
 
     assert conn.closed is True
+
+
+class _FakeConn:
+    """Minimal fake pymysql connection for unit tests."""
+
+    def __init__(self, *, is_open=True, rollback_raises=False):
+        self.open = is_open
+        self._closed = False
+        self._rollback_raises = rollback_raises
+
+    def close(self):
+        self._closed = True
+
+    def rollback(self):
+        if self._rollback_raises:
+            raise OSError("rollback failed")
+
+
+def _make_pc(conn, *, expired=False):
+    pc = database._PooledConnection(conn)
+    if expired:
+        pc.created_at = 0  # far in the past → is_expired == True
+    return pc
+
+
+def test_return_connection_replenishes_after_expired(monkeypatch):
+    """Discarding an expired connection triggers best-effort pool replenishment."""
+    pool = Queue(maxsize=2)
+    monkeypatch.setattr(database, "_pool", pool)
+
+    fresh_conn = _FakeConn()
+    fresh_pc = database._PooledConnection(fresh_conn)
+    monkeypatch.setattr(database, "_create_connection", lambda: fresh_pc)
+
+    expired_conn = _FakeConn()
+    pc = _make_pc(expired_conn, expired=True)
+
+    database._return_connection_to_pool(pc)
+
+    # Original expired connection must be closed.
+    assert expired_conn._closed is True
+    # Pool should now contain exactly the fresh replacement.
+    assert pool.qsize() == 1
+    assert pool.get_nowait() is fresh_pc
+
+
+def test_return_connection_replenishes_after_rollback_failure(monkeypatch):
+    """When rollback raises, a replacement connection is put back into the pool."""
+    pool = Queue(maxsize=2)
+    monkeypatch.setattr(database, "_pool", pool)
+
+    fresh_conn = _FakeConn()
+    fresh_pc = database._PooledConnection(fresh_conn)
+    monkeypatch.setattr(database, "_create_connection", lambda: fresh_pc)
+
+    bad_conn = _FakeConn(rollback_raises=True)
+    pc = _make_pc(bad_conn)
+
+    database._return_connection_to_pool(pc)
+
+    assert bad_conn._closed is True
+    assert pool.qsize() == 1
+    assert pool.get_nowait() is fresh_pc
+
+
+def test_return_connection_replenish_failure_is_silent(monkeypatch):
+    """If replacement creation fails, the error is swallowed and no exception propagates."""
+    pool = Queue(maxsize=2)
+    monkeypatch.setattr(database, "_pool", pool)
+    monkeypatch.setattr(database, "_create_connection", lambda: (_ for _ in ()).throw(OSError("no DB")))
+
+    expired_conn = _FakeConn()
+    pc = _make_pc(expired_conn, expired=True)
+
+    # Must not raise even though replenishment fails.
+    database._return_connection_to_pool(pc)
+
+    assert expired_conn._closed is True
+    assert pool.qsize() == 0  # pool stays empty — no crash
+
+
+def test_return_connection_no_replenish_when_pool_full(monkeypatch):
+    """When the pool is already full, no replenishment attempt is made."""
+    pool = Queue(maxsize=1)
+    # Pre-fill so the pool is at capacity
+    existing_conn = _FakeConn()
+    pool.put_nowait(database._PooledConnection(existing_conn))
+    monkeypatch.setattr(database, "_pool", pool)
+
+    create_calls = []
+
+    def _fake_create():
+        create_calls.append(1)
+        return database._PooledConnection(_FakeConn())
+
+    monkeypatch.setattr(database, "_create_connection", _fake_create)
+
+    # A healthy, non-expired connection that fits in the pool … but pool is full.
+    extra_conn = _FakeConn()
+    pc = _make_pc(extra_conn)
+
+    database._return_connection_to_pool(pc)
+
+    # The extra connection is closed; no replenishment attempt should happen
+    # because the pool-full path only evicts the surplus connection.
+    assert extra_conn._closed is True
+    assert len(create_calls) == 0
+
+
+def test_try_replenish_pool_no_op_when_pool_none(monkeypatch):
+    """`_try_replenish_pool` exits early when the pool is not initialized."""
+    monkeypatch.setattr(database, "_pool", None)
+    create_calls = []
+    monkeypatch.setattr(database, "_create_connection", lambda: create_calls.append(1) or None)
+
+    database._try_replenish_pool()
+
+    assert len(create_calls) == 0
 
 
 @pytest.mark.integration
