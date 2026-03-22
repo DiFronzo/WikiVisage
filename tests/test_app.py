@@ -5017,6 +5017,20 @@ def test_api_manual_face_bbox_out_of_range_too_small_area(monkeypatch):
     assert resp.get_json()["error"] == "Bounding box out of allowed range"
 
 
+def test_api_manual_face_dismiss_face_ids_too_many(monkeypatch):
+    import json as _json
+
+    client, _ = _authed_client(monkeypatch)
+    oversized = _json.dumps(list(range(101)))
+    resp = client.post(
+        "/api/manual-face",
+        data=_manual_face_form(dismiss_face_ids=oversized),
+    )
+
+    assert resp.status_code == 400
+    assert resp.get_json()["error"] == "Too many face IDs in dismiss list"
+
+
 def test_api_manual_face_ownership_check_fail(monkeypatch):
     def _route_query(sql):
         if "FROM images i " in sql:
