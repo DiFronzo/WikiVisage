@@ -128,6 +128,10 @@ def _is_connection_healthy(pc: _PooledConnection) -> bool:
         return False
     try:
         pc.conn.ping(reconnect=False)
+        # Reset age after successful ping — avoids mass-expiry when
+        # connections created in the same batch all hit MAX_CONNECTION_AGE
+        # simultaneously during the next poll cycle.
+        pc.created_at = time.monotonic()
         return True
     except Exception:
         return False
