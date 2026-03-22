@@ -369,16 +369,22 @@ def test_process_images_prioritises_non_bootstrap():
 
 
 def test_process_images_caps_bootstrap_when_already_processed():
+    # bs_ratio = 400/1000 = 0.4 <= 0.5  →  bootstrap_cap = base_cap = 900
+    # bs_already_processed = 900 >= bootstrap_cap = 900  →  bootstrap_remaining = 0
+    # The bootstrapped=1 pending query must NOT be executed.
     project = {"id": 99}
+    bootstrap_pending_queried = []
 
     def mock_execute_query(sql, params=None, fetch=True):
         if "SUM(CASE WHEN bootstrapped = 1 AND status != 'pending'" in sql:
             return [{"bs_done": 900, "total": 1000}]
         if "COUNT(*) AS cnt FROM images" in sql and "bootstrapped = 1" in sql:
-            return [{"cnt": 950}]
+            # bs_ratio = 400/1000 = 0.4  →  bootstrap_cap stays at base_cap (900)
+            return [{"cnt": 400}]
         if "bootstrapped = 0" in sql and "LIMIT" in sql:
             return []
         if "bootstrapped = 1" in sql and "LIMIT" in sql:
+            bootstrap_pending_queried.append(sql)
             return []
         if "UPDATE projects SET images_processed" in sql:
             return 1
@@ -392,6 +398,9 @@ def test_process_images_caps_bootstrap_when_already_processed():
         count = process_images(project)
 
     assert count == 0
+    assert not bootstrap_pending_queried, (
+        "Bootstrap pending query should not be executed when cap is already met"
+    )
 
 
 import pytest
