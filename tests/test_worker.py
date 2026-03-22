@@ -1147,7 +1147,7 @@ def test_bootstrap_flags_existing_images_at_cap():
 
         # COUNT(*) — project at cap
         if "SELECT COUNT(*) AS cnt FROM images" in sql_s:
-            return [{"cnt": 9000}]
+            return [{"cnt": _worker_module.MAX_IMAGES_PER_PROJECT}]
 
         # SELECT existing image by page_id
         if "SELECT id, status FROM images WHERE project_id" in sql_s:
@@ -1213,7 +1213,7 @@ def test_bootstrap_at_cap_does_not_insert_new_images():
         sql_s = sql.strip()
 
         if "SELECT COUNT(*) AS cnt FROM images" in sql_s:
-            return [{"cnt": 9000}]
+            return [{"cnt": _worker_module.MAX_IMAGES_PER_PROJECT}]
         if "SELECT id, status FROM images WHERE project_id" in sql_s:
             return []
         return []
