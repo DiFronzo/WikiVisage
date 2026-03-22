@@ -1080,7 +1080,7 @@ msgstr[1] ""
 "segundo plano los clasificará automáticamente en el próximo minuto."
 
 #: templates/project_detail.html:770
-#, fuzzy, python-format
+#, python-format
 msgid ""
 "The background worker is still processing images (%(pending)d image "
 "remaining). Model inference will start once all images have been "
@@ -1091,12 +1091,12 @@ msgid_plural ""
 "processed."
 msgstr[0] ""
 "El trabajador en segundo plano aún está procesando imágenes (%(pending)d "
-"imagen restante). Aparecerán más rostros a medida que continúe el "
-"procesamiento."
+"imagen restante). La inferencia del modelo comenzará una vez que todas las "
+"imágenes hayan sido procesadas."
 msgstr[1] ""
 "El trabajador en segundo plano aún está procesando imágenes (%(pending)d "
-"imágenes restantes). Aparecerán más rostros a medida que continúe el "
-"procesamiento."
+"imágenes restantes). La inferencia del modelo comenzará una vez que todas "
+"las imágenes hayan sido procesadas."
 
 #: templates/project_detail.html:774
 #, python-format
