@@ -2753,65 +2753,72 @@ def main():
 
                         last_heartbeat = time.time()
                         last_sdc_check = time.time()
-                        while futures:
-                            if shutdown_requested:
-                                break
+                        sdc_future = None
+                        # Dedicated single-thread executor so SDC writes run in the
+                        # background and never block heartbeat / claim refresh / future
+                        # consumption in this monitoring loop.
+                        with ThreadPoolExecutor(max_workers=1) as sdc_executor:
+                            while futures:
+                                if shutdown_requested:
+                                    break
 
-                            # Refresh heartbeat + claim timestamps during long processing cycles
-                            if time.time() - last_heartbeat >= 60:
-                                try:
-                                    execute_query(
-                                        "REPLACE INTO worker_heartbeat (id, last_seen) VALUES (1, NOW())",
-                                        fetch=False,
-                                    )
-                                except Exception:
-                                    pass
-                                _refresh_claims()
-                                last_heartbeat = time.time()
+                                # Refresh heartbeat + claim timestamps during long processing cycles
+                                if time.time() - last_heartbeat >= 60:
+                                    try:
+                                        execute_query(
+                                            "REPLACE INTO worker_heartbeat (id, last_seen) VALUES (1, NOW())",
+                                            fetch=False,
+                                        )
+                                    except Exception:
+                                        pass
+                                    _refresh_claims()
+                                    last_heartbeat = time.time()
 
-                            # Check for wake-up signal every iteration (even if no futures done)
-                            if os.path.exists(WAKE_FILE_PATH):
-                                try:
-                                    os.remove(WAKE_FILE_PATH)
-                                except OSError:
-                                    pass
-                                logger.info("Wake-up signal received mid-cycle, checking for new work")
+                                # Check for wake-up signal every iteration (even if no futures done)
+                                if os.path.exists(WAKE_FILE_PATH):
+                                    try:
+                                        os.remove(WAKE_FILE_PATH)
+                                    except OSError:
+                                        pass
+                                    logger.info("Wake-up signal received mid-cycle, checking for new work")
 
-                                _process_sdc_writes()
-                                last_sdc_check = time.time()
+                                    if sdc_future is None or sdc_future.done():
+                                        sdc_future = sdc_executor.submit(_process_sdc_writes)
+                                    last_sdc_check = time.time()
 
-                                unfinished_futures = [f for f in futures if not f.done()]
-                                free_slots = MAX_CONCURRENT_PROJECTS - len(unfinished_futures)
-                                if free_slots <= 0:
-                                    logger.debug(
-                                        "All %d worker slots occupied, skipping mid-cycle claim",
-                                        MAX_CONCURRENT_PROJECTS,
-                                    )
-                                else:
-                                    new_projects = _claim_active_projects(free_slots)
-                                    for project in new_projects:
-                                        if project["id"] not in seen_ids:
-                                            seen_ids.add(project["id"])
-                                            logger.info(f"Adding new project {project['id']} to current cycle")
-                                            future = executor.submit(_process_and_release, project)
-                                            futures[future] = project["id"]
+                                    unfinished_futures = [f for f in futures if not f.done()]
+                                    free_slots = MAX_CONCURRENT_PROJECTS - len(unfinished_futures)
+                                    if free_slots <= 0:
+                                        logger.debug(
+                                            "All %d worker slots occupied, skipping mid-cycle claim",
+                                            MAX_CONCURRENT_PROJECTS,
+                                        )
+                                    else:
+                                        new_projects = _claim_active_projects(free_slots)
+                                        for project in new_projects:
+                                            if project["id"] not in seen_ids:
+                                                seen_ids.add(project["id"])
+                                                logger.info(f"Adding new project {project['id']} to current cycle")
+                                                future = executor.submit(_process_and_release, project)
+                                                futures[future] = project["id"]
 
-                            # Periodic SDC check (works across pods where wake file doesn't)
-                            if time.time() - last_sdc_check >= 10:
-                                _process_sdc_writes()
-                                last_sdc_check = time.time()
+                                # Periodic SDC check (works across pods where wake file doesn't)
+                                if time.time() - last_sdc_check >= 10:
+                                    if sdc_future is None or sdc_future.done():
+                                        sdc_future = sdc_executor.submit(_process_sdc_writes)
+                                    last_sdc_check = time.time()
 
-                            done = {f for f in futures if f.done()}
-                            if not done:
-                                time.sleep(1)
-                                continue
+                                done = {f for f in futures if f.done()}
+                                if not done:
+                                    time.sleep(1)
+                                    continue
 
-                            for future in done:
-                                project_id = futures.pop(future)
-                                try:
-                                    future.result()
-                                except Exception as e:
-                                    logger.error(f"Project {project_id} processing failed: {e}")
+                                for future in done:
+                                    project_id = futures.pop(future)
+                                    try:
+                                        future.result()
+                                    except Exception as e:
+                                        logger.error(f"Project {project_id} processing failed: {e}")
 
                 # Run inference for eligible projects not already processed (claims released in wrapper)
                 if inference_only:
@@ -2828,69 +2835,82 @@ def main():
 
                         last_heartbeat_inf = time.time()
                         last_sdc_check_inf = time.time()
-                        while futures:
-                            if shutdown_requested:
-                                break
+                        sdc_future_inf = None
+                        with ThreadPoolExecutor(max_workers=1) as sdc_executor_inf:
+                            while futures:
+                                if shutdown_requested:
+                                    break
 
-                            # Refresh heartbeat + claims during inference
-                            if time.time() - last_heartbeat_inf >= 60:
-                                try:
-                                    execute_query(
-                                        "REPLACE INTO worker_heartbeat (id, last_seen) VALUES (1, NOW())",
-                                        fetch=False,
-                                    )
-                                except Exception:
-                                    pass
-                                _refresh_claims()
-                                last_heartbeat_inf = time.time()
+                                # Refresh heartbeat + claims during inference
+                                if time.time() - last_heartbeat_inf >= 60:
+                                    try:
+                                        execute_query(
+                                            "REPLACE INTO worker_heartbeat (id, last_seen) VALUES (1, NOW())",
+                                            fetch=False,
+                                        )
+                                    except Exception:
+                                        pass
+                                    _refresh_claims()
+                                    last_heartbeat_inf = time.time()
 
-                            # Check for wake-up signal during inference
-                            if os.path.exists(WAKE_FILE_PATH):
-                                try:
-                                    os.remove(WAKE_FILE_PATH)
-                                except OSError:
-                                    pass
-                                _process_sdc_writes()
-                                last_sdc_check_inf = time.time()
+                                # Check for wake-up signal during inference
+                                if os.path.exists(WAKE_FILE_PATH):
+                                    try:
+                                        os.remove(WAKE_FILE_PATH)
+                                    except OSError:
+                                        pass
+                                    if sdc_future_inf is None or sdc_future_inf.done():
+                                        sdc_future_inf = sdc_executor_inf.submit(_process_sdc_writes)
+                                    last_sdc_check_inf = time.time()
 
-                            # Periodic SDC check (works across pods where wake file doesn't)
-                            if time.time() - last_sdc_check_inf >= 10:
-                                _process_sdc_writes()
-                                last_sdc_check_inf = time.time()
+                                # Periodic SDC check (works across pods where wake file doesn't)
+                                if time.time() - last_sdc_check_inf >= 10:
+                                    if sdc_future_inf is None or sdc_future_inf.done():
+                                        sdc_future_inf = sdc_executor_inf.submit(_process_sdc_writes)
+                                    last_sdc_check_inf = time.time()
 
-                            done = {f for f in futures if f.done()}
-                            if not done:
-                                time.sleep(1)
-                                continue
+                                done = {f for f in futures if f.done()}
+                                if not done:
+                                    time.sleep(1)
+                                    continue
 
-                            for future in done:
-                                project_id = futures.pop(future)
-                                try:
-                                    classified = future.result()
-                                    logger.info(f"Inference classified {classified} faces for project {project_id}")
-                                except Exception as e:
-                                    logger.error(f"Inference failed for project {project_id}: {e}")
+                                for future in done:
+                                    project_id = futures.pop(future)
+                                    try:
+                                        classified = future.result()
+                                        logger.info(f"Inference classified {classified} faces for project {project_id}")
+                                    except Exception as e:
+                                        logger.error(f"Inference failed for project {project_id}: {e}")
 
                 # Add random jitter (0–15s) so multiple workers desynchronize
                 # and don't all race to claim the same projects every cycle.
                 jitter = random.randint(0, 15)
                 last_sdc_check_sleep = time.time()
-                for _ in range(POLL_INTERVAL + jitter):
-                    if shutdown_requested:
-                        break
-                    if os.path.exists(WAKE_FILE_PATH):
-                        try:
-                            os.remove(WAKE_FILE_PATH)
-                        except OSError:
-                            pass
-                        logger.info("Wake-up signal received, starting next cycle")
-                        break
-                    if time.time() - last_sdc_check_sleep >= 10:
-                        written = _process_sdc_writes()
-                        last_sdc_check_sleep = time.time()
-                        if written:
+                sdc_sleep_future = None
+                with ThreadPoolExecutor(max_workers=1) as sdc_sleep_executor:
+                    for _ in range(POLL_INTERVAL + jitter):
+                        if shutdown_requested:
                             break
-                    time.sleep(1)
+                        if os.path.exists(WAKE_FILE_PATH):
+                            try:
+                                os.remove(WAKE_FILE_PATH)
+                            except OSError:
+                                pass
+                            logger.info("Wake-up signal received, starting next cycle")
+                            break
+                        if time.time() - last_sdc_check_sleep >= 10:
+                            # Harvest result from previous background write for early-exit
+                            if sdc_sleep_future is not None and sdc_sleep_future.done():
+                                try:
+                                    if sdc_sleep_future.result():
+                                        break
+                                except Exception:
+                                    pass
+                                sdc_sleep_future = None
+                            if sdc_sleep_future is None:
+                                sdc_sleep_future = sdc_sleep_executor.submit(_process_sdc_writes)
+                            last_sdc_check_sleep = time.time()
+                        time.sleep(1)
 
             except DatabaseError as e:
                 logger.error(f"Database error in main loop: {e}")
