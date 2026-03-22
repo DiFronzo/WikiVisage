@@ -155,6 +155,27 @@ def _get_connection_from_pool(timeout: float = 30.0) -> _PooledConnection:
     return _create_connection()
 
 
+def _try_replenish_pool() -> None:
+    """Best-effort: replace a discarded connection with a fresh one.
+
+    Called after closing a bad or expired connection so the pool does not
+    permanently shrink under transient failures.  Failures here are logged
+    and silently swallowed — the pool will recover on the next successful
+    return or on the next caller that creates a fresh connection at GET time.
+    """
+    if _pool is None:
+        return
+    try:
+        fresh = _create_connection()
+        try:
+            _pool.put_nowait(fresh)
+            logger.debug("Replenished pool with fresh replacement connection")
+        except Full:
+            _close_quietly(fresh)
+    except Exception as e:
+        logger.warning(f"Could not replenish pool after discarding connection: {e}")
+
+
 def _return_connection_to_pool(pc: _PooledConnection) -> None:
     if _pool is None:
         _close_quietly(pc)
@@ -166,6 +187,7 @@ def _return_connection_to_pool(pc: _PooledConnection) -> None:
                 pc.conn.rollback()
             except Exception:
                 _close_quietly(pc)
+                _try_replenish_pool()
                 return
             try:
                 _pool.put_nowait(pc)
@@ -173,8 +195,10 @@ def _return_connection_to_pool(pc: _PooledConnection) -> None:
                 _close_quietly(pc)
         else:
             _close_quietly(pc)
+            _try_replenish_pool()
     except Exception:
         _close_quietly(pc)
+        _try_replenish_pool()
 
 
 def _execute_with_retry(func: Callable[..., Any], *args, allow_retry: bool = True, **kwargs) -> Any:
