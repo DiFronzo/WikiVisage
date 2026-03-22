@@ -1,3 +1,4 @@
+import time
 from queue import Queue
 
 import pytest
@@ -133,7 +134,7 @@ class _FakeConn:
 def _make_pc(conn, *, expired=False):
     pc = database._PooledConnection(conn)
     if expired:
-        pc.created_at = 0  # far in the past → is_expired == True
+        pc.created_at = time.monotonic() - database.MAX_CONNECTION_AGE - 1
     return pc
 
 
