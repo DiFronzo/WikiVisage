@@ -22,10 +22,11 @@ import random
 import re
 import secrets
 import time
+import unicodedata
 from datetime import UTC, datetime, timedelta
 from functools import wraps
 from typing import Any
-from urllib.parse import urljoin, urlparse
+from urllib.parse import quote, urljoin, urlparse
 
 from dotenv import load_dotenv
 
@@ -107,8 +108,12 @@ _whitelist_cache_time: float = 0.0
 
 
 def _parse_whitelist(text: str) -> set[str]:
-    """Parse whitelist text into a set of usernames."""
-    return {line.strip() for line in text.splitlines() if line.strip() and not line.startswith("#")}
+    """Parse whitelist text into a set of usernames (NFKC-normalized)."""
+    return {
+        unicodedata.normalize("NFKC", line.strip())
+        for line in text.splitlines()
+        if line.strip() and not line.startswith("#")
+    }
 
 
 def _load_whitelist() -> set[str]:
@@ -171,6 +176,7 @@ try:
     _r = _redis_mod.from_url(_REDIS_URL, socket_connect_timeout=2)
     _r.ping()
 except Exception:
+    logger.warning("Redis unavailable at %s — rate limiter using per-process memory storage", _REDIS_URL)
     _limiter_storage_uri = "memory://"
 
 limiter = Limiter(
@@ -210,12 +216,7 @@ def set_language(lang: str):
     if lang not in LANGUAGES:
         lang = "en"
     referrer = request.referrer or ""
-    if referrer:
-        ref_parsed = urlparse(referrer)
-        # Only allow same-host referrer redirects
-        if ref_parsed.netloc and ref_parsed.netloc != request.host:
-            referrer = url_for("index")
-    if not referrer:
+    if not referrer or not _is_safe_url(referrer):
         referrer = url_for("index")
     resp = redirect(referrer)
     if not request.args.get("nocookie"):
@@ -278,7 +279,7 @@ def before_request() -> None:
                 # Enforce whitelist on every request (not just login).
                 # Fail-closed: empty whitelist = deny all (prevents bypass if both sources fail).
                 allowed = _load_whitelist()
-                if not allowed or g.user["wiki_username"] not in allowed:
+                if not allowed or unicodedata.normalize("NFKC", g.user["wiki_username"]) not in allowed:
                     logger.warning(f"Session revoked for user not on whitelist: {g.user['wiki_username']}")
                     session.clear()
                     g.user = None
@@ -310,11 +311,18 @@ def _is_safe_url(target: str) -> bool:
     return parsed.scheme in ("http", "https") and parsed.netloc == urlparse(ref_url).netloc
 
 
+_ALLOWED_DOWNLOAD_HOSTS = frozenset({"commons.wikimedia.org", "upload.wikimedia.org"})
+
+
 def _download_image(url: str, max_bytes: int = MAX_IMAGE_DOWNLOAD_BYTES) -> bytes:
     """Download an image with streaming size cap to prevent OOM.
 
-    Raises ValueError if the response exceeds max_bytes.
+    Raises ValueError if the URL points to an untrusted host or if the
+    response exceeds max_bytes.
     """
+    parsed_url = urlparse(url)
+    if parsed_url.scheme not in ("http", "https") or parsed_url.hostname not in _ALLOWED_DOWNLOAD_HOSTS:
+        raise ValueError(f"Blocked download from untrusted host: {parsed_url.hostname}")
     resp = requests.get(
         url,
         headers={"User-Agent": USER_AGENT},
@@ -752,16 +760,19 @@ def commons_thumb_url(file_title: str, width: int = 330) -> str:
     md5 = hashlib.md5(clean.encode("utf-8")).hexdigest()
     ext = os.path.splitext(clean)[1].lower()
 
-    base = f"https://upload.wikimedia.org/wikipedia/commons/thumb/{md5[0]}/{md5[0:2]}/{clean}"
+    # URL-encode the filename for safe use in path segments / redirect headers
+    encoded = quote(clean, safe="")
+
+    base = f"https://upload.wikimedia.org/wikipedia/commons/thumb/{md5[0]}/{md5[0:2]}/{encoded}"
 
     if ext in _VIDEO_EXTENSIONS:
-        return f"{base}/{width}px--{clean}.jpg"
+        return f"{base}/{width}px--{encoded}.jpg"
     elif ext in _CONVERT_TO_JPG_EXTENSIONS:
-        return f"{base}/{width}px-{clean}.jpg"
+        return f"{base}/{width}px-{encoded}.jpg"
     elif ext in _CONVERT_TO_PNG_EXTENSIONS:
-        return f"{base}/{width}px-{clean}.png"
+        return f"{base}/{width}px-{encoded}.png"
     else:
-        return f"{base}/{width}px-{clean}"
+        return f"{base}/{width}px-{encoded}"
 
 
 # Make helper available in all Jinja2 templates
@@ -3735,7 +3746,7 @@ def internal_error(e):
 # Initialize DB pool at import time so gunicorn `app:app` works without a
 # factory call.  The `create_app()` factory is kept for backwards compat
 # (e.g. tests, one-off scripts) but is no longer required for production.
-init_db(pool_size=5)
+init_db(pool_size=2)
 
 
 def create_app() -> Flask:

@@ -3,6 +3,11 @@ MariaDB connection module for Wikimedia Toolforge.
 
 Provides a lightweight connection pool with retry logic, health checks,
 and proper error handling for the Toolforge environment.
+
+Toolforge ToolsDB enforces max_user_connections=20 shared across ALL
+processes for the same DB user account.  Default pool_size=2 keeps the
+web process footprint small (2 gunicorn workers × 2 = 4 conns), leaving
+room for background workers.
 """
 
 import logging
@@ -21,8 +26,12 @@ logger = logging.getLogger(__name__)
 
 # Connection pool configuration
 _pool: Queue | None = None
-_pool_size: int = int(os.environ.get("WIKIVISAGE_DB_POOL_SIZE", 5))
+_pool_size: int = int(os.environ.get("WIKIVISAGE_DB_POOL_SIZE", 2))
 _db_config: dict[str, Any] = {}
+
+# Connections older than this are proactively replaced to avoid Toolforge
+# killing idle connections unexpectedly (ToolsDB drops idle conns ~300s).
+MAX_CONNECTION_AGE = 270  # seconds — below the 300s server-side timeout
 
 # Retry configuration
 MAX_RETRIES = 3
@@ -83,139 +92,89 @@ def _get_db_config() -> dict[str, Any]:
     }
 
 
-def _create_connection() -> pymysql.Connection:
-    """
-    Create a new database connection.
+class _PooledConnection:
+    """Wraps a pymysql connection with creation timestamp for age-based eviction."""
 
-    Returns:
-        A new pymysql connection object.
+    __slots__ = ("conn", "created_at")
 
-    Raises:
-        DatabaseError: If connection cannot be established.
-    """
+    def __init__(self, conn: pymysql.Connection):
+        self.conn = conn
+        self.created_at: float = time.monotonic()
+
+    @property
+    def is_expired(self) -> bool:
+        return (time.monotonic() - self.created_at) >= MAX_CONNECTION_AGE
+
+
+def _create_connection() -> _PooledConnection:
     try:
         conn = pymysql.connect(**_db_config)
         logger.debug("Created new database connection")
-        return conn
+        return _PooledConnection(conn)
     except Exception as e:
         logger.error(f"Failed to create database connection: {e}")
         raise DatabaseError(f"Could not connect to database: {e}") from e
 
 
-def _is_connection_alive(conn: pymysql.Connection) -> bool:
-    """
-    Check if a connection is still alive.
-
-    Args:
-        conn: The connection to check.
-
-    Returns:
-        True if connection is alive, False otherwise.
-    """
+def _close_quietly(pc: _PooledConnection) -> None:
     try:
-        conn.ping(reconnect=False)
+        pc.conn.close()
+    except Exception:
+        pass
+
+
+def _is_connection_healthy(pc: _PooledConnection) -> bool:
+    if pc.is_expired:
+        return False
+    try:
+        pc.conn.ping(reconnect=False)
         return True
-    except Exception as e:
-        logger.debug(f"Connection health check failed: {e}")
+    except Exception:
         return False
 
 
-def _get_connection_from_pool(timeout: float = 30.0) -> pymysql.Connection:
-    """
-    Get a connection from the pool, creating a new one if needed.
-
-    Args:
-        timeout: Maximum time to wait for a connection (seconds).
-
-    Returns:
-        A healthy database connection.
-
-    Raises:
-        PoolExhaustedError: If no connection available within timeout.
-        DatabaseError: If connection cannot be created.
-    """
+def _get_connection_from_pool(timeout: float = 30.0) -> _PooledConnection:
     if _pool is None:
         raise DatabaseError("Connection pool not initialized. Call init_db() first.")
 
     try:
-        conn = _pool.get(timeout=timeout)
-
-        # Health check - reconnect if dead
-        if not _is_connection_alive(conn):
-            logger.warning("Retrieved dead connection from pool, creating new one")
-            # Create replacement BEFORE closing dead conn to avoid pool shrink
-            # if _create_connection() fails.
-            try:
-                new_conn = _create_connection()
-            except Exception:
-                # Replacement failed — return the dead conn to the pool so the
-                # pool slot isn't permanently lost, then re-raise.
-                try:
-                    _pool.put_nowait(conn)
-                except Full:
-                    pass
-                raise
-            # Replacement succeeded — now safe to close the dead one.
-            try:
-                conn.close()
-            except Exception:
-                pass
-            conn = new_conn
-
-        return conn
-
+        pc = _pool.get(timeout=timeout)
     except Empty:
         raise PoolExhaustedError(
             f"Connection pool exhausted after {timeout}s timeout. Consider increasing pool size or reducing query time."
         )
 
+    if _is_connection_healthy(pc):
+        return pc
 
-def _return_connection_to_pool(conn: pymysql.Connection) -> None:
-    """
-    Return a connection to the pool.
+    # Connection is dead or expired — close it and create a fresh one.
+    # If creation fails, the pool shrinks by one slot.  This is intentional:
+    # re-pooling a dead connection just poisons the next caller.
+    _close_quietly(pc)
+    logger.warning("Evicted dead/expired connection from pool, creating replacement")
+    return _create_connection()
 
-    Args:
-        conn: The connection to return.
-    """
+
+def _return_connection_to_pool(pc: _PooledConnection) -> None:
     if _pool is None:
-        logger.warning("Attempting to return connection but pool is not initialized")
-        try:
-            conn.close()
-        except Exception:
-            pass
+        _close_quietly(pc)
         return
 
     try:
-        if conn.open:
+        if pc.conn.open and not pc.is_expired:
             try:
-                conn.rollback()
-            except Exception as e:
-                logger.debug(f"Rollback failed when returning connection: {e}")
-            try:
-                _pool.put_nowait(conn)
-            except Full:
-                logger.debug("Pool full, closing connection instead of returning")
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-        else:
-            logger.debug("Connection closed, creating replacement to maintain pool size")
-            replacement = None
-            try:
-                replacement = _create_connection()
-                _pool.put_nowait(replacement)
-            except Full:
-                logger.debug("Pool full, discarding replacement connection")
-                if replacement:
-                    try:
-                        replacement.close()
-                    except Exception:
-                        pass
+                pc.conn.rollback()
             except Exception:
-                logger.warning("Failed to create replacement connection for pool", exc_info=True)
+                _close_quietly(pc)
+                return
+            try:
+                _pool.put_nowait(pc)
+            except Full:
+                _close_quietly(pc)
+        else:
+            _close_quietly(pc)
     except Exception:
-        logger.warning("Unexpected error returning connection to pool", exc_info=True)
+        _close_quietly(pc)
 
 
 def _execute_with_retry(func: Callable[..., Any], *args, allow_retry: bool = True, **kwargs) -> Any:
@@ -277,25 +236,22 @@ def get_connection(timeout: float = 30.0):
             cursor.execute("SELECT * FROM users")
             results = cursor.fetchall()
     """
-    conn = None
+    pc: _PooledConnection | None = None
     try:
-        conn = _execute_with_retry(_get_connection_from_pool, timeout)
-        yield conn
+        result = _execute_with_retry(_get_connection_from_pool, timeout)
+        pc = result  # type: _PooledConnection
+        yield pc.conn
     except Exception:
-        if conn and conn.open:
+        if pc and pc.conn.open:
             try:
-                conn.rollback()
-            except Exception as rollback_error:
-                logger.error(f"Rollback failed: {rollback_error}")
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-                conn = None
+                pc.conn.rollback()
+            except Exception:
+                _close_quietly(pc)
+                pc = None
         raise
     finally:
-        if conn:
-            _return_connection_to_pool(conn)
+        if pc:
+            _return_connection_to_pool(pc)
 
 
 @overload
@@ -440,7 +396,7 @@ def init_db(pool_size: int | None = None) -> None:
 
     Args:
         pool_size: Number of connections to maintain in the pool.
-                   Defaults to WIKIVISAGE_DB_POOL_SIZE env var or 5.
+                   Defaults to WIKIVISAGE_DB_POOL_SIZE env var or 2.
 
     Raises:
         ConfigurationError: If database configuration is invalid.
@@ -465,8 +421,8 @@ def init_db(pool_size: int | None = None) -> None:
     # Pre-populate with connections
     for i in range(_pool_size):
         try:
-            conn = _create_connection()
-            _pool.put_nowait(conn)
+            pc = _create_connection()
+            _pool.put_nowait(pc)
             logger.debug(f"Created connection {i + 1}/{_pool_size}")
         except Exception as e:
             logger.error(f"Failed to create initial connection {i + 1}/{_pool_size}: {e}")
@@ -516,13 +472,11 @@ def close_pool() -> None:
     closed_count = 0
     while not _pool.empty():
         try:
-            conn = _pool.get_nowait()
-            conn.close()
+            pc = _pool.get_nowait()
+            _close_quietly(pc)
             closed_count += 1
         except Empty:
             break
-        except Exception as e:
-            logger.warning(f"Error closing connection: {e}")
 
     _pool = None
     logger.info(f"Closed {closed_count} database connections")

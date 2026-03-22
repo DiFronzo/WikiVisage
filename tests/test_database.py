@@ -104,9 +104,10 @@ def test_return_connection_to_pool_with_none_pool_closes_connection(monkeypatch)
             self.closed = True
 
     conn = DummyConnection()
+    pc = database._PooledConnection(conn)
     monkeypatch.setattr(database, "_pool", None)
 
-    database._return_connection_to_pool(conn)
+    database._return_connection_to_pool(pc)
 
     assert conn.closed is True
 

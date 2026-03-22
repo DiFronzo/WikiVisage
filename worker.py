@@ -14,6 +14,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 
@@ -211,12 +212,18 @@ def _api_request(
     raise Exception(f"Failed to execute API request after 3 attempts: {url}")
 
 
+_ALLOWED_DOWNLOAD_HOSTS = frozenset({"commons.wikimedia.org", "upload.wikimedia.org"})
+
+
 def _download_image(url: str, max_bytes: int = MAX_IMAGE_DOWNLOAD_BYTES) -> bytes:
     """Download an image with streaming size cap to prevent OOM.
 
     Uses _get_session() for connection pooling / retry. Raises ValueError
-    if the response exceeds max_bytes.
+    if the URL points to an untrusted host or if the response exceeds max_bytes.
     """
+    parsed_url = urlparse(url)
+    if parsed_url.scheme not in ("http", "https") or parsed_url.hostname not in _ALLOWED_DOWNLOAD_HOSTS:
+        raise ValueError(f"Blocked download from untrusted host: {parsed_url.hostname}")
     session = _get_session()
     resp = session.get(
         url,
@@ -2353,6 +2360,51 @@ def _claim_sdc_projects() -> list[dict[str, Any]]:
         return []
 
 
+def _process_sdc_writes() -> int:
+    """Claim and process all pending SDC write requests.
+
+    Returns the total number of claims written across all projects.
+    Safe to call from any point in the main loop (top-of-cycle,
+    mid-cycle wake handler, inference loop).
+    """
+    sdc_projects = _claim_sdc_projects()
+    if not sdc_projects:
+        return 0
+    logger.info(f"Claimed {len(sdc_projects)} SDC project(s) for writing")
+    total_written = 0
+    for sdc_project in sdc_projects:
+        if shutdown_requested:
+            break
+        # Refresh claim before starting potentially long SDC write
+        try:
+            execute_query(
+                "UPDATE projects SET worker_claimed_at = NOW() WHERE id = %s AND worker_claimed_by = %s",
+                (sdc_project["id"], _worker_id),
+                fetch=False,
+            )
+        except DatabaseError:
+            pass
+        logger.info(f"Processing SDC write request for project {sdc_project['id']}")
+        try:
+            written = write_sdc_claims(sdc_project)
+            total_written += written
+            logger.info(f"SDC write complete for project {sdc_project['id']}: {written} claims written")
+        except Exception as e:
+            logger.error(f"SDC write failed for project {sdc_project['id']}: {e}")
+            # Clear the flag so it doesn't retry endlessly
+            try:
+                execute_query(
+                    "UPDATE projects SET sdc_write_requested = 0, sdc_write_error = %s WHERE id = %s",
+                    (str(e)[:1000], sdc_project["id"]),
+                    fetch=False,
+                )
+            except DatabaseError:
+                pass
+        finally:
+            _release_project(sdc_project["id"])
+    return total_written
+
+
 def _release_project(project_id: int) -> None:
     """Release this worker's claim on a single project."""
     try:
@@ -2583,16 +2635,16 @@ def main():
         # Respect WIKIVISAGE_DB_POOL_SIZE env var if set; otherwise compute from concurrency settings.
         # Toolforge ToolsDB enforces max_user_connections=20 across ALL processes sharing the same
         # DB user account (gunicorn + all worker instances). Default gunicorn uses pool_size=2 per
-        # worker (2 workers = 4 conns). Cap each worker at 8 so 2 workers + web stays <= 20.
+        # worker (2 workers = 4 conns). Cap each worker at 6 so 2 workers + web stays <= 20.
         db_pool_env = os.environ.get("WIKIVISAGE_DB_POOL_SIZE")
         if db_pool_env:
             worker_pool_size = int(db_pool_env)
         else:
-            worker_pool_size = min(MAX_CONCURRENT_PROJECTS * IMAGE_THREADS + 3, 8)
-        if worker_pool_size > 8:
+            worker_pool_size = min(MAX_CONCURRENT_PROJECTS * IMAGE_THREADS + 3, 6)
+        if worker_pool_size > 6:
             logger.warning(
                 "DB pool size %d may exceed Toolforge max_user_connections (20 shared across all processes). "
-                "With 2 workers + gunicorn, keep each worker's pool <= 8.",
+                "With 2 workers + gunicorn, keep each worker's pool <= 6.",
                 worker_pool_size,
             )
         init_db(pool_size=worker_pool_size)
@@ -2672,38 +2724,7 @@ def main():
                 # Process SDC write requests before the active pipeline so users
                 # don't wait minutes through crawl/detect/infer before their
                 # "Send Edits to Wikimedia Commons" request is serviced.
-                sdc_projects = _claim_sdc_projects()
-                if sdc_projects:
-                    logger.info(f"Claimed {len(sdc_projects)} SDC project(s) for writing")
-                for sdc_project in sdc_projects:
-                    if shutdown_requested:
-                        break
-                    # Refresh claim before starting potentially long SDC write
-                    try:
-                        execute_query(
-                            "UPDATE projects SET worker_claimed_at = NOW() WHERE id = %s AND worker_claimed_by = %s",
-                            (sdc_project["id"], _worker_id),
-                            fetch=False,
-                        )
-                    except DatabaseError:
-                        pass
-                    logger.info(f"Processing SDC write request for project {sdc_project['id']}")
-                    try:
-                        written = write_sdc_claims(sdc_project)
-                        logger.info(f"SDC write complete for project {sdc_project['id']}: {written} claims written")
-                    except Exception as e:
-                        logger.error(f"SDC write failed for project {sdc_project['id']}: {e}")
-                        # Clear the flag so it doesn't retry endlessly
-                        try:
-                            execute_query(
-                                "UPDATE projects SET sdc_write_requested = 0, sdc_write_error = %s WHERE id = %s",
-                                (str(e)[:1000], sdc_project["id"]),
-                                fetch=False,
-                            )
-                        except DatabaseError:
-                            pass
-                    finally:
-                        _release_project(sdc_project["id"])
+                _process_sdc_writes()
 
                 # ---- Claim active projects (atomic, distributed-safe) ----
                 active_projects = _claim_active_projects(MAX_CONCURRENT_PROJECTS)
@@ -2752,7 +2773,12 @@ def main():
                                     os.remove(WAKE_FILE_PATH)
                                 except OSError:
                                     pass
-                                logger.info("Wake-up signal received mid-cycle, checking for new projects")
+                                logger.info("Wake-up signal received mid-cycle, checking for new work")
+
+                                # SDC writes are latency-sensitive — process immediately
+                                # on the main thread (doesn't need a worker slot).
+                                _process_sdc_writes()
+
                                 unfinished_futures = [f for f in futures if not f.done()]
                                 free_slots = MAX_CONCURRENT_PROJECTS - len(unfinished_futures)
                                 if free_slots <= 0:
@@ -2810,6 +2836,15 @@ def main():
                                     pass
                                 _refresh_claims()
                                 last_heartbeat_inf = time.time()
+
+                            # Check for wake-up signal during inference
+                            if os.path.exists(WAKE_FILE_PATH):
+                                try:
+                                    os.remove(WAKE_FILE_PATH)
+                                except OSError:
+                                    pass
+                                # SDC writes are latency-sensitive — process immediately
+                                _process_sdc_writes()
 
                             done = {f for f in futures if f.done()}
                             if not done:

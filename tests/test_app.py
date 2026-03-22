@@ -942,7 +942,7 @@ def test_download_image_success(monkeypatch):
     resp = _FakeResponse(headers={"Content-Length": "6"}, chunks=[b"ab", b"cd", b"ef"])
     monkeypatch.setattr(app_module.requests, "get", lambda *_a, **_k: resp)
 
-    data = app_module._download_image("https://example.org/file.jpg", max_bytes=10)
+    data = app_module._download_image("https://upload.wikimedia.org/file.jpg", max_bytes=10)
     assert data == b"abcdef"
 
 
@@ -951,7 +951,7 @@ def test_download_image_content_length_too_large(monkeypatch):
     monkeypatch.setattr(app_module.requests, "get", lambda *_a, **_k: resp)
 
     with pytest.raises(ValueError, match="Image too large"):
-        app_module._download_image("https://example.org/file.jpg", max_bytes=10)
+        app_module._download_image("https://upload.wikimedia.org/file.jpg", max_bytes=10)
     assert resp.closed is True
 
 
@@ -960,7 +960,7 @@ def test_download_image_stream_exceeds_limit(monkeypatch):
     monkeypatch.setattr(app_module.requests, "get", lambda *_a, **_k: resp)
 
     with pytest.raises(ValueError, match="exceeded"):
-        app_module._download_image("https://example.org/file.jpg", max_bytes=10)
+        app_module._download_image("https://upload.wikimedia.org/file.jpg", max_bytes=10)
     assert resp.closed is True
 
 
@@ -969,7 +969,7 @@ def test_download_image_raises_http_error(monkeypatch):
     monkeypatch.setattr(app_module.requests, "get", lambda *_a, **_k: resp)
 
     with pytest.raises(requests.HTTPError):
-        app_module._download_image("https://example.org/file.jpg")
+        app_module._download_image("https://upload.wikimedia.org/file.jpg")
 
 
 def test_login_required_redirects_unauthenticated(monkeypatch):
