@@ -21,6 +21,7 @@ with patch("database.init_db"):
         _refresh_claims,
         _release_all_claims,
         _release_project,
+        process_images,
         run_autonomous_inference,
         write_sdc_claims,
     )
@@ -240,7 +241,7 @@ def test_inference_returns_classified_count():
 
 
 def test_process_single_image_bootstrapped_single_face_auto_classifies():
-    """Single-face bootstrapped image should auto-classify as target and increment faces_confirmed."""
+    """Single-face bootstrapped image should auto-classify as target, set sdc_written=1, and increment faces_confirmed."""
     fake_location = (10, 110, 110, 10)
     fake_encoding = _make_encoding(1)
 
@@ -269,6 +270,11 @@ def test_process_single_image_bootstrapped_single_face_auto_classifies():
     project_update_calls = [c for c in query_calls if "UPDATE projects SET faces_confirmed" in c[0]]
     assert len(project_update_calls) == 1
     assert project_update_calls[0][1] == (1, 5)
+
+    # sdc_written=1 must be set — the image already has P180 on Commons
+    sdc_written_calls = [c for c in query_calls if "UPDATE faces SET sdc_written = 1" in c[0]]
+    assert len(sdc_written_calls) == 1
+    assert sdc_written_calls[0][1] == (42,)
 
 
 def test_process_single_image_bootstrapped_multi_face_no_auto_classify():
@@ -317,6 +323,82 @@ def test_process_single_image_non_bootstrapped_no_auto_classify():
     assert result is True
     assert not any("UPDATE faces SET is_target" in c[0] for c in query_calls)
     assert not any("UPDATE projects SET faces_confirmed" in c[0] for c in query_calls)
+
+
+def test_process_images_prioritises_non_bootstrap():
+    project = {"id": 99}
+
+    non_bs_rows = [
+        {"id": 1, "file_title": "File:A.jpg", "bootstrapped": 0},
+        {"id": 2, "file_title": "File:B.jpg", "bootstrapped": 0},
+    ]
+    bs_rows = [
+        {"id": 3, "file_title": "File:C.jpg", "bootstrapped": 1},
+    ]
+
+    def mock_execute_query(sql, params=None, fetch=True):
+        if "SUM(CASE WHEN bootstrapped = 1 AND status != 'pending'" in sql:
+            return [{"bs_done": 0, "total": 100}]
+        if "COUNT(*) AS cnt FROM images" in sql and "bootstrapped = 1" in sql:
+            return [{"cnt": 10}]
+        if "bootstrapped = 0" in sql and "LIMIT" in sql:
+            return non_bs_rows
+        if "bootstrapped = 1" in sql and "LIMIT" in sql:
+            return bs_rows
+        if "UPDATE projects SET images_processed" in sql:
+            return 1
+        return ()
+
+    submitted_ids = []
+
+    def fake_process_single(img_id, title, bootstrapped=False, project_id=None):
+        submitted_ids.append((img_id, bootstrapped))
+        return True
+
+    with (
+        patch("worker.execute_query", side_effect=mock_execute_query),
+        patch("worker._process_single_image", side_effect=fake_process_single),
+        patch("worker.shutdown_requested", False),
+    ):
+        count = process_images(project)
+
+    assert count == 3
+    assert (1, False) in submitted_ids
+    assert (2, False) in submitted_ids
+    assert (3, True) in submitted_ids
+
+
+def test_process_images_caps_bootstrap_when_already_processed():
+    # bs_ratio = 400/1000 = 0.4 <= 0.5  →  bootstrap_cap = base_cap = 900
+    # bs_already_processed = 900 >= bootstrap_cap = 900  →  bootstrap_remaining = 0
+    # The bootstrapped=1 pending query must NOT be executed.
+    project = {"id": 99}
+    bootstrap_pending_queried = []
+
+    def mock_execute_query(sql, params=None, fetch=True):
+        if "SUM(CASE WHEN bootstrapped = 1 AND status != 'pending'" in sql:
+            return [{"bs_done": 900, "total": 1000}]
+        if "COUNT(*) AS cnt FROM images" in sql and "bootstrapped = 1" in sql:
+            # bs_ratio = 400/1000 = 0.4  →  bootstrap_cap stays at base_cap (900)
+            return [{"cnt": 400}]
+        if "bootstrapped = 0" in sql and "LIMIT" in sql:
+            return []
+        if "bootstrapped = 1" in sql and "LIMIT" in sql:
+            bootstrap_pending_queried.append(sql)
+            return []
+        if "UPDATE projects SET images_processed" in sql:
+            return 1
+        return ()
+
+    with (
+        patch("worker.execute_query", side_effect=mock_execute_query),
+        patch("worker._process_single_image"),
+        patch("worker.shutdown_requested", False),
+    ):
+        count = process_images(project)
+
+    assert count == 0
+    assert not bootstrap_pending_queried, "Bootstrap pending query should not be executed when cap is already met"
 
 
 import pytest
