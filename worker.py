@@ -2886,10 +2886,8 @@ def main():
                         logger.info("Wake-up signal received, starting next cycle")
                         break
                     if time.time() - last_sdc_check_sleep >= 10:
-                        written = _process_sdc_writes()
+                        _process_sdc_writes()
                         last_sdc_check_sleep = time.time()
-                        if written:
-                            break
                     time.sleep(1)
 
             except DatabaseError as e:
