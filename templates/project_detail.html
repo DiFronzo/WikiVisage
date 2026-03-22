@@ -761,16 +761,20 @@
 {% set eligible = inference_eligible or 0 %}
 {% if unclassified > 0 or pending_images > 0 %}
 <div class="card info-banner" id="infoBanner">
-    {% if human_confirmed >= project.min_confirmed and eligible > 0 %}
+    {% if human_confirmed >= project.min_confirmed and eligible > 0 and pending_images == 0 %}
     <p class="info-banner-text info-text-info">
         {{ ngettext('%(num)d face waiting for model inference. The background worker will classify it automatically within the next minute.', '%(num)d faces waiting for model inference. The background worker will classify them automatically within the next minute.', eligible, num=eligible) }}
+    </p>
+    {% elif human_confirmed >= project.min_confirmed and pending_images > 0 %}
+    <p class="info-banner-text info-text-info" id="infoBannerText">
+        {{ ngettext('The background worker is still processing images (%(pending)d image remaining). Model inference will start once all images have been processed.', 'The background worker is still processing images (%(pending)d images remaining). Model inference will start once all images have been processed.', pending_images, pending=pending_images) }}
     </p>
     {% elif human_confirmed >= project.min_confirmed %}
     <p class="info-banner-text info-text-info">
         {{ ngettext('%(num)d unclassified face remaining, but none are currently eligible for automatic model inference.', '%(num)d unclassified faces remaining, but none are currently eligible for automatic model inference.', unclassified, num=unclassified) }}
     </p>
     {% elif pending_images > 0 %}
-    <p class="info-banner-text info-text-info">
+    <p class="info-banner-text info-text-info" id="infoBannerText">
         {{ ngettext('The background worker is still processing images (%(pending)d image remaining). More faces will appear as processing continues.', 'The background worker is still processing images (%(pending)d images remaining). More faces will appear as processing continues.', pending_images, pending=pending_images) }}
     </p>
     {% elif human_confirmed + unclassified < project.min_confirmed %}
@@ -1970,8 +1974,13 @@
             imagesProcessed: {{ _('{num} images processed')|tojson }},
             waiting: {{ _('Waiting for worker')|tojson }},
             pendingOne: {{ _('The background worker is still processing images ({pending} image remaining). More faces will appear as processing continues.')|tojson }},
-            pendingMany: {{ _('The background worker is still processing images ({pending} images remaining). More faces will appear as processing continues.')|tojson }}
+            pendingMany: {{ _('The background worker is still processing images ({pending} images remaining). More faces will appear as processing continues.')|tojson }},
+            inferenceAfterOne: {{ _('The background worker is still processing images ({pending} image remaining). Model inference will start once all images have been processed.')|tojson }},
+            inferenceAfterMany: {{ _('The background worker is still processing images ({pending} images remaining). Model inference will start once all images have been processed.')|tojson }},
+            inferenceWaiting: {{ ngettext('{num} face waiting for model inference. The background worker will classify it automatically within the next minute.', '{num} faces waiting for model inference. The background worker will classify them automatically within the next minute.', 2)|tojson }},
+            inferenceWaitingOne: {{ ngettext('{num} face waiting for model inference. The background worker will classify it automatically within the next minute.', '{num} faces waiting for model inference. The background worker will classify them automatically within the next minute.', 1)|tojson }}
         };
+        var minConfirmed = {{ project.min_confirmed }};
 
         function updateStats(fs) {
             if (!fs) return;
@@ -2057,14 +2066,30 @@
                     }
 
                     var banner = document.getElementById('infoBanner');
-                    if (banner && data.pending_images > 0) {
-                        var p = banner.querySelector('p');
+                    if (banner) {
+                        var p = document.getElementById('infoBannerText') || banner.querySelector('p');
                         if (p) {
-                            p.style.color = 'var(--info)';
-                            p.style.fontWeight = '700';
-                            p.textContent = data.pending_images === 1
-                                ? i18nProgress.pendingOne.replace('{pending}', '1')
-                                : i18nProgress.pendingMany.replace('{pending}', data.pending_images);
+                            var confirmed = (data.face_stats && data.face_stats.confirmed_matches) || 0;
+                            if (data.pending_images > 0 && confirmed >= minConfirmed) {
+                                p.style.color = 'var(--info)';
+                                p.style.fontWeight = '700';
+                                p.textContent = data.pending_images === 1
+                                    ? i18nProgress.inferenceAfterOne.replace('{pending}', '1')
+                                    : i18nProgress.inferenceAfterMany.replace('{pending}', data.pending_images);
+                            } else if (data.pending_images > 0) {
+                                p.style.color = 'var(--info)';
+                                p.style.fontWeight = '700';
+                                p.textContent = data.pending_images === 1
+                                    ? i18nProgress.pendingOne.replace('{pending}', '1')
+                                    : i18nProgress.pendingMany.replace('{pending}', data.pending_images);
+                            } else if (data.pending_images === 0 && confirmed >= minConfirmed && (data.inference_eligible || 0) > 0) {
+                                var eligible = data.inference_eligible;
+                                p.style.color = 'var(--info)';
+                                p.style.fontWeight = '700';
+                                p.textContent = eligible === 1
+                                    ? i18nProgress.inferenceWaitingOne.replace('{num}', '1')
+                                    : i18nProgress.inferenceWaiting.replace('{num}', eligible);
+                            }
                         }
                     }
                 }

@@ -79,7 +79,7 @@ CREATE TABLE IF NOT EXISTS images (
     project_id      BIGINT UNSIGNED NOT NULL,
     commons_page_id BIGINT UNSIGNED NOT NULL COMMENT 'MediaWiki page ID on Commons',
     file_title      VARCHAR(512)    NOT NULL COMMENT 'Full file title including "File:" prefix',
-    status          ENUM('pending', 'processed', 'enriched', 'error') NOT NULL DEFAULT 'pending',
+    status          ENUM('pending', 'processed', 'enriched', 'error', 'skipped') NOT NULL DEFAULT 'pending',
     face_count      SMALLINT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'Number of faces detected',
     detection_width MEDIUMINT UNSIGNED NULL COMMENT 'Image width in pixels at which face detection was run',
     detection_height MEDIUMINT UNSIGNED NULL COMMENT 'Image height in pixels at which face detection was run',

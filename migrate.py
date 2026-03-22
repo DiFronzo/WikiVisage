@@ -350,6 +350,11 @@ _ALTER_MIGRATIONS = [
         "Add unique index on invite_code",
         "ALTER TABLE projects ADD UNIQUE INDEX idx_projects_invite_code (invite_code)",
     ),
+    (
+        "Add 'skipped' to images.status ENUM for bootstrap cap overflow",
+        "ALTER TABLE images MODIFY COLUMN status "
+        "ENUM('pending', 'processed', 'enriched', 'error', 'skipped') NOT NULL DEFAULT 'pending'",
+    ),
 ]
 
 

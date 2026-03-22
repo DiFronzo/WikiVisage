@@ -1087,6 +1087,27 @@ def process_images(project: dict[str, Any]) -> int:
             pending_images.extend(bs)
 
     if not pending_images:
+        # If no non-bootstrap images remain and bootstrap cap is reached,
+        # mark any leftover pending bootstrap images as 'skipped' so the
+        # progress bar can reach 100%.
+        if bootstrap_remaining == 0:
+            skipped = execute_query(
+                "UPDATE images SET status = 'skipped' "
+                "WHERE project_id = %s AND status = 'pending' AND bootstrapped = 1",
+                (project_id,),
+                fetch=False,
+            )
+            if skipped:
+                logger.info(f"Marked {skipped} bootstrap images as skipped (cap reached)")
+                # Recount images_processed to include skipped
+                execute_query(
+                    "UPDATE projects SET images_processed = "
+                    "(SELECT COUNT(*) FROM images WHERE project_id = %s "
+                    "AND status IN ('processed', 'error', 'enriched', 'skipped')) "
+                    "WHERE id = %s",
+                    (project_id, project_id),
+                    fetch=False,
+                )
         return 0
 
     batch_start = time.monotonic()
@@ -1126,7 +1147,7 @@ def process_images(project: dict[str, Any]) -> int:
 
     # Update project stats
     execute_query(
-        "UPDATE projects SET images_processed = (SELECT COUNT(*) FROM images WHERE project_id = %s AND status IN ('processed', 'error', 'enriched')) WHERE id = %s",
+        "UPDATE projects SET images_processed = (SELECT COUNT(*) FROM images WHERE project_id = %s AND status IN ('processed', 'error', 'enriched', 'skipped')) WHERE id = %s",
         (project_id, project_id),
         fetch=False,
     )
@@ -2553,31 +2574,16 @@ def process_project(project: dict[str, Any], *, skip_discovery: bool = False) ->
         #    Interleave inference every 5 batches so results appear progressively
         t0 = time.monotonic()
         total_processed = 0
-        batches_since_inference = 0
         while not shutdown_requested:
             batch_count = process_images(project)
             if batch_count == 0:
                 break
             total_processed += batch_count
-            batches_since_inference += 1
             logger.info(f"Processed batch of {batch_count} images ({total_processed} total so far)")
 
             # Check if project was paused/completed between batches
             if not _is_still_active():
                 break
-
-            # Run inference periodically during image processing
-            if batches_since_inference >= 5:
-                batches_since_inference = 0
-                fresh = execute_query(
-                    "SELECT * FROM projects WHERE id = %s AND status != 'deleted'",
-                    (project["id"],),
-                    fetch=True,
-                )
-                proj = fresh[0] if fresh else project
-                classified = run_autonomous_inference(proj)
-                if classified:
-                    logger.info(f"Mid-processing inference classified {classified} faces")
         t_images = time.monotonic() - t0
 
         # 4. Final Autonomous Inference (catch any remaining unclassified faces)
