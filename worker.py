@@ -2327,11 +2327,12 @@ def _claim_sdc_projects() -> list[dict[str, Any]]:
             "SELECT p.id FROM projects p "
             "WHERE p.sdc_write_requested = 1 AND p.status != 'deleted' "
             "AND (p.worker_claimed_by IS NULL "
+            "     OR p.worker_claimed_by = %s "
             "     OR p.worker_claimed_at < NOW() - INTERVAL %s MINUTE) "
             "ORDER BY COALESCE(p.worker_claimed_at, '1970-01-01') ASC "
             "LIMIT %s "
             "FOR UPDATE",
-            (CLAIM_EXPIRY_MINUTES, MAX_CONCURRENT_PROJECTS),
+            (_worker_id, CLAIM_EXPIRY_MINUTES, MAX_CONCURRENT_PROJECTS),
         )
         rows = cursor.fetchall()
         if not rows:
@@ -2751,6 +2752,7 @@ def main():
                             futures[future] = project["id"]
 
                         last_heartbeat = time.time()
+                        last_sdc_check = time.time()
                         while futures:
                             if shutdown_requested:
                                 break
@@ -2775,9 +2777,8 @@ def main():
                                     pass
                                 logger.info("Wake-up signal received mid-cycle, checking for new work")
 
-                                # SDC writes are latency-sensitive — process immediately
-                                # on the main thread (doesn't need a worker slot).
                                 _process_sdc_writes()
+                                last_sdc_check = time.time()
 
                                 unfinished_futures = [f for f in futures if not f.done()]
                                 free_slots = MAX_CONCURRENT_PROJECTS - len(unfinished_futures)
@@ -2794,6 +2795,11 @@ def main():
                                             logger.info(f"Adding new project {project['id']} to current cycle")
                                             future = executor.submit(_process_and_release, project)
                                             futures[future] = project["id"]
+
+                            # Periodic SDC check (works across pods where wake file doesn't)
+                            if time.time() - last_sdc_check >= 10:
+                                _process_sdc_writes()
+                                last_sdc_check = time.time()
 
                             done = {f for f in futures if f.done()}
                             if not done:
@@ -2821,6 +2827,7 @@ def main():
                             futures[future] = project["id"]
 
                         last_heartbeat_inf = time.time()
+                        last_sdc_check_inf = time.time()
                         while futures:
                             if shutdown_requested:
                                 break
@@ -2843,8 +2850,13 @@ def main():
                                     os.remove(WAKE_FILE_PATH)
                                 except OSError:
                                     pass
-                                # SDC writes are latency-sensitive — process immediately
                                 _process_sdc_writes()
+                                last_sdc_check_inf = time.time()
+
+                            # Periodic SDC check (works across pods where wake file doesn't)
+                            if time.time() - last_sdc_check_inf >= 10:
+                                _process_sdc_writes()
+                                last_sdc_check_inf = time.time()
 
                             done = {f for f in futures if f.done()}
                             if not done:
@@ -2862,6 +2874,7 @@ def main():
                 # Add random jitter (0–15s) so multiple workers desynchronize
                 # and don't all race to claim the same projects every cycle.
                 jitter = random.randint(0, 15)
+                last_sdc_check_sleep = time.time()
                 for _ in range(POLL_INTERVAL + jitter):
                     if shutdown_requested:
                         break
@@ -2872,6 +2885,11 @@ def main():
                             pass
                         logger.info("Wake-up signal received, starting next cycle")
                         break
+                    if time.time() - last_sdc_check_sleep >= 10:
+                        written = _process_sdc_writes()
+                        last_sdc_check_sleep = time.time()
+                        if written:
+                            break
                     time.sleep(1)
 
             except DatabaseError as e:
