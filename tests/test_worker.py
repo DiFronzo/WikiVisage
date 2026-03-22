@@ -21,6 +21,7 @@ with patch("database.init_db"):
         _refresh_claims,
         _release_all_claims,
         _release_project,
+        bootstrap_from_sparql,
         process_images,
         run_autonomous_inference,
         write_sdc_claims,
@@ -1132,3 +1133,109 @@ def test_write_sdc_insert_ignore_zero_other_project_stale_reclaims():
     # Verify face was marked as written after reclaim + API write
     face_updates = [(sql, p) for sql, p in db_calls if "UPDATE faces SET sdc_written" in sql]
     assert len(face_updates) == 1
+
+
+def test_bootstrap_flags_existing_images_at_cap():
+    """When project is at MAX_IMAGES_PER_PROJECT, bootstrap still flags existing images."""
+    project = {"id": 7, "user_id": 1, "wikidata_qid": "Q22686", "commons_category": "Donald Trump"}
+
+    db_calls = []
+
+    def mock_execute_query(sql, params=None, fetch=True):
+        db_calls.append((sql.strip(), params))
+        sql_s = sql.strip()
+
+        # COUNT(*) — project at cap
+        if "SELECT COUNT(*) AS cnt FROM images" in sql_s:
+            return [{"cnt": 9000}]
+
+        # SELECT existing image by page_id
+        if "SELECT id, status FROM images WHERE project_id" in sql_s:
+            page_id = params[1]
+            if page_id == 5001:
+                return [{"id": 101, "status": "processed"}]
+            if page_id == 5002:
+                return [{"id": 102, "status": "processed"}]
+            return []
+
+        if "UPDATE images SET bootstrapped = 1 WHERE id" in sql_s:
+            return 1
+        if "UPDATE faces SET sdc_written = 1" in sql_s:
+            return 1
+        if "UPDATE faces" in sql_s and "classified_by = 'bootstrap'" in sql_s:
+            return 1
+        if "UPDATE projects SET faces_confirmed" in sql_s:
+            return 1
+        if "UPDATE projects SET images_total" in sql_s:
+            return 1
+        return []
+
+    api_response = MagicMock()
+    api_response.json.return_value = {
+        "query": {
+            "search": [
+                {"pageid": 5001, "title": "File:Trump photo.jpg"},
+                {"pageid": 5002, "title": "File:Trump rally.jpg"},
+                {"pageid": 5003, "title": "File:New trump image.jpg"},
+            ]
+        },
+    }
+
+    with (
+        patch("worker.execute_query", side_effect=mock_execute_query),
+        patch("worker._api_request", return_value=api_response),
+        patch("worker.shutdown_requested", False),
+    ):
+        result = bootstrap_from_sparql(project)
+
+    assert result == 2
+
+    bootstrap_updates = [(sql, p) for sql, p in db_calls if "UPDATE images SET bootstrapped = 1 WHERE id" in sql]
+    assert len(bootstrap_updates) == 2
+    flagged_ids = {p[0] for _, p in bootstrap_updates}
+    assert flagged_ids == {101, 102}
+
+    sdc_updates = [(sql, p) for sql, p in db_calls if "UPDATE faces SET sdc_written = 1" in sql]
+    assert len(sdc_updates) == 2
+
+    inserts = [sql for sql, _ in db_calls if "INSERT IGNORE INTO images" in sql]
+    assert len(inserts) == 0
+
+
+def test_bootstrap_at_cap_does_not_insert_new_images():
+    """When at cap, bootstrap skips new images entirely (no INSERT)."""
+    project = {"id": 8, "user_id": 1, "wikidata_qid": "Q42", "commons_category": "Test"}
+
+    db_calls = []
+
+    def mock_execute_query(sql, params=None, fetch=True):
+        db_calls.append((sql.strip(), params))
+        sql_s = sql.strip()
+
+        if "SELECT COUNT(*) AS cnt FROM images" in sql_s:
+            return [{"cnt": 9000}]
+        if "SELECT id, status FROM images WHERE project_id" in sql_s:
+            return []
+        return []
+
+    api_response = MagicMock()
+    api_response.json.return_value = {
+        "query": {
+            "search": [
+                {"pageid": 7001, "title": "File:New1.jpg"},
+                {"pageid": 7002, "title": "File:New2.jpg"},
+            ]
+        },
+    }
+
+    with (
+        patch("worker.execute_query", side_effect=mock_execute_query),
+        patch("worker._api_request", return_value=api_response),
+        patch("worker.shutdown_requested", False),
+    ):
+        result = bootstrap_from_sparql(project)
+
+    assert result == 0
+
+    inserts = [sql for sql, _ in db_calls if "INSERT IGNORE INTO images" in sql]
+    assert len(inserts) == 0

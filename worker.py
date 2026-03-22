@@ -1176,13 +1176,7 @@ def bootstrap_from_sparql(project: dict[str, Any]) -> int:
         fetch=True,
     )
     existing_count = existing_count_rows[0]["cnt"] if existing_count_rows else 0
-    if existing_count >= MAX_IMAGES_PER_PROJECT:
-        logger.info(
-            f"Project {project['id']} already has {existing_count} images "
-            f"(limit {MAX_IMAGES_PER_PROJECT}), skipping bootstrap."
-        )
-        return 0
-    remaining_global = MAX_IMAGES_PER_PROJECT - existing_count
+    remaining_global = max(0, MAX_IMAGES_PER_PROJECT - existing_count)
 
     qid = project["wikidata_qid"]
     category = project["commons_category"]
@@ -1202,13 +1196,6 @@ def bootstrap_from_sparql(project: dict[str, Any]) -> int:
 
         while True:
             if shutdown_requested:
-                break
-
-            if inserted_count >= remaining_global:
-                logger.info(
-                    f"Bootstrap reached global image limit for project {project['id']}"
-                    f" (inserted {inserted_count}, global remaining was {remaining_global})"
-                )
                 break
 
             resp = _api_request(COMMONS_API_URL, params=search_params)
@@ -1299,9 +1286,9 @@ def bootstrap_from_sparql(project: dict[str, Any]) -> int:
                                 f"already-processed image {image_id} as target"
                             )
                 else:
-                    # New image not in category — insert as pending + bootstrapped.
-                    # All P180 images are inserted (no cap here); the processing
-                    # cap is enforced in process_images() instead.
+                    # New image — insert as pending + bootstrapped.
+                    # Respects MAX_IMAGES_PER_PROJECT cap for new inserts, but the
+                    # flagging loop above always runs for existing images regardless.
                     if inserted_count >= remaining_global:
                         continue
 
