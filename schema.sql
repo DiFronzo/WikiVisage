@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS projects (
     last_inference_min_confirmed INT UNSIGNED NULL COMMENT 'min_confirmed used in last inference run',
     sdc_write_requested TINYINT(1)      NOT NULL DEFAULT 0 COMMENT '1=user requested SDC writes, worker picks up',
     sdc_write_error     VARCHAR(1024)   NULL COMMENT 'Error message from last SDC write attempt',
+    invite_code         VARCHAR(8)       NULL DEFAULT NULL COMMENT 'Unique code for others to join this project',
     worker_claimed_by   VARCHAR(255)    NULL COMMENT 'Worker instance ID that claimed this project',
     worker_claimed_at   DATETIME        NULL COMMENT 'When the worker claimed this project',
     created_at          DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -65,6 +66,7 @@ CREATE TABLE IF NOT EXISTS projects (
     INDEX idx_projects_status_claim (status, worker_claimed_by, worker_claimed_at),
     INDEX idx_projects_sdc_claim (sdc_write_requested, worker_claimed_by, worker_claimed_at),
     UNIQUE INDEX idx_projects_user_qid_cat (user_id, wikidata_qid, commons_category),
+    UNIQUE INDEX idx_projects_invite_code (invite_code),
 
     CONSTRAINT fk_projects_user
         FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
@@ -148,6 +150,47 @@ CREATE TABLE IF NOT EXISTS user_stats (
     updated_at      DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
 
     CONSTRAINT fk_user_stats_user
+        FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+
+-- SDC claims table: cross-project deduplication of P180 depicts claims.
+-- Ensures that only one project writes a given P180 claim per Commons page,
+-- even when multiple projects target the same Wikidata entity.
+CREATE TABLE IF NOT EXISTS sdc_claims (
+    id              BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    commons_page_id BIGINT UNSIGNED NOT NULL COMMENT 'MediaWiki page ID on Commons',
+    wikidata_qid    VARCHAR(20)     NOT NULL COMMENT 'e.g. Q42',
+    project_id      BIGINT UNSIGNED NOT NULL COMMENT 'Project that claimed this write',
+    face_id         BIGINT UNSIGNED NOT NULL COMMENT 'Face that triggered this write',
+    claimed_at      DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    written_at      DATETIME        NULL COMMENT 'When the API write succeeded',
+
+    UNIQUE INDEX idx_sdc_claims_page_qid (commons_page_id, wikidata_qid),
+    INDEX idx_sdc_claims_project (project_id),
+
+    CONSTRAINT fk_sdc_claims_project
+        FOREIGN KEY (project_id) REFERENCES projects (id) ON DELETE CASCADE,
+    CONSTRAINT fk_sdc_claims_face
+        FOREIGN KEY (face_id) REFERENCES faces (id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+
+-- Project members table: allows multiple users to collaborate on a project.
+-- The project owner is always in users.id via projects.user_id. This table
+-- tracks additional members who joined the project.
+CREATE TABLE IF NOT EXISTS project_members (
+    project_id  BIGINT UNSIGNED NOT NULL,
+    user_id     BIGINT UNSIGNED NOT NULL,
+    role        ENUM('owner', 'member') NOT NULL DEFAULT 'member',
+    status      ENUM('active', 'banned') NOT NULL DEFAULT 'active',
+    joined_at   DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    PRIMARY KEY (project_id, user_id),
+
+    CONSTRAINT fk_pm_project
+        FOREIGN KEY (project_id) REFERENCES projects (id) ON DELETE CASCADE,
+    CONSTRAINT fk_pm_user
         FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 

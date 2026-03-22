@@ -237,7 +237,8 @@
         .card:hover { border-color: var(--primary); }
 
         .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(350px, 1fr)); gap: 2rem; }
-        .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 2rem; }
+        .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0 2rem; }
+.grid-2 > .form-group { display: grid; grid-template-rows: subgrid; grid-row: span 3; gap: 0; margin-bottom: 0; }
         @media (max-width: 600px) { .grid-2 { grid-template-columns: 1fr; } .grid { grid-template-columns: 1fr; } .container { padding: 0 1rem; } }
 
         .badge {
@@ -825,7 +826,6 @@
         })();
     </script>
 
-    <!-- Screen pet easter egg -->
     <div id="jimmy-pet-init" style="position:fixed;bottom:0;cursor:pointer;z-index:50;transition:transform 0.3s ease;transform:translateY(75%);display:none"
          aria-hidden="true">
         <button id="jimmy-pet-close" style="position:absolute;top:-8px;right:-8px;width:22px;height:22px;background:var(--surface);color:var(--text-muted);border:2px solid var(--border);font-size:14px;line-height:1;cursor:pointer;z-index:51;display:none;align-items:center;justify-content:center;padding:0" aria-label="Dismiss">&times;</button>

@@ -645,6 +645,11 @@
         {% endif %}
         <div class="project-header-text">
             <h1 class="project-title">{{ project.label or project.wikidata_qid }}</h1>
+            {% if member_count > 0 %}
+                <span class="badge" style="background: var(--surface); border: 1px solid var(--border); color: var(--text-muted); font-size: 0.7rem;">
+                    {{ ngettext('%(num)d collaborator', '%(num)d collaborators', member_count, num=member_count) }}
+                </span>
+            {% endif %}
             <p class="project-links">
                 <a href="https://www.wikidata.org/wiki/{{ project.wikidata_qid }}" target="_blank" rel="noopener">{{ project.wikidata_qid }}</a> &bull;
                 <a href="https://commons.wikimedia.org/wiki/Category:{{ project.commons_category | urlencode }}" target="_blank" rel="noopener">Category:{{ project.commons_category }}</a>
@@ -773,7 +778,11 @@
         {{ _('Cannot reach autonomous inference: even if all %(unclassified)d unclassified faces are target matches, you would have %(potential)d/%(min)d human-confirmed — below the threshold.', unclassified=unclassified, potential=human_confirmed + unclassified, min=project.min_confirmed) }}
     </p>
     <p class="info-text-muted">
+        {% if is_owner %}
         {{ _('Lower the min_confirmed setting in') }} <a href="{{ url_for('project_settings', project_id=project.id) }}" class="info-link">{{ _('Project Settings') }}</a> {{ _('to proceed, or wait for the background worker to detect more faces.') }}
+        {% else %}
+        {{ _('Ask the project owner to lower the min_confirmed setting, or wait for the background worker to detect more faces.') }}
+        {% endif %}
     </p>
     {% else %}
     <p class="info-banner-text info-text-warning">
@@ -815,7 +824,11 @@
     {% if project.images_total > 0 %}
     <a href="{{ url_for('classify', project_id=project.id) }}" class="btn btn-primary btn-lg">{{ _('Start Classifying') }}</a>
     {% endif %}
+    {% if is_owner %}
     <a href="{{ url_for('project_settings', project_id=project.id) }}" class="btn btn-lg">{{ _('Settings') }}</a>
+    {% else %}
+    <span class="btn btn-lg" style="opacity: 0.4; cursor: not-allowed; pointer-events: none;">{{ _('Settings') }}</span>
+    {% endif %}
 </div>
 
 {% if gallery_total > 0 %}

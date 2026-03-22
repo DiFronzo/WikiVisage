@@ -98,6 +98,7 @@ COMMONS_API_LIMIT = "500"  # MediaWiki API cmlimit
 # Beta whitelist — fetched from GitHub every 5 minutes, falls back to local file
 _WHITELIST_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "whitelist.txt")
 _WHITELIST_URL = "https://raw.githubusercontent.com/DiFronzo/WikiVisage/main/whitelist.txt"
+_WHITELIST_LOCAL_ONLY = os.environ.get("WIKIVISAGE_WHITELIST_LOCAL") == "1"
 _WHITELIST_CACHE_TTL = 300  # seconds
 _whitelist_cache: set[str] = set()
 _whitelist_cache_time: float = 0.0
@@ -119,17 +120,18 @@ def _load_whitelist() -> set[str]:
     if _whitelist_cache and (now - _whitelist_cache_time) < _WHITELIST_CACHE_TTL:
         return _whitelist_cache
 
-    # Try GitHub first
-    try:
-        resp = requests.get(_WHITELIST_URL, timeout=5)
-        resp.raise_for_status()
-        fresh = _parse_whitelist(resp.text)
-        if fresh:
-            _whitelist_cache = fresh
-            _whitelist_cache_time = now
-            return _whitelist_cache
-    except Exception:
-        logger.debug("Failed to fetch whitelist from GitHub, trying local file")
+    # Try GitHub first (skip if local-only mode)
+    if not _WHITELIST_LOCAL_ONLY:
+        try:
+            resp = requests.get(_WHITELIST_URL, timeout=5)
+            resp.raise_for_status()
+            fresh = _parse_whitelist(resp.text)
+            if fresh:
+                _whitelist_cache = fresh
+                _whitelist_cache_time = now
+                return _whitelist_cache
+        except Exception:
+            logger.debug("Failed to fetch whitelist from GitHub, trying local file")
 
     # Fall back to local file
     try:
@@ -156,15 +158,25 @@ app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(hours=8)
 
-# Rate limiter — memory:// is per-process (not shared across gunicorn workers).
-# With 2 gunicorn workers, effective limits are doubled (e.g., 200/hr becomes ~400/hr).
-# Acceptable for a whitelisted beta tool on Toolforge with limited user count.
-# For broader deployments, switch to Redis or memcached storage.
+# Rate limiter — uses Redis on Toolforge for shared state across gunicorn workers.
+# Falls back to memory:// for local development where Redis may not be available.
+_REDIS_URL = os.environ.get("WIKIVISAGE_REDIS_URL", "redis://redis.svc.tools.eqiad1.wikimedia.cloud:6379")
+_limiter_storage_uri = _REDIS_URL
+
+try:
+    import redis as _redis_mod
+
+    _r = _redis_mod.from_url(_REDIS_URL, socket_connect_timeout=2)
+    _r.ping()
+except Exception:
+    _limiter_storage_uri = "memory://"
+
 limiter = Limiter(
     get_remote_address,
     app=app,
     default_limits=["200 per hour"],
-    storage_uri="memory://",
+    storage_uri=_limiter_storage_uri,
+    key_prefix="wikivisage:",
 )
 
 # ---------------------------------------------------------------------------
@@ -361,6 +373,11 @@ def _refresh_access_token(user: dict[str, Any]) -> dict[str, Any] | None:
     """
     Refresh the user's access token if it is expired or about to expire.
 
+    Uses optimistic concurrency: after refreshing, the DB UPDATE compares
+    the old token_expires_at value.  If another process already refreshed
+    (changing token_expires_at), the UPDATE affects 0 rows and we re-read
+    the freshly-refreshed credentials from the DB instead.
+
     Returns updated user dict or None if refresh failed.
     """
     expires_at = user["token_expires_at"]
@@ -373,6 +390,7 @@ def _refresh_access_token(user: dict[str, Any]) -> dict[str, Any] | None:
     if (expires_at - now).total_seconds() > TOKEN_REFRESH_BUFFER:
         return user  # Still valid
 
+    old_expires_str = expires_at.strftime("%Y-%m-%d %H:%M:%S")
     logger.info(f"Refreshing access token for user {user['wiki_username']}")
 
     try:
@@ -386,16 +404,41 @@ def _refresh_access_token(user: dict[str, Any]) -> dict[str, Any] | None:
 
         new_expires_at = datetime.now(UTC) + timedelta(seconds=new_token.get("expires_in", 14400))
 
-        execute_query(
-            "UPDATE users SET access_token = %s, refresh_token = %s, token_expires_at = %s WHERE id = %s",
+        # Optimistic concurrency: only update if no other process refreshed first
+        rowcount = execute_query(
+            "UPDATE users SET access_token = %s, refresh_token = %s, token_expires_at = %s "
+            "WHERE id = %s AND token_expires_at = %s",
             (
                 encrypt_token(new_token["access_token"]),
                 encrypt_token(new_token.get("refresh_token", user["refresh_token"])),
                 new_expires_at.strftime("%Y-%m-%d %H:%M:%S"),
                 user["id"],
+                old_expires_str,
             ),
             fetch=False,
         )
+
+        if rowcount == 0:
+            # Another process already refreshed — re-read from DB
+            logger.info(f"Token already refreshed by another process for user {user['wiki_username']}")
+            fresh = execute_query(
+                "SELECT access_token, refresh_token, token_expires_at FROM users WHERE id = %s",
+                (user["id"],),
+                fetch=True,
+            )
+            if fresh:
+                row = fresh[0]
+                at = row["access_token"]
+                if isinstance(at, bytes):
+                    at = at.decode("utf-8")
+                rt = row["refresh_token"]
+                if isinstance(rt, bytes):
+                    rt = rt.decode("utf-8")
+                user["access_token"] = decrypt_token(at)
+                user["refresh_token"] = decrypt_token(rt)
+                user["token_expires_at"] = row["token_expires_at"]
+                return user
+            return None
 
         user["access_token"] = new_token["access_token"]
         user["refresh_token"] = new_token.get("refresh_token", user["refresh_token"])
@@ -650,6 +693,45 @@ def _snap_thumb_width(width: int) -> int:
     return _THUMB_STEPS[-1]
 
 
+_MAX_INVITE_CODE_RETRIES = 5
+
+
+def _generate_invite_code() -> str:
+    return secrets.token_urlsafe(6)[:8]
+
+
+def _is_mysql_1062(exc: Exception) -> bool:
+    """Return True if *exc* (or its __cause__) is a MySQL 1062 (ER_DUP_ENTRY) error."""
+    for candidate in (getattr(exc, "__cause__", None), exc):
+        if candidate is None:
+            continue
+        args = getattr(candidate, "args", None)
+        if args:
+            try:
+                if int(args[0]) == 1062:
+                    return True
+            except (ValueError, TypeError, IndexError):
+                pass
+    # Last resort: require both 1062 and "Duplicate entry" to avoid false positives
+    # from error messages that incidentally contain the digits 1062.
+    exc_str = str(exc)
+    return bool(re.search(r"\b1062\b", exc_str)) and "Duplicate entry" in exc_str
+
+
+def _is_invite_code_collision(exc: Exception) -> bool:
+    """Return True if *exc* is a MySQL 1062 error on the invite_code UNIQUE index."""
+    if not _is_mysql_1062(exc):
+        return False
+    # Also verify the collision is specifically on the invite_code index.
+    for candidate in (getattr(exc, "__cause__", None), exc):
+        if candidate is None:
+            continue
+        args = getattr(candidate, "args", None)
+        if args and len(args) > 1 and "invite_code" in str(args[1]):
+            return True
+    return "invite_code" in str(exc)
+
+
 def commons_thumb_url(file_title: str, width: int = 330) -> str:
     """Build a Wikimedia Commons thumbnail URL for any file type.
 
@@ -836,6 +918,23 @@ def get_project_for_user(project_id: int, user_id: int) -> dict | None:
     return rows[0] if rows else None
 
 
+def get_project_for_actor(project_id: int, user_id: int, *, require_owner: bool = False) -> dict | None:
+    """Fetch a non-deleted project accessible to *user_id*.
+
+    When *require_owner* is True, only the project owner can access it.
+    Otherwise, both the owner and any member in ``project_members`` qualify.
+    """
+    if require_owner:
+        return get_project_for_user(project_id, user_id)
+    rows = execute_query(
+        "SELECT p.* FROM projects p "
+        "LEFT JOIN project_members pm ON pm.project_id = p.id AND pm.user_id = %s AND pm.status = 'active' "
+        "WHERE p.id = %s AND p.status != 'deleted' AND (p.user_id = %s OR pm.user_id IS NOT NULL)",
+        (user_id, project_id, user_id),
+    )
+    return rows[0] if rows else None
+
+
 def verify_image_ownership(image_id: int, project_id: int, user_id: int) -> dict | None:
     """Confirm *image_id* belongs to a non-deleted project of *user_id*.
 
@@ -846,6 +945,22 @@ def verify_image_ownership(image_id: int, project_id: int, user_id: int) -> dict
         "JOIN projects p ON i.project_id = p.id "
         "WHERE i.id = %s AND p.id = %s AND p.user_id = %s AND p.status != 'deleted'",
         (image_id, project_id, user_id),
+    )
+    return rows[0] if rows else None
+
+
+def verify_image_access(image_id: int, project_id: int, user_id: int) -> dict | None:
+    """Confirm *image_id* belongs to a project accessible to *user_id* (owner or member).
+
+    Returns the image row (``id``, ``file_title``) or ``None``.
+    """
+    rows = execute_query(
+        "SELECT i.id, i.file_title FROM images i "
+        "JOIN projects p ON i.project_id = p.id "
+        "LEFT JOIN project_members pm ON pm.project_id = p.id AND pm.user_id = %s AND pm.status = 'active' "
+        "WHERE i.id = %s AND p.id = %s AND p.status != 'deleted' "
+        "AND (p.user_id = %s OR pm.user_id IS NOT NULL)",
+        (user_id, image_id, project_id, user_id),
     )
     return rows[0] if rows else None
 
@@ -890,8 +1005,10 @@ def dashboard():
 
     try:
         count_row = execute_query(
-            "SELECT COUNT(*) AS cnt FROM projects WHERE user_id = %s AND status != 'deleted'",
-            (g.user["id"],),
+            "SELECT COUNT(DISTINCT p.id) AS cnt FROM projects p "
+            "LEFT JOIN project_members pm ON pm.project_id = p.id AND pm.user_id = %s AND pm.status = 'active' "
+            "WHERE (p.user_id = %s OR pm.user_id IS NOT NULL) AND p.status != 'deleted'",
+            (g.user["id"], g.user["id"]),
         )
         total = count_row[0]["cnt"] if count_row else 0
     except DatabaseError:
@@ -904,13 +1021,32 @@ def dashboard():
 
     try:
         projects = execute_query(
-            "SELECT * FROM projects WHERE user_id = %s AND status != 'deleted' ORDER BY updated_at DESC LIMIT %s OFFSET %s",
-            (g.user["id"], PROJECTS_PER_PAGE, offset),
+            "SELECT DISTINCT p.* FROM projects p "
+            "LEFT JOIN project_members pm ON pm.project_id = p.id AND pm.user_id = %s AND pm.status = 'active' "
+            "WHERE (p.user_id = %s OR pm.user_id IS NOT NULL) AND p.status != 'deleted' "
+            "ORDER BY p.updated_at DESC LIMIT %s OFFSET %s",
+            (g.user["id"], g.user["id"], PROJECTS_PER_PAGE, offset),
         )
     except DatabaseError:
         logger.exception("Failed to load projects")
         projects = []
         flash(_("Failed to load projects."), "error")
+
+    # Add member counts for these projects
+    member_counts = {}
+    if projects:
+        try:
+            project_ids = [p["id"] for p in projects]
+            placeholders = ", ".join(["%s"] * len(project_ids))
+            count_rows = execute_query(
+                f"SELECT project_id, COUNT(*) AS cnt FROM project_members "
+                f"WHERE project_id IN ({placeholders}) AND status = 'active' GROUP BY project_id",
+                tuple(project_ids),
+            )
+            for row in count_rows:
+                member_counts[row["project_id"]] = row["cnt"]
+        except DatabaseError:
+            pass  # Non-critical
 
     # Lazily populate P18 thumbnails for projects missing them (cap to avoid slow page loads)
     if isinstance(projects, list):
@@ -935,6 +1071,8 @@ def dashboard():
     return render_template(
         "dashboard.html",
         projects=projects,
+        member_counts=member_counts,
+        current_user_id=g.user["id"],
         page=page,
         total_pages=total_pages,
         total_projects=total,
@@ -1182,6 +1320,47 @@ def project_new():
     except DatabaseError:
         logger.exception("Failed to check for duplicate project")
 
+    # Cross-user duplicate: inform user if another project exists for same QID + category
+    action = request.form.get("action", "create")
+    try:
+        other_project = execute_query(
+            "SELECT p.id, p.label, u.wiki_username FROM projects p "
+            "JOIN users u ON p.user_id = u.id "
+            "WHERE p.wikidata_qid = %s AND p.commons_category = %s "
+            "AND p.status != 'deleted' AND p.user_id != %s LIMIT 1",
+            (wikidata_qid, commons_category, g.user["id"]),
+        )
+        if other_project:
+            op = other_project[0]
+            existing_membership = execute_query(
+                "SELECT status FROM project_members WHERE project_id = %s AND user_id = %s",
+                (op["id"], g.user["id"]),
+            )
+            is_banned = existing_membership and existing_membership[0]["status"] == "banned"
+            if existing_membership and not is_banned:
+                flash(_("You are already a member of this project."), "info")
+                return redirect(url_for("project_detail", project_id=op["id"]))
+            if not is_banned and action != "create_anyway":
+                flash(
+                    _(
+                        "%(username)s already has a project for this Q-ID and category. "
+                        "You can ask them for an invite code to join, or create your own.",
+                        username=op["wiki_username"],
+                    ),
+                    "info",
+                )
+                return render_template(
+                    "project_new.html",
+                    wikidata_qid=wikidata_qid,
+                    commons_category=commons_category,
+                    label=label,
+                    distance_threshold=distance_threshold,
+                    min_confirmed=min_confirmed,
+                    existing_project=op,
+                )
+    except DatabaseError:
+        logger.exception("Failed to check for joinable projects")
+
     # Create project
     try:
         p18_thumb_url = _fetch_p18_thumb_url(wikidata_qid)
@@ -1189,21 +1368,32 @@ def project_new():
         if not label:
             label = _fetch_wikidata_label(wikidata_qid) or ""
 
-        execute_query(
-            "INSERT INTO projects (user_id, wikidata_qid, commons_category, label, "
-            "distance_threshold, min_confirmed, p18_thumb_url) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s)",
-            (
-                g.user["id"],
-                wikidata_qid,
-                commons_category,
-                label,
-                distance_threshold,
-                min_confirmed,
-                p18_thumb_url,
-            ),
-            fetch=False,
-        )
+        invite_code = _generate_invite_code()
+        for _attempt in range(_MAX_INVITE_CODE_RETRIES):
+            try:
+                execute_query(
+                    "INSERT INTO projects (user_id, wikidata_qid, commons_category, label, "
+                    "distance_threshold, min_confirmed, p18_thumb_url, invite_code) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                    (
+                        g.user["id"],
+                        wikidata_qid,
+                        commons_category,
+                        label,
+                        distance_threshold,
+                        min_confirmed,
+                        p18_thumb_url,
+                        invite_code,
+                    ),
+                    fetch=False,
+                )
+                break
+            except DatabaseError as _exc:
+                if _is_invite_code_collision(_exc) and _attempt < _MAX_INVITE_CODE_RETRIES - 1:
+                    logger.debug("invite_code collision on attempt %d, retrying", _attempt + 1)
+                    invite_code = _generate_invite_code()
+                else:
+                    raise
         flash(_("Project created successfully!"), "success")
 
         # Signal the worker to wake up and process the new project immediately
@@ -1218,34 +1408,13 @@ def project_new():
         # MySQL error 1062 (ER_DUP_ENTRY) means a soft-deleted row with the same
         # user_id + wikidata_qid + commons_category still exists.  The background
         # worker will hard-delete it on the next poll cycle (≤60 s).
-        def _is_duplicate_entry_error(db_exc: Exception) -> bool:
-            """
-            Return True if the given database exception represents a MySQL
-            duplicate-entry (error code 1062) condition.
-            """
-            # database.py wraps PyMySQL exceptions via `raise DatabaseError(...) from e`.
-            # The original PyMySQL IntegrityError is available as __cause__ with
-            # args = (1062, "Duplicate entry '...' for key '...'").
-            cause = getattr(db_exc, "__cause__", None)
-            if cause is not None and getattr(cause, "args", None):
-                try:
-                    return int(cause.args[0]) == 1062
-                except (ValueError, TypeError, IndexError):
-                    pass
-            # Fall back to checking the exception's own args.
-            if getattr(db_exc, "args", None):
-                try:
-                    return int(db_exc.args[0]) == 1062
-                except (ValueError, TypeError, IndexError):
-                    pass
-            # Last resort: check the string representation.
-            # Require both word-boundary match on "1062" and the literal
-            # "Duplicate entry" substring to avoid false positives from
-            # error messages that incidentally contain the digits 1062.
-            exc_str = str(db_exc)
-            return bool(re.search(r"\b1062\b", exc_str)) and "Duplicate entry" in exc_str
-
-        if _is_duplicate_entry_error(exc):
+        if _is_invite_code_collision(exc):
+            # The retry loop exhausted all _MAX_INVITE_CODE_RETRIES attempts to find
+            # a unique invite code and re-raised the last collision — treat as a
+            # generic creation failure (extremely unlikely in practice).
+            logger.exception("Failed to create project: invite_code collision after all retries")
+            flash(_("Failed to create project. Please try again."), "error")
+        elif _is_mysql_1062(exc):
             logger.info("Project creation blocked by pending soft-deleted row: %s", exc)
             flash(
                 _(
@@ -1272,7 +1441,7 @@ def project_new():
 def project_detail(project_id: int):
     """Project detail page with progress and stats."""
     try:
-        project = get_project_for_user(project_id, g.user["id"])
+        project = get_project_for_actor(project_id, g.user["id"])
     except DatabaseError:
         logger.exception("Failed to load project")
         abort(500)
@@ -1370,16 +1539,31 @@ def project_detail(project_id: int):
     except DatabaseError:
         pass
 
+    # Count project members (excluding owner who is implicit)
+    member_count = 0
+    try:
+        mc_row = execute_query(
+            "SELECT COUNT(*) AS cnt FROM project_members WHERE project_id = %s AND status = 'active'",
+            (project_id,),
+        )
+        member_count = mc_row[0]["cnt"] if mc_row else 0
+    except DatabaseError:
+        pass  # Non-critical
+
     inference_triggered = request.args.get("inference_triggered") == "1"
+
+    is_owner = project["user_id"] == g.user["id"]
 
     return render_template(
         "project_detail.html",
         project=project,
         stats=face_stats,
         gallery_total=gallery_total,
+        member_count=member_count,
         pending_images=pending_images,
         inference_eligible=inference_eligible,
         inference_triggered=inference_triggered,
+        is_owner=is_owner,
     )
 
 
@@ -1388,7 +1572,7 @@ def project_detail(project_id: int):
 def classify(project_id: int):
     """Active learning classification interface."""
     try:
-        project = get_project_for_user(project_id, g.user["id"])
+        project = get_project_for_actor(project_id, g.user["id"])
     except DatabaseError:
         abort(500)
 
@@ -1401,7 +1585,7 @@ def classify(project_id: int):
     is_skip_review = request.args.get("skip_reviewing") == "1"
     if request.args.get("skip_image_id"):
         try:
-            skip_id = int(request.args.get("skip_image_id"))
+            skip_id = int(request.args["skip_image_id"])
             active_skip_key = skip_key_review if is_skip_review else skip_key
             skipped = session.get(active_skip_key, [])
             if skip_id not in skipped:
@@ -1615,7 +1799,7 @@ def api_classify():
 
     # Verify ownership: image belongs to a project owned by this user
     try:
-        img = verify_image_ownership(image_id, project_id, g.user["id"])
+        img = verify_image_access(image_id, project_id, g.user["id"])
         if not img:
             return jsonify({"error": _("Image not found or access denied")}), 404
     except DatabaseError:
@@ -1705,9 +1889,10 @@ def api_classify():
                 cursor.execute(
                     "UPDATE faces SET is_target = 1, classified_by = 'human', "
                     "classified_by_user_id = %s "
-                    "WHERE id = %s AND image_id = %s",
+                    "WHERE id = %s AND image_id = %s AND is_target IS NULL",
                     (g.user["id"], selected_face_id, image_id),
                 )
+                target_updated = cursor.rowcount
 
                 if is_review_mode:
                     cursor.execute(
@@ -1726,10 +1911,11 @@ def api_classify():
                         (g.user["id"], image_id, selected_face_id),
                     )
 
-                cursor.execute(
-                    "UPDATE projects SET faces_confirmed = faces_confirmed + 1 WHERE id = %s",
-                    (project_id,),
-                )
+                if target_updated > 0:
+                    cursor.execute(
+                        "UPDATE projects SET faces_confirmed = faces_confirmed + 1 WHERE id = %s",
+                        (project_id,),
+                    )
 
                 # Do NOT queue P180 removal here — the selected face confirms
                 # the person IS depicted, so the P180 claim must stay.
@@ -1777,7 +1963,7 @@ def api_undo_classify():
 
     # Verify ownership
     try:
-        img = verify_image_ownership(image_id, project_id, g.user["id"])
+        img = verify_image_access(image_id, project_id, g.user["id"])
         if not img:
             return jsonify({"error": _("Image not found or access denied")}), 404
     except DatabaseError:
@@ -1885,7 +2071,7 @@ def api_manual_face():
     is_review_mode = request.form.get("reviewing_model") == "1"
 
     try:
-        img = verify_image_ownership(image_id, project_id, g.user["id"])
+        img = verify_image_access(image_id, project_id, g.user["id"])
         if not img:
             return jsonify({"error": _("Image not found or access denied")}), 404
     except DatabaseError:
@@ -1959,8 +2145,9 @@ def api_manual_face():
             else:
                 cursor.execute(
                     "INSERT INTO faces "
-                    "(image_id, encoding, bbox_top, bbox_right, bbox_bottom, bbox_left) "
-                    "VALUES (%s, %s, %s, %s, %s, %s)",
+                    "(image_id, encoding, bbox_top, bbox_right, bbox_bottom, bbox_left, "
+                    "is_target, classified_by, classified_by_user_id) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, 1, 'human', %s)",
                     (
                         image_id,
                         encoding_bytes,
@@ -1968,6 +2155,7 @@ def api_manual_face():
                         bbox_right,
                         bbox_bottom,
                         bbox_left,
+                        g.user["id"],
                     ),
                 )
                 new_face_id = cursor.lastrowid
@@ -2110,7 +2298,7 @@ def api_reclassify():
     except (ValueError, TypeError):
         return jsonify({"error": _("Invalid field values")}), 400
 
-    # Verify ownership: face → image → project → user
+    # Verify ownership: face → image → project → user (or member)
     try:
         rows = execute_query(
             "SELECT f.id, f.image_id, f.is_target AS old_is_target, f.sdc_written, "
@@ -2120,8 +2308,10 @@ def api_reclassify():
             "FROM faces f "
             "JOIN images i ON f.image_id = i.id "
             "JOIN projects p ON i.project_id = p.id "
-            "WHERE f.id = %s AND p.user_id = %s AND f.superseded_by IS NULL AND p.status != 'deleted'",
-            (face_id, g.user["id"]),
+            "LEFT JOIN project_members pm ON pm.project_id = p.id AND pm.user_id = %s AND pm.status = 'active' "
+            "WHERE f.id = %s AND (p.user_id = %s OR pm.user_id IS NOT NULL) "
+            "AND f.superseded_by IS NULL AND p.status != 'deleted'",
+            (g.user["id"], face_id, g.user["id"]),
         )
         if not rows:
             return jsonify({"error": _("Face not found or access denied")}), 404
@@ -2280,7 +2470,7 @@ def api_update_face_bbox():
     ):
         return jsonify({"error": _("Bounding box out of allowed range")}), 400
 
-    # Verify ownership: face → image → project → user
+    # Verify ownership: face → image → project → user (or member)
     try:
         rows = execute_query(
             "SELECT f.id, f.image_id, f.is_target, f.classified_by, f.confidence, "
@@ -2288,8 +2478,10 @@ def api_update_face_bbox():
             "FROM faces f "
             "JOIN images i ON f.image_id = i.id "
             "JOIN projects p ON i.project_id = p.id "
-            "WHERE f.id = %s AND p.user_id = %s AND f.superseded_by IS NULL AND p.status != 'deleted'",
-            (face_id, g.user["id"]),
+            "LEFT JOIN project_members pm ON pm.project_id = p.id AND pm.user_id = %s AND pm.status = 'active' "
+            "WHERE f.id = %s AND (p.user_id = %s OR pm.user_id IS NOT NULL) "
+            "AND f.superseded_by IS NULL AND p.status != 'deleted'",
+            (g.user["id"], face_id, g.user["id"]),
         )
         if not rows:
             return jsonify({"error": _("Face not found or access denied")}), 404
@@ -2383,9 +2575,9 @@ def api_write_sdc(project_id: int):
     if not _validate_csrf():
         return jsonify({"error": _("Invalid CSRF token")}), 400
 
-    # Verify project ownership
+    # Verify project access (owner or member)
     try:
-        project = get_project_for_user(project_id, g.user["id"])
+        project = get_project_for_actor(project_id, g.user["id"])
         if not project:
             return jsonify({"error": _("Project not found or access denied")}), 404
     except DatabaseError:
@@ -2457,7 +2649,7 @@ def api_sdc_status(project_id: int):
     """Poll endpoint for SDC write progress. Returns counts of written,
     pending, and whether the worker is actively writing."""
     try:
-        project = get_project_for_user(project_id, g.user["id"])
+        project = get_project_for_actor(project_id, g.user["id"])
         if not project:
             return jsonify({"error": _("Project not found or access denied")}), 404
     except DatabaseError:
@@ -2506,7 +2698,7 @@ def api_stop_sdc(project_id: int):
         return jsonify({"error": _("Invalid CSRF token")}), 400
 
     try:
-        project = get_project_for_user(project_id, g.user["id"])
+        project = get_project_for_actor(project_id, g.user["id"])
         if not project:
             return jsonify({"error": _("Project not found or access denied")}), 404
     except DatabaseError:
@@ -2541,7 +2733,7 @@ def api_gallery(project_id: int):
         sdc         -- filter by SDC status: sdc-pending | all (default all)
     """
     try:
-        project = get_project_for_user(project_id, g.user["id"])
+        project = get_project_for_actor(project_id, g.user["id"])
         if not project:
             return jsonify({"error": _("Project not found or access denied")}), 404
     except DatabaseError:
@@ -2736,7 +2928,7 @@ def api_gallery(project_id: int):
 def api_progress(project_id: int):
     """Poll endpoint for image processing progress."""
     try:
-        project = get_project_for_user(project_id, g.user["id"])
+        project = get_project_for_actor(project_id, g.user["id"])
         if not project:
             return jsonify({"error": _("Project not found or access denied")}), 404
     except DatabaseError:
@@ -2821,7 +3013,20 @@ def project_settings(project_id: int):
         abort(404)
 
     if request.method == "GET":
-        return render_template("project_settings.html", project=project)
+        # Fetch project members with usernames
+        members = []
+        try:
+            members = execute_query(
+                "SELECT pm.user_id, pm.role, pm.status, pm.joined_at, u.wiki_username "
+                "FROM project_members pm "
+                "JOIN users u ON pm.user_id = u.id "
+                "WHERE pm.project_id = %s "
+                "ORDER BY pm.status ASC, pm.joined_at ASC",
+                (project_id,),
+            )
+        except DatabaseError:
+            logger.exception("Failed to load project members")
+        return render_template("project_settings.html", project=project, members=members, is_owner=True)
 
     if not _validate_csrf():
         abort(400, _("Invalid CSRF token"))
@@ -2859,7 +3064,7 @@ def project_settings(project_id: int):
         project["min_confirmed"] = min_confirmed
         project["status"] = status
         project["label"] = label
-        return render_template("project_settings.html", project=project)
+        return render_template("project_settings.html", project=project, members=[], is_owner=True)
 
     try:
         execute_query(
@@ -2913,11 +3118,229 @@ def project_settings(project_id: int):
         except DatabaseError:
             logger.debug("Non-critical: failed to fetch stats after settings update for project %s", project_id)
 
-        return redirect(url_for("project_detail", project_id=project_id))
+        return redirect(url_for("project_settings", project_id=project_id))
     except DatabaseError:
         logger.exception("Failed to update project settings")
         flash(_("Failed to update settings."), "error")
-        return render_template("project_settings.html", project=project)
+        return render_template("project_settings.html", project=project, members=[], is_owner=True)
+
+
+@app.route("/project/<int:project_id>/settings/remove-member", methods=["POST"])
+@login_required
+def project_remove_member(project_id: int):
+    """Remove a member from the project (owner-only)."""
+    if not _validate_csrf():
+        abort(400, _("Invalid CSRF token"))
+
+    try:
+        project = get_project_for_user(project_id, g.user["id"])
+    except DatabaseError:
+        abort(500)
+
+    if not project:
+        abort(404)
+
+    member_user_id = request.form.get("member_user_id")
+    if not member_user_id:
+        flash(_("No member specified."), "error")
+        return redirect(url_for("project_settings", project_id=project_id))
+
+    try:
+        member_user_id = int(member_user_id)
+    except (ValueError, TypeError):
+        flash(_("Invalid member."), "error")
+        return redirect(url_for("project_settings", project_id=project_id))
+
+    # Don't allow removing yourself (the owner)
+    if member_user_id == g.user["id"]:
+        flash(_("You cannot remove yourself from your own project."), "error")
+        return redirect(url_for("project_settings", project_id=project_id))
+
+    try:
+        affected = execute_query(
+            "UPDATE project_members SET status = 'banned' WHERE project_id = %s AND user_id = %s AND status = 'active'",
+            (project_id, member_user_id),
+            fetch=False,
+        )
+        if affected:
+            flash(_("Member removed and banned from rejoining."), "success")
+        else:
+            flash(_("Member not found."), "error")
+    except DatabaseError:
+        logger.exception("Failed to remove member from project %s", project_id)
+        flash(_("Failed to remove member."), "error")
+
+    return redirect(url_for("project_settings", project_id=project_id))
+
+
+@app.route("/project/<int:project_id>/settings/unban-member", methods=["POST"])
+@login_required
+def project_unban_member(project_id: int):
+    """Unban a member so they can rejoin the project (owner-only)."""
+    if not _validate_csrf():
+        abort(400, _("Invalid CSRF token"))
+
+    try:
+        project = get_project_for_user(project_id, g.user["id"])
+    except DatabaseError:
+        abort(500)
+
+    if not project:
+        abort(404)
+
+    member_user_id = request.form.get("member_user_id")
+    if not member_user_id:
+        flash(_("No member specified."), "error")
+        return redirect(url_for("project_settings", project_id=project_id))
+
+    try:
+        member_user_id = int(member_user_id)
+    except (ValueError, TypeError):
+        flash(_("Invalid member."), "error")
+        return redirect(url_for("project_settings", project_id=project_id))
+
+    try:
+        affected = execute_query(
+            "DELETE FROM project_members WHERE project_id = %s AND user_id = %s AND status = 'banned'",
+            (project_id, member_user_id),
+            fetch=False,
+        )
+        if affected:
+            flash(_("Member unbanned."), "success")
+        else:
+            flash(_("Member not found."), "error")
+    except DatabaseError:
+        logger.exception("Failed to unban member from project %s", project_id)
+        flash(_("Failed to unban member."), "error")
+
+    return redirect(url_for("project_settings", project_id=project_id))
+
+
+@app.route("/project/<int:project_id>/invite-code", methods=["POST"])
+@login_required
+def project_invite_code(project_id: int):
+    if not _validate_csrf():
+        abort(400, _("Invalid CSRF token"))
+
+    try:
+        project = get_project_for_user(project_id, g.user["id"])
+    except DatabaseError:
+        abort(500)
+
+    if not project:
+        abort(404)
+
+    action = request.form.get("action")
+
+    if action == "generate":
+        code = _generate_invite_code()
+        for _attempt in range(_MAX_INVITE_CODE_RETRIES):
+            try:
+                execute_query(
+                    "UPDATE projects SET invite_code = %s WHERE id = %s AND user_id = %s",
+                    (code, project_id, g.user["id"]),
+                    fetch=False,
+                )
+                flash(_("Invite code generated."), "success")
+                break
+            except DatabaseError as exc:
+                if _is_invite_code_collision(exc) and _attempt < _MAX_INVITE_CODE_RETRIES - 1:
+                    logger.debug(
+                        "invite_code collision on attempt %d for project %s, retrying",
+                        _attempt + 1,
+                        project_id,
+                    )
+                    code = _generate_invite_code()
+                else:
+                    logger.exception("Failed to generate invite code for project %s", project_id)
+                    flash(_("Failed to generate invite code."), "error")
+                    break
+    elif action == "revoke":
+        try:
+            execute_query(
+                "UPDATE projects SET invite_code = NULL WHERE id = %s AND user_id = %s",
+                (project_id, g.user["id"]),
+                fetch=False,
+            )
+            flash(_("Invite code revoked."), "success")
+        except DatabaseError:
+            logger.exception("Failed to revoke invite code for project %s", project_id)
+            flash(_("Failed to revoke invite code."), "error")
+    else:
+        flash(_("Invalid action."), "error")
+
+    return redirect(url_for("project_settings", project_id=project_id))
+
+
+@app.route("/join", methods=["POST"])
+@login_required
+def project_join():
+    if not _validate_csrf():
+        abort(400, _("Invalid CSRF token"))
+
+    code = (request.form.get("invite_code") or "").strip()
+    if not code:
+        flash(_("Please enter an invite code."), "error")
+        return redirect(url_for("dashboard"))
+
+    try:
+        project = execute_query(
+            "SELECT p.id, p.label, p.user_id, u.wiki_username FROM projects p "
+            "JOIN users u ON p.user_id = u.id "
+            "WHERE p.invite_code = %s AND p.status != 'deleted' LIMIT 1",
+            (code,),
+        )
+    except DatabaseError:
+        logger.exception("Failed to look up invite code")
+        flash(_("Something went wrong. Please try again."), "error")
+        return redirect(url_for("dashboard"))
+
+    if not project:
+        flash(_("Invalid invite code."), "error")
+        return redirect(url_for("dashboard"))
+
+    proj = project[0]
+
+    if proj["user_id"] == g.user["id"]:
+        flash(_("You are the owner of this project."), "info")
+        return redirect(url_for("project_detail", project_id=proj["id"]))
+
+    try:
+        existing = execute_query(
+            "SELECT status FROM project_members WHERE project_id = %s AND user_id = %s",
+            (proj["id"], g.user["id"]),
+        )
+    except DatabaseError:
+        logger.exception("Failed to check membership for project %s", proj["id"])
+        flash(_("Something went wrong. Please try again."), "error")
+        return redirect(url_for("dashboard"))
+
+    if existing:
+        if existing[0]["status"] == "banned":
+            flash(_("You have been banned from this project."), "error")
+            return redirect(url_for("dashboard"))
+        flash(_("You are already a member of this project."), "info")
+        return redirect(url_for("project_detail", project_id=proj["id"]))
+
+    try:
+        execute_query(
+            "INSERT INTO project_members (project_id, user_id, role) VALUES (%s, %s, 'member')",
+            (proj["id"], g.user["id"]),
+            fetch=False,
+        )
+        flash(
+            _(
+                'Joined %(username)s\'s project "%(label)s" successfully!',
+                username=proj["wiki_username"],
+                label=proj["label"] or proj["id"],
+            ),
+            "success",
+        )
+        return redirect(url_for("project_detail", project_id=proj["id"]))
+    except DatabaseError:
+        logger.exception("Failed to join project %s", proj["id"])
+        flash(_("Failed to join project."), "error")
+        return redirect(url_for("dashboard"))
 
 
 @app.route("/project/<int:project_id>/rerun-inference", methods=["POST"])
@@ -3285,7 +3708,7 @@ def internal_error(e):
 # Initialize DB pool at import time so gunicorn `app:app` works without a
 # factory call.  The `create_app()` factory is kept for backwards compat
 # (e.g. tests, one-off scripts) but is no longer required for production.
-init_db(pool_size=2)
+init_db(pool_size=5)
 
 
 def create_app() -> Flask:

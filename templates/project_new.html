@@ -47,7 +47,11 @@
             </div>
 
             <div style="margin-top: 2rem;">
+                {% if existing_project %}
+                <button type="submit" name="action" value="create_anyway" class="btn btn-primary" style="width: 100%;">{{ _('Create My Own') }}</button>
+                {% else %}
                 <button type="submit" class="btn btn-primary" style="width: 100%;">{{ _('Create Project') }}</button>
+                {% endif %}
             </div>
         </form>
     </div>

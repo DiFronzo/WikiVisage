@@ -62,9 +62,11 @@ The following are **out of scope**:
 - Whitelist enforcement on every request
 - Open redirect protection on login
 - Parameterized SQL queries (no string interpolation of values)
-- Rate limiting on sensitive endpoints
+- Rate limiting on sensitive endpoints (shared via Redis across gunicorn workers, falls back to in-memory)
 - Security headers (`Content-Security-Policy`, `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`, `Permissions-Policy`)
 - Input validation on bounding box coordinates
 - Image download size cap (50 MB) and pixel dimension validation
 - Distributed worker locking (`SELECT … FOR UPDATE`) with stale-claim expiry
+- Cross-project SDC write deduplication (`sdc_claims` table prevents duplicate P180 claims)
+- Membership-aware access control (project owners and members via `project_members`)
 - `maxlag` compliance on all Wikimedia API writes
