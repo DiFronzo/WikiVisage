@@ -175,7 +175,7 @@ msgstr "El cuadro delimitador está fuera del rango permitido"
 
 #: app.py:2093
 msgid "Too many face IDs in dismiss list"
-msgstr ""
+msgstr "Demasiados identificadores de rostro en la lista de descarte"
 
 #: app.py:2123 app.py:2548
 msgid ""
