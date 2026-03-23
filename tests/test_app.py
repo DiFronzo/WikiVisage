@@ -9516,6 +9516,8 @@ def test_api_reclassify_approve_marks_sdc_written_when_p180_exists(monkeypatch):
     def route_query(sql):
         if "FROM faces f " in sql and "old_is_target" in sql and "project_members" in sql:
             return [face_row]
+        if "FROM images i JOIN projects p" in sql and "commons_page_id" in sql:
+            return [{"commons_page_id": face_row["commons_page_id"], "wikidata_qid": face_row["wikidata_qid"]}]
         return []
 
     def eq(sql, params=None, fetch=True):

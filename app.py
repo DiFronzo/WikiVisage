@@ -627,6 +627,42 @@ def _check_p180_exists(commons_page_id: int, qid: str) -> bool:
         return False
 
 
+def _maybe_mark_sdc_written(face_id: int, image_id: int, project_id: int) -> bool:
+    """Check if a P180 (depicts) claim already exists on Commons for the image/QID pair.
+
+    If a matching claim is found, marks the face as ``sdc_written=1`` and the image
+    as ``bootstrapped=1`` to avoid showing the face as "SDC Pending".
+
+    Returns ``True`` if the face was marked as written, ``False`` otherwise.
+    Non-critical: swallows all exceptions with a debug-level log.
+    """
+    try:
+        meta = execute_query(
+            "SELECT i.commons_page_id, p.wikidata_qid "
+            "FROM images i JOIN projects p ON i.project_id = p.id "
+            "WHERE i.id = %s AND p.id = %s",
+            (image_id, project_id),
+        )
+        if meta and meta[0]["commons_page_id"]:
+            cpid = meta[0]["commons_page_id"]
+            qid = meta[0]["wikidata_qid"]
+            if _check_p180_exists(cpid, qid):
+                execute_query(
+                    "UPDATE faces SET sdc_written = 1 WHERE id = %s",
+                    (face_id,),
+                    fetch=False,
+                )
+                execute_query(
+                    "UPDATE images SET bootstrapped = 1 WHERE id = %s AND bootstrapped = 0",
+                    (image_id,),
+                    fetch=False,
+                )
+                return True
+    except Exception:
+        logger.debug("P180 existence check failed (non-critical)", exc_info=True)
+    return False
+
+
 def _fetch_p18_thumb_url(qid: str, width: int = 250) -> str | None:
     """
     Fetch P18 (image) property from Wikidata and return a Commons thumbnail URL.
@@ -1985,31 +2021,7 @@ def api_classify():
             affected_ids = execute_transaction(_classify_target)
 
             if affected_ids:
-                # Check if P180 already exists on Commons for this image/QID.
-                # If so, mark as already written to avoid showing as "SDC Pending".
-                try:
-                    meta = execute_query(
-                        "SELECT i.commons_page_id, p.wikidata_qid "
-                        "FROM images i JOIN projects p ON i.project_id = p.id "
-                        "WHERE i.id = %s AND p.id = %s",
-                        (image_id, project_id),
-                    )
-                    if meta and meta[0]["commons_page_id"]:
-                        cpid = meta[0]["commons_page_id"]
-                        qid = meta[0]["wikidata_qid"]
-                        if _check_p180_exists(cpid, qid):
-                            execute_query(
-                                "UPDATE faces SET sdc_written = 1 WHERE id = %s",
-                                (selected_face_id,),
-                                fetch=False,
-                            )
-                            execute_query(
-                                "UPDATE images SET bootstrapped = 1 WHERE id = %s AND bootstrapped = 0",
-                                (image_id,),
-                                fetch=False,
-                            )
-                except DatabaseError:
-                    logger.debug("P180 existence check failed (non-critical)", exc_info=True)
+                _maybe_mark_sdc_written(selected_face_id, image_id, project_id)
 
             session["last_classify"] = {
                 "project_id": project_id,
@@ -2297,31 +2309,7 @@ def api_manual_face():
         new_face_id, review_confirmed_ids = execute_transaction(_insert_manual_face)
 
         if new_face_id:
-            # Check if P180 already exists on Commons for this image/QID.
-            # If so, mark as already written to avoid showing as "SDC Pending".
-            try:
-                meta = execute_query(
-                    "SELECT i.commons_page_id, p.wikidata_qid "
-                    "FROM images i JOIN projects p ON i.project_id = p.id "
-                    "WHERE i.id = %s AND p.id = %s",
-                    (image_id, project_id),
-                )
-                if meta and meta[0]["commons_page_id"]:
-                    cpid = meta[0]["commons_page_id"]
-                    qid = meta[0]["wikidata_qid"]
-                    if _check_p180_exists(cpid, qid):
-                        execute_query(
-                            "UPDATE faces SET sdc_written = 1 WHERE id = %s",
-                            (new_face_id,),
-                            fetch=False,
-                        )
-                        execute_query(
-                            "UPDATE images SET bootstrapped = 1 WHERE id = %s AND bootstrapped = 0",
-                            (image_id,),
-                            fetch=False,
-                        )
-            except Exception:
-                logger.debug("P180 existence check failed (non-critical)", exc_info=True)
+            _maybe_mark_sdc_written(new_face_id, image_id, project_id)
 
             manual_key = f"manual_faces_{image_id}"
             manual_list = session.get(manual_key, [])
@@ -2572,21 +2560,8 @@ def api_reclassify():
 
         # When approving, check if P180 already exists on Commons
         if is_target == 1 and commons_page_id and not sdc_written:
-            try:
-                if _check_p180_exists(commons_page_id, wikidata_qid):
-                    execute_query(
-                        "UPDATE faces SET sdc_written = 1 WHERE id = %s",
-                        (face_id,),
-                        fetch=False,
-                    )
-                    execute_query(
-                        "UPDATE images SET bootstrapped = 1 WHERE id = %s AND bootstrapped = 0",
-                        (face_row["image_id"],),
-                        fetch=False,
-                    )
-                    sdc_written = 1
-            except DatabaseError:
-                logger.debug("P180 existence check failed (non-critical)", exc_info=True)
+            if _maybe_mark_sdc_written(face_id, face_row["image_id"], face_row["project_id"]):
+                sdc_written = 1
 
     except ValueError as e:
         if str(e) == "already_reviewed":
@@ -2726,22 +2701,7 @@ def api_update_face_bbox():
         new_face_id = execute_transaction(_update_bbox)
 
         if new_face_id and orig_is_target == 1 and not orig_sdc_written:
-            try:
-                cpid = face_row["commons_page_id"]
-                qid = face_row["wikidata_qid"]
-                if cpid and _check_p180_exists(cpid, qid):
-                    execute_query(
-                        "UPDATE faces SET sdc_written = 1 WHERE id = %s",
-                        (new_face_id,),
-                        fetch=False,
-                    )
-                    execute_query(
-                        "UPDATE images SET bootstrapped = 1 WHERE id = %s AND bootstrapped = 0",
-                        (image_id,),
-                        fetch=False,
-                    )
-            except Exception:
-                logger.debug("P180 existence check failed (non-critical)", exc_info=True)
+            _maybe_mark_sdc_written(new_face_id, image_id, face_row["project_id"])
 
         return jsonify(
             {
