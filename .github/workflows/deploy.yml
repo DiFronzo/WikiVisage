@@ -70,6 +70,7 @@ jobs:
           set -euo pipefail
           TAG="$1"
           DB_RESET="${2:-false}"
+          ACTOR="${3:-unknown}"
 
           case "$DB_RESET" in
             true|false) ;;
@@ -133,12 +134,15 @@ jobs:
           toolforge jobs run ml-worker-2 --command 'python -u worker.py --worker-id ml-worker-2' --image tool-wikivisage/tool-wikivisage:latest --continuous --mem 3Gi --cpu 2
           echo "==> Restarting webservice"
           toolforge webservice buildservice restart
-          echo "==> Deploy complete"
+          LOG_MSG="deployed $TAG (by $ACTOR)"
+          [ "$DB_RESET" = "true" ] && LOG_MSG="deployed $TAG with database wipe (by $ACTOR on GitHub)"
+          dologmsg "$LOG_MSG"
+          echo "==> Deploy complete (logged to SAL)"
           SCRIPT
 
           scp -i ~/.ssh/id_ed25519 /tmp/deploy.sh "${{ secrets.USERNAME }}@${{ secrets.HOST }}":/tmp/deploy.sh
           ssh -i ~/.ssh/id_ed25519 "${{ secrets.USERNAME }}@${{ secrets.HOST }}" \
-            "become wikivisage bash /tmp/deploy.sh '${TAG}' '${DB_RESET}'"
+            "become wikivisage bash /tmp/deploy.sh '${TAG}' '${DB_RESET}' '${{ github.actor }}'"
 
           echo "## 🚀 Deploy Summary" >> "$GITHUB_STEP_SUMMARY"
           echo "| | |" >> "$GITHUB_STEP_SUMMARY"

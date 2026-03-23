@@ -596,6 +596,37 @@ def _commons_category_exists(category: str) -> bool:
         return False
 
 
+def _commons_category_has_files(category: str) -> bool:
+    """Check whether a Commons category contains any files (directly or in subcategories).
+
+    Uses the ``categoryinfo`` property — a single lightweight API call.
+    Returns False if the category has 0 files and 0 subcategories, or on
+    API errors (fail-closed).
+    """
+    try:
+        resp = requests.get(
+            COMMONS_API_URL,
+            params={
+                "action": "query",
+                "titles": f"Category:{category}",
+                "prop": "categoryinfo",
+                "format": "json",
+            },
+            headers={"User-Agent": USER_AGENT},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        pages = resp.json().get("query", {}).get("pages", {})
+        if "-1" in pages:
+            return False
+        page = next(iter(pages.values()))
+        info = page.get("categoryinfo", {})
+        return info.get("files", 0) > 0 or info.get("subcats", 0) > 0
+    except Exception:
+        logger.debug(f"Failed to check Commons category files: {category}", exc_info=True)
+        return False
+
+
 def _check_p180_exists(commons_page_id: int, qid: str) -> bool:
     """Check whether a P180 (depicts) claim for *qid* already exists on a Commons media item.
 
@@ -1013,27 +1044,13 @@ def get_project_for_actor(project_id: int, user_id: int, *, require_owner: bool 
     return rows[0] if rows else None
 
 
-def verify_image_ownership(image_id: int, project_id: int, user_id: int) -> dict | None:
-    """Confirm *image_id* belongs to a non-deleted project of *user_id*.
-
-    Returns the image row (``id``, ``file_title``) or ``None``.
-    """
-    rows = execute_query(
-        "SELECT i.id, i.file_title FROM images i "
-        "JOIN projects p ON i.project_id = p.id "
-        "WHERE i.id = %s AND p.id = %s AND p.user_id = %s AND p.status != 'deleted'",
-        (image_id, project_id, user_id),
-    )
-    return rows[0] if rows else None
-
-
 def verify_image_access(image_id: int, project_id: int, user_id: int) -> dict | None:
     """Confirm *image_id* belongs to a project accessible to *user_id* (owner or member).
 
     Returns the image row (``id``, ``file_title``) or ``None``.
     """
     rows = execute_query(
-        "SELECT i.id, i.file_title FROM images i "
+        "SELECT i.id, i.file_title, i.status FROM images i "
         "JOIN projects p ON i.project_id = p.id "
         "LEFT JOIN project_members pm ON pm.project_id = p.id AND pm.user_id = %s AND pm.status = 'active' "
         "WHERE i.id = %s AND p.id = %s AND p.status != 'deleted' "
@@ -1356,12 +1373,19 @@ def project_new():
                 )
             )
 
-    # Validate Commons category exists
+    # Validate Commons category exists and has files
     if not errors and commons_category:
         if not _commons_category_exists(commons_category):
             errors.append(
                 _(
                     'The Commons category "%(category)s" does not exist.',
+                    category=commons_category,
+                )
+            )
+        elif not _commons_category_has_files(commons_category):
+            errors.append(
+                _(
+                    'The Commons category "%(category)s" exists but contains no files.',
                     category=commons_category,
                 )
             )
@@ -1600,6 +1624,36 @@ def project_detail(project_id: int):
             pending_images = pending_row[0]["cnt"] if pending_row else 0
         except DatabaseError:
             pass
+
+    # Auto-complete when processing is done but no usable faces exist.
+    # Mirrors the worker's check so the user gets immediate feedback.
+    total_faces = face_stats.get("total_faces") or 0
+    images_total = project.get("images_total") or 0
+    if (
+        project.get("status") == "active"
+        and pending_images == 0
+        and images_total > 0
+        and not project.get("completion_reason")
+    ):
+        min_confirmed = project.get("min_confirmed") or 5
+        reason = None
+        if total_faces == 0:
+            reason = "no_faces"
+        elif total_faces <= 5 and total_faces < min_confirmed:
+            reason = "insufficient_faces"
+
+        if reason:
+            try:
+                execute_query(
+                    "UPDATE projects SET status = 'completed', completion_reason = %s "
+                    "WHERE id = %s AND status = 'active'",
+                    (reason, project_id),
+                    fetch=False,
+                )
+                project["status"] = "completed"
+                project["completion_reason"] = reason
+            except DatabaseError:
+                pass
 
     # Count faces eligible for model inference (mirrors worker's filter)
     inference_eligible = 0
@@ -2210,6 +2264,9 @@ def api_manual_face():
     except DatabaseError:
         return jsonify({"error": _("Database error")}), 500
 
+    if img.get("status") != "processed":
+        return jsonify({"error": _("Image has not finished processing yet")}), 409
+
     file_title = img["file_title"]
     clean_title = file_title[5:] if file_title.startswith("File:") else file_title
     url = FILE_PATH_URL.format(file_title=clean_title)
@@ -2627,6 +2684,7 @@ def api_update_face_bbox():
         rows = execute_query(
             "SELECT f.id, f.image_id, f.is_target, f.classified_by, f.confidence, "
             "  f.classified_by_user_id, f.sdc_written, i.file_title, i.commons_page_id, "
+            "  i.status AS image_status, "
             "  p.id AS project_id, p.wikidata_qid "
             "FROM faces f "
             "JOIN images i ON f.image_id = i.id "
@@ -2642,6 +2700,8 @@ def api_update_face_bbox():
         return jsonify({"error": _("Database error")}), 500
 
     face_row = rows[0]
+    if face_row.get("image_status") != "processed":
+        return jsonify({"error": _("Image has not finished processing yet")}), 409
     image_id = face_row["image_id"]
     orig_is_target = face_row["is_target"]
     orig_confidence = face_row["confidence"]
@@ -3226,7 +3286,7 @@ def project_settings(project_id: int):
     try:
         execute_query(
             "UPDATE projects SET distance_threshold = %s, min_confirmed = %s, "
-            "status = %s, label = %s WHERE id = %s AND user_id = %s",
+            "status = %s, label = %s, completion_reason = NULL WHERE id = %s AND user_id = %s",
             (
                 distance_threshold,
                 min_confirmed,

@@ -69,7 +69,7 @@ The landing page and `/health` endpoint work without OAuth. See [test-local.md](
 | `database.py` | MariaDB connection pool with retry logic |
 | `schema.sql` | DDL for 9 tables + indexes |
 | `migrate.py` | Idempotent schema migrations with `--reset` flag |
-| `templates/` | Jinja2 templates (9 files, all extend `base.html`) |
+| `templates/` | Jinja2 templates (10 files, all extend `base.html`) |
 | `translations/` | i18n files (en, nb, es, fr) |
 | `tests/` | Hybrid test suite: unit + integration tests |
 | `jobs.yaml` | Toolforge jobs definition (2 worker instances) |

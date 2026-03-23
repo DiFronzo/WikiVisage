@@ -355,6 +355,12 @@ _ALTER_MIGRATIONS = [
         "ALTER TABLE images MODIFY COLUMN status "
         "ENUM('pending', 'processed', 'enriched', 'error', 'skipped') NOT NULL DEFAULT 'pending'",
     ),
+    (
+        "Add completion_reason to projects for worker auto-completion",
+        "ALTER TABLE projects ADD COLUMN completion_reason "
+        "ENUM('no_faces', 'insufficient_faces') NULL "
+        "COMMENT 'Why the project was auto-completed by the worker' AFTER status",
+    ),
 ]
 
 

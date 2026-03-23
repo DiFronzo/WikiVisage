@@ -98,6 +98,11 @@ msgstr ""
 msgid "The Commons category \"%(category)s\" does not exist."
 msgstr "The Commons category \"%(category)s\" does not exist."
 
+#: app.py
+#, python-format
+msgid "The Commons category \"%(category)s\" exists but contains no files."
+msgstr "The Commons category \"%(category)s\" exists but contains no files."
+
 #: app.py:1322
 msgid "A project with this Q-ID and category already exists."
 msgstr "A project with this Q-ID and category already exists."
@@ -142,6 +147,10 @@ msgstr "Invalid field values"
 #: app.py:1815 app.py:1979 app.py:2101
 msgid "Image not found or access denied"
 msgstr "Image not found or access denied"
+
+#: app.py
+msgid "Image has not finished processing yet"
+msgstr "Image has not finished processing yet"
 
 #: app.py:1817 app.py:1981 app.py:2103 app.py:2355 app.py:2376 app.py:2386
 #: app.py:2525 app.py:2620 app.py:2641 app.py:2669 app.py:2692 app.py:2713
@@ -1629,11 +1638,15 @@ msgstr "{files} files across {subcats} subcategories"
 msgid "{files}+ files across {subcats}+ subcategories (estimate)"
 msgstr "{files}+ files across {subcats}+ subcategories (estimate)"
 
-#: templates/project_new.html:65
+#: templates/project_new.html:66
 msgid "Category not found on Commons."
 msgstr "Category not found on Commons."
 
 #: templates/project_new.html:66
+msgid "This category exists on Commons but contains no files."
+msgstr "This category exists on Commons but contains no files."
+
+#: templates/project_new.html:67
 msgid "Could not reach Commons API."
 msgstr "Could not reach Commons API."
 
@@ -1816,6 +1829,46 @@ msgid ""
 msgstr ""
 "Revoke the invite code? Existing members will not be affected, but no new"
 " members can join with this code."
+
+#: templates/project_detail.html
+msgid ""
+"No faces were detected in any of the images in this category. The project"
+" has been automatically completed."
+msgstr ""
+"No faces were detected in any of the images in this category. The project"
+" has been automatically completed."
+
+#: templates/project_detail.html
+msgid "You can reactivate this project from"
+msgstr "You can reactivate this project from"
+
+#: templates/project_detail.html
+msgid "if images are added to the category later."
+msgstr "if images are added to the category later."
+
+#: templates/project_detail.html
+msgid ""
+"The project owner can reactivate this project if images are added to the"
+" category later."
+msgstr ""
+"The project owner can reactivate this project if images are added to the"
+" category later."
+
+#: templates/project_detail.html
+msgid ""
+"Too few faces were detected to reach autonomous inference. The project has"
+" been automatically completed."
+msgstr ""
+"Too few faces were detected to reach autonomous inference. The project has"
+" been automatically completed."
+
+#: templates/project_detail.html
+msgid "You can reactivate this project and lower the min_confirmed setting in"
+msgstr "You can reactivate this project and lower the min_confirmed setting in"
+
+#: templates/project_detail.html
+msgid "The project owner can reactivate this project and adjust settings."
+msgstr "The project owner can reactivate this project and adjust settings."
 
 #~ msgid "2. Active Learning"
 #~ msgstr "2. Active Learning"

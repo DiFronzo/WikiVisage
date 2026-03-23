@@ -97,6 +97,11 @@ msgstr ""
 msgid "The Commons category \"%(category)s\" does not exist."
 msgstr "La catégorie Commons \"%(category)s\" n'existe pas."
 
+#: app.py
+#, python-format
+msgid "The Commons category \"%(category)s\" exists but contains no files."
+msgstr "La catégorie Commons \"%(category)s\" existe mais ne contient aucun fichier."
+
 #: app.py:1322
 msgid "A project with this Q-ID and category already exists."
 msgstr "Un projet avec ce Q-ID et cette catégorie existe déjà."
@@ -142,6 +147,10 @@ msgstr "Valeurs de champ invalides"
 #: app.py:1815 app.py:1979 app.py:2101
 msgid "Image not found or access denied"
 msgstr "Image non trouvée ou accès refusé"
+
+#: app.py
+msgid "Image has not finished processing yet"
+msgstr "L'image n'a pas encore fini d'être traitée"
 
 #: app.py:1817 app.py:1981 app.py:2103 app.py:2355 app.py:2376 app.py:2386
 #: app.py:2525 app.py:2620 app.py:2641 app.py:2669 app.py:2692 app.py:2713
@@ -1671,11 +1680,15 @@ msgstr "{files} fichiers dans {subcats} sous-catégories"
 msgid "{files}+ files across {subcats}+ subcategories (estimate)"
 msgstr "{files}+ fichiers dans {subcats}+ sous-catégories (estimation)"
 
-#: templates/project_new.html:65
+#: templates/project_new.html:66
 msgid "Category not found on Commons."
 msgstr "Catégorie introuvable sur Commons."
 
 #: templates/project_new.html:66
+msgid "This category exists on Commons but contains no files."
+msgstr "Cette catégorie existe sur Commons mais ne contient aucun fichier."
+
+#: templates/project_new.html:67
 msgid "Could not reach Commons API."
 msgstr "Impossible de contacter l'API de Commons."
 
@@ -1864,6 +1877,46 @@ msgid ""
 msgstr ""
 "Révoquer le code d'invitation ? Les membres existants ne seront pas "
 "affectés, mais aucun nouveau membre ne pourra rejoindre avec ce code."
+
+#: templates/project_detail.html
+msgid ""
+"No faces were detected in any of the images in this category. The project"
+" has been automatically completed."
+msgstr ""
+"Aucun visage n'a été détecté dans les images de cette catégorie. Le projet "
+"a été automatiquement terminé."
+
+#: templates/project_detail.html
+msgid "You can reactivate this project from"
+msgstr "Vous pouvez réactiver ce projet depuis"
+
+#: templates/project_detail.html
+msgid "if images are added to the category later."
+msgstr "si des images sont ajoutées à la catégorie plus tard."
+
+#: templates/project_detail.html
+msgid ""
+"The project owner can reactivate this project if images are added to the"
+" category later."
+msgstr ""
+"Le propriétaire du projet peut réactiver ce projet si des images sont "
+"ajoutées à la catégorie plus tard."
+
+#: templates/project_detail.html
+msgid ""
+"Too few faces were detected to reach autonomous inference. The project has"
+" been automatically completed."
+msgstr ""
+"Trop peu de visages ont été détectés pour atteindre l'inférence autonome. "
+"Le projet a été automatiquement terminé."
+
+#: templates/project_detail.html
+msgid "You can reactivate this project and lower the min_confirmed setting in"
+msgstr "Vous pouvez réactiver ce projet et réduire le paramètre min_confirmed dans"
+
+#: templates/project_detail.html
+msgid "The project owner can reactivate this project and adjust settings."
+msgstr "Le propriétaire du projet peut réactiver ce projet et ajuster les paramètres."
 
 #~ msgid "The model says this is <strong>not %(name)s</strong>. Is that correct?"
 #~ msgstr ""

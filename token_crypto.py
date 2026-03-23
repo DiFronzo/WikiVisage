@@ -107,8 +107,3 @@ def decrypt_token(stored: str | bytes) -> str:
         # Value does not look like a Fernet token: treat as legacy plaintext stored
         # before encryption was enabled and return it unchanged.
         return stored
-
-
-def is_encryption_enabled() -> bool:
-    """Return True when token encryption is active."""
-    return _fernet is not None

@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS projects (
     distance_threshold  FLOAT           NOT NULL DEFAULT 0.6 COMMENT 'Face distance threshold for autonomous inference',
     min_confirmed       INT UNSIGNED    NOT NULL DEFAULT 5 COMMENT 'Minimum confirmed faces before autonomous mode',
     status              ENUM('active', 'paused', 'completed', 'deleted') NOT NULL DEFAULT 'active',
+    completion_reason   ENUM('no_faces', 'insufficient_faces') NULL COMMENT 'Why the project was auto-completed by the worker',
     p18_thumb_url       VARCHAR(1024)   NULL COMMENT 'Cached Wikidata P18 image thumbnail URL',
     images_total        INT UNSIGNED    NOT NULL DEFAULT 0,
     images_processed    INT UNSIGNED    NOT NULL DEFAULT 0,

@@ -2590,6 +2590,54 @@ def process_project(project: dict[str, Any], *, skip_discovery: bool = False) ->
                 break
         t_images = time.monotonic() - t0
 
+        # 3b. Auto-complete if no faces or insufficient faces detected
+        if not shutdown_requested and _is_still_active():
+            face_count_row = execute_query(
+                "SELECT COUNT(*) AS cnt FROM faces f "
+                "JOIN images i ON f.image_id = i.id "
+                "WHERE i.project_id = %s AND f.superseded_by IS NULL",
+                (project_id,),
+                fetch=True,
+            )
+            total_faces = face_count_row[0]["cnt"] if face_count_row else 0
+            min_confirmed = project.get("min_confirmed", 5)
+
+            if total_faces == 0:
+                execute_query(
+                    "UPDATE projects SET status = 'completed', completion_reason = 'no_faces' "
+                    "WHERE id = %s AND status = 'active'",
+                    (project_id,),
+                    fetch=False,
+                )
+                logger.info(f"Project {project_id}: 0 faces detected, auto-completed (no_faces)")
+                t_total = time.monotonic() - t_project_start
+                logger.info(
+                    f"--- Project {project['id']} complete: "
+                    f"traversal={t_traversal:.1f}s, bootstrap={t_bootstrap:.1f}s, "
+                    f"images={t_images:.1f}s ({total_processed} processed), "
+                    f"inference=skipped, total={t_total:.1f}s ---"
+                )
+                return
+            elif total_faces <= 5 and total_faces < min_confirmed:
+                execute_query(
+                    "UPDATE projects SET status = 'completed', completion_reason = 'insufficient_faces' "
+                    "WHERE id = %s AND status = 'active'",
+                    (project_id,),
+                    fetch=False,
+                )
+                logger.info(
+                    f"Project {project_id}: only {total_faces} faces detected "
+                    f"(need {min_confirmed}), auto-completed (insufficient_faces)"
+                )
+                t_total = time.monotonic() - t_project_start
+                logger.info(
+                    f"--- Project {project['id']} complete: "
+                    f"traversal={t_traversal:.1f}s, bootstrap={t_bootstrap:.1f}s, "
+                    f"images={t_images:.1f}s ({total_processed} processed), "
+                    f"inference=skipped, total={t_total:.1f}s ---"
+                )
+                return
+
         # 4. Final Autonomous Inference (catch any remaining unclassified faces)
         t0 = time.monotonic()
         if not shutdown_requested and _is_still_active():

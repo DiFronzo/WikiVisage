@@ -23,6 +23,7 @@ with patch("database.init_db"):
         _release_project,
         bootstrap_from_sparql,
         process_images,
+        process_project,
         run_autonomous_inference,
         write_sdc_claims,
     )
@@ -1239,3 +1240,185 @@ def test_bootstrap_at_cap_does_not_insert_new_images():
 
     inserts = [sql for sql, _ in db_calls if "INSERT IGNORE INTO images" in sql]
     assert len(inserts) == 0
+
+
+def test_process_project_auto_completes_no_faces():
+    """process_project sets status=completed, completion_reason=no_faces when 0 faces detected."""
+    project = {
+        "id": 99,
+        "user_id": 1,
+        "wikidata_qid": "Q42",
+        "commons_category": "Empty_Category",
+        "status": "active",
+        "distance_threshold": 0.6,
+        "min_confirmed": 5,
+    }
+    update_calls = []
+
+    def mock_eq(sql, params=None, fetch=True):
+        sql_s = sql if isinstance(sql, str) else str(sql)
+        # _is_still_active check
+        if "SELECT status, worker_claimed_by FROM projects" in sql_s:
+            return [{"status": "active", "worker_claimed_by": "test-worker"}]
+        if "UPDATE projects SET worker_claimed_at" in sql_s:
+            return 1
+        # Face count check — 0 faces
+        if "COUNT(*) AS cnt FROM faces" in sql_s:
+            return [{"cnt": 0}]
+        # Auto-complete UPDATE
+        if "UPDATE projects SET status = 'completed'" in sql_s:
+            update_calls.append((sql_s, params))
+            return 1
+        return ()
+
+    with (
+        patch("worker.execute_query", side_effect=mock_eq),
+        patch("worker.traverse_category", return_value=0),
+        patch("worker.bootstrap_from_sparql", return_value=0),
+        patch("worker.process_images", return_value=0),
+        patch("worker.run_autonomous_inference") as mock_inference,
+        patch("worker.shutdown_requested", False),
+        patch("worker._worker_id", "test-worker"),
+    ):
+        process_project(project)
+
+    # Should have called UPDATE with completion_reason = 'no_faces'
+    assert len(update_calls) == 1
+    assert "no_faces" in update_calls[0][0]
+    # Should NOT have called inference
+    mock_inference.assert_not_called()
+
+
+def test_process_project_auto_completes_insufficient_faces():
+    """process_project sets status=completed, completion_reason=insufficient_faces when ≤5 faces < min_confirmed."""
+    project = {
+        "id": 100,
+        "user_id": 1,
+        "wikidata_qid": "Q42",
+        "commons_category": "Few_Faces",
+        "status": "active",
+        "distance_threshold": 0.6,
+        "min_confirmed": 5,
+    }
+    update_calls = []
+
+    def mock_eq(sql, params=None, fetch=True):
+        sql_s = sql if isinstance(sql, str) else str(sql)
+        if "SELECT status, worker_claimed_by FROM projects" in sql_s:
+            return [{"status": "active", "worker_claimed_by": "test-worker"}]
+        if "UPDATE projects SET worker_claimed_at" in sql_s:
+            return 1
+        # 3 faces detected — less than min_confirmed=5 and ≤5
+        if "COUNT(*) AS cnt FROM faces" in sql_s:
+            return [{"cnt": 3}]
+        if "UPDATE projects SET status = 'completed'" in sql_s:
+            update_calls.append((sql_s, params))
+            return 1
+        return ()
+
+    with (
+        patch("worker.execute_query", side_effect=mock_eq),
+        patch("worker.traverse_category", return_value=0),
+        patch("worker.bootstrap_from_sparql", return_value=0),
+        patch("worker.process_images", return_value=0),
+        patch("worker.run_autonomous_inference") as mock_inference,
+        patch("worker.shutdown_requested", False),
+        patch("worker._worker_id", "test-worker"),
+    ):
+        process_project(project)
+
+    assert len(update_calls) == 1
+    assert "insufficient_faces" in update_calls[0][0]
+    mock_inference.assert_not_called()
+
+
+def test_process_project_no_auto_complete_when_enough_faces():
+    """process_project does NOT auto-complete when faces > 5."""
+    project = {
+        "id": 101,
+        "user_id": 1,
+        "wikidata_qid": "Q42",
+        "commons_category": "Many_Faces",
+        "status": "active",
+        "distance_threshold": 0.6,
+        "min_confirmed": 5,
+    }
+    auto_complete_calls = []
+
+    def mock_eq(sql, params=None, fetch=True):
+        sql_s = sql if isinstance(sql, str) else str(sql)
+        if "SELECT status, worker_claimed_by FROM projects" in sql_s:
+            return [{"status": "active", "worker_claimed_by": "test-worker"}]
+        if "UPDATE projects SET worker_claimed_at" in sql_s:
+            return 1
+        # 10 faces detected — above threshold
+        if "COUNT(*) AS cnt FROM faces" in sql_s:
+            return [{"cnt": 10}]
+        if "UPDATE projects SET status = 'completed'" in sql_s:
+            auto_complete_calls.append((sql_s, params))
+            return 1
+        # Fresh project fetch for inference
+        if "SELECT * FROM projects WHERE id" in sql_s:
+            return [project.copy()]
+        return ()
+
+    with (
+        patch("worker.execute_query", side_effect=mock_eq),
+        patch("worker.traverse_category", return_value=0),
+        patch("worker.bootstrap_from_sparql", return_value=0),
+        patch("worker.process_images", return_value=0),
+        patch("worker.run_autonomous_inference") as mock_inference,
+        patch("worker.shutdown_requested", False),
+        patch("worker._worker_id", "test-worker"),
+    ):
+        process_project(project)
+
+    # Should NOT auto-complete
+    assert len(auto_complete_calls) == 0
+    # Should have called inference
+    mock_inference.assert_called_once()
+
+
+def test_process_project_no_auto_complete_faces_at_min_confirmed():
+    """process_project does NOT auto-complete when faces ≤5 but >= min_confirmed."""
+    project = {
+        "id": 102,
+        "user_id": 1,
+        "wikidata_qid": "Q42",
+        "commons_category": "Exact_Min",
+        "status": "active",
+        "distance_threshold": 0.6,
+        "min_confirmed": 3,
+    }
+    auto_complete_calls = []
+
+    def mock_eq(sql, params=None, fetch=True):
+        sql_s = sql if isinstance(sql, str) else str(sql)
+        if "SELECT status, worker_claimed_by FROM projects" in sql_s:
+            return [{"status": "active", "worker_claimed_by": "test-worker"}]
+        if "UPDATE projects SET worker_claimed_at" in sql_s:
+            return 1
+        # 3 faces = min_confirmed, so should NOT auto-complete even though ≤5
+        if "COUNT(*) AS cnt FROM faces" in sql_s:
+            return [{"cnt": 3}]
+        if "UPDATE projects SET status = 'completed'" in sql_s:
+            auto_complete_calls.append((sql_s, params))
+            return 1
+        if "SELECT * FROM projects WHERE id" in sql_s:
+            return [project.copy()]
+        return ()
+
+    with (
+        patch("worker.execute_query", side_effect=mock_eq),
+        patch("worker.traverse_category", return_value=0),
+        patch("worker.bootstrap_from_sparql", return_value=0),
+        patch("worker.process_images", return_value=0),
+        patch("worker.run_autonomous_inference") as mock_inference,
+        patch("worker.shutdown_requested", False),
+        patch("worker._worker_id", "test-worker"),
+    ):
+        process_project(project)
+
+    # faces >= min_confirmed → no auto-complete
+    assert len(auto_complete_calls) == 0
+    mock_inference.assert_called_once()

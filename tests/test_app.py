@@ -1453,6 +1453,56 @@ def test_commons_category_exists_calls_commons_api_with_expected_params(monkeypa
     assert captured["timeout"] == 10
 
 
+def test_commons_category_has_files_true_when_files_present(monkeypatch):
+    monkeypatch.setattr(
+        app_module.requests,
+        "get",
+        lambda *_a, **_kw: _MockResponse({"query": {"pages": {"123": {"categoryinfo": {"files": 5, "subcats": 0}}}}}),
+    )
+    assert app_module._commons_category_has_files("People") is True
+
+
+def test_commons_category_has_files_true_when_only_subcats(monkeypatch):
+    monkeypatch.setattr(
+        app_module.requests,
+        "get",
+        lambda *_a, **_kw: _MockResponse({"query": {"pages": {"123": {"categoryinfo": {"files": 0, "subcats": 3}}}}}),
+    )
+    assert app_module._commons_category_has_files("People") is True
+
+
+def test_commons_category_has_files_false_when_empty(monkeypatch):
+    monkeypatch.setattr(
+        app_module.requests,
+        "get",
+        lambda *_a, **_kw: _MockResponse({"query": {"pages": {"123": {"categoryinfo": {"files": 0, "subcats": 0}}}}}),
+    )
+    assert app_module._commons_category_has_files("EmptyCat") is False
+
+
+def test_commons_category_has_files_false_when_no_categoryinfo(monkeypatch):
+    monkeypatch.setattr(
+        app_module.requests,
+        "get",
+        lambda *_a, **_kw: _MockResponse({"query": {"pages": {"123": {}}}}),
+    )
+    assert app_module._commons_category_has_files("NoCatInfo") is False
+
+
+def test_commons_category_has_files_false_on_missing_page(monkeypatch):
+    monkeypatch.setattr(
+        app_module.requests,
+        "get",
+        lambda *_a, **_kw: _MockResponse({"query": {"pages": {"-1": {"missing": ""}}}}),
+    )
+    assert app_module._commons_category_has_files("Missing") is False
+
+
+def test_commons_category_has_files_false_on_error(monkeypatch):
+    monkeypatch.setattr(app_module.requests, "get", lambda *_a, **_kw: (_ for _ in ()).throw(RuntimeError("boom")))
+    assert app_module._commons_category_has_files("People") is False
+
+
 def test_fetch_p18_thumb_url_returns_none_when_no_claims(monkeypatch):
     monkeypatch.setattr(app_module.requests, "get", lambda *_a, **_kw: _MockResponse({"claims": {"P18": []}}))
     assert app_module._fetch_p18_thumb_url("Q42") is None
@@ -2802,6 +2852,25 @@ def test_project_new_post_missing_commons_category_on_wikimedia_flashes_error(mo
     assert any("does not exist" in msg for _cat, msg in _flashes_chunk3(client))
 
 
+def test_project_new_post_empty_commons_category_flashes_error(monkeypatch):
+    captured = _capture_render(monkeypatch)
+    client, _ = _make_authenticated_client_chunk3(monkeypatch)
+    _set_csrf_chunk3(client)
+
+    monkeypatch.setattr(app_module, "_is_human_entity", lambda _qid: True)
+    monkeypatch.setattr(app_module, "_commons_category_exists", lambda _category: True)
+    monkeypatch.setattr(app_module, "_commons_category_has_files", lambda _category: False)
+
+    response = client.post(
+        "/project/new",
+        data={"csrf_token": "testtoken", "wikidata_qid": "Q42", "commons_category": "EmptyCat"},
+    )
+
+    assert response.status_code == 200
+    assert captured["template"] == "project_new.html"
+    assert any("exists but contains no files" in msg for _cat, msg in _flashes_chunk3(client))
+
+
 def test_project_new_post_duplicate_project_renders_form(monkeypatch):
     captured = _capture_render(monkeypatch)
     fake_user = _fake_user_chunk3()
@@ -2815,6 +2884,7 @@ def test_project_new_post_duplicate_project_renders_form(monkeypatch):
 
     monkeypatch.setattr(app_module, "_is_human_entity", lambda _qid: True)
     monkeypatch.setattr(app_module, "_commons_category_exists", lambda _category: True)
+    monkeypatch.setattr(app_module, "_commons_category_has_files", lambda _category: True)
     monkeypatch.setattr(app_module, "_fetch_p18_thumb_url", lambda _qid: "thumb")
     monkeypatch.setattr(app_module, "_fetch_wikidata_label", lambda _qid: "Label")
 
@@ -2849,6 +2919,7 @@ def test_project_new_duplicate_check_db_error_continues_to_create(monkeypatch):
 
     monkeypatch.setattr(app_module, "_is_human_entity", lambda _qid: True)
     monkeypatch.setattr(app_module, "_commons_category_exists", lambda _category: True)
+    monkeypatch.setattr(app_module, "_commons_category_has_files", lambda _category: True)
     monkeypatch.setattr(app_module, "_fetch_p18_thumb_url", lambda _qid: "thumb-q42")
     monkeypatch.setattr(app_module, "_fetch_wikidata_label", lambda _qid: "Douglas Adams")
     monkeypatch.setattr("builtins.open", MagicMock())
@@ -2885,6 +2956,7 @@ def test_project_new_join_while_banned_creates_own_project(monkeypatch):
 
     monkeypatch.setattr(app_module, "_is_human_entity", lambda _qid: True)
     monkeypatch.setattr(app_module, "_commons_category_exists", lambda _category: True)
+    monkeypatch.setattr(app_module, "_commons_category_has_files", lambda _category: True)
     monkeypatch.setattr(app_module, "_fetch_p18_thumb_url", lambda _qid: "thumb")
     monkeypatch.setattr(app_module, "_fetch_wikidata_label", lambda _qid: "Label")
     monkeypatch.setattr("builtins.open", MagicMock())
@@ -2921,6 +2993,7 @@ def test_project_new_successful_creation_with_label_fetch_and_p18(monkeypatch):
 
     monkeypatch.setattr(app_module, "_is_human_entity", lambda _qid: True)
     monkeypatch.setattr(app_module, "_commons_category_exists", lambda _category: True)
+    monkeypatch.setattr(app_module, "_commons_category_has_files", lambda _category: True)
     monkeypatch.setattr(app_module, "_fetch_p18_thumb_url", lambda _qid: "https://thumb")
 
     def _fetch_label(_qid):
@@ -2967,6 +3040,7 @@ def test_project_new_successful_creation_with_user_label_skips_wikidata_label_fe
 
     monkeypatch.setattr(app_module, "_is_human_entity", lambda _qid: True)
     monkeypatch.setattr(app_module, "_commons_category_exists", lambda _category: True)
+    monkeypatch.setattr(app_module, "_commons_category_has_files", lambda _category: True)
     monkeypatch.setattr(app_module, "_fetch_p18_thumb_url", lambda _qid: "thumb")
 
     def _fetch_label(_qid):
@@ -3012,6 +3086,7 @@ def test_project_new_successful_creation_with_missing_p18_thumb(monkeypatch):
 
     monkeypatch.setattr(app_module, "_is_human_entity", lambda _qid: True)
     monkeypatch.setattr(app_module, "_commons_category_exists", lambda _category: True)
+    monkeypatch.setattr(app_module, "_commons_category_has_files", lambda _category: True)
     monkeypatch.setattr(app_module, "_fetch_p18_thumb_url", lambda _qid: None)
     monkeypatch.setattr(app_module, "_fetch_wikidata_label", lambda _qid: "Label")
     monkeypatch.setattr("builtins.open", MagicMock())
@@ -3043,6 +3118,7 @@ def test_project_new_wake_file_oserror_is_non_critical(monkeypatch):
 
     monkeypatch.setattr(app_module, "_is_human_entity", lambda _qid: True)
     monkeypatch.setattr(app_module, "_commons_category_exists", lambda _category: True)
+    monkeypatch.setattr(app_module, "_commons_category_has_files", lambda _category: True)
     monkeypatch.setattr(app_module, "_fetch_p18_thumb_url", lambda _qid: "thumb")
     monkeypatch.setattr(app_module, "_fetch_wikidata_label", lambda _qid: "Label")
 
@@ -3079,6 +3155,7 @@ def test_project_new_db_error_on_insert_renders_form_with_error(monkeypatch):
 
     monkeypatch.setattr(app_module, "_is_human_entity", lambda _qid: True)
     monkeypatch.setattr(app_module, "_commons_category_exists", lambda _category: True)
+    monkeypatch.setattr(app_module, "_commons_category_has_files", lambda _category: True)
     monkeypatch.setattr(app_module, "_fetch_p18_thumb_url", lambda _qid: "thumb")
     monkeypatch.setattr(app_module, "_fetch_wikidata_label", lambda _qid: "Label")
 
@@ -4115,7 +4192,7 @@ def test_api_classify_ownership_check_fail(monkeypatch):
                     "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
                 }
             ]
-        if "SELECT i.id, i.file_title FROM images i" in sql:
+        if "SELECT i.id, i.file_title, i.status FROM images i" in sql:
             return ()
         return ()
 
@@ -4142,7 +4219,7 @@ def test_api_classify_ownership_check_db_error(monkeypatch):
                     "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
                 }
             ]
-        if "SELECT i.id, i.file_title FROM images i" in sql:
+        if "SELECT i.id, i.file_title, i.status FROM images i" in sql:
             raise app_module.DatabaseError("db")
         return ()
 
@@ -4171,8 +4248,8 @@ def test_api_classify_invalid_selected_face_id(monkeypatch):
                     "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
                 }
             ]
-        if "SELECT i.id, i.file_title FROM images i" in sql:
-            return [{"id": 2, "file_title": "File:Test.jpg"}]
+        if "SELECT i.id, i.file_title, i.status FROM images i" in sql:
+            return [{"id": 2, "file_title": "File:Test.jpg", "status": "processed"}]
         return ()
 
     client, _ = _auth_client_chunk4(monkeypatch, eq)
@@ -4183,7 +4260,7 @@ def test_api_classify_invalid_selected_face_id(monkeypatch):
     )
     assert response.status_code == 400
     assert response.get_json()["error"] == "Invalid face ID"
-    assert any("SELECT i.id, i.file_title FROM images i" in q[0] for q in queries)
+    assert any("SELECT i.id, i.file_title, i.status FROM images i" in q[0] for q in queries)
 
 
 def test_api_classify_none_normal_mode_sets_last_classify(monkeypatch):
@@ -4201,8 +4278,8 @@ def test_api_classify_none_normal_mode_sets_last_classify(monkeypatch):
                     "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
                 }
             ]
-        if "SELECT i.id, i.file_title FROM images i" in sql:
-            return [{"id": 22, "file_title": "File:Test.jpg"}]
+        if "SELECT i.id, i.file_title, i.status FROM images i" in sql:
+            return [{"id": 22, "file_title": "File:Test.jpg", "status": "processed"}]
         return ()
 
     def tx(fn):
@@ -4248,8 +4325,8 @@ def test_api_classify_none_review_mode_updates_human_flags(monkeypatch):
                     "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
                 }
             ]
-        if "SELECT i.id, i.file_title FROM images i" in sql:
-            return [{"id": 22, "file_title": "File:Test.jpg"}]
+        if "SELECT i.id, i.file_title, i.status FROM images i" in sql:
+            return [{"id": 22, "file_title": "File:Test.jpg", "status": "processed"}]
         return ()
 
     def tx(fn):
@@ -4291,8 +4368,8 @@ def test_api_classify_none_bootstrapped_without_sibling_queues_removal(monkeypat
                     "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
                 }
             ]
-        if "SELECT i.id, i.file_title FROM images i" in sql:
-            return [{"id": 22, "file_title": "File:Test.jpg"}]
+        if "SELECT i.id, i.file_title, i.status FROM images i" in sql:
+            return [{"id": 22, "file_title": "File:Test.jpg", "status": "processed"}]
         return ()
 
     def tx(fn):
@@ -4328,8 +4405,8 @@ def test_api_classify_none_bootstrapped_with_sibling_does_not_queue_removal(monk
                     "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
                 }
             ]
-        if "SELECT i.id, i.file_title FROM images i" in sql:
-            return [{"id": 22, "file_title": "File:Test.jpg"}]
+        if "SELECT i.id, i.file_title, i.status FROM images i" in sql:
+            return [{"id": 22, "file_title": "File:Test.jpg", "status": "processed"}]
         return ()
 
     def tx(fn):
@@ -4365,8 +4442,8 @@ def test_api_classify_target_normal_mode_updates_and_counter(monkeypatch):
                     "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
                 }
             ]
-        if "SELECT i.id, i.file_title FROM images i" in sql:
-            return [{"id": 22, "file_title": "File:Test.jpg"}]
+        if "SELECT i.id, i.file_title, i.status FROM images i" in sql:
+            return [{"id": 22, "file_title": "File:Test.jpg", "status": "processed"}]
         return ()
 
     def tx(fn):
@@ -4413,8 +4490,8 @@ def test_api_classify_target_review_mode_updates_other_faces_human(monkeypatch):
                     "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
                 }
             ]
-        if "SELECT i.id, i.file_title FROM images i" in sql:
-            return [{"id": 22, "file_title": "File:Test.jpg"}]
+        if "SELECT i.id, i.file_title, i.status FROM images i" in sql:
+            return [{"id": 22, "file_title": "File:Test.jpg", "status": "processed"}]
         return ()
 
     def tx(fn):
@@ -4468,8 +4545,8 @@ def test_api_classify_target_review_mode_does_not_use_is_target_null(monkeypatch
                     "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
                 }
             ]
-        if "SELECT i.id, i.file_title FROM images i" in sql:
-            return [{"id": 22, "file_title": "File:Test.jpg"}]
+        if "SELECT i.id, i.file_title, i.status FROM images i" in sql:
+            return [{"id": 22, "file_title": "File:Test.jpg", "status": "processed"}]
         return ()
 
     def tx(fn):
@@ -4521,8 +4598,8 @@ def test_api_classify_db_error_during_transaction(monkeypatch):
                     "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
                 }
             ]
-        if "SELECT i.id, i.file_title FROM images i" in sql:
-            return [{"id": 22, "file_title": "File:Test.jpg"}]
+        if "SELECT i.id, i.file_title, i.status FROM images i" in sql:
+            return [{"id": 22, "file_title": "File:Test.jpg", "status": "processed"}]
         return ()
 
     def tx(_fn):
@@ -4580,7 +4657,7 @@ def test_api_undo_classify_ownership_check_fail(monkeypatch):
                     "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
                 }
             ]
-        if "SELECT i.id, i.file_title FROM images i" in sql:
+        if "SELECT i.id, i.file_title, i.status FROM images i" in sql:
             return ()
         return ()
 
@@ -4606,7 +4683,7 @@ def test_api_undo_classify_ownership_check_db_error(monkeypatch):
                     "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
                 }
             ]
-        if "SELECT i.id, i.file_title FROM images i" in sql:
+        if "SELECT i.id, i.file_title, i.status FROM images i" in sql:
             raise app_module.DatabaseError("db")
         return ()
 
@@ -4634,8 +4711,8 @@ def test_api_undo_classify_target_normal_decrements_counter(monkeypatch):
                     "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
                 }
             ]
-        if "SELECT i.id, i.file_title FROM images i" in sql:
-            return [{"id": 2, "file_title": "File:Test.jpg"}]
+        if "SELECT i.id, i.file_title, i.status FROM images i" in sql:
+            return [{"id": 2, "file_title": "File:Test.jpg", "status": "processed"}]
         return ()
 
     def tx(fn):
@@ -4678,8 +4755,8 @@ def test_api_undo_classify_none_review_restores_model(monkeypatch):
                     "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
                 }
             ]
-        if "SELECT i.id, i.file_title FROM images i" in sql:
-            return [{"id": 2, "file_title": "File:Test.jpg"}]
+        if "SELECT i.id, i.file_title, i.status FROM images i" in sql:
+            return [{"id": 2, "file_title": "File:Test.jpg", "status": "processed"}]
         return ()
 
     def tx(fn):
@@ -4720,8 +4797,8 @@ def test_api_undo_classify_manual_face_deletion_and_exclusion(monkeypatch):
                     "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
                 }
             ]
-        if "SELECT i.id, i.file_title FROM images i" in sql:
-            return [{"id": 2, "file_title": "File:Test.jpg"}]
+        if "SELECT i.id, i.file_title, i.status FROM images i" in sql:
+            return [{"id": 2, "file_title": "File:Test.jpg", "status": "processed"}]
         return ()
 
     def tx(fn):
@@ -4764,8 +4841,8 @@ def test_api_undo_classify_manual_face_review_action_decrements(monkeypatch):
                     "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
                 }
             ]
-        if "SELECT i.id, i.file_title FROM images i" in sql:
-            return [{"id": 2, "file_title": "File:Test.jpg"}]
+        if "SELECT i.id, i.file_title, i.status FROM images i" in sql:
+            return [{"id": 2, "file_title": "File:Test.jpg", "status": "processed"}]
         return ()
 
     def tx(fn):
@@ -4803,8 +4880,8 @@ def test_api_undo_classify_db_error_during_transaction(monkeypatch):
                     "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
                 }
             ]
-        if "SELECT i.id, i.file_title FROM images i" in sql:
-            return [{"id": 2, "file_title": "File:Test.jpg"}]
+        if "SELECT i.id, i.file_title, i.status FROM images i" in sql:
+            return [{"id": 2, "file_title": "File:Test.jpg", "status": "processed"}]
         return ()
 
     def tx(_fn):
@@ -4842,8 +4919,8 @@ def test_api_undo_classify_success_response_contains_ids(monkeypatch):
                     "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
                 }
             ]
-        if "SELECT i.id, i.file_title FROM images i" in sql:
-            return [{"id": 2, "file_title": "File:Test.jpg"}]
+        if "SELECT i.id, i.file_title, i.status FROM images i" in sql:
+            return [{"id": 2, "file_title": "File:Test.jpg", "status": "processed"}]
         return ()
 
     def tx(fn):
@@ -5331,6 +5408,7 @@ def _default_bbox_face_row(**overrides):
         "commons_page_id": 12345,
         "project_id": 1,
         "wikidata_qid": "Q42",
+        "image_status": "processed",
     }
     row.update(overrides)
     return row
@@ -5448,7 +5526,7 @@ def test_api_manual_face_ownership_check_fail(monkeypatch):
 def test_api_manual_face_no_encoding_result(monkeypatch):
     def _route_query(sql):
         if "FROM images i " in sql:
-            return [{"id": 10, "file_title": "File:Face.jpg"}]
+            return [{"id": 10, "file_title": "File:Face.jpg", "status": "processed"}]
         return []
 
     client, _ = _authed_client(monkeypatch, route_execute_query=_route_query)
@@ -5465,7 +5543,7 @@ def test_api_manual_face_no_encoding_result(monkeypatch):
 def test_api_manual_face_success_normal_insert(monkeypatch):
     def _route_query(sql):
         if "FROM images i " in sql:
-            return [{"id": 10, "file_title": "File:Face.jpg"}]
+            return [{"id": 10, "file_title": "File:Face.jpg", "status": "processed"}]
         return []
 
     def _transaction(fn):
@@ -5503,7 +5581,7 @@ def test_api_manual_face_dismiss_faces_on_normal_insert(monkeypatch):
 
     def _route_query(sql):
         if "FROM images i " in sql:
-            return [{"id": 10, "file_title": "File:Face.jpg"}]
+            return [{"id": 10, "file_title": "File:Face.jpg", "status": "processed"}]
         return []
 
     def _transaction(fn):
@@ -5554,7 +5632,7 @@ def test_api_manual_face_dismiss_faces_on_normal_insert(monkeypatch):
 
     def _route_query(sql):
         if "FROM images i " in sql:
-            return [{"id": 10, "file_title": "File:Face.jpg"}]
+            return [{"id": 10, "file_title": "File:Face.jpg", "status": "processed"}]
         return []
 
     def _transaction(fn):
@@ -5588,7 +5666,7 @@ def test_api_manual_face_dismiss_faces_on_normal_insert(monkeypatch):
 def test_api_manual_face_download_error(monkeypatch):
     def _route_query(sql):
         if "FROM images i " in sql:
-            return [{"id": 10, "file_title": "File:Face.jpg"}]
+            return [{"id": 10, "file_title": "File:Face.jpg", "status": "processed"}]
         return []
 
     def _raise(*_args, **_kwargs):
@@ -5619,7 +5697,7 @@ def test_api_manual_face_db_error_on_ownership(monkeypatch):
 def test_api_manual_face_db_error_on_insert(monkeypatch):
     def _route_query(sql):
         if "FROM images i " in sql:
-            return [{"id": 10, "file_title": "File:Face.jpg"}]
+            return [{"id": 10, "file_title": "File:Face.jpg", "status": "processed"}]
         return []
 
     client, _ = _authed_client(monkeypatch, route_execute_query=_route_query)
@@ -5643,7 +5721,7 @@ def test_api_manual_face_db_error_on_insert(monkeypatch):
 def test_api_manual_face_unexpected_error(monkeypatch):
     def _route_query(sql):
         if "FROM images i " in sql:
-            return [{"id": 10, "file_title": "File:Face.jpg"}]
+            return [{"id": 10, "file_title": "File:Face.jpg", "status": "processed"}]
         return []
 
     client, _ = _authed_client(monkeypatch, route_execute_query=_route_query)
@@ -5655,6 +5733,21 @@ def test_api_manual_face_unexpected_error(monkeypatch):
 
     assert resp.status_code == 500
     assert resp.get_json()["error"] == "Failed to process face region"
+
+
+def test_api_manual_face_image_not_processed(monkeypatch):
+    """Return 409 when the image has not finished processing (status != 'processed')."""
+
+    def _route_query(sql):
+        if "FROM images i " in sql:
+            return [{"id": 10, "file_title": "File:Face.jpg", "status": "pending"}]
+        return []
+
+    client, _ = _authed_client(monkeypatch, route_execute_query=_route_query)
+    resp = client.post("/api/manual-face", data=_manual_face_form())
+
+    assert resp.status_code == 409
+    assert resp.get_json()["error"] == "Image has not finished processing yet"
 
 
 def test_remove_sdc_claim_success_claim_found_and_removed(monkeypatch):
@@ -6288,6 +6381,15 @@ def test_api_update_face_bbox_unexpected_error(monkeypatch):
 
     assert resp.status_code == 500
     assert resp.get_json()["error"] == "Failed to process face region"
+
+
+def test_api_update_face_bbox_image_not_processed(monkeypatch):
+    face_row = _default_bbox_face_row(image_status="pending")
+    client, _ = _authed_client(monkeypatch, route_execute_query=_bbox_query_router(face_row=face_row))
+    resp = client.post("/api/update-face-bbox", data=_update_bbox_form())
+
+    assert resp.status_code == 409
+    assert resp.get_json()["error"] == "Image has not finished processing yet"
 
 
 @pytest.fixture
@@ -7887,6 +7989,7 @@ def test_project_new_duplicate_entry_detected_via_exception_cause(monkeypatch):
 
     monkeypatch.setattr(app_module, "_is_human_entity", lambda _qid: True)
     monkeypatch.setattr(app_module, "_commons_category_exists", lambda _category: True)
+    monkeypatch.setattr(app_module, "_commons_category_has_files", lambda _category: True)
     monkeypatch.setattr(app_module, "_fetch_p18_thumb_url", lambda _qid: None)
     monkeypatch.setattr(app_module, "_fetch_wikidata_label", lambda _qid: "Label")
 
@@ -7935,6 +8038,7 @@ def test_project_new_duplicate_error_with_non_numeric_cause_args_falls_back(monk
 
     monkeypatch.setattr(app_module, "_is_human_entity", lambda _qid: True)
     monkeypatch.setattr(app_module, "_commons_category_exists", lambda _category: True)
+    monkeypatch.setattr(app_module, "_commons_category_has_files", lambda _category: True)
     monkeypatch.setattr(app_module, "_fetch_p18_thumb_url", lambda _qid: None)
     monkeypatch.setattr(app_module, "_fetch_wikidata_label", lambda _qid: "Label")
 
@@ -7995,6 +8099,7 @@ def test_project_new_invite_code_collision_retries_and_succeeds(monkeypatch):
 
     monkeypatch.setattr(app_module, "_is_human_entity", lambda _qid: True)
     monkeypatch.setattr(app_module, "_commons_category_exists", lambda _category: True)
+    monkeypatch.setattr(app_module, "_commons_category_has_files", lambda _category: True)
     monkeypatch.setattr(app_module, "_fetch_p18_thumb_url", lambda _qid: None)
     monkeypatch.setattr(app_module, "_fetch_wikidata_label", lambda _qid: "Label")
 
@@ -8023,6 +8128,7 @@ def test_project_new_invite_code_collision_fails_after_max_retries(monkeypatch):
 
     monkeypatch.setattr(app_module, "_is_human_entity", lambda _qid: True)
     monkeypatch.setattr(app_module, "_commons_category_exists", lambda _category: True)
+    monkeypatch.setattr(app_module, "_commons_category_has_files", lambda _category: True)
     monkeypatch.setattr(app_module, "_fetch_p18_thumb_url", lambda _qid: None)
     monkeypatch.setattr(app_module, "_fetch_wikidata_label", lambda _qid: "Label")
 
@@ -9385,8 +9491,8 @@ def test_api_classify_target_marks_sdc_written_when_p180_exists(monkeypatch):
                     "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
                 }
             ]
-        if "SELECT i.id, i.file_title FROM images i" in sql:
-            return [{"id": 22, "file_title": "File:Test.jpg"}]
+        if "SELECT i.id, i.file_title, i.status FROM images i" in sql:
+            return [{"id": 22, "file_title": "File:Test.jpg", "status": "processed"}]
         if "SELECT i.commons_page_id, p.wikidata_qid" in sql:
             return [{"commons_page_id": 555, "wikidata_qid": "Q42"}]
         return ()
@@ -9433,8 +9539,8 @@ def test_api_classify_target_no_sdc_written_when_p180_missing(monkeypatch):
                     "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
                 }
             ]
-        if "SELECT i.id, i.file_title FROM images i" in sql:
-            return [{"id": 22, "file_title": "File:Test.jpg"}]
+        if "SELECT i.id, i.file_title, i.status FROM images i" in sql:
+            return [{"id": 22, "file_title": "File:Test.jpg", "status": "processed"}]
         if "SELECT i.commons_page_id, p.wikidata_qid" in sql:
             return [{"commons_page_id": 555, "wikidata_qid": "Q42"}]
         return ()
@@ -9477,8 +9583,8 @@ def test_api_classify_target_p180_check_db_error_non_fatal(monkeypatch):
                     "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
                 }
             ]
-        if "SELECT i.id, i.file_title FROM images i" in sql:
-            return [{"id": 22, "file_title": "File:Test.jpg"}]
+        if "SELECT i.id, i.file_title, i.status FROM images i" in sql:
+            return [{"id": 22, "file_title": "File:Test.jpg", "status": "processed"}]
         if "SELECT i.commons_page_id, p.wikidata_qid" in sql:
             raise app_module.DatabaseError("meta lookup failed")
         return ()
@@ -9639,3 +9745,128 @@ def test_api_reclassify_approve_skips_p180_check_when_already_sdc_written(monkey
 
     assert resp.status_code == 200
     assert len(p180_called) == 0
+
+
+def test_project_detail_shows_no_faces_banner(monkeypatch):
+    captured = _capture_render_template_chunk4(monkeypatch)
+
+    def eq(sql, params=None, fetch=True):
+        if "FROM users WHERE id = %s" in sql:
+            return [
+                {
+                    "id": 1,
+                    "wiki_username": "tester",
+                    "access_token": "token",
+                    "refresh_token": "refresh",
+                    "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
+                }
+            ]
+        if "FROM projects p LEFT JOIN project_members" in sql:
+            return [
+                {
+                    "id": 1,
+                    "user_id": 1,
+                    "wikidata_qid": "Q42",
+                    "p18_thumb_url": "https://thumb.jpg",
+                    "status": "completed",
+                    "completion_reason": "no_faces",
+                    "images_total": 50,
+                    "images_processed": 50,
+                }
+            ]
+        if "COUNT(*) AS total_faces" in sql:
+            return [{"total_faces": 0, "confirmed_matches": 0}]
+        if "COUNT(*) AS cnt" in sql and "classified_by IN" in sql:
+            return [{"cnt": 0}]
+        if "status = 'pending'" in sql:
+            return [{"cnt": 0}]
+        if "f.is_target IS NULL" in sql:
+            return [{"cnt": 0}]
+        return ()
+
+    client, _ = _auth_client_chunk4(monkeypatch, eq)
+    response = client.get("/project/1")
+
+    assert response.status_code == 200
+    assert captured["template"] == "project_detail.html"
+    assert captured["context"]["project"]["completion_reason"] == "no_faces"
+
+
+def test_project_detail_shows_insufficient_faces_banner(monkeypatch):
+    captured = _capture_render_template_chunk4(monkeypatch)
+
+    def eq(sql, params=None, fetch=True):
+        if "FROM users WHERE id = %s" in sql:
+            return [
+                {
+                    "id": 1,
+                    "wiki_username": "tester",
+                    "access_token": "token",
+                    "refresh_token": "refresh",
+                    "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
+                }
+            ]
+        if "FROM projects p LEFT JOIN project_members" in sql:
+            return [
+                {
+                    "id": 1,
+                    "user_id": 1,
+                    "wikidata_qid": "Q42",
+                    "p18_thumb_url": "https://thumb.jpg",
+                    "status": "completed",
+                    "completion_reason": "insufficient_faces",
+                    "images_total": 50,
+                    "images_processed": 50,
+                }
+            ]
+        if "COUNT(*) AS total_faces" in sql:
+            return [{"total_faces": 3, "confirmed_matches": 0}]
+        if "COUNT(*) AS cnt" in sql and "classified_by IN" in sql:
+            return [{"cnt": 0}]
+        if "status = 'pending'" in sql:
+            return [{"cnt": 0}]
+        if "f.is_target IS NULL" in sql:
+            return [{"cnt": 0}]
+        return ()
+
+    client, _ = _auth_client_chunk4(monkeypatch, eq)
+    response = client.get("/project/1")
+
+    assert response.status_code == 200
+    assert captured["template"] == "project_detail.html"
+    assert captured["context"]["project"]["completion_reason"] == "insufficient_faces"
+
+
+def test_project_settings_clears_completion_reason_on_update(monkeypatch, fake_user):
+    project = _project_settings_base_row()
+    project["completion_reason"] = "no_faces"
+    project["status"] = "completed"
+    update_sqls = []
+
+    def route_execute(sql, params, fetch):
+        if "SELECT * FROM projects" in sql:
+            return [project.copy()]
+        if "UPDATE projects SET distance_threshold" in sql:
+            update_sqls.append(sql)
+            return 1
+        if "AS human_confirmed" in sql:
+            return [{"human_confirmed": 10, "by_bootstrap": 0}]
+        raise AssertionError(f"Unexpected SQL: {sql}")
+
+    client = _make_authed_client(monkeypatch, fake_user, route_execute)
+    _set_csrf_chunk6(client)
+
+    response = client.post(
+        "/project/1/settings",
+        data={
+            "csrf_token": "testtoken",
+            "distance_threshold": "0.55",
+            "min_confirmed": "3",
+            "status": "active",
+            "label": "Reactivated",
+        },
+    )
+
+    assert response.status_code == 302
+    assert len(update_sqls) == 1
+    assert "completion_reason = NULL" in update_sqls[0]
