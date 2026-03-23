@@ -1941,7 +1941,8 @@ def api_classify():
                         "UPDATE faces SET is_target = 1, classified_by = 'human', "
                         "classified_by_user_id = %s "
                         "WHERE id = %s AND image_id = %s "
-                        "AND is_target = 0 AND classified_by = 'model'",
+                        "AND is_target = 0 AND classified_by = 'model' "
+                        "AND classified_by_user_id IS NULL AND superseded_by IS NULL",
                         (g.user["id"], selected_face_id, image_id),
                     )
                 else:
