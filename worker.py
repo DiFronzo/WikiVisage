@@ -1180,6 +1180,9 @@ def bootstrap_from_sparql(project: dict[str, Any]) -> int:
 
     qid = project["wikidata_qid"]
     category = project["commons_category"]
+    # deepcat: search keyword expects bare category name without "Category:" prefix
+    if category.startswith("Category:"):
+        category = category[len("Category:") :]
     search_params: dict[str, Any] = {
         "action": "query",
         "list": "search",
@@ -2349,7 +2352,7 @@ def _claim_sdc_projects() -> tuple[list[dict[str, Any]], set[int]]:
             "ORDER BY COALESCE(p.worker_claimed_at, '1970-01-01') ASC "
             "LIMIT %s "
             "FOR UPDATE",
-            (_worker_id, CLAIM_EXPIRY_MINUTES, MAX_CONCURRENT_PROJECTS),
+            (_worker_id, _worker_id, CLAIM_EXPIRY_MINUTES, MAX_CONCURRENT_PROJECTS),
         )
         rows = cursor.fetchall()
         if not rows:

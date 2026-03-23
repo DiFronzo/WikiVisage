@@ -596,6 +596,37 @@ def _commons_category_exists(category: str) -> bool:
         return False
 
 
+def _check_p180_exists(commons_page_id: int, qid: str) -> bool:
+    """Check whether a P180 (depicts) claim for *qid* already exists on a Commons media item.
+
+    Uses the ``wbgetclaims`` API (read-only, no OAuth required).
+    Returns ``True`` if the claim exists, ``False`` otherwise (including on API errors).
+    """
+    try:
+        resp = requests.get(
+            COMMONS_API_URL,
+            params={
+                "action": "wbgetclaims",
+                "entity": f"M{commons_page_id}",
+                "property": "P180",
+                "format": "json",
+            },
+            headers={"User-Agent": USER_AGENT},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        claims = data.get("claims", {}).get("P180", [])
+        for claim in claims:
+            value = claim.get("mainsnak", {}).get("datavalue", {}).get("value", {}).get("id")
+            if value == qid:
+                return True
+        return False
+    except Exception:
+        logger.debug(f"Failed to check P180 for M{commons_page_id}/{qid}", exc_info=True)
+        return False
+
+
 def _fetch_p18_thumb_url(qid: str, width: int = 250) -> str | None:
     """
     Fetch P18 (image) property from Wikidata and return a Commons thumbnail URL.
@@ -1602,6 +1633,14 @@ def classify(project_id: int):
             if skip_id not in skipped:
                 skipped.append(skip_id)
             session[active_skip_key] = skipped
+            session["last_classify"] = {
+                "action": "skip",
+                "project_id": project_id,
+                "image_id": skip_id,
+                "was_review": is_skip_review,
+                "face_ids": [],
+                "manual_face_ids": [],
+            }
         except (ValueError, TypeError):
             pass
 
@@ -1897,12 +1936,21 @@ def api_classify():
                 rows = cursor.fetchall()
                 ids = [r["id"] for r in rows] if rows else []
 
-                cursor.execute(
-                    "UPDATE faces SET is_target = 1, classified_by = 'human', "
-                    "classified_by_user_id = %s "
-                    "WHERE id = %s AND image_id = %s AND is_target IS NULL",
-                    (g.user["id"], selected_face_id, image_id),
-                )
+                if is_review_mode:
+                    cursor.execute(
+                        "UPDATE faces SET is_target = 1, classified_by = 'human', "
+                        "classified_by_user_id = %s "
+                        "WHERE id = %s AND image_id = %s "
+                        "AND is_target = 0 AND classified_by = 'model'",
+                        (g.user["id"], selected_face_id, image_id),
+                    )
+                else:
+                    cursor.execute(
+                        "UPDATE faces SET is_target = 1, classified_by = 'human', "
+                        "classified_by_user_id = %s "
+                        "WHERE id = %s AND image_id = %s AND is_target IS NULL",
+                        (g.user["id"], selected_face_id, image_id),
+                    )
                 target_updated = cursor.rowcount
 
                 if is_review_mode:
@@ -1935,6 +1983,32 @@ def api_classify():
 
             affected_ids = execute_transaction(_classify_target)
 
+            # Check if P180 already exists on Commons for this image/QID.
+            # If so, mark as already written to avoid showing as "SDC Pending".
+            try:
+                meta = execute_query(
+                    "SELECT i.commons_page_id, p.wikidata_qid "
+                    "FROM images i JOIN projects p ON i.project_id = p.id "
+                    "WHERE i.id = %s AND p.id = %s",
+                    (image_id, project_id),
+                )
+                if meta and meta[0]["commons_page_id"]:
+                    cpid = meta[0]["commons_page_id"]
+                    qid = meta[0]["wikidata_qid"]
+                    if _check_p180_exists(cpid, qid):
+                        execute_query(
+                            "UPDATE faces SET sdc_written = 1 WHERE id = %s",
+                            (selected_face_id,),
+                            fetch=False,
+                        )
+                        execute_query(
+                            "UPDATE images SET bootstrapped = 1 WHERE id = %s AND bootstrapped = 0",
+                            (image_id,),
+                            fetch=False,
+                        )
+            except DatabaseError:
+                logger.debug("P180 existence check failed (non-critical)", exc_info=True)
+
             session["last_classify"] = {
                 "project_id": project_id,
                 "image_id": image_id,
@@ -1953,7 +2027,7 @@ def api_classify():
 
 @app.route("/api/undo-classify", methods=["POST"])
 @login_required
-@limiter.limit("60 per minute")
+@limiter.limit("60 per minute", deduct_when=lambda resp: not getattr(g, "_skip_undo", False))
 def api_undo_classify():
     """Undo the last face classification, resetting affected faces to unclassified."""
     if not _validate_csrf():
@@ -1965,6 +2039,26 @@ def api_undo_classify():
 
     project_id = last["project_id"]
     image_id = last["image_id"]
+
+    # Handle undo of skip — no DB changes, just remove from skip list
+    if last.get("action") == "skip":
+        try:
+            proj = get_project_for_actor(project_id, g.user["id"])
+            if not proj:
+                return jsonify({"error": _("Project not found")}), 404
+        except DatabaseError:
+            return jsonify({"error": _("Database error")}), 500
+
+        was_review = last.get("was_review", False)
+        active_skip_key = f"skipped_images_review_{project_id}" if was_review else f"skipped_images_{project_id}"
+        skipped = session.get(active_skip_key, [])
+        if image_id in skipped:
+            skipped.remove(image_id)
+            session[active_skip_key] = skipped
+        session.pop("last_classify", None)
+        g._skip_undo = True
+        return jsonify({"status": "ok", "project_id": project_id, "image_id": image_id})
+
     face_ids = last.get("face_ids", [])
     manual_face_ids = last.get("manual_face_ids", [])
 
@@ -2201,6 +2295,32 @@ def api_manual_face():
         new_face_id, review_confirmed_ids = execute_transaction(_insert_manual_face)
 
         if new_face_id:
+            # Check if P180 already exists on Commons for this image/QID.
+            # If so, mark as already written to avoid showing as "SDC Pending".
+            try:
+                meta = execute_query(
+                    "SELECT i.commons_page_id, p.wikidata_qid "
+                    "FROM images i JOIN projects p ON i.project_id = p.id "
+                    "WHERE i.id = %s AND p.id = %s",
+                    (image_id, project_id),
+                )
+                if meta and meta[0]["commons_page_id"]:
+                    cpid = meta[0]["commons_page_id"]
+                    qid = meta[0]["wikidata_qid"]
+                    if _check_p180_exists(cpid, qid):
+                        execute_query(
+                            "UPDATE faces SET sdc_written = 1 WHERE id = %s",
+                            (new_face_id,),
+                            fetch=False,
+                        )
+                        execute_query(
+                            "UPDATE images SET bootstrapped = 1 WHERE id = %s AND bootstrapped = 0",
+                            (image_id,),
+                            fetch=False,
+                        )
+            except Exception:
+                logger.debug("P180 existence check failed (non-critical)", exc_info=True)
+
             manual_key = f"manual_faces_{image_id}"
             manual_list = session.get(manual_key, [])
             manual_list.append(new_face_id)
@@ -2447,6 +2567,25 @@ def api_reclassify():
                 )
 
         execute_transaction(_reclassify)
+
+        # When approving, check if P180 already exists on Commons
+        if is_target == 1 and commons_page_id and not sdc_written:
+            try:
+                if _check_p180_exists(commons_page_id, wikidata_qid):
+                    execute_query(
+                        "UPDATE faces SET sdc_written = 1 WHERE id = %s",
+                        (face_id,),
+                        fetch=False,
+                    )
+                    execute_query(
+                        "UPDATE images SET bootstrapped = 1 WHERE id = %s AND bootstrapped = 0",
+                        (face_row["image_id"],),
+                        fetch=False,
+                    )
+                    sdc_written = 1
+            except DatabaseError:
+                logger.debug("P180 existence check failed (non-critical)", exc_info=True)
+
     except ValueError as e:
         if str(e) == "already_reviewed":
             return jsonify({"error": _("This face has already been reviewed by another user")}), 409
@@ -2510,7 +2649,8 @@ def api_update_face_bbox():
     try:
         rows = execute_query(
             "SELECT f.id, f.image_id, f.is_target, f.classified_by, f.confidence, "
-            "  f.classified_by_user_id, i.file_title, p.id AS project_id "
+            "  f.classified_by_user_id, f.sdc_written, i.file_title, i.commons_page_id, "
+            "  p.id AS project_id, p.wikidata_qid "
             "FROM faces f "
             "JOIN images i ON f.image_id = i.id "
             "JOIN projects p ON i.project_id = p.id "
@@ -2528,6 +2668,7 @@ def api_update_face_bbox():
     image_id = face_row["image_id"]
     orig_is_target = face_row["is_target"]
     orig_confidence = face_row["confidence"]
+    orig_sdc_written = face_row["sdc_written"]
     file_title = face_row["file_title"]
     clean_title = file_title[5:] if file_title.startswith("File:") else file_title
     url = FILE_PATH_URL.format(file_title=clean_title)
@@ -2553,12 +2694,11 @@ def api_update_face_bbox():
         encoding_bytes = encodings[0].tobytes()
 
         def _update_bbox(conn, cursor):
-            # Insert new face row with classification carried over from original
             cursor.execute(
                 "INSERT INTO faces "
                 "(image_id, encoding, bbox_top, bbox_right, bbox_bottom, bbox_left, "
-                " is_target, classified_by, confidence, classified_by_user_id) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, 'human', %s, %s)",
+                " is_target, classified_by, confidence, classified_by_user_id, sdc_written) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, 'human', %s, %s, %s)",
                 (
                     image_id,
                     encoding_bytes,
@@ -2569,6 +2709,7 @@ def api_update_face_bbox():
                     orig_is_target,
                     orig_confidence,
                     g.user["id"],
+                    orig_sdc_written,
                 ),
             )
             new_face_id = cursor.lastrowid
@@ -2581,6 +2722,24 @@ def api_update_face_bbox():
             return new_face_id
 
         new_face_id = execute_transaction(_update_bbox)
+
+        if new_face_id and orig_is_target == 1 and not orig_sdc_written:
+            try:
+                cpid = face_row["commons_page_id"]
+                qid = face_row["wikidata_qid"]
+                if cpid and _check_p180_exists(cpid, qid):
+                    execute_query(
+                        "UPDATE faces SET sdc_written = 1 WHERE id = %s",
+                        (new_face_id,),
+                        fetch=False,
+                    )
+                    execute_query(
+                        "UPDATE images SET bootstrapped = 1 WHERE id = %s AND bootstrapped = 0",
+                        (image_id,),
+                        fetch=False,
+                    )
+            except Exception:
+                logger.debug("P180 existence check failed (non-critical)", exc_info=True)
 
         return jsonify(
             {
