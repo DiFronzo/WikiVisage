@@ -703,6 +703,34 @@
     {% endif %}
 </div>
 
+{% if project.completion_reason == 'no_faces' %}
+<div class="card info-banner">
+    <p class="info-banner-text info-text-danger">
+        {{ _('No faces were detected in any of the images in this category. The project has been automatically completed.') }}
+    </p>
+    <p class="info-text-muted">
+        {% if is_owner %}
+        {{ _('You can reactivate this project from') }} <a href="{{ url_for('project_settings', project_id=project.id) }}" class="info-link">{{ _('Project Settings') }}</a> {{ _('if images are added to the category later.') }}
+        {% else %}
+        {{ _('The project owner can reactivate this project if images are added to the category later.') }}
+        {% endif %}
+    </p>
+</div>
+{% elif project.completion_reason == 'insufficient_faces' %}
+<div class="card info-banner">
+    <p class="info-banner-text info-text-warning">
+        {{ _('Too few faces were detected to reach autonomous inference. The project has been automatically completed.') }}
+    </p>
+    <p class="info-text-muted">
+        {% if is_owner %}
+        {{ _('You can reactivate this project and lower the min_confirmed setting in') }} <a href="{{ url_for('project_settings', project_id=project.id) }}" class="info-link">{{ _('Project Settings') }}</a>.
+        {% else %}
+        {{ _('The project owner can reactivate this project and adjust settings.') }}
+        {% endif %}
+    </p>
+</div>
+{% endif %}
+
 {% if project.images_total > 0 %}
 <h2>{{ _('Project Statistics') }}</h2>
 <div class="stats-grid">

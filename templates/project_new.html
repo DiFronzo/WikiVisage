@@ -23,7 +23,7 @@
                     <button type="button" id="check-category-btn" class="btn btn-sm" style="white-space: nowrap; margin-top: 2px;" onclick="checkCategory()">{{ _('Check') }}</button>
                 </div>
                 <div class="help-text">{{ _('Category name without the "Category:" prefix') }}</div>
-                <div id="category-info" style="display: none; margin-top: 0.5rem; padding: 0.5rem 0.75rem; font-size: 0.875rem; border-left: 3px solid var(--primary); background: rgba(20, 184, 166, 0.05);"></div>
+                <div id="category-info" style="display: none; margin-top: 0.5rem; padding: 0.75rem 1rem; font-size: 0.875rem; border-left: 3px solid var(--primary); background: rgba(20, 184, 166, 0.05);"></div>
             </div>
 
             <div class="form-group">
@@ -48,9 +48,9 @@
 
             <div style="margin-top: 2rem;">
                 {% if existing_project %}
-                <button type="submit" name="action" value="create_anyway" class="btn btn-primary" style="width: 100%;">{{ _('Create My Own') }}</button>
+                <button type="submit" id="submit-btn" name="action" value="create_anyway" class="btn btn-primary" style="width: 100%;">{{ _('Create My Own') }}</button>
                 {% else %}
-                <button type="submit" class="btn btn-primary" style="width: 100%;">{{ _('Create Project') }}</button>
+                <button type="submit" id="submit-btn" class="btn btn-primary" style="width: 100%;">{{ _('Create Project') }}</button>
                 {% endif %}
             </div>
         </form>
@@ -63,6 +63,7 @@ var i18nCatInfo = {
     files: {{ _('{files} files across {subcats} subcategories')|tojson }},
     filesApprox: {{ _('{files}+ files across {subcats}+ subcategories (estimate)')|tojson }},
     notFound: {{ _('Category not found on Commons.')|tojson }},
+    emptyCategory: {{ _('This category exists on Commons but contains no files.')|tojson }},
     error: {{ _('Could not reach Commons API.')|tojson }},
     tipSmall: {{ _('With this category size, the default of 5 confirmed faces should work well.')|tojson }},
     tipMedium: {{ _('This is a medium-sized category. Consider raising Min Confirmed Faces to 10–15 for better accuracy.')|tojson }},
@@ -74,6 +75,7 @@ function checkCategory() {
     var input = document.getElementById('commons_category');
     var infoDiv = document.getElementById('category-info');
     var btn = document.getElementById('check-category-btn');
+    var submitBtn = document.getElementById('submit-btn');
     var category = input.value.trim();
 
     if (!category) { input.focus(); return; }
@@ -89,7 +91,9 @@ function checkCategory() {
             if (r.status === 404) {
                 infoDiv.style.borderLeftColor = 'var(--danger)';
                 infoDiv.style.color = 'var(--danger)';
+                infoDiv.style.background = 'rgba(239, 68, 68, 0.1)';
                 infoDiv.textContent = i18nCatInfo.notFound;
+                submitBtn.disabled = true;
                 return;
             }
             if (!r.ok) throw new Error();
@@ -97,8 +101,18 @@ function checkCategory() {
         })
         .then(function(data) {
             if (!data) return;
+            if (data.files === 0 && data.subcats === 0) {
+                infoDiv.style.borderLeftColor = 'var(--warning)';
+                infoDiv.style.color = 'var(--warning)';
+                infoDiv.style.background = 'rgba(245, 158, 11, 0.1)';
+                infoDiv.textContent = i18nCatInfo.emptyCategory;
+                submitBtn.disabled = true;
+                return;
+            }
+            submitBtn.disabled = false;
             infoDiv.style.borderLeftColor = 'var(--success)';
             infoDiv.style.color = 'var(--text)';
+            infoDiv.style.background = 'rgba(20, 184, 166, 0.05)';
             var files = Number(data.files).toLocaleString();
             var subcats = Number(data.subcats).toLocaleString();
             var tpl = data.approximate ? i18nCatInfo.filesApprox : i18nCatInfo.files;
@@ -126,9 +140,18 @@ function checkCategory() {
         .catch(function() {
             infoDiv.style.borderLeftColor = 'var(--danger)';
             infoDiv.style.color = 'var(--danger)';
+            infoDiv.style.background = 'rgba(239, 68, 68, 0.1)';
             infoDiv.textContent = i18nCatInfo.error;
+            submitBtn.disabled = true;
         })
         .finally(function() { btn.disabled = false; });
 }
+
+document.getElementById('commons_category').addEventListener('input', function() {
+    document.getElementById('submit-btn').disabled = false;
+    var infoDiv = document.getElementById('category-info');
+    infoDiv.style.display = 'none';
+    infoDiv.style.background = 'rgba(20, 184, 166, 0.05)';
+});
 </script>
 {% endblock %}

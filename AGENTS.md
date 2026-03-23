@@ -8,10 +8,10 @@ Active-learning Flask app for Wikimedia Commons. Users classify faces via yes/no
 
 ```
 WikiVisage/
-├── app.py              # Flask web app: OAuth, routes, classification API (~3440 lines)
-├── worker.py           # Background ML pipeline: crawl, detect, infer (~2760 lines)
-├── token_crypto.py     # Fernet encrypt/decrypt helpers for OAuth tokens at rest (~82 lines)
-├── database.py         # MariaDB connection pool with retry logic (~485 lines)
+├── app.py              # Flask web app: OAuth, routes, classification API (~3860 lines)
+├── worker.py           # Background ML pipeline: crawl, detect, infer (~2930 lines)
+├── token_crypto.py     # Fernet encrypt/decrypt helpers for OAuth tokens at rest (~110 lines)
+├── database.py         # MariaDB connection pool with retry logic (~510 lines)
 ├── schema.sql          # DDL for 9 tables: users, sessions, projects, images, faces, user_stats, sdc_claims, project_members, worker_heartbeat
 ├── migrate.py          # Idempotent schema migration with --reset flag (~430 lines)
 ├── whitelist.txt       # Allowed usernames (one per line, checked on every request)
@@ -26,18 +26,19 @@ WikiVisage/
 │   ├── nb/LC_MESSAGES/ # Norwegian Bokmål
 │   ├── es/LC_MESSAGES/ # Spanish
 │   └── fr/LC_MESSAGES/ # French
-├── tests/              # Hybrid test suite: 470 unit + 34 integration tests
+├── tests/              # Hybrid test suite: 546 unit + 34 integration tests
 │   ├── __init__.py
 │   ├── conftest.py     # Integration fixture infrastructure (~450 lines)
-│   ├── test_app.py     # 395 unit + 11 integration tests (~7800 lines)
-│   ├── test_database.py # 9 unit + 9 integration tests (~235 lines)
+│   ├── test_app.py     # 457 unit + 11 integration tests (~9640 lines)
+│   ├── test_database.py # 14 unit + 9 integration tests (~360 lines)
 │   ├── test_migrate.py # 15 unit + 8 integration tests (~471 lines)
-│   ├── test_token_crypto.py # 25 unit tests (~120 lines)
-│   └── test_worker.py  # 26 unit + 6 integration tests (~473 lines)
-├── templates/          # Jinja2 templates (9 files, all extend base.html)
+│   ├── test_token_crypto.py # 22 unit tests (~175 lines)
+│   └── test_worker.py  # 38 unit + 6 integration tests (~1240 lines)
+├── templates/          # Jinja2 templates (10 files, all extend base.html)
 │   ├── base.html       # Layout: nav, flash messages, CSS variables. Blocks: title, extra_head, content
 │   ├── classify.html   # Active learning UI: face image, yes/no/skip/none buttons, keyboard shortcuts, undo
 │   ├── project_detail.html  # Stats, classification breakdown, model results gallery, validation UI, SDC write button
+│   ├── account_settings.html  # User account settings (leaderboard opt-out)
 │   └── ...             # dashboard, index, leaderboard, project_new, project_settings, error
 ├── static/             # Static assets
 │   ├── wikivisage-logo.svg        # Full logo with text
@@ -68,7 +69,7 @@ Flask app served by gunicorn via app factory (`create_app()`). Handles OAuth 2.0
 - Rate limiting via Flask-Limiter (global 200/hour default, 10/min on bbox endpoints)
 - Security headers: `X-Content-Type-Options`, `X-Frame-Options`, `X-XSS-Protection`
 
-**Routes (22 total):**
+**Routes (36 total):**
 | Route | Method | Purpose |
 |-------|--------|---------|
 | `/` | GET | Landing page |
@@ -77,6 +78,7 @@ Flask app served by gunicorn via app factory (`create_app()`). Handles OAuth 2.0
 | `/auth/callback` | GET | OAuth token exchange |
 | `/logout` | POST | End session (CSRF protected) |
 | `/dashboard` | GET | User's project list (paginated), includes collaborator count badges |
+| `/api/category-info` | GET | Return total file count for a Commons category (BFS subcategory traversal) |
 | `/project/new` | GET/POST | Create project (QID + Commons category, validates P31=Q5 and category existence). Detects cross-user duplicates and offers join option |
 | `/project/<id>` | GET | Project stats, classification breakdown, model results gallery with approve/reject/edit-bbox, collaborator count badge |
 | `/project/<id>/classify` | GET | Active learning face classification UI |
@@ -88,11 +90,23 @@ Flask app served by gunicorn via app factory (`create_app()`). Handles OAuth 2.0
 | `/api/update-face-bbox` | POST | Redraw face bounding box from Model Results (rate limited: 10/min) |
 | `/api/write-sdc/<id>` | POST | Queue P180 depicts claims for writing by background worker (sets flag, returns immediately) |
 | `/api/sdc-status/<id>` | GET | Poll SDC write progress (written/pending counts, in_progress flag) |
+| `/api/stop-sdc/<id>` | POST | Cancel an in-progress SDC write (clears sdc_write_requested flag) |
+| `/api/project/<id>/gallery` | GET | Paginated JSON API for Classification Results gallery (filter by result/source/sdc) |
+| `/api/progress/<id>` | GET | Poll image processing progress (processed/total/pending counts) |
 | `/project/<id>/settings` | GET/POST | Edit project params, view member list (owner-only) |
 | `/project/<id>/settings/remove-member` | POST | Remove a member from the project (owner-only, CSRF protected) |
+| `/project/<id>/settings/unban-member` | POST | Unban a member so they can rejoin the project (owner-only) |
+| `/project/<id>/invite-code` | POST | Generate or revoke invite code for the project (owner-only) |
+| `/join` | POST | Join a project via invite code |
+| `/project/<id>/rerun-inference` | POST | Reset model-classified faces to re-run inference with current settings (owner-only) |
 | `/project/<id>/delete` | POST | Delete project |
+| `/account/settings` | GET/POST | User account settings (leaderboard opt-out) |
 | `/leaderboard` | GET | Top classifiers |
+| `/sw.js` | GET | Serve service worker from root scope |
+| `/.well-known/appspecific/com.chrome.devtools.json` | GET | Silence Chrome DevTools auto-request |
 | `/health` | GET | Health check (JSON) |
+| `/robots.txt` | GET | Custom robots.txt (overrides Toolforge default Disallow: /) |
+| `/sitemap.xml` | GET | XML sitemap for search engines |
 | `/commons-thumb/<path>` | GET | Redirect to Commons thumbnail URL (standard step sizes enforced) |
 
 **Error handlers:** 400, 403, 404, 500 — all render `error.html`.
@@ -336,7 +350,7 @@ Each face encoding is 1024 bytes (128 float64). Even 10K faces ~ 10MB. No RAM co
 
 ## Testing
 
-Hybrid test suite: **470 unit tests** (run in CI) + **34 integration tests** (require local Docker MariaDB).
+Hybrid test suite: **546 unit tests** (run in CI) + **34 integration tests** (require local Docker MariaDB).
 
 ### Architecture
 
@@ -349,12 +363,12 @@ Hybrid test suite: **470 unit tests** (run in CI) + **34 integration tests** (re
 
 | File | Unit | Integration | Total |
 |------|------|-------------|-------|
-| `test_app.py` | 395 | 11 | 406 |
-| `test_database.py` | 9 | 9 | 18 |
+| `test_app.py` | 457 | 11 | 468 |
+| `test_database.py` | 14 | 9 | 23 |
 | `test_migrate.py` | 15 | 8 | 23 |
-| `test_token_crypto.py` | 25 | 0 | 25 |
-| `test_worker.py` | 26 | 6 | 32 |
-| **Total** | **470** | **34** | **504** |
+| `test_token_crypto.py` | 22 | 0 | 22 |
+| `test_worker.py` | 38 | 6 | 44 |
+| **Total** | **546** | **34** | **580** |
 
 ### Commands
 

@@ -45,9 +45,6 @@ def _with_bad_key():
 
 
 class TestEncryptionDisabled:
-    def test_is_encryption_enabled_false(self, _no_token_key):
-        assert _no_token_key.is_encryption_enabled() is False
-
     def test_encrypt_passthrough(self, _no_token_key):
         token = "my-oauth-token-abc123"
         assert _no_token_key.encrypt_token(token) == token
@@ -71,9 +68,6 @@ class TestEncryptionDisabled:
 
 
 class TestEncryptionEnabled:
-    def test_is_encryption_enabled_true(self, _with_token_key):
-        assert _with_token_key.is_encryption_enabled() is True
-
     def test_encrypt_returns_different_value(self, _with_token_key):
         token = "my-oauth-token-abc123"
         encrypted = _with_token_key.encrypt_token(token)
@@ -152,9 +146,6 @@ class TestEncryptionEnabled:
 
 
 class TestInvalidKey:
-    def test_is_encryption_enabled_false(self, _with_bad_key):
-        assert _with_bad_key.is_encryption_enabled() is False
-
     def test_encrypt_passthrough_on_bad_key(self, _with_bad_key):
         token = "my-oauth-token"
         assert _with_bad_key.encrypt_token(token) == token

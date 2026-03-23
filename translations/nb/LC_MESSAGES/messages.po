@@ -98,6 +98,11 @@ msgstr ""
 msgid "The Commons category \"%(category)s\" does not exist."
 msgstr "Commons-kategorien «%(category)s» finnes ikke."
 
+#: app.py
+#, python-format
+msgid "The Commons category \"%(category)s\" exists but contains no files."
+msgstr "Commons-kategorien «%(category)s» finnes, men inneholder ingen filer."
+
 #: app.py:1322
 msgid "A project with this Q-ID and category already exists."
 msgstr "Et prosjekt med denne Q-ID-en og kategorien finnes allerede."
@@ -143,6 +148,10 @@ msgstr "Ugyldige feltverdier"
 #: app.py:1815 app.py:1979 app.py:2101
 msgid "Image not found or access denied"
 msgstr "Bildet ble ikke funnet eller tilgang ble nektet"
+
+#: app.py
+msgid "Image has not finished processing yet"
+msgstr "Bildet er ikke ferdig behandlet ennå"
 
 #: app.py:1817 app.py:1981 app.py:2103 app.py:2355 app.py:2376 app.py:2386
 #: app.py:2525 app.py:2620 app.py:2641 app.py:2669 app.py:2692 app.py:2713
@@ -1649,11 +1658,15 @@ msgstr "{files} filer på tvers av {subcats} underkategorier"
 msgid "{files}+ files across {subcats}+ subcategories (estimate)"
 msgstr "{files}+ filer på tvers av {subcats}+ underkategorier (estimat)"
 
-#: templates/project_new.html:65
+#: templates/project_new.html:66
 msgid "Category not found on Commons."
 msgstr "Kategori ikke funnet på Commons."
 
 #: templates/project_new.html:66
+msgid "This category exists on Commons but contains no files."
+msgstr "Denne kategorien finnes på Commons, men inneholder ingen filer."
+
+#: templates/project_new.html:67
 msgid "Could not reach Commons API."
 msgstr "Kunne ikke nå Commons API."
 
@@ -1839,6 +1852,46 @@ msgid ""
 msgstr ""
 "Tilbakekall invitasjonskoden? Eksisterende medlemmer vil ikke bli "
 "påvirket, men ingen nye medlemmer kan bli med med denne koden."
+
+#: templates/project_detail.html
+msgid ""
+"No faces were detected in any of the images in this category. The project"
+" has been automatically completed."
+msgstr ""
+"Ingen ansikter ble oppdaget i noen av bildene i denne kategorien. "
+"Prosjektet har blitt automatisk fullført."
+
+#: templates/project_detail.html
+msgid "You can reactivate this project from"
+msgstr "Du kan reaktivere dette prosjektet fra"
+
+#: templates/project_detail.html
+msgid "if images are added to the category later."
+msgstr "hvis bilder legges til i kategorien senere."
+
+#: templates/project_detail.html
+msgid ""
+"The project owner can reactivate this project if images are added to the"
+" category later."
+msgstr ""
+"Prosjekteieren kan reaktivere dette prosjektet hvis bilder legges til i "
+"kategorien senere."
+
+#: templates/project_detail.html
+msgid ""
+"Too few faces were detected to reach autonomous inference. The project has"
+" been automatically completed."
+msgstr ""
+"For få ansikter ble oppdaget til å nå autonom inferens. Prosjektet har "
+"blitt automatisk fullført."
+
+#: templates/project_detail.html
+msgid "You can reactivate this project and lower the min_confirmed setting in"
+msgstr "Du kan reaktivere dette prosjektet og senke min_confirmed-innstillingen i"
+
+#: templates/project_detail.html
+msgid "The project owner can reactivate this project and adjust settings."
+msgstr "Prosjekteieren kan reaktivere dette prosjektet og justere innstillingene."
 
 #~ msgid "2. Active Learning"
 #~ msgstr "2. Aktiv læring"

@@ -91,13 +91,13 @@ WikiVisage/
 ├── schema.sql           # Database schema (9 tables + indices)
 ├── migrate.py           # Idempotent migration script with --reset flag
 ├── jobs.yaml            # Toolforge jobs definition (2 worker instances)
-├── templates/           # Jinja2 templates (9 files, all extend base.html)
+├── templates/           # Jinja2 templates (10 files, all extend base.html)
 ├── static/              # Logos + screenshots
 ├── translations/        # i18n: en, nb, es, fr
 ├── requirements.txt     # Runtime dependencies
 ├── requirements-dev.txt # Dev/test deps (pytest, ruff)
 ├── whitelist.txt        # Allowed usernames (Toolforge)
-└── tests/               # 504 tests (unit + integration)
+└── tests/               # 580 tests (unit + integration)
 ```
 
 ## 🧑‍💻 Setup
