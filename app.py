@@ -2029,7 +2029,7 @@ def api_classify():
 
 @app.route("/api/undo-classify", methods=["POST"])
 @login_required
-@limiter.limit("60 per minute", deduct_when=lambda resp: not getattr(g, "_skip_undo", False))
+@limiter.limit("60 per minute")
 def api_undo_classify():
     """Undo the last face classification, resetting affected faces to unclassified."""
     if not _validate_csrf():
