@@ -3277,9 +3277,10 @@ def project_settings(project_id: int):
         return render_template("project_settings.html", project=project, members=[], is_owner=True)
 
     try:
+        completion_reason_clause = ", completion_reason = NULL" if status != "completed" else ""
         execute_query(
             "UPDATE projects SET distance_threshold = %s, min_confirmed = %s, "
-            "status = %s, label = %s, completion_reason = NULL WHERE id = %s AND user_id = %s",
+            f"status = %s, label = %s{completion_reason_clause} WHERE id = %s AND user_id = %s",
             (
                 distance_threshold,
                 min_confirmed,

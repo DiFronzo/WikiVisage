@@ -7203,6 +7203,76 @@ def test_project_settings_db_error_on_update(monkeypatch, fake_user):
     assert b"Failed to update settings." in response.data
 
 
+def test_project_settings_completed_status_preserves_completion_reason(monkeypatch, fake_user):
+    project = _project_settings_base_row()
+    project["status"] = "completed"
+    sqls_seen = []
+
+    def route_execute(sql, params, fetch):
+        if "SELECT * FROM projects" in sql:
+            return [project.copy()]
+        if "UPDATE projects SET distance_threshold" in sql:
+            sqls_seen.append(sql)
+            return 1
+        if "AS human_confirmed" in sql:
+            return [{"human_confirmed": 10, "by_bootstrap": 0}]
+        raise AssertionError(f"Unexpected SQL: {sql}")
+
+    client = _make_authed_client(monkeypatch, fake_user, route_execute)
+    _set_csrf_chunk6(client)
+
+    response = client.post(
+        "/project/1/settings",
+        data={
+            "csrf_token": "testtoken",
+            "distance_threshold": "0.5",
+            "min_confirmed": "5",
+            "status": "completed",
+            "label": "My Project",
+        },
+    )
+
+    assert response.status_code == 302
+    assert len(sqls_seen) == 1
+    # Must NOT include completion_reason = NULL when keeping completed status
+    assert "completion_reason" not in sqls_seen[0]
+
+
+def test_project_settings_reactivation_clears_completion_reason(monkeypatch, fake_user):
+    project = _project_settings_base_row()
+    project["status"] = "completed"
+    sqls_seen = []
+
+    def route_execute(sql, params, fetch):
+        if "SELECT * FROM projects" in sql:
+            return [project.copy()]
+        if "UPDATE projects SET distance_threshold" in sql:
+            sqls_seen.append(sql)
+            return 1
+        if "AS human_confirmed" in sql:
+            return [{"human_confirmed": 10, "by_bootstrap": 0}]
+        raise AssertionError(f"Unexpected SQL: {sql}")
+
+    client = _make_authed_client(monkeypatch, fake_user, route_execute)
+    _set_csrf_chunk6(client)
+
+    response = client.post(
+        "/project/1/settings",
+        data={
+            "csrf_token": "testtoken",
+            "distance_threshold": "0.5",
+            "min_confirmed": "5",
+            "status": "active",
+            "label": "My Project",
+        },
+    )
+
+    assert response.status_code == 302
+    assert len(sqls_seen) == 1
+    # MUST include completion_reason = NULL when reactivating
+    assert "completion_reason" in sqls_seen[0]
+
+
 def test_project_rerun_inference_csrf_fail(monkeypatch, fake_user):
     client = _make_authed_client(monkeypatch, fake_user)
 
