@@ -88,6 +88,9 @@
         letter-spacing: 0.05em;
         white-space: nowrap;
     }
+    .face-box.label-inside .face-label {
+        top: 0;
+    }
     .face-box:hover .face-label {
         background: var(--success);
     }
@@ -130,6 +133,9 @@
         overflow: hidden;
         text-overflow: ellipsis;
         flex-basis: 100%;
+        max-width: 100%;
+        min-width: 0;
+        box-sizing: border-box;
         text-align: center;
         margin-top: 0.4rem;
     }
@@ -590,11 +596,19 @@
             var b = parseInt(box.dataset.bboxBottom);
             var l = parseInt(box.dataset.bboxLeft);
 
+            var topPx = t * scaleY + imgOffsetTop;
             box.style.left   = (l * scaleX + imgOffsetLeft) + 'px';
-            box.style.top    = (t * scaleY + imgOffsetTop) + 'px';
+            box.style.top    = topPx + 'px';
             box.style.width  = ((r - l) * scaleX) + 'px';
             box.style.height = ((b - t) * scaleY) + 'px';
             box.style.display = 'block';
+
+            /* Move label inside the box when it would be clipped at the top edge */
+            if (topPx < 22) {
+                box.classList.add('label-inside');
+            } else {
+                box.classList.remove('label-inside');
+            }
         });
     }
 

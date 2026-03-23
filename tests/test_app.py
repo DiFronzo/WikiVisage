@@ -4422,7 +4422,7 @@ def test_api_classify_target_review_mode_updates_other_faces_human(monkeypatch):
 
         def _execute(sql, params=None):
             executed.append((sql, params))
-            if "WHERE id = %s AND image_id = %s AND is_target IS NULL" in sql:
+            if "AND is_target = 0 AND classified_by = 'model'" in sql and "SET is_target = 1" in sql:
                 cursor.rowcount = 1
 
         cursor.execute.side_effect = _execute
@@ -4443,9 +4443,69 @@ def test_api_classify_target_review_mode_updates_other_faces_human(monkeypatch):
         },
     )
     assert response.status_code == 200
-    assert any("AND is_target = 0 AND classified_by = 'model'" in sql for sql, _ in executed)
+    assert any(
+        "AND is_target = 0 AND classified_by = 'model'" in sql and "SET is_target = 1" in sql for sql, _ in executed
+    )
+    assert any("AND is_target = 0 AND classified_by = 'model'" in sql and "id != %s" in sql for sql, _ in executed)
+    assert any("faces_confirmed = faces_confirmed + 1" in sql for sql, _ in executed)
     with client.session_transaction() as sess:
         assert sess["last_classify"]["was_review"] is True
+
+
+def test_api_classify_target_review_mode_does_not_use_is_target_null(monkeypatch):
+    """Regression: review-mode target UPDATE must NOT use is_target IS NULL (would match 0 rows)."""
+    executed = []
+
+    def eq(sql, params=None, fetch=True):
+        del params, fetch
+        if "FROM users WHERE id = %s" in sql:
+            return [
+                {
+                    "id": 1,
+                    "wiki_username": "tester",
+                    "access_token": "token",
+                    "refresh_token": "refresh",
+                    "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
+                }
+            ]
+        if "SELECT i.id, i.file_title FROM images i" in sql:
+            return [{"id": 22, "file_title": "File:Test.jpg"}]
+        return ()
+
+    def tx(fn):
+        cursor = MagicMock()
+
+        def _execute(sql, params=None):
+            executed.append((sql, params))
+            if "SET is_target = 1" in sql:
+                if "is_target IS NULL" in sql:
+                    cursor.rowcount = 0
+                elif "is_target = 0" in sql:
+                    cursor.rowcount = 1
+
+        cursor.execute.side_effect = _execute
+        cursor.fetchall.return_value = [{"id": 10}, {"id": 11}]
+        return fn(MagicMock(), cursor)
+
+    monkeypatch.setattr(app_module, "execute_transaction", tx)
+    client, _ = _auth_client_chunk4(monkeypatch, eq)
+    _set_csrf_chunk4(client)
+    response = client.post(
+        "/api/classify",
+        data={
+            "csrf_token": "testtoken",
+            "selected_face_id": "10",
+            "project_id": "1",
+            "image_id": "22",
+            "reviewing_model": "1",
+        },
+    )
+    assert response.status_code == 200
+    target_sqls = [sql for sql, _ in executed if "SET is_target = 1" in sql]
+    assert len(target_sqls) == 1
+    assert "is_target IS NULL" not in target_sqls[0]
+    assert "is_target = 0" in target_sqls[0]
+    assert any("faces_confirmed = faces_confirmed + 1" in sql for sql, _ in executed)
 
 
 def test_api_classify_db_error_during_transaction(monkeypatch):
@@ -4809,6 +4869,344 @@ def test_api_undo_classify_success_response_contains_ids(monkeypatch):
     assert payload == {"status": "ok", "project_id": 9, "image_id": 77}
 
 
+# --- Undo-after-skip tests ---
+
+
+def test_classify_skip_sets_last_classify_with_skip_action(monkeypatch):
+    """Skip sets session['last_classify'] with action='skip' so undo button appears."""
+    captured = _capture_render_template_chunk4(monkeypatch)
+    monkeypatch.setattr(app_module.random, "choice", lambda rows: rows[0])
+
+    def eq(sql, params=None, fetch=True):
+        if "FROM users WHERE id = %s" in sql:
+            return [
+                {
+                    "id": 1,
+                    "wiki_username": "tester",
+                    "access_token": "token",
+                    "refresh_token": "refresh",
+                    "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
+                }
+            ]
+        if "FROM projects p LEFT JOIN project_members" in sql:
+            return [{"id": 1, "user_id": 1}]
+        if "f.is_target IS NULL" in sql and "LIMIT 200" in sql:
+            return [
+                {
+                    "image_id": 15,
+                    "file_title": "File:A.jpg",
+                    "commons_page_id": 1,
+                    "detection_width": 100,
+                    "detection_height": 100,
+                }
+            ]
+        if "WHERE f.image_id = %s AND f.is_target IS NULL" in sql:
+            return [
+                {"face_id": 1, "bbox_left": 10, "bbox_top": 1, "bbox_right": 20, "bbox_bottom": 30, "confidence": None}
+            ]
+        if "COUNT(DISTINCT i.id) AS cnt" in sql:
+            return [{"cnt": 1}]
+        return ()
+
+    client, _ = _auth_client_chunk4(monkeypatch, eq)
+    response = client.get("/project/1/classify?skip_image_id=77")
+    assert response.status_code == 200
+    with client.session_transaction() as sess:
+        last = sess.get("last_classify")
+        assert last is not None
+        assert last["action"] == "skip"
+        assert last["project_id"] == 1
+        assert last["image_id"] == 77
+        assert last["was_review"] is False
+    assert captured["context"]["has_undo"] is True
+
+
+def test_classify_skip_review_sets_last_classify_with_was_review(monkeypatch):
+    """Skip in review mode sets was_review=True in last_classify."""
+    _capture_render_template_chunk4(monkeypatch)
+    monkeypatch.setattr(app_module.random, "choice", lambda rows: rows[0])
+
+    def eq(sql, params=None, fetch=True):
+        if "FROM users WHERE id = %s" in sql:
+            return [
+                {
+                    "id": 1,
+                    "wiki_username": "tester",
+                    "access_token": "token",
+                    "refresh_token": "refresh",
+                    "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
+                }
+            ]
+        if "FROM projects p LEFT JOIN project_members" in sql:
+            return [{"id": 1, "user_id": 1}]
+        if "f.is_target IS NULL" in sql and "LIMIT 200" in sql:
+            return []
+        if "f.is_target = 0 AND f.classified_by = 'model'" in sql and "LIMIT 200" in sql:
+            return [
+                {
+                    "image_id": 22,
+                    "file_title": "File:B.jpg",
+                    "commons_page_id": 2,
+                    "detection_width": 100,
+                    "detection_height": 100,
+                }
+            ]
+        if "WHERE f.image_id = %s AND f.is_target = 0" in sql:
+            return [
+                {"face_id": 9, "bbox_left": 10, "bbox_top": 1, "bbox_right": 20, "bbox_bottom": 30, "confidence": 0.2}
+            ]
+        if "COUNT(DISTINCT i.id) AS cnt" in sql:
+            return [{"cnt": 0}]
+        return ()
+
+    client, _ = _auth_client_chunk4(monkeypatch, eq)
+    response = client.get("/project/1/classify?skip_image_id=88&skip_reviewing=1")
+    assert response.status_code == 200
+    with client.session_transaction() as sess:
+        last = sess.get("last_classify")
+        assert last is not None
+        assert last["action"] == "skip"
+        assert last["was_review"] is True
+        assert last["image_id"] == 88
+
+
+def test_api_undo_skip_removes_from_skip_list(monkeypatch):
+    """Undo of skip removes image from skip list and returns image_id for redirect."""
+
+    def eq(sql, params=None, fetch=True):
+        if "FROM users WHERE id = %s" in sql:
+            return [
+                {
+                    "id": 1,
+                    "wiki_username": "tester",
+                    "access_token": "token",
+                    "refresh_token": "refresh",
+                    "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
+                }
+            ]
+        if "FROM projects p LEFT JOIN project_members" in sql:
+            return [{"id": 5, "user_id": 1}]
+        return ()
+
+    client, _ = _auth_client_chunk4(monkeypatch, eq)
+    _set_csrf_chunk4(client)
+    with client.session_transaction() as sess:
+        sess["skipped_images_5"] = [10, 20, 30]
+        sess["last_classify"] = {
+            "action": "skip",
+            "project_id": 5,
+            "image_id": 20,
+            "was_review": False,
+            "face_ids": [],
+            "manual_face_ids": [],
+        }
+    response = client.post("/api/undo-classify", data={"csrf_token": "testtoken"})
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload == {"status": "ok", "project_id": 5, "image_id": 20}
+    with client.session_transaction() as sess:
+        assert 20 not in sess["skipped_images_5"]
+        assert sess["skipped_images_5"] == [10, 30]
+        assert "last_classify" not in sess
+
+
+def test_api_undo_skip_review_removes_from_review_skip_list(monkeypatch):
+    """Undo of review-mode skip removes from the review skip list."""
+
+    def eq(sql, params=None, fetch=True):
+        if "FROM users WHERE id = %s" in sql:
+            return [
+                {
+                    "id": 1,
+                    "wiki_username": "tester",
+                    "access_token": "token",
+                    "refresh_token": "refresh",
+                    "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
+                }
+            ]
+        if "FROM projects p LEFT JOIN project_members" in sql:
+            return [{"id": 3, "user_id": 1}]
+        return ()
+
+    client, _ = _auth_client_chunk4(monkeypatch, eq)
+    _set_csrf_chunk4(client)
+    with client.session_transaction() as sess:
+        sess["skipped_images_review_3"] = [50, 60]
+        sess["last_classify"] = {
+            "action": "skip",
+            "project_id": 3,
+            "image_id": 60,
+            "was_review": True,
+            "face_ids": [],
+            "manual_face_ids": [],
+        }
+    response = client.post("/api/undo-classify", data={"csrf_token": "testtoken"})
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload == {"status": "ok", "project_id": 3, "image_id": 60}
+    with client.session_transaction() as sess:
+        assert sess["skipped_images_review_3"] == [50]
+        assert "last_classify" not in sess
+
+
+def test_api_undo_skip_idempotent_when_not_in_list(monkeypatch):
+    """Undo of skip succeeds even if image_id is not in skip list (idempotent)."""
+
+    def eq(sql, params=None, fetch=True):
+        if "FROM users WHERE id = %s" in sql:
+            return [
+                {
+                    "id": 1,
+                    "wiki_username": "tester",
+                    "access_token": "token",
+                    "refresh_token": "refresh",
+                    "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
+                }
+            ]
+        if "FROM projects p LEFT JOIN project_members" in sql:
+            return [{"id": 7, "user_id": 1}]
+        return ()
+
+    client, _ = _auth_client_chunk4(monkeypatch, eq)
+    _set_csrf_chunk4(client)
+    with client.session_transaction() as sess:
+        sess["skipped_images_7"] = [100]
+        sess["last_classify"] = {
+            "action": "skip",
+            "project_id": 7,
+            "image_id": 999,
+            "was_review": False,
+            "face_ids": [],
+            "manual_face_ids": [],
+        }
+    response = client.post("/api/undo-classify", data={"csrf_token": "testtoken"})
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload == {"status": "ok", "project_id": 7, "image_id": 999}
+    with client.session_transaction() as sess:
+        assert sess["skipped_images_7"] == [100]
+        assert "last_classify" not in sess
+
+
+def test_api_undo_skip_no_db_transaction_needed(monkeypatch):
+    """Undo of skip does NOT call execute_transaction (session-only operation)."""
+    tx_called = []
+
+    def tx(_fn):
+        tx_called.append(True)
+        raise AssertionError("execute_transaction should not be called for skip undo")
+
+    monkeypatch.setattr(app_module, "execute_transaction", tx)
+
+    def eq(sql, params=None, fetch=True):
+        if "FROM users WHERE id = %s" in sql:
+            return [
+                {
+                    "id": 1,
+                    "wiki_username": "tester",
+                    "access_token": "token",
+                    "refresh_token": "refresh",
+                    "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
+                }
+            ]
+        if "FROM projects p LEFT JOIN project_members" in sql:
+            return [{"id": 2, "user_id": 1}]
+        return ()
+
+    client, _ = _auth_client_chunk4(monkeypatch, eq)
+    _set_csrf_chunk4(client)
+    with client.session_transaction() as sess:
+        sess["skipped_images_2"] = [42]
+        sess["last_classify"] = {
+            "action": "skip",
+            "project_id": 2,
+            "image_id": 42,
+            "was_review": False,
+            "face_ids": [],
+            "manual_face_ids": [],
+        }
+    response = client.post("/api/undo-classify", data={"csrf_token": "testtoken"})
+    assert response.status_code == 200
+    assert len(tx_called) == 0
+
+
+def test_api_undo_skip_returns_404_when_not_owner_or_member(monkeypatch):
+    """Undo of skip returns 404 if user is not the project owner or a member."""
+
+    def eq(sql, params=None, fetch=True):
+        if "FROM users WHERE id = %s" in sql:
+            return [
+                {
+                    "id": 1,
+                    "wiki_username": "tester",
+                    "access_token": "token",
+                    "refresh_token": "refresh",
+                    "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
+                }
+            ]
+        if "FROM projects p LEFT JOIN project_members" in sql:
+            return ()
+        return ()
+
+    client, _ = _auth_client_chunk4(monkeypatch, eq)
+    _set_csrf_chunk4(client)
+    with client.session_transaction() as sess:
+        sess["skipped_images_99"] = [10]
+        sess["last_classify"] = {
+            "action": "skip",
+            "project_id": 99,
+            "image_id": 10,
+            "was_review": False,
+            "face_ids": [],
+            "manual_face_ids": [],
+        }
+    response = client.post("/api/undo-classify", data={"csrf_token": "testtoken"})
+    assert response.status_code == 404
+    with client.session_transaction() as sess:
+        assert sess["skipped_images_99"] == [10]
+        assert sess.get("last_classify") is not None
+
+
+def test_api_undo_skip_works_for_project_member(monkeypatch):
+    """Undo of skip succeeds when user is a project member (not owner)."""
+
+    def eq(sql, params=None, fetch=True):
+        if "FROM users WHERE id = %s" in sql:
+            return [
+                {
+                    "id": 2,
+                    "wiki_username": "tester",
+                    "access_token": "token",
+                    "refresh_token": "refresh",
+                    "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
+                }
+            ]
+        if "FROM projects p LEFT JOIN project_members" in sql:
+            return [{"id": 5, "user_id": 1}]
+        return ()
+
+    client, _ = _auth_client_chunk4(monkeypatch, eq)
+    _set_csrf_chunk4(client)
+    with client.session_transaction() as sess:
+        sess["user_id"] = 2
+        sess["skipped_images_5"] = [10, 20]
+        sess["last_classify"] = {
+            "action": "skip",
+            "project_id": 5,
+            "image_id": 20,
+            "was_review": False,
+            "face_ids": [],
+            "manual_face_ids": [],
+        }
+    response = client.post("/api/undo-classify", data={"csrf_token": "testtoken"})
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload == {"status": "ok", "project_id": 5, "image_id": 20}
+    with client.session_transaction() as sess:
+        assert sess["skipped_images_5"] == [10]
+        assert "last_classify" not in sess
+
+
 def _fake_user_chunk5():
     return {
         "id": 1,
@@ -4928,8 +5326,11 @@ def _default_bbox_face_row(**overrides):
         "classified_by": "model",
         "confidence": 0.23,
         "classified_by_user_id": None,
+        "sdc_written": 0,
         "file_title": "File:Face.jpg",
+        "commons_page_id": 12345,
         "project_id": 1,
+        "wikidata_qid": "Q42",
     }
     row.update(overrides)
     return row
@@ -8887,3 +9288,354 @@ def test_sitemap_xml_returns_valid_xml():
 
     loc_texts = [(elem.text or "") for elem in root.iter() if elem.tag.endswith("loc")]
     assert any("/leaderboard" in text for text in loc_texts)
+
+
+# --- _check_p180_exists tests ---
+
+
+def test_check_p180_exists_true_when_claim_matches(monkeypatch):
+    def mock_get(*_a, **_kw):
+        return _MockResponse({"claims": {"P180": [{"mainsnak": {"datavalue": {"value": {"id": "Q42"}}}}]}})
+
+    monkeypatch.setattr(app_module.requests, "get", mock_get)
+    assert app_module._check_p180_exists(555, "Q42") is True
+
+
+def test_check_p180_exists_false_when_different_qid(monkeypatch):
+    def mock_get(*_a, **_kw):
+        return _MockResponse({"claims": {"P180": [{"mainsnak": {"datavalue": {"value": {"id": "Q99"}}}}]}})
+
+    monkeypatch.setattr(app_module.requests, "get", mock_get)
+    assert app_module._check_p180_exists(555, "Q42") is False
+
+
+def test_check_p180_exists_false_when_no_p180_claims(monkeypatch):
+    monkeypatch.setattr(app_module.requests, "get", lambda *_a, **_kw: _MockResponse({"claims": {}}))
+    assert app_module._check_p180_exists(555, "Q42") is False
+
+
+def test_check_p180_exists_true_among_multiple_claims(monkeypatch):
+    def mock_get(*_a, **_kw):
+        return _MockResponse(
+            {
+                "claims": {
+                    "P180": [
+                        {"mainsnak": {"datavalue": {"value": {"id": "Q99"}}}},
+                        {"mainsnak": {"datavalue": {"value": {"id": "Q42"}}}},
+                    ]
+                }
+            }
+        )
+
+    monkeypatch.setattr(app_module.requests, "get", mock_get)
+    assert app_module._check_p180_exists(555, "Q42") is True
+
+
+def test_check_p180_exists_false_on_missing_nested_keys(monkeypatch):
+    monkeypatch.setattr(app_module.requests, "get", lambda *_a, **_kw: _MockResponse({"claims": {"P180": [{}]}}))
+    assert app_module._check_p180_exists(555, "Q42") is False
+
+
+def test_check_p180_exists_false_on_http_error(monkeypatch):
+    monkeypatch.setattr(app_module.requests, "get", lambda *_a, **_kw: _MockResponse({}, should_raise=True))
+    assert app_module._check_p180_exists(555, "Q42") is False
+
+
+def test_check_p180_exists_false_on_request_exception(monkeypatch):
+    monkeypatch.setattr(app_module.requests, "get", lambda *_a, **_kw: (_ for _ in ()).throw(RuntimeError("boom")))
+    assert app_module._check_p180_exists(555, "Q42") is False
+
+
+def test_check_p180_exists_calls_commons_api_with_expected_params(monkeypatch):
+    captured = {}
+
+    def mock_get(url, **kwargs):
+        captured["url"] = url
+        captured.update(kwargs)
+        return _MockResponse({"claims": {"P180": []}})
+
+    monkeypatch.setattr(app_module.requests, "get", mock_get)
+    app_module._check_p180_exists(777, "Q76")
+
+    assert captured["url"] == app_module.COMMONS_API_URL
+    assert captured["params"]["action"] == "wbgetclaims"
+    assert captured["params"]["entity"] == "M777"
+    assert captured["params"]["property"] == "P180"
+    assert captured["params"]["format"] == "json"
+    assert captured["headers"] == {"User-Agent": app_module.USER_AGENT}
+    assert captured["timeout"] == 10
+
+
+# --- P180 check at classify time tests ---
+
+
+def test_api_classify_target_marks_sdc_written_when_p180_exists(monkeypatch):
+    executed_queries = []
+
+    def eq(sql, params=None, fetch=True):
+        del fetch
+        executed_queries.append((sql, params))
+        if "FROM users WHERE id = %s" in sql:
+            return [
+                {
+                    "id": 1,
+                    "wiki_username": "tester",
+                    "access_token": "token",
+                    "refresh_token": "refresh",
+                    "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
+                }
+            ]
+        if "SELECT i.id, i.file_title FROM images i" in sql:
+            return [{"id": 22, "file_title": "File:Test.jpg"}]
+        if "SELECT i.commons_page_id, p.wikidata_qid" in sql:
+            return [{"commons_page_id": 555, "wikidata_qid": "Q42"}]
+        return ()
+
+    def tx(fn):
+        cursor = MagicMock()
+
+        def _execute(sql, params=None):
+            executed_queries.append((sql, params))
+            if "WHERE id = %s AND image_id = %s AND is_target IS NULL" in sql:
+                cursor.rowcount = 1
+
+        cursor.execute.side_effect = _execute
+        cursor.fetchall.return_value = [{"id": 10}]
+        return fn(MagicMock(), cursor)
+
+    monkeypatch.setattr(app_module, "execute_transaction", tx)
+    monkeypatch.setattr(app_module, "_check_p180_exists", lambda cpid, qid: True)
+    client, _ = _auth_client_chunk4(monkeypatch, eq)
+    _set_csrf_chunk4(client)
+    response = client.post(
+        "/api/classify",
+        data={"csrf_token": "testtoken", "selected_face_id": "10", "project_id": "1", "image_id": "22"},
+    )
+
+    assert response.status_code == 200
+    assert any("UPDATE faces SET sdc_written = 1" in sql for sql, _ in executed_queries)
+    assert any("UPDATE images SET bootstrapped = 1" in sql for sql, _ in executed_queries)
+
+
+def test_api_classify_target_no_sdc_written_when_p180_missing(monkeypatch):
+    executed_queries = []
+
+    def eq(sql, params=None, fetch=True):
+        del fetch
+        executed_queries.append((sql, params))
+        if "FROM users WHERE id = %s" in sql:
+            return [
+                {
+                    "id": 1,
+                    "wiki_username": "tester",
+                    "access_token": "token",
+                    "refresh_token": "refresh",
+                    "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
+                }
+            ]
+        if "SELECT i.id, i.file_title FROM images i" in sql:
+            return [{"id": 22, "file_title": "File:Test.jpg"}]
+        if "SELECT i.commons_page_id, p.wikidata_qid" in sql:
+            return [{"commons_page_id": 555, "wikidata_qid": "Q42"}]
+        return ()
+
+    def tx(fn):
+        cursor = MagicMock()
+
+        def _execute(sql, params=None):
+            executed_queries.append((sql, params))
+            if "WHERE id = %s AND image_id = %s AND is_target IS NULL" in sql:
+                cursor.rowcount = 1
+
+        cursor.execute.side_effect = _execute
+        cursor.fetchall.return_value = [{"id": 10}]
+        return fn(MagicMock(), cursor)
+
+    monkeypatch.setattr(app_module, "execute_transaction", tx)
+    monkeypatch.setattr(app_module, "_check_p180_exists", lambda cpid, qid: False)
+    client, _ = _auth_client_chunk4(monkeypatch, eq)
+    _set_csrf_chunk4(client)
+    response = client.post(
+        "/api/classify",
+        data={"csrf_token": "testtoken", "selected_face_id": "10", "project_id": "1", "image_id": "22"},
+    )
+
+    assert response.status_code == 200
+    assert not any("UPDATE faces SET sdc_written = 1" in sql for sql, _ in executed_queries)
+
+
+def test_api_classify_target_p180_check_db_error_non_fatal(monkeypatch):
+    def eq(sql, params=None, fetch=True):
+        del params, fetch
+        if "FROM users WHERE id = %s" in sql:
+            return [
+                {
+                    "id": 1,
+                    "wiki_username": "tester",
+                    "access_token": "token",
+                    "refresh_token": "refresh",
+                    "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
+                }
+            ]
+        if "SELECT i.id, i.file_title FROM images i" in sql:
+            return [{"id": 22, "file_title": "File:Test.jpg"}]
+        if "SELECT i.commons_page_id, p.wikidata_qid" in sql:
+            raise app_module.DatabaseError("meta lookup failed")
+        return ()
+
+    def tx(fn):
+        cursor = MagicMock()
+
+        def _execute(sql, params=None):
+            if "WHERE id = %s AND image_id = %s AND is_target IS NULL" in sql:
+                cursor.rowcount = 1
+
+        cursor.execute.side_effect = _execute
+        cursor.fetchall.return_value = [{"id": 10}]
+        return fn(MagicMock(), cursor)
+
+    monkeypatch.setattr(app_module, "execute_transaction", tx)
+    client, _ = _auth_client_chunk4(monkeypatch, eq)
+    _set_csrf_chunk4(client)
+    response = client.post(
+        "/api/classify",
+        data={"csrf_token": "testtoken", "selected_face_id": "10", "project_id": "1", "image_id": "22"},
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["status"] == "ok"
+
+
+# --- P180 check at reclassify time tests ---
+
+
+def test_api_reclassify_approve_marks_sdc_written_when_p180_exists(monkeypatch):
+    face_row = _default_reclassify_face_row(old_is_target=0, classified_by="model")
+    executed_queries = []
+
+    def route_query(sql):
+        if "FROM faces f " in sql and "old_is_target" in sql and "project_members" in sql:
+            return [face_row]
+        if "FROM images i JOIN projects p" in sql and "commons_page_id" in sql:
+            return [{"commons_page_id": face_row["commons_page_id"], "wikidata_qid": face_row["wikidata_qid"]}]
+        return []
+
+    def eq(sql, params=None, fetch=True):
+        del fetch
+        executed_queries.append((sql, params))
+        if "FROM users WHERE id" in sql:
+            return [_fake_user_chunk5()]
+        return route_query(sql)
+
+    monkeypatch.setattr(app_module, "execute_query", eq)
+    monkeypatch.setattr(app_module, "_load_whitelist", lambda: {"tester"})
+    monkeypatch.setattr(app_module, "_check_p180_exists", lambda cpid, qid: True)
+    monkeypatch.setattr(app_module.limiter, "enabled", False, raising=False)
+
+    def _transaction(fn):
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_cursor.rowcount = 1
+        return fn(mock_conn, mock_cursor)
+
+    monkeypatch.setattr(app_module, "execute_transaction", _transaction)
+
+    flask_app.config["TESTING"] = True
+    flask_app.config["RATELIMIT_ENABLED"] = False
+    client = flask_app.test_client()
+    with client.session_transaction() as sess:
+        sess["user_id"] = 1
+        sess["csrf_token"] = "testtoken"
+
+    resp = client.post("/api/reclassify", data={"csrf_token": "testtoken", "face_id": "1", "is_target": "1"})
+
+    assert resp.status_code == 200
+    assert any("UPDATE faces SET sdc_written = 1" in sql for sql, _ in executed_queries)
+    assert any("UPDATE images SET bootstrapped = 1" in sql for sql, _ in executed_queries)
+
+
+def test_api_reclassify_approve_no_sdc_written_when_p180_missing(monkeypatch):
+    face_row = _default_reclassify_face_row(old_is_target=0, classified_by="model")
+    executed_queries = []
+
+    def route_query(sql):
+        if "FROM faces f " in sql and "old_is_target" in sql and "project_members" in sql:
+            return [face_row]
+        return []
+
+    def eq(sql, params=None, fetch=True):
+        del fetch
+        executed_queries.append((sql, params))
+        if "FROM users WHERE id" in sql:
+            return [_fake_user_chunk5()]
+        return route_query(sql)
+
+    monkeypatch.setattr(app_module, "execute_query", eq)
+    monkeypatch.setattr(app_module, "_load_whitelist", lambda: {"tester"})
+    monkeypatch.setattr(app_module, "_check_p180_exists", lambda cpid, qid: False)
+    monkeypatch.setattr(app_module.limiter, "enabled", False, raising=False)
+
+    def _transaction(fn):
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_cursor.rowcount = 1
+        return fn(mock_conn, mock_cursor)
+
+    monkeypatch.setattr(app_module, "execute_transaction", _transaction)
+
+    flask_app.config["TESTING"] = True
+    flask_app.config["RATELIMIT_ENABLED"] = False
+    client = flask_app.test_client()
+    with client.session_transaction() as sess:
+        sess["user_id"] = 1
+        sess["csrf_token"] = "testtoken"
+
+    resp = client.post("/api/reclassify", data={"csrf_token": "testtoken", "face_id": "1", "is_target": "1"})
+
+    assert resp.status_code == 200
+    assert not any("UPDATE faces SET sdc_written = 1" in sql for sql, _ in executed_queries)
+
+
+def test_api_reclassify_approve_skips_p180_check_when_already_sdc_written(monkeypatch):
+    face_row = _default_reclassify_face_row(old_is_target=0, classified_by="model", sdc_written=1)
+    p180_called = []
+
+    def route_query(sql):
+        if "FROM faces f " in sql and "old_is_target" in sql and "project_members" in sql:
+            return [face_row]
+        return []
+
+    def eq(sql, params=None, fetch=True):
+        del params, fetch
+        if "FROM users WHERE id" in sql:
+            return [_fake_user_chunk5()]
+        return route_query(sql)
+
+    def mock_check(cpid, qid):
+        p180_called.append((cpid, qid))
+        return True
+
+    monkeypatch.setattr(app_module, "execute_query", eq)
+    monkeypatch.setattr(app_module, "_load_whitelist", lambda: {"tester"})
+    monkeypatch.setattr(app_module, "_check_p180_exists", mock_check)
+    monkeypatch.setattr(app_module.limiter, "enabled", False, raising=False)
+
+    def _transaction(fn):
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_cursor.rowcount = 1
+        return fn(mock_conn, mock_cursor)
+
+    monkeypatch.setattr(app_module, "execute_transaction", _transaction)
+
+    flask_app.config["TESTING"] = True
+    flask_app.config["RATELIMIT_ENABLED"] = False
+    client = flask_app.test_client()
+    with client.session_transaction() as sess:
+        sess["user_id"] = 1
+        sess["csrf_token"] = "testtoken"
+
+    resp = client.post("/api/reclassify", data={"csrf_token": "testtoken", "face_id": "1", "is_target": "1"})
+
+    assert resp.status_code == 200
+    assert len(p180_called) == 0
