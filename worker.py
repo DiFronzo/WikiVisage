@@ -2600,8 +2600,18 @@ def process_project(project: dict[str, Any], *, skip_discovery: bool = False) ->
                 fetch=True,
             )
             total_faces = face_count_row[0]["cnt"] if face_count_row else 0
-            min_confirmed = project.get("min_confirmed", 5)
 
+            # Fetch the latest min_confirmed from the database to avoid using a stale in-memory value.
+            min_conf_row = execute_query(
+                "SELECT min_confirmed FROM projects WHERE id = %s",
+                (project_id,),
+                fetch=True,
+            )
+            if min_conf_row and min_conf_row[0].get("min_confirmed") is not None:
+                min_confirmed = min_conf_row[0]["min_confirmed"]
+            else:
+                # Fall back to the original project dict or default to preserve existing behavior.
+                min_confirmed = project.get("min_confirmed", 5)
             if total_faces == 0:
                 execute_query(
                     "UPDATE projects SET status = 'completed', completion_reason = 'no_faces' "
