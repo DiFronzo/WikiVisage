@@ -1643,17 +1643,10 @@ def project_detail(project_id: int):
             reason = "insufficient_faces"
 
         if reason:
-            try:
-                execute_query(
-                    "UPDATE projects SET status = 'completed', completion_reason = %s "
-                    "WHERE id = %s AND status = 'active'",
-                    (reason, project_id),
-                    fetch=False,
-                )
-                project["status"] = "completed"
-                project["completion_reason"] = reason
-            except DatabaseError:
-                pass
+            # Reflect completion status only in-memory for this response.
+            # The worker is responsible for persisting this transition.
+            project["status"] = "completed"
+            project["completion_reason"] = reason
 
     # Count faces eligible for model inference (mirrors worker's filter)
     inference_eligible = 0
