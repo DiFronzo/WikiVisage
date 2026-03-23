@@ -1047,7 +1047,7 @@ def get_project_for_actor(project_id: int, user_id: int, *, require_owner: bool 
 def verify_image_access(image_id: int, project_id: int, user_id: int) -> dict | None:
     """Confirm *image_id* belongs to a project accessible to *user_id* (owner or member).
 
-    Returns the image row (``id``, ``file_title``) or ``None``.
+    Returns the image row (``id``, ``file_title``, ``status``) or ``None``.
     """
     rows = execute_query(
         "SELECT i.id, i.file_title, i.status FROM images i "
