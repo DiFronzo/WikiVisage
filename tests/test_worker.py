@@ -1136,6 +1136,70 @@ def test_write_sdc_insert_ignore_zero_other_project_stale_reclaims():
     assert len(face_updates) == 1
 
 
+def test_write_sdc_uses_sdc_write_user_id_when_set():
+    """write_sdc_claims should use sdc_write_user_id for token lookup when set, not the project owner."""
+    project = {"id": 5, "user_id": 1, "sdc_write_user_id": 99, "wikidata_qid": "Q42"}
+
+    token_user_ids = []
+
+    def mock_refresh(uid):
+        token_user_ids.append(uid)
+        return "fake-token"
+
+    def mock_execute_query(sql, params=None, fetch=True):
+        if "sdc_write_requested" in sql and "SELECT" in sql:
+            return [{"sdc_write_requested": 1}]
+        if "SELECT f.id as face_id" in sql:
+            return []
+        if "sdc_removal_pending" in sql and "SELECT" in sql:
+            return []
+        if "UPDATE projects SET sdc_write_requested = 0" in sql:
+            return 1
+        return []
+
+    with (
+        patch("worker.execute_query", side_effect=mock_execute_query),
+        patch("worker._refresh_worker_token", side_effect=mock_refresh),
+        patch("worker._get_csrf_token", return_value="fake-csrf"),
+        patch("worker.shutdown_requested", False),
+    ):
+        write_sdc_claims(project)
+
+    assert token_user_ids[0] == 99, f"Expected user 99 (sdc_write_user_id), got {token_user_ids[0]}"
+
+
+def test_write_sdc_falls_back_to_owner_when_sdc_write_user_id_missing():
+    """write_sdc_claims should fall back to project owner when sdc_write_user_id is not set."""
+    project = {"id": 5, "user_id": 1, "wikidata_qid": "Q42"}
+
+    token_user_ids = []
+
+    def mock_refresh(uid):
+        token_user_ids.append(uid)
+        return "fake-token"
+
+    def mock_execute_query(sql, params=None, fetch=True):
+        if "sdc_write_requested" in sql and "SELECT" in sql:
+            return [{"sdc_write_requested": 1}]
+        if "SELECT f.id as face_id" in sql:
+            return []
+        if "sdc_removal_pending" in sql and "SELECT" in sql:
+            return []
+        if "UPDATE projects SET sdc_write_requested = 0" in sql:
+            return 1
+        return []
+
+    with (
+        patch("worker.execute_query", side_effect=mock_execute_query),
+        patch("worker._refresh_worker_token", side_effect=mock_refresh),
+        patch("worker._get_csrf_token", return_value="fake-csrf"),
+        patch("worker.shutdown_requested", False),
+    ):
+        write_sdc_claims(project)
+
+    assert token_user_ids[0] == 1, f"Expected user 1 (owner), got {token_user_ids[0]}"
+
+
 def test_bootstrap_flags_existing_images_at_cap():
     """When project is at MAX_IMAGES_PER_PROJECT, bootstrap still flags existing images."""
     project = {"id": 7, "user_id": 1, "wikidata_qid": "Q22686", "commons_category": "Donald Trump"}

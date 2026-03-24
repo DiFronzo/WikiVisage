@@ -125,21 +125,6 @@ toolforge jobs logs migrate
 
 ---
 
-## 6. Configure the Whitelist
-
-WikiVisage restricts access to whitelisted usernames. Edit `whitelist.txt` in your repo — one Wikimedia username per line:
-
-```
-YourUsername
-AnotherUser
-```
-
-The file is checked on every request (no restart needed after changes). To update the whitelist, commit the change, rebuild, and restart the web service.
-
-> **Note**: If `whitelist.txt` is empty or missing, the app is open to all authenticated users.
-
----
-
 ## 7. Start the Web Service
 
 ```bash
@@ -281,15 +266,6 @@ toolforge jobs delete ml-worker || true
 toolforge jobs run ml-worker --command 'python -u worker.py --worker-id ml-worker-1' --image tool-wikivisage/tool-wikivisage:latest --continuous --mem 3Gi
 toolforge jobs delete ml-worker-2 || true
 toolforge jobs run ml-worker-2 --command 'python -u worker.py --worker-id ml-worker-2' --image tool-wikivisage/tool-wikivisage:latest --continuous --mem 3Gi
-```
-
-### Update the whitelist
-
-Edit `whitelist.txt` in the repo, then rebuild and restart:
-
-```bash
-toolforge build start https://github.com/DiFronzo/WikiVisage.git
-toolforge webservice restart
 ```
 
 ---

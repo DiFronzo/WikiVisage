@@ -77,7 +77,6 @@ The landing page and `/health` endpoint work without OAuth. See [test-local.md](
 | `pyproject.toml` | Ruff config, pytest config, project metadata |
 | `requirements.txt` | Runtime dependencies |
 | `requirements-dev.txt` | Dev/test deps (pytest, pytest-cov, ruff) |
-| `whitelist.txt` | Allowed usernames (one per line) |
 | `.github/workflows/` | CI (lint + test) and CD (release-triggered Toolforge deploy) |
 | `SECURITY.md` | Vulnerability reporting policy |
 

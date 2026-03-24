@@ -42,7 +42,6 @@ The following are in scope:
 - CSRF protection bypass
 - SQL injection
 - Cross-site scripting (XSS) in templates
-- Access control (whitelist bypass)
 - Wikibase API abuse via SDC write endpoints
 - Sensitive data exposure (tokens, credentials)
 - Denial of service against the worker or web process

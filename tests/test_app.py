@@ -202,7 +202,6 @@ def test_commons_thumb_route_logged_in_redirects_to_generated_thumb(monkeypatch)
     }
 
     monkeypatch.setattr(app_module, "execute_query", lambda *args, **kwargs: [fake_user])
-    monkeypatch.setattr(app_module, "_load_whitelist", lambda: {"tester"})
 
     with client.session_transaction() as sess:
         sess["user_id"] = 1
@@ -558,7 +557,6 @@ def test_session_cleared_on_login_callback(monkeypatch):
     ]
 
     monkeypatch.setattr(app_module, "execute_query", lambda *a, **kw: fake_user_row)
-    monkeypatch.setattr(app_module, "_load_whitelist", lambda: {"TestUser"})
 
     class FakeResp:
         def raise_for_status(self):
@@ -631,182 +629,10 @@ def test_wake_file_path_consistent():
     assert "from config import WAKE_FILE_PATH" in app_source, "app.py must import WAKE_FILE_PATH from config"
 
 
-def _reset_whitelist_cache(monkeypatch, cache=None, cache_time=0.0):
-    monkeypatch.setattr(app_module, "_whitelist_cache", set() if cache is None else cache.copy())
-    monkeypatch.setattr(app_module, "_whitelist_cache_time", cache_time)
-    monkeypatch.setattr(app_module, "_WHITELIST_LOCAL_ONLY", False)
-
-
-def test_parse_whitelist_empty():
-    assert app_module._parse_whitelist("") == set()
-
-
-def test_parse_whitelist_ignores_comments_and_blank_lines():
-    text = "\n# comment\n\nuser1\n"
-    assert app_module._parse_whitelist(text) == {"user1"}
-
-
-def test_parse_whitelist_strips_whitespace():
-    text = "  user1  \n\tuser2\t\n"
-    assert app_module._parse_whitelist(text) == {"user1", "user2"}
-
-
-def test_parse_whitelist_keeps_hash_if_not_line_start():
-    text = "user#name\n"
-    assert app_module._parse_whitelist(text) == {"user#name"}
-
-
-def test_load_whitelist_returns_cache_within_ttl(monkeypatch):
-    _reset_whitelist_cache(monkeypatch, cache={"cached"}, cache_time=100.0)
-    monkeypatch.setattr(app_module.time, "monotonic", lambda: 150.0)
-
-    called = {"value": False}
-
-    def _should_not_call(*_args, **_kwargs):
-        called["value"] = True
-        raise AssertionError("requests.get should not be called when cache is fresh")
-
-    monkeypatch.setattr(app_module.requests, "get", _should_not_call)
-    result = app_module._load_whitelist()
-
-    assert result == {"cached"}
-    assert called["value"] is False
-
-
-def test_load_whitelist_refreshes_from_github_success(monkeypatch):
-    _reset_whitelist_cache(monkeypatch)
-    monkeypatch.setattr(app_module.time, "monotonic", lambda: 1000.0)
-
-    resp = MagicMock()
-    resp.text = "alice\nbob\n"
-    resp.raise_for_status.return_value = None
-    monkeypatch.setattr(app_module.requests, "get", lambda *_a, **_k: resp)
-
-    result = app_module._load_whitelist()
-
-    assert result == {"alice", "bob"}
-    assert app_module._whitelist_cache == {"alice", "bob"}
-    assert app_module._whitelist_cache_time == 1000.0
-
-
-def test_load_whitelist_github_empty_falls_back_to_local(monkeypatch):
-    _reset_whitelist_cache(monkeypatch)
-    monkeypatch.setattr(app_module.time, "monotonic", lambda: 101.0)
-
-    resp = MagicMock()
-    resp.text = "\n# only comments\n"
-    resp.raise_for_status.return_value = None
-    monkeypatch.setattr(app_module.requests, "get", lambda *_a, **_k: resp)
-    monkeypatch.setattr("builtins.open", mock_open(read_data="local1\nlocal2\n"))
-
-    result = app_module._load_whitelist()
-
-    assert result == {"local1", "local2"}
-
-
-def test_load_whitelist_github_fail_local_success(monkeypatch):
-    _reset_whitelist_cache(monkeypatch)
-    monkeypatch.setattr(app_module.time, "monotonic", lambda: 500.0)
-
-    def _raise(*_args, **_kwargs):
-        raise requests.RequestException("network")
-
-    monkeypatch.setattr(app_module.requests, "get", _raise)
-    monkeypatch.setattr("builtins.open", mock_open(read_data="localuser\n"))
-
-    result = app_module._load_whitelist()
-    assert result == {"localuser"}
-
-
-def test_load_whitelist_both_fail_returns_last_known_good_cache(monkeypatch):
-    _reset_whitelist_cache(monkeypatch, cache={"known"}, cache_time=0.0)
-    monkeypatch.setattr(app_module.time, "monotonic", lambda: 1000.0)
-
-    def _raise(*_args, **_kwargs):
-        raise requests.RequestException("network")
-
-    monkeypatch.setattr(app_module.requests, "get", _raise)
-
-    def _raise_file(*_args, **_kwargs):
-        raise FileNotFoundError
-
-    monkeypatch.setattr("builtins.open", _raise_file)
-    result = app_module._load_whitelist()
-
-    assert result == {"known"}
-
-
-def test_load_whitelist_both_fail_no_cache_returns_empty(monkeypatch):
-    _reset_whitelist_cache(monkeypatch)
-    monkeypatch.setattr(app_module.time, "monotonic", lambda: 2000.0)
-
-    def _raise(*_args, **_kwargs):
-        raise requests.RequestException("network")
-
-    monkeypatch.setattr(app_module.requests, "get", _raise)
-
-    def _raise_file(*_args, **_kwargs):
-        raise FileNotFoundError
-
-    monkeypatch.setattr("builtins.open", _raise_file)
-    assert app_module._load_whitelist() == set()
-
-
-def test_load_whitelist_cache_expired_refetches(monkeypatch):
-    _reset_whitelist_cache(monkeypatch, cache={"old"}, cache_time=0.0)
-    monkeypatch.setattr(app_module.time, "monotonic", lambda: app_module._WHITELIST_CACHE_TTL + 1.0)
-
-    resp = MagicMock()
-    resp.text = "newuser\n"
-    resp.raise_for_status.return_value = None
-    monkeypatch.setattr(app_module.requests, "get", lambda *_a, **_k: resp)
-
-    assert app_module._load_whitelist() == {"newuser"}
-
-
 def test_before_request_without_session_user_id_sets_no_user():
     with flask_app.test_request_context("/"):
         app_module.before_request()
         assert g.user is None
-
-
-def test_before_request_sets_user_when_valid_and_whitelisted(monkeypatch):
-    fake_user = {
-        "id": 1,
-        "wiki_user_id": 123,
-        "wiki_username": "tester",
-        "access_token": "token",
-        "refresh_token": "refresh",
-        "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
-    }
-    monkeypatch.setattr(app_module, "execute_query", lambda *_a, **_kw: [fake_user.copy()])
-    monkeypatch.setattr(app_module, "_load_whitelist", lambda: {"tester"})
-
-    with flask_app.test_request_context("/"):
-        session["user_id"] = 1
-        app_module.before_request()
-        assert g.user is not None
-        assert g.user["wiki_username"] == "tester"
-        assert session.get("user_id") == 1
-
-
-def test_before_request_revokes_session_when_not_whitelisted(monkeypatch):
-    fake_user = {
-        "id": 1,
-        "wiki_user_id": 123,
-        "wiki_username": "tester",
-        "access_token": "token",
-        "refresh_token": "refresh",
-        "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
-    }
-    monkeypatch.setattr(app_module, "execute_query", lambda *_a, **_kw: [fake_user.copy()])
-    monkeypatch.setattr(app_module, "_load_whitelist", lambda: {"someone_else"})
-
-    with flask_app.test_request_context("/"):
-        session["user_id"] = 1
-        app_module.before_request()
-        assert g.user is None
-        assert "user_id" not in session
 
 
 def test_before_request_handles_database_error_and_clears_session(monkeypatch):
@@ -831,7 +657,6 @@ def test_before_request_normalizes_bytes_tokens(monkeypatch):
         "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
     }
     monkeypatch.setattr(app_module, "execute_query", lambda *_a, **_kw: [fake_user.copy()])
-    monkeypatch.setattr(app_module, "_load_whitelist", lambda: {"tester"})
 
     with flask_app.test_request_context("/"):
         session["user_id"] = 1
@@ -917,6 +742,27 @@ def test_set_security_headers_sets_all_required_headers():
     assert result.headers["X-Frame-Options"] == "DENY"
     assert result.headers["Referrer-Policy"] == "strict-origin-when-cross-origin"
     assert result.headers["Permissions-Policy"] == "camera=(), microphone=(), geolocation=()"
+    assert (
+        "Strict-Transport-Security" not in result.headers
+        or result.headers.get("Strict-Transport-Security") == "max-age=31536000; includeSubDomains"
+    )
+
+
+def test_hsts_header_not_set_in_debug_mode():
+    flask_app.debug = True
+    try:
+        response = flask_app.make_response(("ok", 200))
+        result = app_module.set_security_headers(response)
+        assert "Strict-Transport-Security" not in result.headers
+    finally:
+        flask_app.debug = False
+
+
+def test_hsts_header_set_when_not_debug():
+    flask_app.debug = False
+    response = flask_app.make_response(("ok", 200))
+    result = app_module.set_security_headers(response)
+    assert result.headers["Strict-Transport-Security"] == "max-age=31536000; includeSubDomains"
 
 
 class _FakeResponse:
@@ -1176,7 +1022,7 @@ def test_set_language_valid_lang_sets_cookie(monkeypatch):
         "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
     }
     monkeypatch.setattr(app_module, "execute_query", lambda *a, **kw: [fake_user])
-    monkeypatch.setattr(app_module, "_load_whitelist", lambda: {"tester"})
+
     with client.session_transaction() as sess:
         sess["user_id"] = 1
 
@@ -1199,7 +1045,7 @@ def test_set_language_invalid_lang_falls_back_to_en(monkeypatch):
         "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
     }
     monkeypatch.setattr(app_module, "execute_query", lambda *a, **kw: [fake_user])
-    monkeypatch.setattr(app_module, "_load_whitelist", lambda: {"tester"})
+
     with client.session_transaction() as sess:
         sess["user_id"] = 1
 
@@ -1221,7 +1067,7 @@ def test_set_language_nocookie_deletes_cookie(monkeypatch):
         "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
     }
     monkeypatch.setattr(app_module, "execute_query", lambda *a, **kw: [fake_user])
-    monkeypatch.setattr(app_module, "_load_whitelist", lambda: {"tester"})
+
     with client.session_transaction() as sess:
         sess["user_id"] = 1
 
@@ -1245,7 +1091,7 @@ def test_set_language_cross_host_referrer_redirects_to_index(monkeypatch):
         "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
     }
     monkeypatch.setattr(app_module, "execute_query", lambda *a, **kw: [fake_user])
-    monkeypatch.setattr(app_module, "_load_whitelist", lambda: {"tester"})
+
     with client.session_transaction() as sess:
         sess["user_id"] = 1
 
@@ -1297,7 +1143,7 @@ def _make_authenticated_client(monkeypatch):
     }
     client = flask_app.test_client()
     monkeypatch.setattr(app_module, "execute_query", lambda *a, **kw: [fake_user])
-    monkeypatch.setattr(app_module, "_load_whitelist", lambda: {"tester"})
+
     with client.session_transaction() as sess:
         sess["user_id"] = 1
     return client, fake_user
@@ -1807,46 +1653,6 @@ def test_oauth_callback_no_wiki_user_id_redirects_to_index(monkeypatch):
     assert any("Invalid profile data received" in msg for _cat, msg in flashes)
 
 
-def test_oauth_callback_whitelist_denied_redirects_to_index(monkeypatch):
-    _reset_rate_limit()
-    client = flask_app.test_client()
-    _set_oauth_state(client)
-
-    oauth = MagicMock()
-    oauth.fetch_token.return_value = {"access_token": "tok", "refresh_token": "ref", "expires_in": 3600}
-    monkeypatch.setattr(app_module, "_make_oauth_session", lambda *_a, **_kw: oauth)
-    monkeypatch.setattr(
-        app_module.requests, "get", lambda *_a, **_kw: _MockResponse({"sub": 999, "username": "blocked"})
-    )
-    monkeypatch.setattr(app_module, "_load_whitelist", lambda: {"tester"})
-
-    response = client.get("/auth/callback?code=x")
-
-    assert response.status_code == 302
-    assert response.headers["Location"].endswith("/")
-    flashes = _get_flashes(client)
-    assert any("Access is currently restricted" in msg for _cat, msg in flashes)
-
-
-def test_oauth_callback_whitelist_empty_denies_login(monkeypatch):
-    _reset_rate_limit()
-    client = flask_app.test_client()
-    _set_oauth_state(client)
-
-    oauth = MagicMock()
-    oauth.fetch_token.return_value = {"access_token": "tok", "refresh_token": "ref", "expires_in": 3600}
-    monkeypatch.setattr(app_module, "_make_oauth_session", lambda *_a, **_kw: oauth)
-    monkeypatch.setattr(
-        app_module.requests, "get", lambda *_a, **_kw: _MockResponse({"sub": 999, "username": "tester"})
-    )
-    monkeypatch.setattr(app_module, "_load_whitelist", lambda: set())
-
-    response = client.get("/auth/callback?code=x")
-
-    assert response.status_code == 302
-    assert response.headers["Location"].endswith("/")
-
-
 def test_oauth_callback_existing_user_updates_and_sets_session(monkeypatch):
     _reset_rate_limit()
     client = flask_app.test_client()
@@ -1864,7 +1670,6 @@ def test_oauth_callback_existing_user_updates_and_sets_session(monkeypatch):
     monkeypatch.setattr(
         app_module.requests, "get", lambda *_a, **_kw: _MockResponse({"sub": 123, "username": "tester"})
     )
-    monkeypatch.setattr(app_module, "_load_whitelist", lambda: {"tester"})
 
     calls = []
 
@@ -1897,7 +1702,6 @@ def test_oauth_callback_new_user_inserts_and_reads_back_id(monkeypatch):
     monkeypatch.setattr(
         app_module.requests, "get", lambda *_a, **_kw: _MockResponse({"sub": 555, "username": "tester"})
     )
-    monkeypatch.setattr(app_module, "_load_whitelist", lambda: {"tester"})
 
     calls = []
 
@@ -1931,7 +1735,6 @@ def test_oauth_callback_db_error_during_upsert_redirects_to_index(monkeypatch):
     monkeypatch.setattr(
         app_module.requests, "get", lambda *_a, **_kw: _MockResponse({"sub": 777, "username": "tester"})
     )
-    monkeypatch.setattr(app_module, "_load_whitelist", lambda: {"tester"})
 
     def _raise_db(*_a, **_kw):
         raise app_module.DatabaseError("db fail")
@@ -1955,7 +1758,7 @@ def test_oauth_callback_uses_safe_login_next_redirect(monkeypatch):
     oauth.fetch_token.return_value = {"access_token": "tok", "refresh_token": "ref", "expires_in": 3600}
     monkeypatch.setattr(app_module, "_make_oauth_session", lambda *_a, **_kw: oauth)
     monkeypatch.setattr(app_module.requests, "get", lambda *_a, **_kw: _MockResponse({"sub": 42, "username": "tester"}))
-    monkeypatch.setattr(app_module, "_load_whitelist", lambda: {"tester"})
+
     monkeypatch.setattr(app_module, "execute_query", lambda *_a, **_kw: [{"id": 42}])
 
     response = client.get("/auth/callback?code=x")
@@ -1973,7 +1776,7 @@ def test_oauth_callback_unsafe_login_next_falls_back_to_dashboard(monkeypatch):
     oauth.fetch_token.return_value = {"access_token": "tok", "refresh_token": "ref", "expires_in": 3600}
     monkeypatch.setattr(app_module, "_make_oauth_session", lambda *_a, **_kw: oauth)
     monkeypatch.setattr(app_module.requests, "get", lambda *_a, **_kw: _MockResponse({"sub": 5, "username": "tester"}))
-    monkeypatch.setattr(app_module, "_load_whitelist", lambda: {"tester"})
+
     monkeypatch.setattr(app_module, "execute_query", lambda *_a, **_kw: [{"id": 5}])
 
     response = client.get("/auth/callback?code=x")
@@ -1999,7 +1802,7 @@ def test_oauth_callback_profile_call_uses_bearer_token_and_timeout(monkeypatch):
         return _MockResponse({"sub": 1, "username": "tester"})
 
     monkeypatch.setattr(app_module.requests, "get", mock_get)
-    monkeypatch.setattr(app_module, "_load_whitelist", lambda: {"tester"})
+
     monkeypatch.setattr(app_module, "execute_query", lambda *_a, **_kw: [{"id": 1}])
 
     response = client.get("/auth/callback?code=x")
@@ -2065,7 +1868,7 @@ def _make_authenticated_client_chunk3(monkeypatch, execute_query_fn=None):
         execute_query_fn = _default_execute_query
 
     monkeypatch.setattr(app_module, "execute_query", execute_query_fn)
-    monkeypatch.setattr(app_module, "_load_whitelist", lambda: {"tester"})
+
     with client.session_transaction() as sess:
         sess["user_id"] = 1
     return client, fake_user
@@ -3196,7 +2999,7 @@ def _auth_client_chunk4(monkeypatch, execute_query_impl=None):
         execute_query_impl = _default_execute_query_impl
 
     monkeypatch.setattr(app_module, "execute_query", execute_query_impl)
-    monkeypatch.setattr(app_module, "_load_whitelist", lambda: {"tester"})
+
     with client.session_transaction() as sess:
         sess["user_id"] = 1
     return client, fake_user
@@ -4133,8 +3936,32 @@ def test_clear_skips_csrf_fail(monkeypatch):
     assert response.status_code == 403
 
 
-def test_clear_skips_clears_normal_and_review_keys(monkeypatch):
+def test_clear_skips_nonmember_returns_404(monkeypatch):
     client, _ = _auth_client_chunk4(monkeypatch)
+    _set_csrf_chunk4(client)
+    response = client.post("/project/999/classify/clear-skips", data={"csrf_token": "testtoken"})
+    assert response.status_code == 404
+
+
+def test_clear_skips_clears_normal_and_review_keys(monkeypatch):
+    def eq(sql, params=None, fetch=True):
+        del params, fetch
+        if "FROM users WHERE id = %s" in sql:
+            return [
+                {
+                    "id": 1,
+                    "wiki_user_id": 123,
+                    "wiki_username": "tester",
+                    "access_token": "token",
+                    "refresh_token": "refresh",
+                    "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
+                }
+            ]
+        if "FROM projects p LEFT JOIN project_members" in sql:
+            return [{"id": 1, "user_id": 1, "status": "active"}]
+        return ()
+
+    client, _ = _auth_client_chunk4(monkeypatch, execute_query_impl=eq)
     _set_csrf_chunk4(client)
     with client.session_transaction() as sess:
         sess["skipped_images_1"] = [1, 2]
@@ -5313,7 +5140,6 @@ def _authed_client(monkeypatch, route_execute_query=None, csrf_token=None):
         return [fake_user]
 
     monkeypatch.setattr(app_module, "execute_query", _query)
-    monkeypatch.setattr(app_module, "_load_whitelist", lambda: {"tester"})
 
     with client.session_transaction() as sess:
         sess["user_id"] = 1
@@ -6416,7 +6242,7 @@ def _make_authed_client(monkeypatch, fake_user, route_execute=None):
         return [] if fetch else 0
 
     monkeypatch.setattr(app_module, "execute_query", execute_query_mock)
-    monkeypatch.setattr(app_module, "_load_whitelist", lambda: {"tester"})
+
     with client.session_transaction() as sess:
         sess["user_id"] = 1
     return client
@@ -7719,7 +7545,7 @@ def test_account_settings_get(monkeypatch, fake_user):
         return [] if fetch else 0
 
     monkeypatch.setattr(app_module, "execute_query", execute_query_mock)
-    monkeypatch.setattr(app_module, "_load_whitelist", lambda: {"tester"})
+
     with client.session_transaction() as sess:
         sess["user_id"] = 1
 
@@ -7744,7 +7570,7 @@ def test_account_settings_get_opted_out(monkeypatch, fake_user):
         return [] if fetch else 0
 
     monkeypatch.setattr(app_module, "execute_query", execute_query_mock)
-    monkeypatch.setattr(app_module, "_load_whitelist", lambda: {"tester"})
+
     with client.session_transaction() as sess:
         sess["user_id"] = 1
 
@@ -7836,7 +7662,6 @@ def test_account_settings_requires_login(monkeypatch):
         return []
 
     monkeypatch.setattr(app_module, "execute_query", execute_query_mock)
-    monkeypatch.setattr(app_module, "_load_whitelist", lambda: set())
 
     response = client.get("/account/settings")
 
@@ -9704,7 +9529,7 @@ def test_api_reclassify_approve_marks_sdc_written_when_p180_exists(monkeypatch):
         return route_query(sql)
 
     monkeypatch.setattr(app_module, "execute_query", eq)
-    monkeypatch.setattr(app_module, "_load_whitelist", lambda: {"tester"})
+
     monkeypatch.setattr(app_module, "_check_p180_exists", lambda cpid, qid: True)
     monkeypatch.setattr(app_module.limiter, "enabled", False, raising=False)
 
@@ -9747,7 +9572,7 @@ def test_api_reclassify_approve_no_sdc_written_when_p180_missing(monkeypatch):
         return route_query(sql)
 
     monkeypatch.setattr(app_module, "execute_query", eq)
-    monkeypatch.setattr(app_module, "_load_whitelist", lambda: {"tester"})
+
     monkeypatch.setattr(app_module, "_check_p180_exists", lambda cpid, qid: False)
     monkeypatch.setattr(app_module.limiter, "enabled", False, raising=False)
 
@@ -9792,7 +9617,7 @@ def test_api_reclassify_approve_skips_p180_check_when_already_sdc_written(monkey
         return True
 
     monkeypatch.setattr(app_module, "execute_query", eq)
-    monkeypatch.setattr(app_module, "_load_whitelist", lambda: {"tester"})
+
     monkeypatch.setattr(app_module, "_check_p180_exists", mock_check)
     monkeypatch.setattr(app_module.limiter, "enabled", False, raising=False)
 
@@ -9940,3 +9765,116 @@ def test_project_settings_clears_completion_reason_on_update(monkeypatch, fake_u
     assert response.status_code == 302
     assert len(update_sqls) == 1
     assert "completion_reason = NULL" in update_sqls[0]
+
+
+def test_leave_project_success(monkeypatch, fake_user):
+    project = _project_settings_base_row()
+    project["user_id"] = 99
+    deleted = {"called": False}
+
+    def route_execute(sql, params, fetch):
+        if "FROM projects p LEFT JOIN project_members" in sql:
+            return [project.copy()]
+        if "DELETE FROM project_members" in sql:
+            deleted["called"] = True
+            assert params == (1, 1)
+            return 1
+        raise AssertionError(f"Unexpected SQL: {sql}")
+
+    client = _make_authed_client(monkeypatch, fake_user, route_execute)
+    _set_csrf_chunk6(client)
+
+    response = client.post("/project/1/leave", data={"csrf_token": "testtoken"})
+
+    assert response.status_code == 302
+    assert "/dashboard" in response.headers["Location"]
+    assert deleted["called"] is True
+    flashes = _flashes_chunk6(client)
+    assert any("left the project" in msg.lower() for _cat, msg in flashes)
+
+
+def test_leave_project_owner_blocked(monkeypatch, fake_user):
+    project = _project_settings_base_row()
+
+    def route_execute(sql, _params, _fetch):
+        if "FROM projects p LEFT JOIN project_members" in sql:
+            return [project.copy()]
+        raise AssertionError(f"Unexpected SQL: {sql}")
+
+    client = _make_authed_client(monkeypatch, fake_user, route_execute)
+    _set_csrf_chunk6(client)
+
+    response = client.post("/project/1/leave", data={"csrf_token": "testtoken"})
+
+    assert response.status_code == 302
+    assert "/project/1" in response.headers["Location"]
+    flashes = _flashes_chunk6(client)
+    assert any("cannot leave" in msg.lower() for _cat, msg in flashes)
+
+
+def test_leave_project_csrf_fail(monkeypatch, fake_user):
+    client = _make_authed_client(monkeypatch, fake_user)
+    _set_csrf_chunk6(client, "expected")
+
+    response = client.post("/project/1/leave", data={"csrf_token": "wrong"})
+
+    assert response.status_code == 400
+    assert b"Invalid CSRF token" in response.data
+
+
+def test_leave_project_not_found(monkeypatch, fake_user):
+    def route_execute(sql, _params, _fetch):
+        if "FROM projects p LEFT JOIN project_members" in sql:
+            return []
+        raise AssertionError(f"Unexpected SQL: {sql}")
+
+    client = _make_authed_client(monkeypatch, fake_user, route_execute)
+    _set_csrf_chunk6(client)
+
+    response = client.post("/project/1/leave", data={"csrf_token": "testtoken"})
+
+    assert response.status_code == 404
+
+
+def test_leave_project_not_a_member(monkeypatch, fake_user):
+    project = _project_settings_base_row()
+    project["user_id"] = 99
+
+    def route_execute(sql, _params, fetch):
+        if "FROM projects p LEFT JOIN project_members" in sql:
+            return [project.copy()]
+        if "DELETE FROM project_members" in sql:
+            return 0
+        raise AssertionError(f"Unexpected SQL: {sql}")
+
+    client = _make_authed_client(monkeypatch, fake_user, route_execute)
+    _set_csrf_chunk6(client)
+
+    response = client.post("/project/1/leave", data={"csrf_token": "testtoken"})
+
+    assert response.status_code == 302
+    assert "/dashboard" in response.headers["Location"]
+    flashes = _flashes_chunk6(client)
+    assert any("not a member" in msg.lower() for _cat, msg in flashes)
+
+
+def test_leave_project_db_error(monkeypatch, fake_user):
+    project = _project_settings_base_row()
+    project["user_id"] = 99
+
+    def route_execute(sql, _params, _fetch):
+        if "FROM projects p LEFT JOIN project_members" in sql:
+            return [project.copy()]
+        if "DELETE FROM project_members" in sql:
+            raise app_module.DatabaseError("boom")
+        raise AssertionError(f"Unexpected SQL: {sql}")
+
+    client = _make_authed_client(monkeypatch, fake_user, route_execute)
+    _set_csrf_chunk6(client)
+
+    response = client.post("/project/1/leave", data={"csrf_token": "testtoken"})
+
+    assert response.status_code == 302
+    assert "/project/1" in response.headers["Location"]
+    flashes = _flashes_chunk6(client)
+    assert any("failed to leave" in msg.lower() for _cat, msg in flashes)

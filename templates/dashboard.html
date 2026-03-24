@@ -336,12 +336,12 @@
 
 <script>
     document.addEventListener('DOMContentLoaded', function() {
-        const toggleBtn = document.getElementById('toggleJoinBtn');
-        const drawer = document.getElementById('joinDrawer');
-        const input = document.getElementById('joinInputEl');
+        var toggleBtn = document.getElementById('toggleJoinBtn');
+        var drawer = document.getElementById('joinDrawer');
+        var input = document.getElementById('joinInputEl');
         
         toggleBtn.addEventListener('click', function() {
-            const isOpen = drawer.classList.contains('open');
+            var isOpen = drawer.classList.contains('open');
             if (isOpen) {
                 drawer.classList.remove('open');
                 toggleBtn.classList.remove('open');
@@ -349,7 +349,7 @@
                 drawer.classList.add('open');
                 toggleBtn.classList.add('open');
                 // Wait for the slide animation to reveal before focusing
-                setTimeout(() => input.focus(), 250);
+                setTimeout(function() { input.focus(); }, 250);
             }
         });
     });

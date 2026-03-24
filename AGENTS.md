@@ -14,7 +14,6 @@ WikiVisage/
 ├── database.py         # MariaDB connection pool with retry logic (~510 lines)
 ├── schema.sql          # DDL for 9 tables: users, sessions, projects, images, faces, user_stats, sdc_claims, project_members, worker_heartbeat
 ├── migrate.py          # Idempotent schema migration with --reset flag (~430 lines)
-├── whitelist.txt       # Allowed usernames (one per line, checked on every request)
 ├── pyproject.toml      # Project config: Ruff linter/formatter rules, pytest config, markers
 ├── requirements.txt    # Python 3.11+, dlib-bin fork (no source compilation)
 ├── requirements-dev.txt # Dev/test deps: pytest, pytest-cov, ruff (includes requirements.txt)
@@ -26,10 +25,10 @@ WikiVisage/
 │   ├── nb/LC_MESSAGES/ # Norwegian Bokmål
 │   ├── es/LC_MESSAGES/ # Spanish
 │   └── fr/LC_MESSAGES/ # French
-├── tests/              # Hybrid test suite: 546 unit + 34 integration tests
+├── tests/              # Hybrid test suite: 533 unit + 34 integration tests
 │   ├── __init__.py
 │   ├── conftest.py     # Integration fixture infrastructure (~450 lines)
-│   ├── test_app.py     # 457 unit + 11 integration tests (~9640 lines)
+│   ├── test_app.py     # 444 unit + 11 integration tests (~9640 lines)
 │   ├── test_database.py # 14 unit + 9 integration tests (~360 lines)
 │   ├── test_migrate.py # 15 unit + 8 integration tests (~471 lines)
 │   ├── test_token_crypto.py # 22 unit tests (~175 lines)
@@ -60,10 +59,9 @@ WikiVisage/
 
 ### Web (app.py)
 
-Flask app served by gunicorn via app factory (`create_app()`). Handles OAuth 2.0 login, whitelist enforcement, project CRUD, face classification UI, and a Commons thumbnail proxy. SDC write requests are queued via a flag; the background worker performs the actual API writes.
+Flask app served by gunicorn via app factory (`create_app()`). Handles OAuth 2.0 login, project CRUD, face classification UI, and a Commons thumbnail proxy. SDC write requests are queued via a flag; the background worker performs the actual API writes.
 
 **Security middleware:**
-- Whitelist check on every request (`whitelist.txt`, re-read each request)
 - Open redirect protection on login (`_is_safe_url()`)
 - CSRF protection on all POST routes (Flask-Session + token validation)
 - Rate limiting via Flask-Limiter (global 200/hour default, 10/min on bbox endpoints)
@@ -273,7 +271,6 @@ worker_heartbeat (single-row: id=1, last_seen DATETIME)
 - Do NOT translate: worker log messages, health endpoint JSON values, technical terms (Wikidata, Q-ID, Commons, SDC, P180, OAuth, CSRF, WikiVisage, BETA).
 
 ### Security
-- Whitelist enforcement: `whitelist.txt` checked on every request via `@before_request`. Blocks non-whitelisted users after login.
 - Open redirect protection: `_is_safe_url()` validates all redirect targets.
 - Rate limiting: Global 200/hour default. `10/min` on `api_manual_face` and `api_update_face_bbox`. Uses Redis for shared storage across gunicorn workers (`WIKIVISAGE_REDIS_URL`). Falls back to `memory://` if Redis is unreachable.
 - CSRF: All POST routes protected via Flask-Session tokens.
@@ -336,9 +333,6 @@ The project detail page includes approve/reject/edit-bbox controls on each Model
 - **Edit bbox** (pencil): Opens a modal with a 1280px image. User draws a new bounding box. Old face is kept; a new face row is inserted via `/api/update-face-bbox` (face encoding recomputed server-side).
 - **Filter interaction**: After reclassification, `data-source` is NOT changed — the card remains visible under its original source filter (Model/Bootstrap). Only the visible method label updates to "human".
 
-### Whitelist enforcement
-`whitelist.txt` is checked on every request. Only listed usernames can access the app after OAuth login. The file is re-read on each request (no caching) so changes take effect immediately without restart.
-
 ### Cookies
 Only 2 cookies: `session` (strictly necessary, server-side via Flask-Session) and `locale` (functional, language preference). No tracking cookies. A non-blocking consent banner is shown.
 
@@ -350,7 +344,7 @@ Each face encoding is 1024 bytes (128 float64). Even 10K faces ~ 10MB. No RAM co
 
 ## Testing
 
-Hybrid test suite: **546 unit tests** (run in CI) + **34 integration tests** (require local Docker MariaDB).
+Hybrid test suite: **533 unit tests** (run in CI) + **34 integration tests** (require local Docker MariaDB).
 
 ### Architecture
 
@@ -363,12 +357,12 @@ Hybrid test suite: **546 unit tests** (run in CI) + **34 integration tests** (re
 
 | File | Unit | Integration | Total |
 |------|------|-------------|-------|
-| `test_app.py` | 457 | 11 | 468 |
+| `test_app.py` | 444 | 11 | 455 |
 | `test_database.py` | 14 | 9 | 23 |
 | `test_migrate.py` | 15 | 8 | 23 |
 | `test_token_crypto.py` | 22 | 0 | 22 |
 | `test_worker.py` | 38 | 6 | 44 |
-| **Total** | **546** | **34** | **580** |
+| **Total** | **533** | **34** | **567** |
 
 ### Commands
 
@@ -409,7 +403,7 @@ test_db (session) → creates/drops wikiface_test DB
 - **DB connection**: `host=127.0.0.1, user=root, password=devpass, port=3306`.
 - **Assertion gotcha**: `execute_query()` returns empty **tuple** `()` not `[]` — use `len(result) == 0` not `result == []`.
 - **Integration test isolation**: Each `db_conn` fixture truncates all tables after the test via `SET FOREIGN_KEY_CHECKS=0`.
-- **App auth simulation**: Set `session["user_id"]`, patch `_load_whitelist` to return `{"TestUser"}`.
+- **App auth simulation**: Set `session["user_id"]` in test client session transaction.
 
 ## CI/CD
 

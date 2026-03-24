@@ -361,6 +361,11 @@ _ALTER_MIGRATIONS = [
         "ENUM('no_faces', 'insufficient_faces') NULL "
         "COMMENT 'Why the project was auto-completed by the worker' AFTER status",
     ),
+    (
+        "Add sdc_write_user_id to projects for member-attributed SDC writes",
+        "ALTER TABLE projects ADD COLUMN sdc_write_user_id BIGINT UNSIGNED NULL "
+        "COMMENT 'User who triggered SDC writes (their token is used)' AFTER sdc_write_requested",
+    ),
 ]
 
 

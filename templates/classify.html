@@ -287,7 +287,7 @@
         border: 1px solid var(--border);
         border-radius: 4px;
         background: var(--surface);
-        color: var(--text);
+        color: var(--text-main);
         margin-right: 0.25em;
         min-width: 1.5em;
         text-align: center;
@@ -642,7 +642,7 @@
         overlay.style.display = 'flex';
 
         var formData = new FormData();
-        formData.append('csrf_token', '{{ csrf_token() }}');
+        formData.append('csrf_token', {{ csrf_token()|tojson }});
         formData.append('project_id', '{{ project.id }}');
         formData.append('image_id', '{{ image.image_id }}');
         formData.append('selected_face_id', faceId);
@@ -693,7 +693,7 @@
         overlay.textContent = i18n.undoing;
 
         var formData = new FormData();
-        formData.append('csrf_token', '{{ csrf_token() }}');
+        formData.append('csrf_token', {{ csrf_token()|tojson }});
 
         fetch('{{ url_for("api_undo_classify") }}', {
             method: 'POST',
@@ -898,7 +898,7 @@
         overlay.textContent = i18n.detectingFace;
 
         var formData = new FormData();
-        formData.append('csrf_token', '{{ csrf_token() }}');
+        formData.append('csrf_token', {{ csrf_token()|tojson }});
         formData.append('project_id', '{{ project.id }}');
         formData.append('image_id', '{{ image.image_id }}');
         formData.append('bbox_top', top);
