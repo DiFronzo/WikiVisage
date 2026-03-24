@@ -334,7 +334,7 @@ The project detail page includes approve/reject/edit-bbox controls on each Model
 - **Filter interaction**: After reclassification, `data-source` is NOT changed — the card remains visible under its original source filter (Model/Bootstrap). Only the visible method label updates to "human".
 
 ### Cookies
-Only 2 cookies: `session` (strictly necessary, server-side via Flask-Session) and `locale` (functional, language preference). No tracking cookies. A non-blocking consent banner is shown.
+Only 2 cookies: `session` (strictly necessary, managed by Flask's built-in signed session cookie mechanism) and `locale` (functional, language preference). No tracking cookies. A non-blocking consent banner is shown.
 
 ### Inference RAM
 Each face encoding is 1024 bytes (128 float64). Even 10K faces ~ 10MB. No RAM concern for inference.
