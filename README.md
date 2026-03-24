@@ -96,8 +96,7 @@ WikiVisage/
 ├── translations/        # i18n: en, nb, es, fr
 ├── requirements.txt     # Runtime dependencies
 ├── requirements-dev.txt # Dev/test deps (pytest, ruff)
-├── whitelist.txt        # Allowed usernames (Toolforge)
-└── tests/               # 580 tests (unit + integration)
+└── tests/               # 567 tests (unit + integration)
 ```
 
 ## 🧑‍💻 Setup

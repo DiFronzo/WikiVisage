@@ -434,9 +434,7 @@ def integration_client(integration_app, db_conn, seed_user):
     """
     application, app_module = integration_app
 
-    # Patch whitelist to allow our test user
     monkeypatch = pytest.MonkeyPatch()
-    monkeypatch.setattr(app_module, "_load_whitelist", lambda: {"TestUser"})
 
     test_client = application.test_client()
 

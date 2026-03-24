@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS projects (
     last_inference_threshold FLOAT       NULL COMMENT 'distance_threshold used in last inference run',
     last_inference_min_confirmed INT UNSIGNED NULL COMMENT 'min_confirmed used in last inference run',
     sdc_write_requested TINYINT(1)      NOT NULL DEFAULT 0 COMMENT '1=user requested SDC writes, worker picks up',
+    sdc_write_user_id   BIGINT UNSIGNED NULL COMMENT 'User who triggered SDC writes (their token is used)',
     sdc_write_error     VARCHAR(1024)   NULL COMMENT 'Error message from last SDC write attempt',
     invite_code         VARCHAR(8)       NULL DEFAULT NULL COMMENT 'Unique code for others to join this project',
     worker_claimed_by   VARCHAR(255)    NULL COMMENT 'Worker instance ID that claimed this project',
@@ -169,6 +170,7 @@ CREATE TABLE IF NOT EXISTS sdc_claims (
 
     UNIQUE INDEX idx_sdc_claims_page_qid (commons_page_id, wikidata_qid),
     INDEX idx_sdc_claims_project (project_id),
+    INDEX idx_sdc_claims_face (face_id, written_at),
 
     CONSTRAINT fk_sdc_claims_project
         FOREIGN KEY (project_id) REFERENCES projects (id) ON DELETE CASCADE,

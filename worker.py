@@ -1016,15 +1016,15 @@ def _process_single_image(
 def process_images(project: dict[str, Any]) -> int:
     """Download images, detect faces, and extract embeddings using parallel threads.
 
-    Non-bootstrap images are processed first (no cap).  Bootstrap images are
-    processed up to a dynamic cap based on the project's total image count —
-    this avoids the worker spending all its time on bootstrap downloads while
-    category-discovered images wait.  The cap uses the same ratios as the old
-    insertion cap (BOOTSTRAP_TARGET_RATIO / BOOTSTRAP_MAX_RATIO) but is
-    enforced here instead of in bootstrap_from_sparql so that eligible P180
-    images are inserted into the database (subject to the global
-    MAX_IMAGES_PER_PROJECT cap and file-type filtering) for correct
-    SDC-pending bookkeeping.
+    Bootstrap images are processed first (up to a dynamic cap) so that faces
+    from images already known to depict the target appear in the gallery
+    quickly.  Non-bootstrap images fill the remaining batch slots.  The
+    bootstrap cap uses BOOTSTRAP_TARGET_RATIO / BOOTSTRAP_MAX_RATIO to avoid
+    the worker spending all its time on bootstrap downloads while
+    category-discovered images wait.  The cap is enforced here instead of in
+    bootstrap_from_sparql so that eligible P180 images are inserted into the
+    database (subject to the global MAX_IMAGES_PER_PROJECT cap and file-type
+    filtering) for correct SDC-pending bookkeeping.
     """
     project_id = project["id"]
     logger.info(f"Processing images for project {project_id}")
@@ -1063,18 +1063,13 @@ def process_images(project: dict[str, Any]) -> int:
     bootstrap_cap = max(MIN_BOOTSTRAP_IMAGES, bootstrap_cap)
     bootstrap_remaining = max(0, bootstrap_cap - bs_already_processed)
 
-    # --- Build the batch: non-bootstrap first, then bootstrap ----------------
-    non_bs = execute_query(
-        "SELECT id, file_title, bootstrapped FROM images "
-        "WHERE project_id = %s AND status = 'pending' AND bootstrapped = 0 "
-        "LIMIT %s",
-        (project_id, BATCH_SIZE),
-        fetch=True,
-    )
-    pending_images = list(non_bs) if non_bs else []
-
-    remaining_slots = BATCH_SIZE - len(pending_images)
-    bs_to_fetch = min(remaining_slots, bootstrap_remaining) if remaining_slots > 0 else 0
+    # --- Build the batch: bootstrap first, then non-bootstrap ----------------
+    # Bootstrap images are processed first so that faces from images already
+    # known to depict the target (via existing P180 claims on Commons) appear
+    # in the gallery quickly — giving the user early visual feedback and
+    # providing training data for autonomous inference sooner.
+    pending_images: list[dict[str, Any]] = []
+    bs_to_fetch = min(BATCH_SIZE, bootstrap_remaining)
     if bs_to_fetch > 0:
         bs = execute_query(
             "SELECT id, file_title, bootstrapped FROM images "
@@ -1085,6 +1080,18 @@ def process_images(project: dict[str, Any]) -> int:
         )
         if bs:
             pending_images.extend(bs)
+
+    remaining_slots = BATCH_SIZE - len(pending_images)
+    if remaining_slots > 0:
+        non_bs = execute_query(
+            "SELECT id, file_title, bootstrapped FROM images "
+            "WHERE project_id = %s AND status = 'pending' AND bootstrapped = 0 "
+            "LIMIT %s",
+            (project_id, remaining_slots),
+            fetch=True,
+        )
+        if non_bs:
+            pending_images.extend(non_bs)
 
     if not pending_images:
         # If no non-bootstrap images remain and bootstrap cap is reached,
@@ -1597,14 +1604,14 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
     clears the flag when done (or sets sdc_write_error on failure).
     """
     project_id = project["id"]
-    user_id = project["user_id"]
+    user_id = project.get("sdc_write_user_id") or project["user_id"]
     logger.info(f"Starting SDC writes for project {project_id}")
 
     access_token = _refresh_worker_token(user_id)
     if not access_token:
         logger.error(f"Cannot obtain valid token for user {user_id}, aborting SDC writes")
         execute_query(
-            "UPDATE projects SET sdc_write_requested = 0, "
+            "UPDATE projects SET sdc_write_requested = 0, sdc_write_user_id = NULL, "
             "sdc_write_error = 'Token expired or user not found. Please log in again.' WHERE id = %s",
             (project_id,),
             fetch=False,
@@ -1616,7 +1623,7 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
     except Exception as e:
         logger.error(f"Failed to get CSRF token for project {project_id}: {e}")
         execute_query(
-            "UPDATE projects SET sdc_write_requested = 0, sdc_write_error = 'Failed to get CSRF token' WHERE id = %s",
+            "UPDATE projects SET sdc_write_requested = 0, sdc_write_user_id = NULL, sdc_write_error = 'Failed to get CSRF token' WHERE id = %s",
             (project_id,),
             fetch=False,
         )
@@ -1628,7 +1635,7 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
     except ValueError:
         logger.error(f"Invalid QID format: {qid}")
         execute_query(
-            "UPDATE projects SET sdc_write_requested = 0, sdc_write_error = 'Invalid QID format' WHERE id = %s",
+            "UPDATE projects SET sdc_write_requested = 0, sdc_write_user_id = NULL, sdc_write_error = 'Invalid QID format' WHERE id = %s",
             (project_id,),
             fetch=False,
         )
@@ -1778,7 +1785,7 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
                                 f"{error_code}"
                             )
                             execute_query(
-                                "UPDATE projects SET sdc_write_requested = 0, sdc_write_error = %s WHERE id = %s",
+                                "UPDATE projects SET sdc_write_requested = 0, sdc_write_user_id = NULL, sdc_write_error = %s WHERE id = %s",
                                 (msg, project_id),
                                 fetch=False,
                             )
@@ -1794,7 +1801,7 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
                             msg = _sdc_error_message(error_code, error_info)
                             logger.error(f"Failed to refresh tokens for project {project_id}")
                             execute_query(
-                                "UPDATE projects SET sdc_write_requested = 0, sdc_write_error = %s WHERE id = %s",
+                                "UPDATE projects SET sdc_write_requested = 0, sdc_write_user_id = NULL, sdc_write_error = %s WHERE id = %s",
                                 (msg, project_id),
                                 fetch=False,
                             )
@@ -1804,7 +1811,7 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
                         msg = _sdc_error_message(error_code, error_info)
                         logger.error(f"SDC idempotency check error for {mid}: {claim_data['error']}")
                         execute_query(
-                            "UPDATE projects SET sdc_write_requested = 0, sdc_write_error = %s WHERE id = %s",
+                            "UPDATE projects SET sdc_write_requested = 0, sdc_write_user_id = NULL, sdc_write_error = %s WHERE id = %s",
                             (msg, project_id),
                             fetch=False,
                         )
@@ -1889,7 +1896,7 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
                             msg = _sdc_error_message(error_code, error_info)
                             logger.error(f"SDC token retry limit reached for project {project_id}: {error_code}")
                             execute_query(
-                                "UPDATE projects SET sdc_write_requested = 0, sdc_write_error = %s WHERE id = %s",
+                                "UPDATE projects SET sdc_write_requested = 0, sdc_write_user_id = NULL, sdc_write_error = %s WHERE id = %s",
                                 (msg, project_id),
                                 fetch=False,
                             )
@@ -1905,7 +1912,7 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
                             msg = _sdc_error_message(error_code, error_info)
                             logger.error(f"Failed to refresh tokens for project {project_id}")
                             execute_query(
-                                "UPDATE projects SET sdc_write_requested = 0, sdc_write_error = %s WHERE id = %s",
+                                "UPDATE projects SET sdc_write_requested = 0, sdc_write_user_id = NULL, sdc_write_error = %s WHERE id = %s",
                                 (msg, project_id),
                                 fetch=False,
                             )
@@ -1916,7 +1923,7 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
                         msg = _sdc_error_message(error_code, error_info)
                         logger.error(f"SDC Write error for {mid}: {edit_json['error']}")
                         execute_query(
-                            "UPDATE projects SET sdc_write_requested = 0, sdc_write_error = %s WHERE id = %s",
+                            "UPDATE projects SET sdc_write_requested = 0, sdc_write_user_id = NULL, sdc_write_error = %s WHERE id = %s",
                             (msg, project_id),
                             fetch=False,
                         )
@@ -1950,7 +1957,7 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
             except Exception as e:
                 logger.error(f"Error writing SDC for face {face_id} on {mid}: {e}")
                 execute_query(
-                    "UPDATE projects SET sdc_write_requested = 0, sdc_write_error = %s WHERE id = %s",
+                    "UPDATE projects SET sdc_write_requested = 0, sdc_write_user_id = NULL, sdc_write_error = %s WHERE id = %s",
                     (str(e)[:1024], project_id),
                     fetch=False,
                 )
@@ -2049,7 +2056,7 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
                                 f"for project {project_id}: {error_code}"
                             )
                             execute_query(
-                                "UPDATE projects SET sdc_write_requested = 0, sdc_write_error = %s WHERE id = %s",
+                                "UPDATE projects SET sdc_write_requested = 0, sdc_write_user_id = NULL, sdc_write_error = %s WHERE id = %s",
                                 (msg, project_id),
                                 fetch=False,
                             )
@@ -2065,7 +2072,7 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
                             msg = _sdc_error_message(error_code, error_info)
                             logger.error(f"Failed to refresh tokens during removal for project {project_id}")
                             execute_query(
-                                "UPDATE projects SET sdc_write_requested = 0, sdc_write_error = %s WHERE id = %s",
+                                "UPDATE projects SET sdc_write_requested = 0, sdc_write_user_id = NULL, sdc_write_error = %s WHERE id = %s",
                                 (msg, project_id),
                                 fetch=False,
                             )
@@ -2075,7 +2082,7 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
                         msg = _sdc_error_message(error_code, error_info)
                         logger.error(f"SDC removal idempotency check error for {mid}: {claim_data['error']}")
                         execute_query(
-                            "UPDATE projects SET sdc_write_requested = 0, sdc_write_error = %s WHERE id = %s",
+                            "UPDATE projects SET sdc_write_requested = 0, sdc_write_user_id = NULL, sdc_write_error = %s WHERE id = %s",
                             (msg, project_id),
                             fetch=False,
                         )
@@ -2132,7 +2139,7 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
                             msg = _sdc_error_message(error_code, error_info)
                             logger.error(f"SDC token retry limit reached during removal for project {project_id}")
                             execute_query(
-                                "UPDATE projects SET sdc_write_requested = 0, sdc_write_error = %s WHERE id = %s",
+                                "UPDATE projects SET sdc_write_requested = 0, sdc_write_user_id = NULL, sdc_write_error = %s WHERE id = %s",
                                 (msg, project_id),
                                 fetch=False,
                             )
@@ -2147,7 +2154,7 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
                             msg = _sdc_error_message(error_code, error_info)
                             logger.error(f"Failed to refresh tokens during removal for project {project_id}")
                             execute_query(
-                                "UPDATE projects SET sdc_write_requested = 0, sdc_write_error = %s WHERE id = %s",
+                                "UPDATE projects SET sdc_write_requested = 0, sdc_write_user_id = NULL, sdc_write_error = %s WHERE id = %s",
                                 (msg, project_id),
                                 fetch=False,
                             )
@@ -2157,7 +2164,7 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
                         msg = _sdc_error_message(error_code, error_info)
                         logger.error(f"SDC removal error for {mid}: {remove_json['error']}")
                         execute_query(
-                            "UPDATE projects SET sdc_write_requested = 0, sdc_write_error = %s WHERE id = %s",
+                            "UPDATE projects SET sdc_write_requested = 0, sdc_write_user_id = NULL, sdc_write_error = %s WHERE id = %s",
                             (msg, project_id),
                             fetch=False,
                         )
@@ -2183,7 +2190,7 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
             except Exception as e:
                 logger.error(f"Error removing SDC for {mid}: {e}")
                 execute_query(
-                    "UPDATE projects SET sdc_write_requested = 0, sdc_write_error = %s WHERE id = %s",
+                    "UPDATE projects SET sdc_write_requested = 0, sdc_write_user_id = NULL, sdc_write_error = %s WHERE id = %s",
                     (str(e)[:1024], project_id),
                     fetch=False,
                 )
@@ -2196,7 +2203,7 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
         error_msg = "Worker shutdown interrupted SDC writes"
 
     execute_query(
-        "UPDATE projects SET sdc_write_requested = 0, sdc_write_error = %s WHERE id = %s",
+        "UPDATE projects SET sdc_write_requested = 0, sdc_write_user_id = NULL, sdc_write_error = %s WHERE id = %s",
         (error_msg, project_id),
         fetch=False,
     )
@@ -2416,7 +2423,7 @@ def _process_sdc_writes() -> int:
             # Clear the flag so it doesn't retry endlessly
             try:
                 execute_query(
-                    "UPDATE projects SET sdc_write_requested = 0, sdc_write_error = %s WHERE id = %s",
+                    "UPDATE projects SET sdc_write_requested = 0, sdc_write_user_id = NULL, sdc_write_error = %s WHERE id = %s",
                     (str(e)[:1000], sdc_project["id"]),
                     fetch=False,
                 )

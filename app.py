@@ -22,7 +22,6 @@ import random
 import re
 import secrets
 import time
-import unicodedata
 from datetime import UTC, datetime, timedelta
 from functools import wraps
 from typing import Any
@@ -97,65 +96,6 @@ PROJECTS_PER_PAGE = 25
 MAX_CATEGORY_TRAVERSAL = 50  # Max subcategories to visit in BFS
 CATEGORY_API_TIMEOUT = 8  # Seconds for category info API calls
 COMMONS_API_LIMIT = "500"  # MediaWiki API cmlimit
-
-# Beta whitelist — fetched from GitHub every 5 minutes, falls back to local file
-_WHITELIST_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "whitelist.txt")
-_WHITELIST_URL = "https://raw.githubusercontent.com/DiFronzo/WikiVisage/main/whitelist.txt"
-_WHITELIST_LOCAL_ONLY = os.environ.get("WIKIVISAGE_WHITELIST_LOCAL") == "1"
-_WHITELIST_CACHE_TTL = 300  # seconds
-_whitelist_cache: set[str] = set()
-_whitelist_cache_time: float = 0.0
-
-
-def _parse_whitelist(text: str) -> set[str]:
-    """Parse whitelist text into a set of usernames (NFKC-normalized)."""
-    return {
-        unicodedata.normalize("NFKC", s) for line in text.splitlines() if (s := line.strip()) and not s.startswith("#")
-    }
-
-
-def _load_whitelist() -> set[str]:
-    """Return cached whitelist, refreshing from GitHub every 5 minutes.
-
-    Fetch order: GitHub raw → local file → last-known-good cache.
-    """
-    global _whitelist_cache, _whitelist_cache_time
-
-    now = time.monotonic()
-    if _whitelist_cache and (now - _whitelist_cache_time) < _WHITELIST_CACHE_TTL:
-        return _whitelist_cache
-
-    # Try GitHub first (skip if local-only mode)
-    if not _WHITELIST_LOCAL_ONLY:
-        try:
-            resp = requests.get(_WHITELIST_URL, timeout=5)
-            resp.raise_for_status()
-            fresh = _parse_whitelist(resp.text)
-            if fresh:
-                _whitelist_cache = fresh
-                _whitelist_cache_time = now
-                return _whitelist_cache
-        except Exception:
-            logger.debug("Failed to fetch whitelist from GitHub, trying local file")
-
-    # Fall back to local file
-    try:
-        with open(_WHITELIST_PATH, encoding="utf-8") as f:
-            fresh = _parse_whitelist(f.read())
-            if fresh:
-                _whitelist_cache = fresh
-                _whitelist_cache_time = now
-                return _whitelist_cache
-    except FileNotFoundError:
-        pass
-
-    # Return last-known-good (may be empty on first boot if both fail)
-    if not _whitelist_cache:
-        logger.warning("Whitelist is empty — all authenticated access will be denied (fail-closed)")
-    return _whitelist_cache
-
-
-ALLOWED_USERS = _load_whitelist()
 
 # Session configuration
 app.config["SESSION_COOKIE_SECURE"] = not app.debug
@@ -274,13 +214,6 @@ def before_request() -> None:
                     if isinstance(g.user.get(_tk), bytes):
                         g.user[_tk] = g.user[_tk].decode("utf-8")
                     g.user[_tk] = decrypt_token(g.user[_tk])
-                # Enforce whitelist on every request (not just login).
-                # Fail-closed: empty whitelist = deny all (prevents bypass if both sources fail).
-                allowed = _load_whitelist()
-                if not allowed or unicodedata.normalize("NFKC", g.user["wiki_username"]) not in allowed:
-                    logger.warning(f"Session revoked for user not on whitelist: {g.user['wiki_username']}")
-                    session.clear()
-                    g.user = None
         except TokenDecryptionError:
             logger.warning("Token decryption failed for user %s — clearing session to force re-auth", user_id)
             session.clear()
@@ -523,6 +456,8 @@ def set_security_headers(response):
     """Add security headers to all responses."""
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
+    if not app.debug:
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
     response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
     response.headers["Content-Security-Policy"] = (
@@ -935,13 +870,6 @@ def oauth_callback():
 
     if not wiki_user_id:
         flash(_("Invalid profile data received."), "error")
-        return redirect(url_for("index"))
-
-    # Beta whitelist check — fail-closed: empty whitelist = deny all
-    allowed = _load_whitelist()
-    if not allowed or wiki_username not in allowed:
-        logger.warning(f"Login denied for user not on whitelist: {wiki_username}")
-        flash(_("Access is currently restricted to approved testers."), "warning")
         return redirect(url_for("index"))
 
     expires_at = datetime.now(UTC) + timedelta(seconds=token.get("expires_in", 14400))
@@ -1574,7 +1502,7 @@ def project_detail(project_id: int):
             "  SUM(CASE WHEN f.is_target = 0 THEN 1 ELSE 0 END) AS confirmed_non_matches, "
             "  SUM(CASE WHEN f.is_target IS NULL THEN 1 ELSE 0 END) AS unclassified, "
             "  SUM(CASE WHEN f.is_target = 1 AND f.classified_by_user_id IS NOT NULL THEN 1 ELSE 0 END) AS human_confirmed, "
-            "  SUM(CASE WHEN f.sdc_written = 1 THEN 1 ELSE 0 END) AS sdc_written, "
+            "  SUM(CASE WHEN f.sdc_written = 1 AND sc.face_id IS NOT NULL THEN 1 ELSE 0 END) AS sdc_written, "
             "  SUM(CASE WHEN f.is_target = 1 AND f.sdc_written = 0 AND f.classified_by != 'bootstrap' AND i.bootstrapped = 0 THEN 1 ELSE 0 END) AS sdc_pending, "
             "  SUM(CASE WHEN f.sdc_removal_pending = 1 "
             "    AND NOT EXISTS (SELECT 1 FROM faces f2 WHERE f2.image_id = f.image_id "
@@ -1589,6 +1517,7 @@ def project_detail(project_id: int):
             "  SUM(CASE WHEN f.classified_by = 'bootstrap' AND f.classified_by_user_id IS NULL THEN 1 ELSE 0 END) AS by_bootstrap "
             "FROM faces f "
             "JOIN images i ON f.image_id = i.id "
+            "LEFT JOIN (SELECT DISTINCT face_id FROM sdc_claims WHERE written_at IS NOT NULL) sc ON sc.face_id = f.id "
             "WHERE i.project_id = %s AND f.superseded_by IS NULL",
             (project_id,),
         )
@@ -1900,6 +1829,9 @@ def clear_skips(project_id: int):
     """Clear skipped images and redirect back to classify."""
     if not _validate_csrf():
         abort(403)
+    project = get_project_for_actor(project_id, g.user["id"])
+    if not project:
+        abort(404)
     skip_key = f"skipped_images_{project_id}"
     skip_key_review = f"skipped_images_review_{project_id}"
     session.pop(skip_key, None)
@@ -2835,8 +2767,8 @@ def api_write_sdc(project_id: int):
     # Set the flag for the worker to pick up
     try:
         execute_query(
-            "UPDATE projects SET sdc_write_requested = 1, sdc_write_error = NULL WHERE id = %s",
-            (project_id,),
+            "UPDATE projects SET sdc_write_requested = 1, sdc_write_user_id = %s, sdc_write_error = NULL WHERE id = %s",
+            (g.user["id"], project_id),
             fetch=False,
         )
     except DatabaseError:
@@ -2868,7 +2800,7 @@ def api_sdc_status(project_id: int):
     try:
         counts = execute_query(
             "SELECT "
-            "  SUM(CASE WHEN f.is_target = 1 AND f.sdc_written = 1 THEN 1 ELSE 0 END) AS written, "
+            "  SUM(CASE WHEN f.is_target = 1 AND f.sdc_written = 1 AND sc.face_id IS NOT NULL THEN 1 ELSE 0 END) AS written, "
             "  SUM(CASE WHEN f.is_target = 1 AND f.sdc_written = 0 AND f.classified_by != 'bootstrap' AND i.bootstrapped = 0 THEN 1 ELSE 0 END) AS pending, "
             "  COUNT(DISTINCT CASE WHEN f.sdc_removal_pending = 1 "
             "    AND NOT EXISTS (SELECT 1 FROM faces f2 WHERE f2.image_id = f.image_id "
@@ -2876,6 +2808,7 @@ def api_sdc_status(project_id: int):
             "    THEN f.image_id END) AS removal_pending "
             "FROM faces f "
             "JOIN images i ON f.image_id = i.id "
+            "LEFT JOIN sdc_claims sc ON sc.face_id = f.id AND sc.written_at IS NOT NULL "
             "WHERE i.project_id = %s AND f.superseded_by IS NULL",
             (project_id,),
             fetch=True,
@@ -2919,7 +2852,7 @@ def api_stop_sdc(project_id: int):
 
     try:
         execute_query(
-            "UPDATE projects SET sdc_write_requested = 0, sdc_write_error = NULL WHERE id = %s",
+            "UPDATE projects SET sdc_write_requested = 0, sdc_write_user_id = NULL, sdc_write_error = NULL WHERE id = %s",
             (project_id,),
             fetch=False,
         )
@@ -3166,7 +3099,7 @@ def api_progress(project_id: int):
             "  SUM(CASE WHEN f.is_target = 1 THEN 1 ELSE 0 END) AS confirmed_matches, "
             "  SUM(CASE WHEN f.is_target = 0 THEN 1 ELSE 0 END) AS confirmed_non_matches, "
             "  SUM(CASE WHEN f.is_target IS NULL THEN 1 ELSE 0 END) AS unclassified, "
-            "  SUM(CASE WHEN f.sdc_written = 1 THEN 1 ELSE 0 END) AS sdc_written, "
+            "  SUM(CASE WHEN f.sdc_written = 1 AND EXISTS (SELECT 1 FROM sdc_claims sc WHERE sc.face_id = f.id AND sc.written_at IS NOT NULL) THEN 1 ELSE 0 END) AS sdc_written, "
             "  SUM(CASE WHEN (f.is_target = 1 AND f.sdc_written = 0 AND f.classified_by != 'bootstrap' AND i.bootstrapped = 0) OR (f.sdc_removal_pending = 1 AND NOT EXISTS (SELECT 1 FROM faces f2 WHERE f2.image_id = f.image_id AND f2.superseded_by IS NULL AND f2.is_target = 1)) THEN 1 ELSE 0 END) AS sdc_pending, "
             "  SUM(CASE WHEN f.classified_by_user_id IS NOT NULL THEN 1 ELSE 0 END) AS by_human, "
             "  SUM(CASE WHEN f.classified_by = 'model' AND f.classified_by_user_id IS NULL THEN 1 ELSE 0 END) AS by_model, "
@@ -3425,6 +3358,43 @@ def project_unban_member(project_id: int):
         flash(_("Failed to unban member."), "error")
 
     return redirect(url_for("project_settings", project_id=project_id))
+
+
+@app.route("/project/<int:project_id>/leave", methods=["POST"])
+@login_required
+def project_leave(project_id: int):
+    """Leave a project (member-only, not the owner)."""
+    if not _validate_csrf():
+        abort(400, _("Invalid CSRF token"))
+
+    try:
+        project = get_project_for_actor(project_id, g.user["id"])
+    except DatabaseError:
+        abort(500)
+
+    if not project:
+        abort(404)
+
+    if project["user_id"] == g.user["id"]:
+        flash(_("You cannot leave a project you own. Delete it instead."), "error")
+        return redirect(url_for("project_detail", project_id=project_id))
+
+    try:
+        affected = execute_query(
+            "DELETE FROM project_members WHERE project_id = %s AND user_id = %s AND status = 'active'",
+            (project_id, g.user["id"]),
+            fetch=False,
+        )
+        if affected:
+            flash(_("You have left the project."), "success")
+        else:
+            flash(_("You are not a member of this project."), "error")
+    except DatabaseError:
+        logger.exception("Failed to leave project %s", project_id)
+        flash(_("Failed to leave the project."), "error")
+        return redirect(url_for("project_detail", project_id=project_id))
+
+    return redirect(url_for("dashboard"))
 
 
 @app.route("/project/<int:project_id>/invite-code", methods=["POST"])
@@ -3759,7 +3729,7 @@ def leaderboard():
             "  u.wiki_username, "
             "  COUNT(f.id) + COALESCE(us.classifications, 0) "
             "    AS classifications, "
-            "  COUNT(CASE WHEN f.sdc_written = 1 THEN 1 END) "
+            "  COUNT(CASE WHEN f.sdc_written = 1 AND f.classified_by != 'bootstrap' THEN 1 END) "
             "    + COALESCE(us.sdc_tags, 0) AS sdc_tags "
             "FROM users u "
             "LEFT JOIN faces f ON f.classified_by_user_id = u.id "
@@ -3769,7 +3739,7 @@ def leaderboard():
             "  AND (f.id IS NOT NULL OR us.user_id IS NOT NULL) "
             "GROUP BY u.id, u.wiki_username, us.classifications, us.sdc_tags "
             "ORDER BY (COUNT(f.id) + COALESCE(us.classifications, 0) "
-            "        + COUNT(CASE WHEN f.sdc_written = 1 THEN 1 END) "
+            "        + COUNT(CASE WHEN f.sdc_written = 1 AND f.classified_by != 'bootstrap' THEN 1 END) "
             "        + COALESCE(us.sdc_tags, 0)) DESC, "
             "         (COUNT(f.id) + COALESCE(us.classifications, 0)) DESC "
             "LIMIT 100",
@@ -3881,6 +3851,13 @@ def bad_request(e):
     """Handle 400 errors."""
     msg = e.description if hasattr(e, "description") and isinstance(e.description, str) else _("Bad request")
     return render_template("error.html", code=400, message=msg), 400
+
+
+@app.errorhandler(403)
+def forbidden(e):
+    """Handle 403 errors."""
+    msg = e.description if hasattr(e, "description") and isinstance(e.description, str) else _("Forbidden")
+    return render_template("error.html", code=403, message=msg), 403
 
 
 @app.errorhandler(404)

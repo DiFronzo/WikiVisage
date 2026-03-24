@@ -27,9 +27,6 @@ face-recognition @ git+https://github.com/DiFronzo/face_recognition@d632e2e8d5b5
 Pillow>=10.4.0
 scipy>=1.14.0
 
-# Server-side sessions
-Flask-Session==0.8.0
-
 # Rate limiting
 Flask-Limiter==4.1.1
 redis>=5.0.0

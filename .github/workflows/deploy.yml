@@ -134,7 +134,7 @@ jobs:
           toolforge jobs run ml-worker-2 --command 'python -u worker.py --worker-id ml-worker-2' --image tool-wikivisage/tool-wikivisage:latest --continuous --mem 3Gi --cpu 2
           echo "==> Restarting webservice"
           toolforge webservice buildservice restart
-          LOG_MSG="deployed $TAG (by $ACTOR)"
+          LOG_MSG="deployed $TAG (by $ACTOR on GitHub)"
           [ "$DB_RESET" = "true" ] && LOG_MSG="deployed $TAG with database wipe (by $ACTOR on GitHub)"
           dologmsg "$LOG_MSG"
           echo "==> Deploy complete (logged to SAL)"

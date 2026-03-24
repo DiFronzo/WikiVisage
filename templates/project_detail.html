@@ -389,7 +389,7 @@
     .inference-banner-done { border-color: var(--success); background: rgba(34, 197, 94, 0.06); }
     .inference-banner-done .inference-banner-text { color: var(--success); }
     .inference-banner-close { position: absolute; top: 0.75rem; right: 0.75rem; background: none; border: none; color: var(--text-muted); font-size: 1.25rem; line-height: 1; cursor: pointer; padding: 0.25rem; opacity: 0.6; transition: opacity 0.2s ease, color 0.2s ease; }
-    .inference-banner-close:hover { opacity: 1; color: var(--text); }
+    .inference-banner-close:hover { opacity: 1; color: var(--text-main); }
     .action-buttons { margin: 3rem 0; display: flex; gap: 1rem; flex-wrap: wrap; }
     .btn-lg { font-size: 1.25rem; }
     .results-description { color: var(--text-muted); margin-bottom: 1.5rem; }
@@ -859,7 +859,10 @@
     {% if is_owner %}
     <a href="{{ url_for('project_settings', project_id=project.id) }}" class="btn btn-lg">{{ _('Settings') }}</a>
     {% else %}
-    <span class="btn btn-lg" style="opacity: 0.4; cursor: not-allowed; pointer-events: none;">{{ _('Settings') }}</span>
+    <form method="POST" action="{{ url_for('project_leave', project_id=project.id) }}" style="display:inline" onsubmit="return confirm({{ _('Are you sure you want to leave this project?')|tojson }})">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <button type="submit" class="btn btn-danger btn-lg">{{ _('Leave Project') }}</button>
+    </form>
     {% endif %}
 </div>
 
@@ -1899,9 +1902,21 @@
             // Session-relative counts: how many were written/removed THIS session
             var sessionWritten = (sdcInitialPending || 0) - pending;
             if (sessionWritten < 0) sessionWritten = 0;
-            var sessionTotal = (sdcInitialPending || 0) + (sdcInitialRemoval || 0);
-            var sessionDone = sessionWritten + removalsDone;
-            var pct = Math.min(100, Math.round(sessionDone / (sessionTotal || 1) * 100));
+
+            // Calculate percentage in two phases to keep bar aligned with text.
+            // Phase 1 (writes): bar tracks writes only.
+            // Phase 2 (removals after writes): bar tracks removals only.
+            var pct;
+            if (pending > 0) {
+                // Still writing — show write progress only
+                pct = Math.min(100, Math.round(sessionWritten / (sdcInitialPending || 1) * 100));
+            } else if (removalPending > 0) {
+                // Writes done, removals in progress
+                pct = Math.min(100, Math.round(removalsDone / (sdcInitialRemoval || 1) * 100));
+            } else {
+                // Everything done
+                pct = 100;
+            }
 
             if (data.in_progress) {
                 // Worker is actively writing

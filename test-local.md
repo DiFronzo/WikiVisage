@@ -44,8 +44,6 @@ export OAUTH_CLIENT_ID=""
 export OAUTH_CLIENT_SECRET=""
 export OAUTH_REDIRECT_URI="http://localhost:8000/auth/callback"
 export OAUTHLIB_INSECURE_TRANSPORT=1
-# Optional: use local whitelist.txt instead of fetching from GitHub (whitelist still enforced)
-export WIKIVISAGE_WHITELIST_LOCAL=1
 # Optional: encrypt OAuth tokens at rest (leave unset for plaintext)
 # export WIKIVISAGE_TOKEN_KEY="$(python3 -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())')"
 ```
