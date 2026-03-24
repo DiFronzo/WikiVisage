@@ -63,7 +63,7 @@ Flask app served by gunicorn via app factory (`create_app()`). Handles OAuth 2.0
 
 **Security middleware:**
 - Open redirect protection on login (`_is_safe_url()`)
-- CSRF protection on all POST routes (Flask-Session + token validation)
+- CSRF protection on all POST routes (per-request CSRF token stored in Flask's signed session cookie)
 - Rate limiting via Flask-Limiter (global 200/hour default, 10/min on bbox endpoints)
 - Security headers: `X-Content-Type-Options`, `X-Frame-Options`, `X-XSS-Protection`
 
