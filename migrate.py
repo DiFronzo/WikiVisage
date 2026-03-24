@@ -367,8 +367,8 @@ _ALTER_MIGRATIONS = [
         "COMMENT 'User who triggered SDC writes (their token is used)' AFTER sdc_write_requested",
     ),
     (
-        "Add composite index on sdc_claims(face_id, written_at) for SDC status queries",
-        "ALTER TABLE sdc_claims ADD INDEX idx_sdc_claims_face_written (face_id, written_at)",
+        "Add composite index on sdc_claims(face_id, written_at) for efficient EXISTS subqueries",
+        "ALTER TABLE sdc_claims ADD INDEX idx_sdc_claims_face (face_id, written_at)",
     ),
 ]
 
