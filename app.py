@@ -1502,7 +1502,7 @@ def project_detail(project_id: int):
             "  SUM(CASE WHEN f.is_target = 0 THEN 1 ELSE 0 END) AS confirmed_non_matches, "
             "  SUM(CASE WHEN f.is_target IS NULL THEN 1 ELSE 0 END) AS unclassified, "
             "  SUM(CASE WHEN f.is_target = 1 AND f.classified_by_user_id IS NOT NULL THEN 1 ELSE 0 END) AS human_confirmed, "
-            "  SUM(CASE WHEN f.sdc_written = 1 AND EXISTS (SELECT 1 FROM sdc_claims sc WHERE sc.face_id = f.id AND sc.written_at IS NOT NULL) THEN 1 ELSE 0 END) AS sdc_written, "
+            "  SUM(CASE WHEN f.sdc_written = 1 AND sc.face_id IS NOT NULL THEN 1 ELSE 0 END) AS sdc_written, "
             "  SUM(CASE WHEN f.is_target = 1 AND f.sdc_written = 0 AND f.classified_by != 'bootstrap' AND i.bootstrapped = 0 THEN 1 ELSE 0 END) AS sdc_pending, "
             "  SUM(CASE WHEN f.sdc_removal_pending = 1 "
             "    AND NOT EXISTS (SELECT 1 FROM faces f2 WHERE f2.image_id = f.image_id "
@@ -1517,6 +1517,7 @@ def project_detail(project_id: int):
             "  SUM(CASE WHEN f.classified_by = 'bootstrap' AND f.classified_by_user_id IS NULL THEN 1 ELSE 0 END) AS by_bootstrap "
             "FROM faces f "
             "JOIN images i ON f.image_id = i.id "
+            "LEFT JOIN (SELECT DISTINCT face_id FROM sdc_claims WHERE written_at IS NOT NULL) sc ON sc.face_id = f.id "
             "WHERE i.project_id = %s AND f.superseded_by IS NULL",
             (project_id,),
         )
