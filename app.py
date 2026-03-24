@@ -2799,7 +2799,7 @@ def api_sdc_status(project_id: int):
     try:
         counts = execute_query(
             "SELECT "
-            "  SUM(CASE WHEN f.is_target = 1 AND f.sdc_written = 1 AND EXISTS (SELECT 1 FROM sdc_claims sc WHERE sc.face_id = f.id AND sc.written_at IS NOT NULL) THEN 1 ELSE 0 END) AS written, "
+            "  SUM(CASE WHEN f.is_target = 1 AND f.sdc_written = 1 AND sc.face_id IS NOT NULL THEN 1 ELSE 0 END) AS written, "
             "  SUM(CASE WHEN f.is_target = 1 AND f.sdc_written = 0 AND f.classified_by != 'bootstrap' AND i.bootstrapped = 0 THEN 1 ELSE 0 END) AS pending, "
             "  COUNT(DISTINCT CASE WHEN f.sdc_removal_pending = 1 "
             "    AND NOT EXISTS (SELECT 1 FROM faces f2 WHERE f2.image_id = f.image_id "
@@ -2807,6 +2807,7 @@ def api_sdc_status(project_id: int):
             "    THEN f.image_id END) AS removal_pending "
             "FROM faces f "
             "JOIN images i ON f.image_id = i.id "
+            "LEFT JOIN sdc_claims sc ON sc.face_id = f.id AND sc.written_at IS NOT NULL "
             "WHERE i.project_id = %s AND f.superseded_by IS NULL",
             (project_id,),
             fetch=True,

@@ -366,6 +366,10 @@ _ALTER_MIGRATIONS = [
         "ALTER TABLE projects ADD COLUMN sdc_write_user_id BIGINT UNSIGNED NULL "
         "COMMENT 'User who triggered SDC writes (their token is used)' AFTER sdc_write_requested",
     ),
+    (
+        "Add composite index on sdc_claims(face_id, written_at) for SDC status queries",
+        "ALTER TABLE sdc_claims ADD INDEX idx_sdc_claims_face_written (face_id, written_at)",
+    ),
 ]
 
 

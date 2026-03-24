@@ -170,6 +170,7 @@ CREATE TABLE IF NOT EXISTS sdc_claims (
 
     UNIQUE INDEX idx_sdc_claims_page_qid (commons_page_id, wikidata_qid),
     INDEX idx_sdc_claims_project (project_id),
+    INDEX idx_sdc_claims_face_written (face_id, written_at),
 
     CONSTRAINT fk_sdc_claims_project
         FOREIGN KEY (project_id) REFERENCES projects (id) ON DELETE CASCADE,
