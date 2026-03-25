@@ -225,58 +225,6 @@
         pointer-events: none;
         box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.5);
     }
-    .pagination {
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        gap: 0.25rem;
-        margin: 2rem 0 1rem;
-        flex-wrap: wrap;
-    }
-    .pagination:empty {
-        display: none;
-    }
-    .pagination button, .pagination span {
-        display: inline-flex;
-        align-items: center;
-        justify-content: center;
-        min-width: 2.25rem;
-        height: 2.25rem;
-        padding: 0 0.5rem;
-        font-size: 0.8rem;
-        font-weight: 700;
-        text-transform: uppercase;
-        letter-spacing: 0.05em;
-        border: 2px solid var(--border);
-        background: var(--surface);
-        color: var(--text-main);
-        text-decoration: none;
-        cursor: pointer;
-        transition: all 0.15s ease;
-        font-family: inherit;
-    }
-    .pagination button:hover:not(:disabled) {
-        border-color: var(--primary);
-        color: var(--primary);
-        transform: translate(-1px, -1px);
-        box-shadow: 3px 3px 0px var(--primary);
-    }
-    .pagination .active {
-        background: var(--primary);
-        color: var(--bg);
-        border-color: var(--primary);
-    }
-    .pagination button:disabled {
-        opacity: 0.35;
-        cursor: default;
-    }
-    .pagination .ellipsis {
-        border: none;
-        background: none;
-        color: var(--text-muted);
-        min-width: auto;
-        padding: 0 0.25rem;
-    }
     .stat-box-success { border-color: var(--success); }
     .stat-box-success .stat-value { color: var(--success); }
     .stat-box-danger { border-color: var(--danger); }
@@ -420,52 +368,10 @@
     .results-filters .results-filter { white-space: nowrap; }
     /* --- REDESIGN CSS: SDC Write Section --- */
     .sdc-section {
-        position: relative;
-        overflow: hidden;
-        border: 2px solid var(--info);
-        background: linear-gradient(135deg, var(--surface) 0%, color-mix(in srgb, var(--info) 8%, var(--bg)) 100%);
-        box-shadow: 6px 6px 0px rgba(59, 130, 246, 0.2);
         margin-top: 4rem;
-        animation: stat-entrance 0.6s cubic-bezier(0.16, 1, 0.3, 1) backwards;
         animation-delay: 0.4s;
-    }
-
-    .sdc-section::before {
-        content: '';
-        position: absolute;
-        inset: 0;
-        background: repeating-linear-gradient(
-            0deg,
-            transparent,
-            transparent 2px,
-            rgba(59, 130, 246, 0.04) 2px,
-            rgba(59, 130, 246, 0.04) 4px
-        );
-        pointer-events: none;
-        z-index: 1;
-        animation: scanline 20s linear infinite;
-    }
-
-    .sdc-section::after {
-        content: '';
-        position: absolute;
-        top: 0; right: 0; bottom: 0; left: 0;
-        pointer-events: none;
-        background:
-            linear-gradient(var(--info), var(--info)) top left / 15px 3px no-repeat,
-            linear-gradient(var(--info), var(--info)) top left / 3px 15px no-repeat,
-            linear-gradient(var(--info), var(--info)) top right / 15px 3px no-repeat,
-            linear-gradient(var(--info), var(--info)) top right / 3px 15px no-repeat,
-            linear-gradient(var(--info), var(--info)) bottom left / 15px 3px no-repeat,
-            linear-gradient(var(--info), var(--info)) bottom left / 3px 15px no-repeat,
-            linear-gradient(var(--info), var(--info)) bottom right / 15px 3px no-repeat,
-            linear-gradient(var(--info), var(--info)) bottom right / 3px 15px no-repeat;
-        z-index: 2;
-    }
-
-    .sdc-section > * {
-        position: relative;
-        z-index: 3;
+        box-shadow: 6px 6px 0px rgba(59, 130, 246, 0.2);
+        background: linear-gradient(135deg, var(--surface) 0%, color-mix(in srgb, var(--info) 8%, var(--bg)) 100%);
     }
 
     .sdc-title {
@@ -524,51 +430,7 @@
     .gallery-empty { color: var(--text-muted); }
 
     /* Progress Card */
-    #progressCard {
-        position: relative;
-        overflow: hidden;
-        border: 2px solid var(--primary);
-        background: linear-gradient(135deg, var(--surface) 0%, var(--bg) 100%);
-        box-shadow: var(--shadow);
-    }
-    
-    #progressCard::before {
-        content: '';
-        position: absolute;
-        inset: 0;
-        background: repeating-linear-gradient(
-            0deg,
-            transparent,
-            transparent 2px,
-            rgba(20, 184, 166, 0.04) 2px,
-            rgba(20, 184, 166, 0.04) 4px
-        );
-        pointer-events: none;
-        z-index: 1;
-        animation: scanline 20s linear infinite;
-    }
-    
-    #progressCard::after {
-        content: '';
-        position: absolute;
-        top: 0; right: 0; bottom: 0; left: 0;
-        pointer-events: none;
-        background: 
-            linear-gradient(var(--primary), var(--primary)) top left / 15px 3px no-repeat,
-            linear-gradient(var(--primary), var(--primary)) top left / 3px 15px no-repeat,
-            linear-gradient(var(--primary), var(--primary)) top right / 15px 3px no-repeat,
-            linear-gradient(var(--primary), var(--primary)) top right / 3px 15px no-repeat,
-            linear-gradient(var(--primary), var(--primary)) bottom left / 15px 3px no-repeat,
-            linear-gradient(var(--primary), var(--primary)) bottom left / 3px 15px no-repeat,
-            linear-gradient(var(--primary), var(--primary)) bottom right / 15px 3px no-repeat,
-            linear-gradient(var(--primary), var(--primary)) bottom right / 3px 15px no-repeat;
-        z-index: 2;
-    }
-
-    #progressCard > * {
-        position: relative;
-        z-index: 3;
-    }
+    /* (Styles inherited from .decorated-card in base.html) */
 
     /* Progress Bar Enhancement */
     .progress-wrap {
@@ -635,6 +497,7 @@
         .sdc-progress-text { font-size: 0.7rem; letter-spacing: 0.03em; }
     }
 </style>
+<script src="{{ url_for('static', filename='wikivisage-common.js') }}"></script>
 {% endblock %}
 
 {% block content %}
@@ -663,7 +526,7 @@
 
 <div class="viewit-strip" id="viewitStrip">
     <div class="viewit-strip-content">
-        <img src="https://upload.wikimedia.org/wikipedia/commons/d/d0/View_it%21_Tool_%28transparent%29.png" alt="" loading="lazy">
+        <img src="{{ url_for('static', filename='view-it-tool.png') }}" alt="" loading="lazy">
         <span>{{ _('View all related media on Commons with') }}</span>
         <a href="https://view-it.toolforge.org/?q={{ project.wikidata_qid }}&amp;utm_source=WikiVisage" target="_blank" rel="noopener">View it! &nearr;</a>
     </div>
@@ -671,7 +534,7 @@
 </div>
 <script>try{if(localStorage.getItem('viewit_dismissed')==='1'){var s=document.getElementById('viewitStrip');if(s)s.remove()}}catch(e){}</script>
 
-<div class="card" id="progressCard">
+<div class="card decorated-card" id="progressCard">
     {% if project.images_total == 0 %}
         <h2>{{ _('Processing Progress') }}</h2>
         <p id="progressMsg" class="text-muted-msg">
@@ -899,7 +762,7 @@
 {% if project.images_total > 0 %}
 {% set sdc_pending = stats.sdc_pending or 0 %}
 {% set sdc_removal = stats.sdc_removal_pending or 0 %}
-<div class="card sdc-section" id="sdcWriteSection">
+<div class="card sdc-section decorated-card" id="sdcWriteSection" style="--card-accent: var(--info)">
     <h3 class="sdc-title">{{ _('Send Edits to Wikimedia Commons') }}</h3>
     <p class="sdc-description">
         {{ _('Write P180 depicts claims for all approved target faces that have not yet been written to Commons. Review the Classification Results above to remove false positives before sending.') }}
@@ -1018,17 +881,9 @@
         var loading = card.querySelector('.result-loading');
         loading.classList.add('active');
 
-        var formData = new FormData();
-        formData.append('csrf_token', csrfToken);
-        formData.append('face_id', faceId);
-        formData.append('is_target', isTarget);
-
-        fetch(apiReclassifyUrl, {
-            method: 'POST',
-            body: formData
-        }).then(function(r) {
-            if (!r.ok) throw new Error('Network response was not ok');
-            return r.json();
+        postForm(apiReclassifyUrl, csrfToken, {
+            face_id: faceId,
+            is_target: isTarget
         }).then(function(data) {
             loading.classList.remove('active');
             if (data.status === 'ok') {
@@ -1098,29 +953,6 @@
     var imgOffsetX = 0;
     var imgOffsetY = 0;
     var bboxTriggerElement = null;
-
-    var VIDEO_EXTENSIONS = ['.webm', '.ogv', '.ogg'];
-    var TIF_EXTENSIONS = ['.tif', '.tiff'];
-
-    // Wikimedia Commons enforces standard thumbnail step sizes ($wgThumbnailSteps).
-    var THUMB_STEPS = [20, 40, 60, 120, 250, 330, 500, 960, 1280, 1920, 3840];
-    function snapThumbWidth(w) {
-        for (var i = 0; i < THUMB_STEPS.length; i++) {
-            if (THUMB_STEPS[i] >= w) return THUMB_STEPS[i];
-        }
-        return THUMB_STEPS[THUMB_STEPS.length - 1];
-    }
-
-    function commonsThumbUrl(fileTitle, width) {
-        width = snapThumbWidth(width);
-        var clean = fileTitle.replace('File:', '').replace(/ /g, '_');
-        // Spark MD5 not available — use the commons-thumb endpoint for non-standard files
-        var ext = '.' + clean.split('.').pop().toLowerCase();
-        if (VIDEO_EXTENSIONS.indexOf(ext) !== -1 || TIF_EXTENSIONS.indexOf(ext) !== -1 || ext === '.svg') {
-            return '/commons-thumb/' + encodeURIComponent(clean) + '?width=' + width;
-        }
-        return 'https://commons.wikimedia.org/wiki/Special:FilePath/' + encodeURIComponent(clean) + '?width=' + width;
-    }
 
     /**
      * Crop a gallery thumbnail to show just the face bounding box region.
@@ -1239,16 +1071,19 @@
             img._detW = detW;
             img._detH = detH;
             
-            var t = parseInt(thumb.dataset.bboxTop);
-            var r = parseInt(thumb.dataset.bboxRight);
-            var b = parseInt(thumb.dataset.bboxBottom);
-            var l = parseInt(thumb.dataset.bboxLeft);
+            var oldBbox = {
+                top: parseInt(thumb.dataset.bboxTop),
+                right: parseInt(thumb.dataset.bboxRight),
+                bottom: parseInt(thumb.dataset.bboxBottom),
+                left: parseInt(thumb.dataset.bboxLeft)
+            };
             
             var oldBox = document.getElementById('oldBbox');
-            oldBox.style.left = (imgOffsetX + l * imgScale) + 'px';
-            oldBox.style.top = (imgOffsetY + t * imgScale) + 'px';
-            oldBox.style.width = ((r - l) * imgScale) + 'px';
-            oldBox.style.height = ((b - t) * imgScale) + 'px';
+            var oldRect = bboxToDisplayRect(oldBbox, imgScale, imgScale, imgOffsetX, imgOffsetY);
+            oldBox.style.left = oldRect.left + 'px';
+            oldBox.style.top = oldRect.top + 'px';
+            oldBox.style.width = oldRect.width + 'px';
+            oldBox.style.height = oldRect.height + 'px';
             oldBox.style.display = 'block';
         };
         
@@ -1345,12 +1180,10 @@
             var boxLeft = parseFloat(drawingBox.style.left);
             var boxTop = parseFloat(drawingBox.style.top);
             
-            currentBbox = {
-                top: Math.round((boxTop - imgOffsetY) / imgScale),
-                right: Math.round((boxLeft + w - imgOffsetX) / imgScale),
-                bottom: Math.round((boxTop + h - imgOffsetY) / imgScale),
-                left: Math.round((boxLeft - imgOffsetX) / imgScale)
-            };
+            currentBbox = displayRectToDetectionBbox(
+                { left: boxLeft, top: boxTop, width: w, height: h },
+                imgScale, imgScale, imgOffsetX, imgOffsetY
+            );
             document.getElementById('saveBboxBtn').disabled = false;
         } else {
             drawingBox.style.display = 'none';
@@ -1366,20 +1199,12 @@
         var loading = document.getElementById('modalLoading');
         loading.classList.add('active');
         
-        var formData = new FormData();
-        formData.append('csrf_token', csrfToken);
-        formData.append('face_id', currentEditFaceId);
-        formData.append('bbox_top', currentBbox.top);
-        formData.append('bbox_right', currentBbox.right);
-        formData.append('bbox_bottom', currentBbox.bottom);
-        formData.append('bbox_left', currentBbox.left);
-        
-        fetch(apiUpdateBboxUrl, {
-            method: 'POST',
-            body: formData
-        }).then(function(r) {
-            if (!r.ok) throw new Error('Network response was not ok');
-            return r.json();
+        postForm(apiUpdateBboxUrl, csrfToken, {
+            face_id: currentEditFaceId,
+            bbox_top: currentBbox.top,
+            bbox_right: currentBbox.right,
+            bbox_bottom: currentBbox.bottom,
+            bbox_left: currentBbox.left
         }).then(function(data) {
             if (data.status === 'ok') {
                 closeBboxModal();

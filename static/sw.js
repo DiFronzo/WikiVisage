@@ -16,8 +16,10 @@ const PRECACHE_URLS = [
   "/static/wikivisage-logo.svg",
   "/static/wikivisage-logo-notext.svg",
   "/static/powered-by-toolforge.svg",
+  "/static/view-it-tool.png",
   "/static/icon-192.png",
-  "/static/icon-512.png"
+  "/static/icon-512.png",
+  "/static/wikivisage-common.js"
 ];
 
 /* Install — precache static assets */

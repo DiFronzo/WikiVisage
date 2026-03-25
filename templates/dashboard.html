@@ -258,53 +258,6 @@
         color: var(--text-muted);
         position: relative;
     }
-    .pagination {
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        gap: 0.25rem;
-        margin: 2rem 0 1rem;
-        flex-wrap: wrap;
-    }
-    .pagination a, .pagination span {
-        display: inline-flex;
-        align-items: center;
-        justify-content: center;
-        min-width: 2.25rem;
-        height: 2.25rem;
-        padding: 0 0.5rem;
-        font-size: 0.8rem;
-        font-weight: 700;
-        text-transform: uppercase;
-        letter-spacing: 0.05em;
-        border: 2px solid var(--border);
-        background: var(--surface);
-        color: var(--text-main);
-        text-decoration: none;
-        transition: all 0.15s ease;
-    }
-    .pagination a:hover {
-        border-color: var(--primary);
-        color: var(--primary);
-        transform: translate(-1px, -1px);
-        box-shadow: 3px 3px 0px var(--primary);
-    }
-    .pagination .active {
-        background: var(--primary);
-        color: var(--bg);
-        border-color: var(--primary);
-    }
-    .pagination .disabled {
-        opacity: 0.35;
-        pointer-events: none;
-    }
-    .pagination .ellipsis {
-        border: none;
-        background: none;
-        color: var(--text-muted);
-        min-width: auto;
-        padding: 0 0.25rem;
-    }
 </style>
 {% endblock %}
 

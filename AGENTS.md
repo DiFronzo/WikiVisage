@@ -8,7 +8,7 @@ Active-learning Flask app for Wikimedia Commons. Users classify faces via yes/no
 
 ```
 WikiVisage/
-├── app.py              # Flask web app: OAuth, routes, classification API (~3860 lines)
+├── app.py              # Flask web app: OAuth, routes, classification API (~3870 lines)
 ├── worker.py           # Background ML pipeline: crawl, detect, infer (~2930 lines)
 ├── token_crypto.py     # Fernet encrypt/decrypt helpers for OAuth tokens at rest (~110 lines)
 ├── database.py         # MariaDB connection pool with retry logic (~510 lines)
@@ -25,14 +25,14 @@ WikiVisage/
 │   ├── nb/LC_MESSAGES/ # Norwegian Bokmål
 │   ├── es/LC_MESSAGES/ # Spanish
 │   └── fr/LC_MESSAGES/ # French
-├── tests/              # Hybrid test suite: 533 unit + 34 integration tests
+├── tests/              # Hybrid test suite: 544 unit + 34 integration tests
 │   ├── __init__.py
 │   ├── conftest.py     # Integration fixture infrastructure (~450 lines)
-│   ├── test_app.py     # 444 unit + 11 integration tests (~9640 lines)
+│   ├── test_app.py     # 453 unit + 11 integration tests (~9640 lines)
 │   ├── test_database.py # 14 unit + 9 integration tests (~360 lines)
 │   ├── test_migrate.py # 15 unit + 8 integration tests (~471 lines)
 │   ├── test_token_crypto.py # 22 unit tests (~175 lines)
-│   └── test_worker.py  # 38 unit + 6 integration tests (~1240 lines)
+│   └── test_worker.py  # 40 unit + 6 integration tests (~1240 lines)
 ├── templates/          # Jinja2 templates (10 files, all extend base.html)
 │   ├── base.html       # Layout: nav, flash messages, CSS variables. Blocks: title, extra_head, content
 │   ├── classify.html   # Active learning UI: face image, yes/no/skip/none buttons, keyboard shortcuts, undo
@@ -41,7 +41,9 @@ WikiVisage/
 │   └── ...             # dashboard, index, leaderboard, project_new, project_settings, error
 ├── static/             # Static assets
 │   ├── wikivisage-logo.svg        # Full logo with text
-│   └── wikivisage-logo-notext.svg # Logo icon only
+│   ├── wikivisage-logo-notext.svg # Logo icon only
+│   ├── wikivisage-common.js       # Shared JS helpers: snapThumbWidth(), commonsThumbUrl()
+│   └── view-it-tool.png           # View it! Tool icon (local copy)
 ├── .github/
 │   └── workflows/
 │       ├── ci.yml      # CI: Ruff lint + pytest on Python 3.11/3.13 (integration tests skipped)
@@ -259,7 +261,9 @@ worker_heartbeat (single-row: id=1, last_seen DATETIME)
 ### Templates
 - All templates extend `base.html`. Three blocks: `title`, `extra_head` (CSS/JS), `content`.
 - CSS is embedded in `base.html` `<style>` tag (CSS custom properties) + per-page `{% block extra_head %}`. No external CSS files.
-- No JavaScript build system. Inline `<script>` tags in templates.
+- Reusable CSS classes live in `base.html`: `.decorated-card` (scanline + corner overlay pattern, accent color via `--card-accent` CSS variable), unified pagination styles (`.pagination a, .pagination button`).
+- Shared JS helpers are in `static/wikivisage-common.js` (thumbnail snapping, Commons URL building). Templates that need them add `<script src="{{ url_for('static', filename='wikivisage-common.js') }}">` in `{% block extra_head %}`.
+- No JavaScript build system. Inline `<script>` tags in templates for page-specific logic.
 - Title format: `Page Name - WikiVisage BETA`
 - Dark brutalist/industrial theme with CSS variables: `--bg: #090e17`, `--surface: #141f33`, `--primary: #14b8a6`, etc.
 
@@ -287,9 +291,40 @@ worker_heartbeat (single-row: id=1, last_seen DATETIME)
 ### Thumbnail URLs
 - Commons enforces standard thumbnail step sizes (`$wgThumbnailSteps`). Non-standard widths return 429.
 - Python: `_snap_thumb_width(w)` rounds to nearest allowed step from `_THUMB_STEPS`.
-- JavaScript: `snapThumbWidth(w)` mirrors the same logic in project_detail.html.
+- JavaScript: `snapThumbWidth(w)` mirrors the same logic in `static/wikivisage-common.js`.
 - All thumbnail URL generation must go through these snapping functions.
 - Standard steps: 20, 40, 60, 120, 250, 330, 500, 960, 1280, 1920, 3840px.
+
+### Shared Helpers
+
+Extracted common patterns to reduce duplication across routes, templates, and JS.
+
+**Python (app.py):**
+
+| Helper | Signature | Purpose | Call sites |
+|--------|-----------|---------|------------|
+| `_wikimedia_api_get` | `(url, params, timeout=10) → dict` | Standardizes User-Agent header, `raise_for_status()`, `.json()` parsing for Wikimedia API GET requests | 10: `_is_human_entity`, `_commons_category_exists`, `_commons_category_has_files`, `_check_p180_exists`, `_fetch_p18_thumb_url`, `_fetch_wikidata_label`, + 4 calls in `api_category_info` |
+| `_validate_bbox` | `(top, right, bottom, left) → str \| None` | Validates bounding box coordinates against `MAX_BBOX_PX` and `MIN_BBOX_AREA`. Returns error message or `None` | 2: `api_manual_face`, `api_update_face_bbox` |
+| `_get_face_stats` | `(project_id) → dict[str, Any]` | Single SQL query returning 12-column face/image stats with NULL→0 coercion | 2: `project_detail`, `api_progress` |
+
+**CSS (base.html):**
+
+| Class | Purpose | Used in |
+|-------|---------|---------|
+| `.decorated-card` | Scanline + corner overlay pattern. Accent color via `--card-accent` CSS variable (defaults to `--primary`) | `project_detail.html` (SDC section with `--card-accent: var(--info)`, progress card), `leaderboard.html` |
+| `.pagination-controls` | Unified pagination button/link styles | `project_detail.html`, `dashboard.html` |
+
+**JavaScript (`static/wikivisage-common.js`):**
+
+| Export | Purpose |
+|--------|---------|
+| `THUMB_STEPS` | Array of Commons-allowed thumbnail widths |
+| `snapThumbWidth(w)` | Snaps arbitrary width to nearest allowed Commons step |
+| `commonsThumbUrl(filename, width)` | Builds proxied Commons thumbnail URL with step-snapped width |
+| `VIDEO_EXTENSIONS`, `TIF_EXTENSIONS` | File extension sets for media type detection |
+| `postForm(url, csrfToken, fields)` | CSRF-enabled POST helper — builds FormData, returns parsed JSON Promise |
+| `bboxToDisplayRect(bbox, scaleX, scaleY, offsetX, offsetY)` | Converts detection-space bbox `{top,right,bottom,left}` to display-space `{left,top,width,height}` |
+| `displayRectToDetectionBbox(rect, scaleX, scaleY, offsetX, offsetY)` | Inverse of `bboxToDisplayRect` — display rect to rounded detection bbox |
 
 ## Known Issues & Gotchas
 
@@ -344,7 +379,7 @@ Each face encoding is 1024 bytes (128 float64). Even 10K faces ~ 10MB. No RAM co
 
 ## Testing
 
-Hybrid test suite: **533 unit tests** (run in CI) + **34 integration tests** (require local Docker MariaDB).
+Hybrid test suite: **544 unit tests** (run in CI) + **34 integration tests** (require local Docker MariaDB).
 
 ### Architecture
 
@@ -357,12 +392,12 @@ Hybrid test suite: **533 unit tests** (run in CI) + **34 integration tests** (re
 
 | File | Unit | Integration | Total |
 |------|------|-------------|-------|
-| `test_app.py` | 444 | 11 | 455 |
+| `test_app.py` | 453 | 11 | 464 |
 | `test_database.py` | 14 | 9 | 23 |
 | `test_migrate.py` | 15 | 8 | 23 |
 | `test_token_crypto.py` | 22 | 0 | 22 |
-| `test_worker.py` | 38 | 6 | 44 |
-| **Total** | **533** | **34** | **567** |
+| `test_worker.py` | 40 | 6 | 46 |
+| **Total** | **544** | **34** | **578** |
 
 ### Commands
 

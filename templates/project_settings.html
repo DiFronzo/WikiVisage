@@ -116,7 +116,7 @@
                     <form method="POST" action="{{ url_for('project_remove_member', project_id=project.id) }}" style="display: inline;" onsubmit="return confirm(REMOVE_MEMBER_MSG.replace('{username}', {{ member.wiki_username|tojson }}));">
                         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                         <input type="hidden" name="member_user_id" value="{{ member.user_id }}">
-                        <button type="submit" class="btn btn-sm" style="border-color: var(--danger); color: var(--danger); padding: 0.25rem 0.5rem; font-size: 0.75rem;">{{ _('Remove') }}</button>
+                        <button type="submit" class="btn btn-danger btn-sm" style="padding: 0.25rem 0.5rem; font-size: 0.75rem;">{{ _('Remove') }}</button>
                     </form>
                     {% endif %}
                 </td>
@@ -159,7 +159,7 @@
     <p style="color: var(--text-muted); margin-bottom: 1.5rem;">{{ _('Reset all model-classified faces and let the worker reclassify them using current settings. Human classifications and faces already written to Commons are preserved.') }}</p>
     <form method="POST" action="{{ url_for('project_rerun_inference', project_id=project.id) }}" onsubmit="return confirmRerun(event);">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-        <button type="submit" class="btn" style="width: 100%; border-color: var(--warning); color: var(--warning);">{{ _('Re-run Inference') }}</button>
+        <button type="submit" class="btn btn-warning" style="width: 100%;">{{ _('Re-run Inference') }}</button>
     </form>
 </div>
 
