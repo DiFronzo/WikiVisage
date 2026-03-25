@@ -351,7 +351,7 @@ def _get_face_stats(project_id: int) -> dict[str, Any]:
             (project_id,),
         )
         if rows:
-            return {k: (v or 0) for k, v in rows[0].items()}
+            return {k: int(v or 0) for k, v in rows[0].items()}
     except DatabaseError:
         logger.exception("Failed to load face stats for project %s", project_id)
     return {}
