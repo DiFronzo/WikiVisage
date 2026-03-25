@@ -7691,6 +7691,32 @@ def test_leaderboard_excludes_opted_out_users(monkeypatch):
     assert "leaderboard_opt_out = 0" in captured_sql["leaderboard"]
 
 
+def test_leaderboard_sdc_tags_attributed_to_classifier_not_project_owner(monkeypatch):
+    """SDC tag count must be grouped by faces.classified_by_user_id, matching
+    the archival logic in worker.py, not by projects.user_id (project owner)."""
+    captured_sql = {}
+
+    def execute_query_mock(sql, _params=None, _fetch=True):
+        if "FROM worker_heartbeat" in sql:
+            return [{"is_stale": 0}]
+        if "FROM users u" in sql and "LEFT JOIN faces f" in sql:
+            captured_sql["leaderboard"] = sql
+            return [{"wiki_username": "alice", "classifications": 3, "sdc_tags": 1}]
+        return []
+
+    monkeypatch.setattr(app_module, "execute_query", execute_query_mock)
+
+    flask_app.config["TESTING"] = True
+    client = flask_app.test_client()
+    response = client.get("/leaderboard")
+
+    assert response.status_code == 200
+    sql = captured_sql["leaderboard"]
+    # Live query must credit the face classifier, not the project owner
+    assert "classified_by_user_id" in sql
+    assert "JOIN projects p ON sc.project_id = p.id" not in sql
+
+
 def _flashes_tail(client):
     with client.session_transaction() as sess:
         return sess.get("_flashes", [])
