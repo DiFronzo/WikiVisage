@@ -242,6 +242,17 @@ def _is_safe_url(target: str) -> bool:
     return parsed.scheme in ("http", "https") and parsed.netloc == urlparse(ref_url).netloc
 
 
+def _wikimedia_api_get(url: str, params: dict[str, str], timeout: int = 10) -> dict[str, Any]:
+    """Make a GET request to a Wikimedia API endpoint and return parsed JSON.
+
+    Sets the standard User-Agent header, calls ``raise_for_status()``, and
+    parses the JSON response.  Callers handle their own exceptions.
+    """
+    resp = requests.get(url, params=params, headers={"User-Agent": USER_AGENT}, timeout=timeout)
+    resp.raise_for_status()
+    return resp.json()
+
+
 _ALLOWED_DOWNLOAD_HOSTS = frozenset({"commons.wikimedia.org", "upload.wikimedia.org"})
 
 
@@ -279,6 +290,71 @@ def _download_image(url: str, max_bytes: int = MAX_IMAGE_DOWNLOAD_BYTES) -> byte
         chunks.append(chunk)
 
     return b"".join(chunks)
+
+
+def _validate_bbox(bbox_top: int, bbox_right: int, bbox_bottom: int, bbox_left: int) -> str | None:
+    """Validate bounding box coordinates.
+
+    Returns an error message string if validation fails, or ``None`` if valid.
+    Checks ordering (top < bottom, left < right), range (0..MAX_BBOX_PX),
+    and minimum area (MIN_BBOX_AREA).
+    """
+    if bbox_top >= bbox_bottom or bbox_left >= bbox_right:
+        return _("Invalid bounding box dimensions")
+
+    if (
+        bbox_top < 0
+        or bbox_left < 0
+        or bbox_bottom > MAX_BBOX_PX
+        or bbox_right > MAX_BBOX_PX
+        or (bbox_bottom - bbox_top) * (bbox_right - bbox_left) < MIN_BBOX_AREA
+    ):
+        return _("Bounding box out of allowed range")
+
+    return None
+
+
+def _get_face_stats(project_id: int) -> dict[str, Any]:
+    """Return aggregate face statistics for a project.
+
+    Columns returned: total_faces, confirmed_matches, confirmed_non_matches,
+    unclassified, human_confirmed, sdc_written, sdc_pending, sdc_removal_pending_faces,
+    sdc_removal_pending, by_human, by_model, by_bootstrap.
+    All values are coerced to ``int`` (NULL → 0).
+    Returns an empty dict on database error.
+    """
+    try:
+        rows = execute_query(
+            "SELECT "
+            "  COUNT(*) AS total_faces, "
+            "  SUM(CASE WHEN f.is_target = 1 THEN 1 ELSE 0 END) AS confirmed_matches, "
+            "  SUM(CASE WHEN f.is_target = 0 THEN 1 ELSE 0 END) AS confirmed_non_matches, "
+            "  SUM(CASE WHEN f.is_target IS NULL THEN 1 ELSE 0 END) AS unclassified, "
+            "  SUM(CASE WHEN f.is_target = 1 AND f.classified_by_user_id IS NOT NULL THEN 1 ELSE 0 END) AS human_confirmed, "
+            "  SUM(CASE WHEN f.sdc_written = 1 AND sc.face_id IS NOT NULL THEN 1 ELSE 0 END) AS sdc_written, "
+            "  SUM(CASE WHEN f.is_target = 1 AND f.sdc_written = 0 AND f.classified_by != 'bootstrap' AND i.bootstrapped = 0 THEN 1 ELSE 0 END) AS sdc_pending, "
+            "  SUM(CASE WHEN f.sdc_removal_pending = 1 "
+            "    AND NOT EXISTS (SELECT 1 FROM faces f2 WHERE f2.image_id = f.image_id "
+            "    AND f2.is_target = 1 AND f2.superseded_by IS NULL AND f2.id != f.id) "
+            "    THEN 1 ELSE 0 END) AS sdc_removal_pending_faces, "
+            "  COUNT(DISTINCT CASE WHEN f.sdc_removal_pending = 1 "
+            "    AND NOT EXISTS (SELECT 1 FROM faces f2 WHERE f2.image_id = f.image_id "
+            "    AND f2.is_target = 1 AND f2.superseded_by IS NULL AND f2.id != f.id) "
+            "    THEN f.image_id END) AS sdc_removal_pending, "
+            "  SUM(CASE WHEN f.classified_by_user_id IS NOT NULL THEN 1 ELSE 0 END) AS by_human, "
+            "  SUM(CASE WHEN f.classified_by = 'model' AND f.classified_by_user_id IS NULL THEN 1 ELSE 0 END) AS by_model, "
+            "  SUM(CASE WHEN f.classified_by = 'bootstrap' AND f.classified_by_user_id IS NULL THEN 1 ELSE 0 END) AS by_bootstrap "
+            "FROM faces f "
+            "JOIN images i ON f.image_id = i.id "
+            "LEFT JOIN (SELECT DISTINCT face_id FROM sdc_claims WHERE written_at IS NOT NULL) sc ON sc.face_id = f.id "
+            "WHERE i.project_id = %s AND f.superseded_by IS NULL",
+            (project_id,),
+        )
+        if rows:
+            return {k: (v or 0) for k, v in rows[0].items()}
+    except DatabaseError:
+        logger.exception("Failed to load face stats for project %s", project_id)
+    return {}
 
 
 # ---------------------------------------------------------------------------
@@ -480,19 +556,10 @@ def _is_human_entity(qid: str) -> bool:
     on API errors — fail-open would allow non-human entities, so we fail-closed).
     """
     try:
-        resp = requests.get(
+        data = _wikimedia_api_get(
             WIKIDATA_API_URL,
-            params={
-                "action": "wbgetclaims",
-                "entity": qid,
-                "property": "P31",
-                "format": "json",
-            },
-            headers={"User-Agent": USER_AGENT},
-            timeout=10,
+            {"action": "wbgetclaims", "entity": qid, "property": "P31", "format": "json"},
         )
-        resp.raise_for_status()
-        data = resp.json()
 
         claims = data.get("claims", {}).get("P31", [])
         for claim in claims:
@@ -512,18 +579,11 @@ def _commons_category_exists(category: str) -> bool:
     on API errors — fail-closed to prevent projects with invalid categories).
     """
     try:
-        resp = requests.get(
+        data = _wikimedia_api_get(
             COMMONS_API_URL,
-            params={
-                "action": "query",
-                "titles": f"Category:{category}",
-                "format": "json",
-            },
-            headers={"User-Agent": USER_AGENT},
-            timeout=10,
+            {"action": "query", "titles": f"Category:{category}", "format": "json"},
         )
-        resp.raise_for_status()
-        pages = resp.json().get("query", {}).get("pages", {})
+        pages = data.get("query", {}).get("pages", {})
         # If the only key is "-1", the page does not exist
         return "-1" not in pages
     except Exception:
@@ -539,19 +599,11 @@ def _commons_category_has_files(category: str) -> bool:
     API errors (fail-closed).
     """
     try:
-        resp = requests.get(
+        data = _wikimedia_api_get(
             COMMONS_API_URL,
-            params={
-                "action": "query",
-                "titles": f"Category:{category}",
-                "prop": "categoryinfo",
-                "format": "json",
-            },
-            headers={"User-Agent": USER_AGENT},
-            timeout=10,
+            {"action": "query", "titles": f"Category:{category}", "prop": "categoryinfo", "format": "json"},
         )
-        resp.raise_for_status()
-        pages = resp.json().get("query", {}).get("pages", {})
+        pages = data.get("query", {}).get("pages", {})
         if "-1" in pages:
             return False
         page = next(iter(pages.values()))
@@ -569,19 +621,10 @@ def _check_p180_exists(commons_page_id: int, qid: str) -> bool:
     Returns ``True`` if the claim exists, ``False`` otherwise (including on API errors).
     """
     try:
-        resp = requests.get(
+        data = _wikimedia_api_get(
             COMMONS_API_URL,
-            params={
-                "action": "wbgetclaims",
-                "entity": f"M{commons_page_id}",
-                "property": "P180",
-                "format": "json",
-            },
-            headers={"User-Agent": USER_AGENT},
-            timeout=10,
+            {"action": "wbgetclaims", "entity": f"M{commons_page_id}", "property": "P180", "format": "json"},
         )
-        resp.raise_for_status()
-        data = resp.json()
         claims = data.get("claims", {}).get("P180", [])
         for claim in claims:
             value = claim.get("mainsnak", {}).get("datavalue", {}).get("value", {}).get("id")
@@ -641,19 +684,10 @@ def _fetch_p18_thumb_url(qid: str, width: int = 250) -> str | None:
         Thumbnail URL string, or None if no P18 exists or API call fails.
     """
     try:
-        resp = requests.get(
+        data = _wikimedia_api_get(
             WIKIDATA_API_URL,
-            params={
-                "action": "wbgetclaims",
-                "entity": qid,
-                "property": "P18",
-                "format": "json",
-            },
-            headers={"User-Agent": USER_AGENT},
-            timeout=10,
+            {"action": "wbgetclaims", "entity": qid, "property": "P18", "format": "json"},
         )
-        resp.raise_for_status()
-        data = resp.json()
 
         claims = data.get("claims", {}).get("P18", [])
         if not claims:
@@ -686,9 +720,9 @@ def _fetch_wikidata_label(qid: str) -> str | None:
         lang = str(locale) if locale else "en"
         languages = f"{lang}|en" if lang != "en" else "en"
 
-        resp = requests.get(
+        data = _wikimedia_api_get(
             WIKIDATA_API_URL,
-            params={
+            {
                 "action": "wbgetentities",
                 "ids": qid,
                 "props": "labels",
@@ -696,11 +730,7 @@ def _fetch_wikidata_label(qid: str) -> str | None:
                 "languagefallback": "1",
                 "format": "json",
             },
-            headers={"User-Agent": USER_AGENT},
-            timeout=10,
         )
-        resp.raise_for_status()
-        data = resp.json()
 
         entity = data.get("entities", {}).get(qid, {})
         labels = entity.get("labels", {})
@@ -1125,19 +1155,15 @@ def api_category_info():
 
     try:
         # 1. Check root category exists
-        resp = requests.get(
-            COMMONS_API_URL,
-            params={
-                "action": "query",
-                "titles": root_title,
-                "prop": "categoryinfo",
-                "format": "json",
-            },
-            headers={"User-Agent": USER_AGENT},
-            timeout=3,
+        pages = (
+            _wikimedia_api_get(
+                COMMONS_API_URL,
+                {"action": "query", "titles": root_title, "prop": "categoryinfo", "format": "json"},
+                timeout=3,
+            )
+            .get("query", {})
+            .get("pages", {})
         )
-        resp.raise_for_status()
-        pages = resp.json().get("query", {}).get("pages", {})
         if "-1" in pages:
             return jsonify({"error": "not_found"}), 404
 
@@ -1153,9 +1179,9 @@ def api_category_info():
 
         # Seed queue with subcategories of root
         if total_subcats > 0:
-            sub_resp = requests.get(
+            sub_data = _wikimedia_api_get(
                 COMMONS_API_URL,
-                params={
+                {
                     "action": "query",
                     "list": "categorymembers",
                     "cmtitle": root_title,
@@ -1163,11 +1189,8 @@ def api_category_info():
                     "cmlimit": COMMONS_API_LIMIT,
                     "format": "json",
                 },
-                headers={"User-Agent": USER_AGENT},
                 timeout=3,
             )
-            sub_resp.raise_for_status()
-            sub_data = sub_resp.json()
             for m in sub_data.get("query", {}).get("categorymembers", []):
                 if m["title"] not in visited:
                     cat_queue.append(m["title"])
@@ -1188,19 +1211,15 @@ def api_category_info():
             for title in batch:
                 visited.add(title)
 
-            info_resp = requests.get(
-                COMMONS_API_URL,
-                params={
-                    "action": "query",
-                    "titles": "|".join(batch),
-                    "prop": "categoryinfo",
-                    "format": "json",
-                },
-                headers={"User-Agent": USER_AGENT},
-                timeout=3,
+            info_pages = (
+                _wikimedia_api_get(
+                    COMMONS_API_URL,
+                    {"action": "query", "titles": "|".join(batch), "prop": "categoryinfo", "format": "json"},
+                    timeout=3,
+                )
+                .get("query", {})
+                .get("pages", {})
             )
-            info_resp.raise_for_status()
-            info_pages = info_resp.json().get("query", {}).get("pages", {})
 
             subcats_to_fetch = []
             for p in info_pages.values():
@@ -1213,9 +1232,9 @@ def api_category_info():
             for sub_title in subcats_to_fetch:
                 if time.monotonic() >= deadline or len(visited) >= MAX_CATEGORY_TRAVERSAL:
                     break
-                sub_resp = requests.get(
+                sub_data = _wikimedia_api_get(
                     COMMONS_API_URL,
-                    params={
+                    {
                         "action": "query",
                         "list": "categorymembers",
                         "cmtitle": sub_title,
@@ -1223,11 +1242,8 @@ def api_category_info():
                         "cmlimit": COMMONS_API_LIMIT,
                         "format": "json",
                     },
-                    headers={"User-Agent": USER_AGENT},
                     timeout=3,
                 )
-                sub_resp.raise_for_status()
-                sub_data = sub_resp.json()
                 for m in sub_data.get("query", {}).get("categorymembers", []):
                     if m["title"] not in visited:
                         cat_queue.append(m["title"])
@@ -1494,37 +1510,7 @@ def project_detail(project_id: int):
                 pass  # Non-critical
 
     # Get face stats (totals + classification method breakdown)
-    try:
-        stats = execute_query(
-            "SELECT "
-            "  COUNT(*) AS total_faces, "
-            "  SUM(CASE WHEN f.is_target = 1 THEN 1 ELSE 0 END) AS confirmed_matches, "
-            "  SUM(CASE WHEN f.is_target = 0 THEN 1 ELSE 0 END) AS confirmed_non_matches, "
-            "  SUM(CASE WHEN f.is_target IS NULL THEN 1 ELSE 0 END) AS unclassified, "
-            "  SUM(CASE WHEN f.is_target = 1 AND f.classified_by_user_id IS NOT NULL THEN 1 ELSE 0 END) AS human_confirmed, "
-            "  SUM(CASE WHEN f.sdc_written = 1 AND sc.face_id IS NOT NULL THEN 1 ELSE 0 END) AS sdc_written, "
-            "  SUM(CASE WHEN f.is_target = 1 AND f.sdc_written = 0 AND f.classified_by != 'bootstrap' AND i.bootstrapped = 0 THEN 1 ELSE 0 END) AS sdc_pending, "
-            "  SUM(CASE WHEN f.sdc_removal_pending = 1 "
-            "    AND NOT EXISTS (SELECT 1 FROM faces f2 WHERE f2.image_id = f.image_id "
-            "    AND f2.is_target = 1 AND f2.superseded_by IS NULL AND f2.id != f.id) "
-            "    THEN 1 ELSE 0 END) AS sdc_removal_pending_faces, "
-            "  COUNT(DISTINCT CASE WHEN f.sdc_removal_pending = 1 "
-            "    AND NOT EXISTS (SELECT 1 FROM faces f2 WHERE f2.image_id = f.image_id "
-            "    AND f2.is_target = 1 AND f2.superseded_by IS NULL AND f2.id != f.id) "
-            "    THEN f.image_id END) AS sdc_removal_pending, "
-            "  SUM(CASE WHEN f.classified_by_user_id IS NOT NULL THEN 1 ELSE 0 END) AS by_human, "
-            "  SUM(CASE WHEN f.classified_by = 'model' AND f.classified_by_user_id IS NULL THEN 1 ELSE 0 END) AS by_model, "
-            "  SUM(CASE WHEN f.classified_by = 'bootstrap' AND f.classified_by_user_id IS NULL THEN 1 ELSE 0 END) AS by_bootstrap "
-            "FROM faces f "
-            "JOIN images i ON f.image_id = i.id "
-            "LEFT JOIN (SELECT DISTINCT face_id FROM sdc_claims WHERE written_at IS NOT NULL) sc ON sc.face_id = f.id "
-            "WHERE i.project_id = %s AND f.superseded_by IS NULL",
-            (project_id,),
-        )
-        face_stats = stats[0] if stats else {}
-    except DatabaseError:
-        logger.exception("Failed to load face stats")
-        face_stats = {}
+    face_stats = _get_face_stats(project_id)
 
     gallery_total = 0
     try:
@@ -2153,17 +2139,9 @@ def api_manual_face():
     except (ValueError, TypeError):
         return jsonify({"error": _("Invalid field values")}), 400
 
-    if bbox_top >= bbox_bottom or bbox_left >= bbox_right:
-        return jsonify({"error": _("Invalid bounding box dimensions")}), 400
-
-    if (
-        bbox_top < 0
-        or bbox_left < 0
-        or bbox_bottom > MAX_BBOX_PX
-        or bbox_right > MAX_BBOX_PX
-        or (bbox_bottom - bbox_top) * (bbox_right - bbox_left) < MIN_BBOX_AREA
-    ):
-        return jsonify({"error": _("Bounding box out of allowed range")}), 400
+    bbox_error = _validate_bbox(bbox_top, bbox_right, bbox_bottom, bbox_left)
+    if bbox_error:
+        return jsonify({"error": bbox_error}), 400
 
     # In review mode, user is drawing a face the model missed — auto-classify
     is_review_mode = request.form.get("reviewing_model") == "1"
@@ -2592,17 +2570,9 @@ def api_update_face_bbox():
     except (ValueError, TypeError):
         return jsonify({"error": _("Invalid field values")}), 400
 
-    if bbox_top >= bbox_bottom or bbox_left >= bbox_right:
-        return jsonify({"error": _("Invalid bounding box dimensions")}), 400
-
-    if (
-        bbox_top < 0
-        or bbox_left < 0
-        or bbox_bottom > MAX_BBOX_PX
-        or bbox_right > MAX_BBOX_PX
-        or (bbox_bottom - bbox_top) * (bbox_right - bbox_left) < MIN_BBOX_AREA
-    ):
-        return jsonify({"error": _("Bounding box out of allowed range")}), 400
+    bbox_error = _validate_bbox(bbox_top, bbox_right, bbox_bottom, bbox_left)
+    if bbox_error:
+        return jsonify({"error": bbox_error}), 400
 
     # Verify ownership: face → image → project → user (or member)
     try:
@@ -3091,29 +3061,11 @@ def api_progress(project_id: int):
         except DatabaseError:
             pass
 
-    face_stats = {}
-    try:
-        stat_rows = execute_query(
-            "SELECT "
-            "  COUNT(*) AS total_faces, "
-            "  SUM(CASE WHEN f.is_target = 1 THEN 1 ELSE 0 END) AS confirmed_matches, "
-            "  SUM(CASE WHEN f.is_target = 0 THEN 1 ELSE 0 END) AS confirmed_non_matches, "
-            "  SUM(CASE WHEN f.is_target IS NULL THEN 1 ELSE 0 END) AS unclassified, "
-            "  SUM(CASE WHEN f.sdc_written = 1 AND EXISTS (SELECT 1 FROM sdc_claims sc WHERE sc.face_id = f.id AND sc.written_at IS NOT NULL) THEN 1 ELSE 0 END) AS sdc_written, "
-            "  SUM(CASE WHEN (f.is_target = 1 AND f.sdc_written = 0 AND f.classified_by != 'bootstrap' AND i.bootstrapped = 0) OR (f.sdc_removal_pending = 1 AND NOT EXISTS (SELECT 1 FROM faces f2 WHERE f2.image_id = f.image_id AND f2.superseded_by IS NULL AND f2.is_target = 1)) THEN 1 ELSE 0 END) AS sdc_pending, "
-            "  SUM(CASE WHEN f.classified_by_user_id IS NOT NULL THEN 1 ELSE 0 END) AS by_human, "
-            "  SUM(CASE WHEN f.classified_by = 'model' AND f.classified_by_user_id IS NULL THEN 1 ELSE 0 END) AS by_model, "
-            "  SUM(CASE WHEN f.classified_by = 'bootstrap' AND f.classified_by_user_id IS NULL THEN 1 ELSE 0 END) AS by_bootstrap "
-            "FROM faces f "
-            "JOIN images i ON f.image_id = i.id "
-            "WHERE i.project_id = %s AND f.superseded_by IS NULL",
-            (project_id,),
-            fetch=True,
-        )
-        if stat_rows:
-            face_stats = {k: (v or 0) for k, v in stat_rows[0].items()}
-    except DatabaseError:
-        pass
+    face_stats = _get_face_stats(project_id)
+    if face_stats:
+        # Progress endpoint combines sdc_pending (writes) + sdc_removal_pending_faces
+        # into a single sdc_pending value for the JS client.
+        face_stats["sdc_pending"] = face_stats.get("sdc_pending", 0) + face_stats.get("sdc_removal_pending_faces", 0)
 
     inference_eligible = 0
     try:
@@ -3729,17 +3681,26 @@ def leaderboard():
             "  u.wiki_username, "
             "  COUNT(f.id) + COALESCE(us.classifications, 0) "
             "    AS classifications, "
-            "  COUNT(CASE WHEN f.sdc_written = 1 AND f.classified_by != 'bootstrap' THEN 1 END) "
+            "  COALESCE(sdc.sdc_count, 0) "
             "    + COALESCE(us.sdc_tags, 0) AS sdc_tags "
             "FROM users u "
             "LEFT JOIN faces f ON f.classified_by_user_id = u.id "
             "  AND f.superseded_by IS NULL "
             "LEFT JOIN user_stats us ON us.user_id = u.id "
+            "LEFT JOIN ("
+            "  SELECT p.user_id, COUNT(*) AS sdc_count "
+            "  FROM sdc_claims sc "
+            "  JOIN projects p ON sc.project_id = p.id "
+            "  WHERE sc.written_at IS NOT NULL "
+            "  GROUP BY p.user_id"
+            ") sdc ON sdc.user_id = u.id "
             "WHERE u.leaderboard_opt_out = 0 "
-            "  AND (f.id IS NOT NULL OR us.user_id IS NOT NULL) "
-            "GROUP BY u.id, u.wiki_username, us.classifications, us.sdc_tags "
+            "  AND (f.id IS NOT NULL OR us.user_id IS NOT NULL "
+            "       OR sdc.user_id IS NOT NULL) "
+            "GROUP BY u.id, u.wiki_username, us.classifications, "
+            "         us.sdc_tags, sdc.sdc_count "
             "ORDER BY (COUNT(f.id) + COALESCE(us.classifications, 0) "
-            "        + COUNT(CASE WHEN f.sdc_written = 1 AND f.classified_by != 'bootstrap' THEN 1 END) "
+            "        + COALESCE(sdc.sdc_count, 0) "
             "        + COALESCE(us.sdc_tags, 0)) DESC, "
             "         (COUNT(f.id) + COALESCE(us.classifications, 0)) DESC "
             "LIMIT 100",

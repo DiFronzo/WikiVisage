@@ -8,52 +8,8 @@
 <style>
     /* --- Leaderboard Card --- */
     .leaderboard-card {
-        position: relative;
-        overflow: hidden;
-        border: 2px solid var(--primary);
-        background: linear-gradient(135deg, var(--surface) 0%, var(--bg) 100%);
-        box-shadow: var(--shadow);
         padding: 0;
-        animation: stat-entrance 0.6s cubic-bezier(0.16, 1, 0.3, 1) backwards;
         animation-delay: 0.25s;
-    }
-
-    .leaderboard-card::before {
-        content: '';
-        position: absolute;
-        inset: 0;
-        background: repeating-linear-gradient(
-            0deg,
-            transparent,
-            transparent 2px,
-            rgba(20, 184, 166, 0.04) 2px,
-            rgba(20, 184, 166, 0.04) 4px
-        );
-        pointer-events: none;
-        z-index: 1;
-        animation: scanline 20s linear infinite;
-    }
-
-    .leaderboard-card::after {
-        content: '';
-        position: absolute;
-        top: 0; right: 0; bottom: 0; left: 0;
-        pointer-events: none;
-        background:
-            linear-gradient(var(--primary), var(--primary)) top left / 15px 3px no-repeat,
-            linear-gradient(var(--primary), var(--primary)) top left / 3px 15px no-repeat,
-            linear-gradient(var(--primary), var(--primary)) top right / 15px 3px no-repeat,
-            linear-gradient(var(--primary), var(--primary)) top right / 3px 15px no-repeat,
-            linear-gradient(var(--primary), var(--primary)) bottom left / 15px 3px no-repeat,
-            linear-gradient(var(--primary), var(--primary)) bottom left / 3px 15px no-repeat,
-            linear-gradient(var(--primary), var(--primary)) bottom right / 15px 3px no-repeat,
-            linear-gradient(var(--primary), var(--primary)) bottom right / 3px 15px no-repeat;
-        z-index: 2;
-    }
-
-    .leaderboard-card > * {
-        position: relative;
-        z-index: 3;
     }
 
     /* --- Leaderboard Table --- */
@@ -166,7 +122,7 @@
 </div>
 
 {% if rows %}
-<div class="card leaderboard-card">
+<div class="card leaderboard-card decorated-card">
     <div class="table-scroll">
     <table class="leaderboard-table">
         <thead>

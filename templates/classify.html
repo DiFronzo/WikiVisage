@@ -551,7 +551,9 @@
 <div class="loading-overlay" id="loadingOverlay" role="status" aria-live="polite">{{ _('Saving...') }}</div>
 
 {% if image %}
+<script src="{{ url_for('static', filename='wikivisage-common.js') }}"></script>
 <script>
+    var csrfToken = {{ csrf_token()|tojson }};
     var i18n = {
         saving: {{ _('Saving...')|tojson }},
         undoing: {{ _('Undoing...')|tojson }},
@@ -577,34 +579,30 @@
     function positionBoxes() {
         if (!img.naturalWidth || !img.naturalHeight) return;
 
-        /* Use detection dimensions when available, otherwise fall back to
-           the thumbnail's intrinsic size (legacy images without detection dims). */
         var refW = detectionWidth || img.naturalWidth;
         var refH = detectionHeight || img.naturalHeight;
 
         var scaleX = img.clientWidth / refW;
         var scaleY = img.clientHeight / refH;
-
-        /* When the image is centered (margin: 0 auto) inside a wider wrapper,
-           account for the horizontal offset so boxes align with the image. */
         var imgOffsetLeft = img.offsetLeft;
         var imgOffsetTop = img.offsetTop;
 
         boxes.forEach(function(box) {
-            var t = parseInt(box.dataset.bboxTop);
-            var r = parseInt(box.dataset.bboxRight);
-            var b = parseInt(box.dataset.bboxBottom);
-            var l = parseInt(box.dataset.bboxLeft);
+            var bbox = {
+                top: parseInt(box.dataset.bboxTop),
+                right: parseInt(box.dataset.bboxRight),
+                bottom: parseInt(box.dataset.bboxBottom),
+                left: parseInt(box.dataset.bboxLeft)
+            };
+            var rect = bboxToDisplayRect(bbox, scaleX, scaleY, imgOffsetLeft, imgOffsetTop);
 
-            var topPx = t * scaleY + imgOffsetTop;
-            box.style.left   = (l * scaleX + imgOffsetLeft) + 'px';
-            box.style.top    = topPx + 'px';
-            box.style.width  = ((r - l) * scaleX) + 'px';
-            box.style.height = ((b - t) * scaleY) + 'px';
+            box.style.left   = rect.left + 'px';
+            box.style.top    = rect.top + 'px';
+            box.style.width  = rect.width + 'px';
+            box.style.height = rect.height + 'px';
             box.style.display = 'block';
 
-            /* Move label inside the box when it would be clipped at the top edge */
-            if (topPx < 22) {
+            if (rect.top < 22) {
                 box.classList.add('label-inside');
             } else {
                 box.classList.remove('label-inside');
@@ -641,31 +639,22 @@
         var overlay = document.getElementById('loadingOverlay');
         overlay.style.display = 'flex';
 
-        var formData = new FormData();
-        formData.append('csrf_token', {{ csrf_token()|tojson }});
-        formData.append('project_id', '{{ project.id }}');
-        formData.append('image_id', '{{ image.image_id }}');
-        formData.append('selected_face_id', faceId);
+        var fields = {
+            project_id: '{{ project.id }}',
+            image_id: '{{ image.image_id }}',
+            selected_face_id: faceId
+        };
         {% if reviewing_model %}
-        formData.append('reviewing_model', '1');
+        fields.reviewing_model = '1';
         {% endif %}
 
-        fetch('{{ url_for("api_classify") }}', {
-            method: 'POST',
-            body: formData
-        })
-        .then(function(response) {
-            if (!response.ok) throw new Error('Network response was not ok');
-            return response.json();
-        })
+        postForm('{{ url_for("api_classify") }}', csrfToken, fields)
         .then(function(data) {
             if (data.error) {
                 alert(i18n.errorPrefix.replace('{message}', data.error));
                 overlay.style.display = 'none';
                 inFlight = false;
             } else {
-                // Navigate to the base classify URL (strip any ?image_id= param
-                // left over from undo redirects to avoid re-forcing a finished image)
                 window.location.href = '{{ url_for("classify", project_id=project.id) }}';
             }
         })
@@ -692,17 +681,7 @@
         overlay.style.display = 'flex';
         overlay.textContent = i18n.undoing;
 
-        var formData = new FormData();
-        formData.append('csrf_token', {{ csrf_token()|tojson }});
-
-        fetch('{{ url_for("api_undo_classify") }}', {
-            method: 'POST',
-            body: formData
-        })
-        .then(function(response) {
-            if (!response.ok) throw new Error('Network response was not ok');
-            return response.json();
-        })
+        postForm('{{ url_for("api_undo_classify") }}', csrfToken, {})
         .then(function(data) {
             if (data.error) {
                 alert(data.error);
@@ -710,7 +689,6 @@
                 overlay.textContent = i18n.saving;
                 inFlight = false;
             } else {
-                // Redirect to the undone image so the user sees it again
                 var url = '{{ url_for("classify", project_id=project.id) }}';
                 if (data.image_id) {
                     url += '?image_id=' + data.image_id;
@@ -864,17 +842,15 @@
 
         var refW = detectionWidth || img.naturalWidth;
         var refH = detectionHeight || img.naturalHeight;
-        var scaleX = refW / img.clientWidth;
-        var scaleY = refH / img.clientHeight;
+        var scaleX = img.clientWidth / refW;
+        var scaleY = img.clientHeight / refH;
 
-        /* Subtract image offset so drawn coordinates are relative to the image,
-           not the wrapper (matters when the image is centered in a wider wrapper). */
-        var bboxLeft   = Math.round((x1 - img.offsetLeft) * scaleX);
-        var bboxTop    = Math.round((y1 - img.offsetTop) * scaleY);
-        var bboxRight  = Math.round((x2 - img.offsetLeft) * scaleX);
-        var bboxBottom = Math.round((y2 - img.offsetTop) * scaleY);
+        var detBbox = displayRectToDetectionBbox(
+            { left: x1, top: y1, width: w, height: h },
+            scaleX, scaleY, img.offsetLeft, img.offsetTop
+        );
 
-        submitManualFace(bboxTop, bboxRight, bboxBottom, bboxLeft);
+        submitManualFace(detBbox.top, detBbox.right, detBbox.bottom, detBbox.left);
     }
 
     wrapper.addEventListener('mousedown', onDrawStart);
@@ -898,7 +874,7 @@
         overlay.textContent = i18n.detectingFace;
 
         var formData = new FormData();
-        formData.append('csrf_token', {{ csrf_token()|tojson }});
+        formData.append('csrf_token', csrfToken);
         formData.append('project_id', '{{ project.id }}');
         formData.append('image_id', '{{ image.image_id }}');
         formData.append('bbox_top', top);

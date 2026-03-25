@@ -155,6 +155,8 @@
         .btn-primary:hover { color: var(--bg); }
         .btn-danger { border-color: var(--danger); color: var(--danger); box-shadow: 4px 4px 0px rgba(239, 68, 68, 0.2); }
         .btn-danger:hover { box-shadow: 6px 6px 0px rgba(239, 68, 68, 0.4); color: var(--danger); }
+        .btn-warning { border-color: var(--warning); color: var(--warning); box-shadow: 4px 4px 0px rgba(245, 158, 11, 0.2); }
+        .btn-warning:hover { box-shadow: 6px 6px 0px rgba(245, 158, 11, 0.4); color: var(--warning); }
         .btn-sm { padding: 0.5rem 1rem; font-size: 0.75rem; }
         .btn:disabled { opacity: 0.4; cursor: not-allowed; transform: none; box-shadow: none; }
         .btn:disabled:hover { transform: none; box-shadow: none; }
@@ -406,6 +408,65 @@
         @keyframes ptr-fade {
             0% { opacity: 1; }
             50%, 100% { opacity: 0.15; }
+        }
+
+        /* Unified Pagination */
+        .pagination {
+            display: flex; align-items: center; justify-content: center; gap: 0.25rem;
+            margin: 2rem 0 1rem; flex-wrap: wrap; font-family: inherit;
+        }
+        .pagination:empty { display: none; }
+        .pagination button, .pagination a, .pagination span {
+            display: inline-flex; align-items: center; justify-content: center;
+            min-width: 2.25rem; height: 2.25rem; padding: 0 0.5rem;
+            font-size: 0.8rem; font-weight: 700; text-transform: uppercase;
+            letter-spacing: 0.05em; border: 2px solid var(--border);
+            background: var(--surface); color: var(--text-main);
+            text-decoration: none; cursor: pointer; transition: all 0.15s ease;
+            font-family: inherit;
+        }
+        .pagination button:hover:not(:disabled), .pagination a:hover {
+            border-color: var(--primary); color: var(--primary);
+            transform: translate(-1px, -1px); box-shadow: 3px 3px 0px var(--primary);
+        }
+        .pagination .active {
+            background: var(--primary); color: var(--bg); border-color: var(--primary);
+        }
+        .pagination button:disabled, .pagination .disabled {
+            opacity: 0.35; cursor: default; pointer-events: none;
+        }
+        .pagination .ellipsis {
+            border: none; background: none; color: var(--text-muted);
+            min-width: auto; padding: 0 0.25rem; pointer-events: none;
+        }
+
+        /* Decorated Card */
+        .decorated-card {
+            position: relative; overflow: hidden;
+            border: 2px solid var(--card-accent, var(--primary));
+            background: linear-gradient(135deg, var(--surface) 0%, var(--bg) 100%);
+            box-shadow: var(--shadow);
+            animation: stat-entrance 0.6s cubic-bezier(0.16, 1, 0.3, 1) backwards;
+        }
+        .decorated-card::before {
+            content: ''; position: absolute; inset: 0;
+            background: repeating-linear-gradient(0deg, transparent, transparent 2px, color-mix(in srgb, var(--card-accent, var(--primary)) 4%, transparent) 2px, color-mix(in srgb, var(--card-accent, var(--primary)) 4%, transparent) 4px);
+            pointer-events: none; z-index: 1; animation: scanline 20s linear infinite;
+        }
+        .decorated-card::after {
+            content: ''; position: absolute; top: 0; right: 0; bottom: 0; left: 0; pointer-events: none; z-index: 2;
+            background:
+                linear-gradient(var(--card-accent, var(--primary)), var(--card-accent, var(--primary))) top left / 15px 3px no-repeat,
+                linear-gradient(var(--card-accent, var(--primary)), var(--card-accent, var(--primary))) top left / 3px 15px no-repeat,
+                linear-gradient(var(--card-accent, var(--primary)), var(--card-accent, var(--primary))) top right / 15px 3px no-repeat,
+                linear-gradient(var(--card-accent, var(--primary)), var(--card-accent, var(--primary))) top right / 3px 15px no-repeat,
+                linear-gradient(var(--card-accent, var(--primary)), var(--card-accent, var(--primary))) bottom left / 15px 3px no-repeat,
+                linear-gradient(var(--card-accent, var(--primary)), var(--card-accent, var(--primary))) bottom left / 3px 15px no-repeat,
+                linear-gradient(var(--card-accent, var(--primary)), var(--card-accent, var(--primary))) bottom right / 15px 3px no-repeat,
+                linear-gradient(var(--card-accent, var(--primary)), var(--card-accent, var(--primary))) bottom right / 3px 15px no-repeat;
+        }
+        .decorated-card > * {
+            position: relative; z-index: 3;
         }
     </style>
     {% block extra_head %}{% endblock %}
