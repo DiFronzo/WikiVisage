@@ -261,7 +261,7 @@ worker_heartbeat (single-row: id=1, last_seen DATETIME)
 ### Templates
 - All templates extend `base.html`. Three blocks: `title`, `extra_head` (CSS/JS), `content`.
 - CSS is embedded in `base.html` `<style>` tag (CSS custom properties) + per-page `{% block extra_head %}`. No external CSS files.
-- Reusable CSS classes live in `base.html`: `.decorated-card` (scanline + corner overlay pattern, accent color via `--card-accent` CSS variable), unified pagination styles (`.pagination-controls a, .pagination-controls button`).
+- Reusable CSS classes live in `base.html`: `.decorated-card` (scanline + corner overlay pattern, accent color via `--card-accent` CSS variable), unified pagination styles (`.pagination a, .pagination button`).
 - Shared JS helpers are in `static/wikivisage-common.js` (thumbnail snapping, Commons URL building). Templates that need them add `<script src="{{ url_for('static', filename='wikivisage-common.js') }}">` in `{% block extra_head %}`.
 - No JavaScript build system. Inline `<script>` tags in templates for page-specific logic.
 - Title format: `Page Name - WikiVisage BETA`
