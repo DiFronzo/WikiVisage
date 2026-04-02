@@ -1,0 +1,12 @@
+# WikiVisage - System dependencies for Toolforge Build Service
+# Installed via heroku/deb-packages buildpack (Ubuntu 24.04 Noble stack)
+# These are runtime libraries required by dlib-bin / numpy
+
+[_]
+schema-version = "0.2"
+
+[com.heroku.buildpacks.deb-packages]
+install = [
+    "libopenblas0",
+    "liblapack3",
+]

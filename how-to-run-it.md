@@ -100,7 +100,7 @@ toolforge build start https://github.com/DiFronzo/WikiVisage.git
 toolforge build show
 ```
 
-The build uses `Procfile`, `requirements.txt`, and `Aptfile` to create the container image. The image name is automatically `tool-wikivisage/tool-wikivisage:latest`.
+The build uses `Procfile`, `requirements.txt`, and `project.toml` to create the container image. The image name is automatically `tool-wikivisage/tool-wikivisage:latest`.
 
 ---
 
@@ -309,7 +309,7 @@ toolforge build show
 
 # Common causes:
 # - requirements.txt has a broken dependency
-# - Aptfile references a package not in Ubuntu 22.04 repos
+# - project.toml references a package not in Ubuntu 24.04 repos
 ```
 
 ### Database connection errors
