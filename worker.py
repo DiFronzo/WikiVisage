@@ -2116,6 +2116,7 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
                             (page_id, project_id),
                             fetch=False,
                         )
+                        total_removed += 1
                         continue
                     else:
                         msg = _sdc_error_message(error_code, error_info)
