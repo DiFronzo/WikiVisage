@@ -1200,6 +1200,180 @@ def test_write_sdc_falls_back_to_owner_when_sdc_write_user_id_missing():
     assert token_user_ids[0] == 1, f"Expected user 1 (owner), got {token_user_ids[0]}"
 
 
+def test_write_sdc_no_such_entity_on_wbgetclaims_skips_face():
+    """no-such-entity on wbgetclaims idempotency check skips the face, writes remaining."""
+    project = {"id": 5, "user_id": 1, "wikidata_qid": "Q42"}
+    db_calls = []
+    face_batch_call = [0]
+
+    def mock_execute_query(sql, params=None, fetch=True):
+        db_calls.append((sql.strip(), params))
+        if "sdc_write_requested" in sql and "SELECT" in sql:
+            return [{"sdc_write_requested": 1}]
+        if "SELECT f.id as face_id" in sql:
+            face_batch_call[0] += 1
+            if face_batch_call[0] == 1:
+                return [
+                    {"face_id": 100, "image_id": 200, "commons_page_id": 8888},
+                    {"face_id": 101, "image_id": 201, "commons_page_id": 9999},
+                ]
+            return []
+        if "INSERT IGNORE INTO sdc_claims" in sql:
+            return 1
+        if "UPDATE faces SET sdc_written" in sql:
+            return 1
+        if "UPDATE sdc_claims SET written_at" in sql:
+            return 1
+        if "UPDATE projects SET sdc_write_requested = 0" in sql:
+            return 1
+        return 0
+
+    api_call_count = [0]
+
+    def mock_api_side_effect(*args, **kwargs):
+        api_call_count[0] += 1
+        resp = MagicMock()
+        if api_call_count[0] == 1:
+            resp.json.return_value = {"error": {"code": "no-such-entity", "info": "no-such-entity"}}
+        elif api_call_count[0] == 2:
+            resp.json.return_value = {"claims": {}}
+        else:
+            resp.json.return_value = {"success": 1}
+        return resp
+
+    with (
+        patch("worker.execute_query", side_effect=mock_execute_query),
+        patch("worker._refresh_worker_token", return_value="fake-token"),
+        patch("worker._get_csrf_token", return_value="fake-csrf"),
+        patch("worker._api_request", side_effect=mock_api_side_effect),
+        patch("worker.shutdown_requested", False),
+        patch("worker.time.sleep"),
+    ):
+        result = write_sdc_claims(project)
+
+    assert result == 1
+
+    face_updates = [(sql, p) for sql, p in db_calls if "UPDATE faces SET sdc_written" in sql]
+    assert len(face_updates) == 2
+    assert face_updates[0][1] == (100,)  # skipped face marked terminal
+    assert face_updates[1][1] == (101,)  # successfully written face
+
+    error_aborts = [(sql, params) for sql, params in db_calls if "sdc_write_error" in sql and "UPDATE projects" in sql]
+    assert all(params is None or params[0] is None for _, params in error_aborts)
+
+
+def test_write_sdc_no_such_entity_on_wbeditentity_skips_face():
+    """no-such-entity on wbeditentity skips the face, writes remaining."""
+    project = {"id": 5, "user_id": 1, "wikidata_qid": "Q42"}
+    db_calls = []
+    face_batch_call = [0]
+
+    def mock_execute_query(sql, params=None, fetch=True):
+        db_calls.append((sql.strip(), params))
+        if "sdc_write_requested" in sql and "SELECT" in sql:
+            return [{"sdc_write_requested": 1}]
+        if "SELECT f.id as face_id" in sql:
+            face_batch_call[0] += 1
+            if face_batch_call[0] == 1:
+                return [
+                    {"face_id": 100, "image_id": 200, "commons_page_id": 8888},
+                    {"face_id": 101, "image_id": 201, "commons_page_id": 9999},
+                ]
+            return []
+        if "INSERT IGNORE INTO sdc_claims" in sql:
+            return 1
+        if "UPDATE faces SET sdc_written" in sql:
+            return 1
+        if "UPDATE sdc_claims SET written_at" in sql:
+            return 1
+        if "UPDATE projects SET sdc_write_requested = 0" in sql:
+            return 1
+        return 0
+
+    api_call_count = [0]
+
+    def mock_api_side_effect(*args, **kwargs):
+        api_call_count[0] += 1
+        resp = MagicMock()
+        if api_call_count[0] == 1:
+            resp.json.return_value = {"claims": {}}
+        elif api_call_count[0] == 2:
+            resp.json.return_value = {"error": {"code": "no-such-entity", "info": "no-such-entity"}}
+        elif api_call_count[0] == 3:
+            resp.json.return_value = {"claims": {}}
+        else:
+            resp.json.return_value = {"success": 1}
+        return resp
+
+    with (
+        patch("worker.execute_query", side_effect=mock_execute_query),
+        patch("worker._refresh_worker_token", return_value="fake-token"),
+        patch("worker._get_csrf_token", return_value="fake-csrf"),
+        patch("worker._api_request", side_effect=mock_api_side_effect),
+        patch("worker.shutdown_requested", False),
+        patch("worker.time.sleep"),
+    ):
+        result = write_sdc_claims(project)
+
+    assert result == 1
+
+    face_updates = [(sql, p) for sql, p in db_calls if "UPDATE faces SET sdc_written" in sql]
+    assert len(face_updates) == 2
+    assert face_updates[0][1] == (100,)  # skipped face marked terminal
+    assert face_updates[1][1] == (101,)  # successfully written face
+
+
+def test_write_sdc_no_such_entity_on_removal_skips_and_clears_flag():
+    """no-such-entity on wbgetclaims during removal clears sdc_removal_pending and continues."""
+    project = {"id": 5, "user_id": 1, "wikidata_qid": "Q42"}
+    db_calls = []
+
+    def mock_execute_query(sql, params=None, fetch=True):
+        db_calls.append((sql.strip(), params))
+        if "sdc_write_requested" in sql and "SELECT" in sql:
+            return [{"sdc_write_requested": 1}]
+        if "SELECT f.id as face_id" in sql:
+            return []
+        if "SELECT DISTINCT i.commons_page_id" in sql and "sdc_removal_pending" in sql:
+            if not any("sdc_removal_pending = 0" in c[0] for c in db_calls):
+                return [{"commons_page_id": 7777}]
+            return []
+        if "WHERE i.commons_page_id" in sql and "sdc_removal_pending = 1" in sql and "NOT EXISTS" in sql:
+            return [{"face_id": 300}]
+        if "sdc_removal_pending = 0" in sql:
+            return 1
+        if "UPDATE projects SET sdc_write_requested = 0" in sql:
+            return 1
+        return 0
+
+    def mock_api_side_effect(*args, **kwargs):
+        resp = MagicMock()
+        resp.json.return_value = {"error": {"code": "no-such-entity", "info": "no-such-entity"}}
+        return resp
+
+    with (
+        patch("worker.execute_query", side_effect=mock_execute_query),
+        patch("worker._refresh_worker_token", return_value="fake-token"),
+        patch("worker._get_csrf_token", return_value="fake-csrf"),
+        patch("worker._api_request", side_effect=mock_api_side_effect),
+        patch("worker.shutdown_requested", False),
+    ):
+        result = write_sdc_claims(project)
+
+    assert result == 0
+
+    removal_clears = [(sql, p) for sql, p in db_calls if "sdc_removal_pending = 0" in sql]
+    assert len(removal_clears) == 1
+    assert removal_clears[0][1] == (7777, 5)
+
+    error_aborts = [
+        (sql, p)
+        for sql, p in db_calls
+        if "sdc_write_error" in sql and "UPDATE projects" in sql and p and p[0] is not None
+    ]
+    assert len(error_aborts) == 0
+
+
 def test_bootstrap_flags_existing_images_at_cap():
     """When project is at MAX_IMAGES_PER_PROJECT, bootstrap still flags existing images."""
     project = {"id": 7, "user_id": 1, "wikidata_qid": "Q22686", "commons_category": "Donald Trump"}
