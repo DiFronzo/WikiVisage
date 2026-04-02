@@ -1814,6 +1814,17 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
                         continue
                     elif error_code in _SDC_PER_FACE_SKIP_ERRORS:
                         logger.warning(f"Skipping face {face_id} on {mid}: {error_code} during idempotency check")
+                        # Mark this face as completed for SDC writes and release its claim so it is not retried indefinitely.
+                        execute_query(
+                            "UPDATE faces SET sdc_written = 1 WHERE id = %s",
+                            (face_id,),
+                            fetch=False,
+                        )
+                        execute_query(
+                            "DELETE FROM sdc_claims WHERE face_id = %s",
+                            (face_id,),
+                            fetch=False,
+                        )
                         continue
                     else:
                         msg = _sdc_error_message(error_code, error_info)
