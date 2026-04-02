@@ -1589,7 +1589,12 @@ _SDC_ERROR_MESSAGES: dict[str, str] = {
     "ratelimited": "Too many edits in a short period. Please wait and try again.",
     "readonly": "The Wikimedia database is currently in read-only mode. Please try again later.",
     "maxlag": "The Wikimedia servers are busy. Please try again later.",
+    "no-such-entity": "A Commons file was deleted or its structured data entity does not exist. The file was skipped.",
 }
+
+# Errors that affect a single entity (file/page) rather than the entire session.
+# These are skipped per-face instead of aborting the whole write batch.
+_SDC_PER_FACE_SKIP_ERRORS = frozenset({"no-such-entity"})
 
 
 def _sdc_error_message(error_code: str, error_info: str) -> str:
@@ -1807,6 +1812,9 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
                             )
                             return total_written
                         continue
+                    elif error_code in _SDC_PER_FACE_SKIP_ERRORS:
+                        logger.warning(f"Skipping face {face_id} on {mid}: {error_code} during idempotency check")
+                        continue
                     else:
                         msg = _sdc_error_message(error_code, error_info)
                         logger.error(f"SDC idempotency check error for {mid}: {claim_data['error']}")
@@ -1917,6 +1925,9 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
                                 fetch=False,
                             )
                             return total_written
+                        continue
+                    elif error_code in _SDC_PER_FACE_SKIP_ERRORS:
+                        logger.warning(f"Skipping face {face_id} on {mid}: {error_code} during write")
                         continue
                     else:
                         # Any other API error — abort entire write
@@ -2078,6 +2089,17 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
                             )
                             return total_written
                         continue
+                    elif error_code in _SDC_PER_FACE_SKIP_ERRORS:
+                        logger.warning(f"Skipping removal for {mid}: {error_code} during idempotency check")
+                        execute_query(
+                            "UPDATE faces f JOIN images i ON f.image_id = i.id "
+                            "SET f.sdc_removal_pending = 0 "
+                            "WHERE i.commons_page_id = %s AND i.project_id = %s "
+                            "AND f.sdc_removal_pending = 1",
+                            (page_id, project_id),
+                            fetch=False,
+                        )
+                        continue
                     else:
                         msg = _sdc_error_message(error_code, error_info)
                         logger.error(f"SDC removal idempotency check error for {mid}: {claim_data['error']}")
@@ -2159,6 +2181,17 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
                                 fetch=False,
                             )
                             return total_written
+                        continue
+                    elif error_code in _SDC_PER_FACE_SKIP_ERRORS:
+                        logger.warning(f"Skipping removal for {mid}: {error_code} during claim removal")
+                        execute_query(
+                            "UPDATE faces f JOIN images i ON f.image_id = i.id "
+                            "SET f.sdc_removal_pending = 0 "
+                            "WHERE i.commons_page_id = %s AND i.project_id = %s "
+                            "AND f.sdc_removal_pending = 1",
+                            (page_id, project_id),
+                            fetch=False,
+                        )
                         continue
                     else:
                         msg = _sdc_error_message(error_code, error_info)
