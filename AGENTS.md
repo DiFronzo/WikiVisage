@@ -49,7 +49,7 @@ WikiVisage/
 │       ├── ci.yml      # CI: Ruff lint + pytest on Python 3.11/3.13 (integration tests skipped)
 │       └── deploy.yml  # CD: Release-triggered Toolforge deploy via SSH
 ├── Procfile            # web: gunicorn (4 workers, app factory), worker: python -u worker.py
-├── Aptfile             # System deps: libopenblas0, liblapack3 (dlib runtime)
+├── project.toml        # System deps via heroku/deb-packages: libopenblas0, liblapack3 (dlib runtime)
 ├── jobs.yaml           # Toolforge jobs definition (ml-worker continuous job)
 ├── how-to-run-it.md    # Toolforge deployment guide
 ├── test-local.md       # Local development setup guide
