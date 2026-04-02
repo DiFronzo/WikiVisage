@@ -1254,8 +1254,9 @@ def test_write_sdc_no_such_entity_on_wbgetclaims_skips_face():
     assert result == 1
 
     face_updates = [(sql, p) for sql, p in db_calls if "UPDATE faces SET sdc_written" in sql]
-    assert len(face_updates) == 1
-    assert face_updates[0][1] == (101,)
+    assert len(face_updates) == 2
+    assert face_updates[0][1] == (100,)  # skipped face marked terminal
+    assert face_updates[1][1] == (101,)  # successfully written face
 
     error_aborts = [(sql, params) for sql, params in db_calls if "sdc_write_error" in sql and "UPDATE projects" in sql]
     assert all(params is None or params[0] is None for _, params in error_aborts)
@@ -1317,8 +1318,9 @@ def test_write_sdc_no_such_entity_on_wbeditentity_skips_face():
     assert result == 1
 
     face_updates = [(sql, p) for sql, p in db_calls if "UPDATE faces SET sdc_written" in sql]
-    assert len(face_updates) == 1
-    assert face_updates[0][1] == (101,)
+    assert len(face_updates) == 2
+    assert face_updates[0][1] == (100,)  # skipped face marked terminal
+    assert face_updates[1][1] == (101,)  # successfully written face
 
 
 def test_write_sdc_no_such_entity_on_removal_skips_and_clears_flag():
