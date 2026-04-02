@@ -1939,6 +1939,12 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
                         continue
                     elif error_code in _SDC_PER_FACE_SKIP_ERRORS:
                         logger.warning(f"Skipping face {face_id} on {mid}: {error_code} during write")
+                        # Mark this face as terminal so it is not retried indefinitely
+                        execute_query(
+                            "UPDATE faces SET sdc_written = 1 WHERE id = %s",
+                            (face_id,),
+                            fetch=False,
+                        )
                         continue
                     else:
                         # Any other API error — abort entire write
