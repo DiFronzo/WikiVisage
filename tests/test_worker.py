@@ -1257,8 +1257,8 @@ def test_write_sdc_no_such_entity_on_wbgetclaims_skips_face():
     assert len(face_updates) == 1
     assert face_updates[0][1] == (101,)
 
-    error_aborts = [sql for sql, _ in db_calls if "sdc_write_error" in sql and "UPDATE projects" in sql]
-    assert all("sdc_write_error = %s" not in sql or "NULL" in sql for sql in error_aborts) or not error_aborts
+    error_aborts = [(sql, params) for sql, params in db_calls if "sdc_write_error" in sql and "UPDATE projects" in sql]
+    assert all(params is None or params[0] is None for _, params in error_aborts)
 
 
 def test_write_sdc_no_such_entity_on_wbeditentity_skips_face():
