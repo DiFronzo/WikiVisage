@@ -3,16 +3,27 @@
 </p>
 
 <p align="center">
-        <img alt="Python" src="https://img.shields.io/badge/python-3.11%2B-blue?style=for-the-badge" />
-        <img alt="Framework" src="https://img.shields.io/badge/flask-web-black?style=for-the-badge" />
+        <a href="https://www.python.org/">
+                <img alt="Python" src="https://img.shields.io/badge/python-3.11%2B-blue?style=for-the-badge" />
+        </a>
+        <a href="https://flask.palletsprojects.com/">
+                <img alt="Framework" src="https://img.shields.io/badge/flask-web-black?style=for-the-badge" />
+        </a>
         <a href="https://github.com/DiFronzo/WikiVisage/actions/workflows/ci.yml">
                 <img alt="CI" src="https://img.shields.io/github/actions/workflow/status/DiFronzo/WikiVisage/ci.yml?branch=main&label=CI&style=for-the-badge" />
         </a>
         <a href="https://github.com/DiFronzo/WikiVisage/releases">
                 <img alt="Release" src="https://img.shields.io/github/v/release/DiFronzo/WikiVisage?label=release&style=for-the-badge" />
         </a>
-        <img alt="Build" src="https://img.shields.io/badge/build-Toolforge-success?style=for-the-badge" />
-        <img alt="Hosting" src="https://img.shields.io/badge/hosted%20on-Toolforge-green?style=for-the-badge" />
+        <a href="https://toolsadmin.wikimedia.org/tools/id/wikivisage">
+                <img alt="Build" src="https://img.shields.io/badge/build-Toolforge-success?style=for-the-badge" />
+        </a>
+        <a href="https://toolhub.wikimedia.org/tools/toolforge-wikivisage">
+                <img alt="Hosting" src="https://img.shields.io/badge/hosted%20on-Toolforge-green?style=for-the-badge" />
+        </a>
+        <a href="https://wikivisage.toolforge.org/">
+                <img alt="Live site" src="https://img.shields.io/badge/live-wikivisage.toolforge.org-blue?style=for-the-badge" />
+        </a>
         <a href="LICENSE">
                 <img alt="License" src="https://img.shields.io/github/license/DiFronzo/WikiVisage?label=license&style=for-the-badge" />
         </a>
@@ -22,7 +33,7 @@
 Active learning facial recognition for Wikimedia Commons. Train an ML model to recognize specific people and automatically add <a href="https://www.wikidata.org/wiki/Property:P180">P180 (depicts)</a> Structured Data to matching images.
 </p>
 
-![WikiVisage landing page screenshot](static/landing_page.png)
+![WikiVisage app screen recording](static/screen-app.gif)
 
 ## 🔗 Quick links
 
