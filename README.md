@@ -33,7 +33,7 @@
 Active learning facial recognition for Wikimedia Commons. Train an ML model to recognize specific people and automatically add <a href="https://www.wikidata.org/wiki/Property:P180">P180 (depicts)</a> Structured Data to matching images.
 </p>
 
-![WikiVisage app showcase](https://upload.wikimedia.org/wikipedia/commons/thumb/d/da/WikiVisage_-_Showcase.gif/960px-WikiVisage_-_Showcase.gif)
+![WikiVisage app showcase](https://upload.wikimedia.org/wikipedia/commons/d/da/WikiVisage_-_Showcase.gif)
 
 ## 🔗 Quick links
 
