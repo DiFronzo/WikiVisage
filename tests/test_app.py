@@ -735,34 +735,63 @@ def test_inject_csrf_token_exposes_callable():
 
 
 def test_set_security_headers_sets_all_required_headers():
-    response = flask_app.make_response(("ok", 200))
-    result = app_module.set_security_headers(response)
+    with flask_app.test_request_context():
+        response = flask_app.make_response(("ok", 200))
+        result = app_module.set_security_headers(response)
 
-    assert result.headers["X-Content-Type-Options"] == "nosniff"
-    assert result.headers["X-Frame-Options"] == "DENY"
-    assert result.headers["Referrer-Policy"] == "strict-origin-when-cross-origin"
-    assert result.headers["Permissions-Policy"] == "camera=(), microphone=(), geolocation=()"
-    assert (
-        "Strict-Transport-Security" not in result.headers
-        or result.headers.get("Strict-Transport-Security") == "max-age=31536000; includeSubDomains"
-    )
+        assert result.headers["X-Content-Type-Options"] == "nosniff"
+        assert result.headers["X-Frame-Options"] == "DENY"
+        assert result.headers["Referrer-Policy"] == "strict-origin-when-cross-origin"
+        assert result.headers["Permissions-Policy"] == "camera=(), microphone=(), geolocation=()"
+        assert (
+            "Strict-Transport-Security" not in result.headers
+            or result.headers.get("Strict-Transport-Security") == "max-age=31536000; includeSubDomains"
+        )
 
 
 def test_hsts_header_not_set_in_debug_mode():
     flask_app.debug = True
     try:
-        response = flask_app.make_response(("ok", 200))
-        result = app_module.set_security_headers(response)
-        assert "Strict-Transport-Security" not in result.headers
+        with flask_app.test_request_context():
+            response = flask_app.make_response(("ok", 200))
+            result = app_module.set_security_headers(response)
+            assert "Strict-Transport-Security" not in result.headers
     finally:
         flask_app.debug = False
 
 
 def test_hsts_header_set_when_not_debug():
     flask_app.debug = False
-    response = flask_app.make_response(("ok", 200))
-    result = app_module.set_security_headers(response)
-    assert result.headers["Strict-Transport-Security"] == "max-age=31536000; includeSubDomains"
+    with flask_app.test_request_context():
+        response = flask_app.make_response(("ok", 200))
+        result = app_module.set_security_headers(response)
+        assert result.headers["Strict-Transport-Security"] == "max-age=31536000; includeSubDomains"
+
+
+def test_csp_header_contains_required_directives():
+    with flask_app.test_request_context():
+        response = flask_app.make_response(("ok", 200))
+        result = app_module.set_security_headers(response)
+        csp = result.headers["Content-Security-Policy"]
+
+        assert "default-src 'self'" in csp
+        assert "script-src 'self' 'unsafe-inline'" in csp
+        assert "style-src 'self' 'unsafe-inline'" in csp
+        assert "img-src 'self' https://*.wikimedia.org data:" in csp
+        assert "connect-src 'self'" in csp
+        assert "font-src 'self'" in csp
+        assert "frame-ancestors 'none'" in csp
+
+
+def test_csp_header_does_not_contain_nonce():
+    """Nonces are not used in CSP because they make 'unsafe-inline' ignored,
+    breaking inline event handlers (onclick, onchange, etc.)."""
+    with flask_app.test_request_context():
+        response = flask_app.make_response(("ok", 200))
+        result = app_module.set_security_headers(response)
+        csp = result.headers["Content-Security-Policy"]
+
+        assert "nonce-" not in csp
 
 
 class _FakeResponse:
@@ -7414,6 +7443,142 @@ def test_leaderboard_empty_results(monkeypatch):
     assert b"No contributions yet" in response.data
 
 
+def test_leaderboard_period_month(monkeypatch):
+    """Month filter uses time-filtered SQL without user_stats."""
+    captured = {}
+    rows = [{"wiki_username": "alice", "classifications": 3, "sdc_tags": 1}]
+
+    def execute_query_mock(sql, params=None, _fetch=True):
+        if "FROM worker_heartbeat" in sql:
+            return [{"is_stale": 0}]
+        if "FROM users u" in sql and "LEFT JOIN faces f" in sql:
+            captured["sql"] = sql
+            captured["params"] = params
+            return rows
+        return []
+
+    monkeypatch.setattr(app_module, "execute_query", execute_query_mock)
+
+    flask_app.config["TESTING"] = True
+    client = flask_app.test_client()
+    response = client.get("/leaderboard?period=month")
+
+    assert response.status_code == 200
+    assert b"alice" in response.data
+    assert "classified_at" in captured["sql"]
+    assert "user_stats" not in captured["sql"]
+    assert captured["params"] is not None
+    assert len(captured["params"]) == 2
+
+
+def test_leaderboard_period_daily(monkeypatch):
+    """Daily filter uses time-filtered SQL without user_stats."""
+    captured = {}
+    rows = [{"wiki_username": "bob", "classifications": 1, "sdc_tags": 0}]
+
+    def execute_query_mock(sql, params=None, _fetch=True):
+        if "FROM worker_heartbeat" in sql:
+            return [{"is_stale": 0}]
+        if "FROM users u" in sql and "LEFT JOIN faces f" in sql:
+            captured["sql"] = sql
+            captured["params"] = params
+            return rows
+        return []
+
+    monkeypatch.setattr(app_module, "execute_query", execute_query_mock)
+
+    flask_app.config["TESTING"] = True
+    client = flask_app.test_client()
+    response = client.get("/leaderboard?period=daily")
+
+    assert response.status_code == 200
+    assert b"bob" in response.data
+    assert "classified_at" in captured["sql"]
+    assert captured["params"] is not None
+    assert len(captured["params"]) == 2
+
+
+def test_leaderboard_period_all_includes_user_stats(monkeypatch):
+    """All-time filter includes user_stats for archived project totals."""
+    captured = {}
+    rows = [{"wiki_username": "carol", "classifications": 10, "sdc_tags": 5}]
+
+    def execute_query_mock(sql, params=None, _fetch=True):
+        if "FROM worker_heartbeat" in sql:
+            return [{"is_stale": 0}]
+        if "FROM users u" in sql and "LEFT JOIN faces f" in sql:
+            captured["sql"] = sql
+            captured["params"] = params
+            return rows
+        return []
+
+    monkeypatch.setattr(app_module, "execute_query", execute_query_mock)
+
+    flask_app.config["TESTING"] = True
+    client = flask_app.test_client()
+    response = client.get("/leaderboard?period=all")
+
+    assert response.status_code == 200
+    assert b"carol" in response.data
+    assert "user_stats" in captured["sql"]
+    assert captured["params"] is None
+
+
+def test_leaderboard_invalid_period_defaults_to_all(monkeypatch):
+    """Invalid period value falls back to all-time query."""
+    captured = {}
+    rows = [{"wiki_username": "dave", "classifications": 2, "sdc_tags": 0}]
+
+    def execute_query_mock(sql, params=None, _fetch=True):
+        if "FROM worker_heartbeat" in sql:
+            return [{"is_stale": 0}]
+        if "FROM users u" in sql and "LEFT JOIN faces f" in sql:
+            captured["sql"] = sql
+            captured["params"] = params
+            return rows
+        return []
+
+    monkeypatch.setattr(app_module, "execute_query", execute_query_mock)
+
+    flask_app.config["TESTING"] = True
+    client = flask_app.test_client()
+    response = client.get("/leaderboard?period=bogus")
+
+    assert response.status_code == 200
+    assert b"dave" in response.data
+    assert "user_stats" in captured["sql"]
+    assert captured["params"] is None
+
+
+def test_leaderboard_filter_bar_active_state(monkeypatch):
+    """Filter bar renders with correct active class for each period."""
+
+    def execute_query_mock(sql, _params=None, _fetch=True):
+        if "FROM worker_heartbeat" in sql:
+            return [{"is_stale": 0}]
+        return []
+
+    monkeypatch.setattr(app_module, "execute_query", execute_query_mock)
+
+    flask_app.config["TESTING"] = True
+    client = flask_app.test_client()
+
+    # Default (all)
+    resp = client.get("/leaderboard")
+    assert b'class="active"' in resp.data
+    assert b"All Time" in resp.data
+
+    # Month
+    resp = client.get("/leaderboard?period=month")
+    html = resp.data.decode()
+    assert "period=month" in html
+
+    # Daily
+    resp = client.get("/leaderboard?period=daily")
+    html = resp.data.decode()
+    assert "period=daily" in html
+
+
 def test_health_healthy_db(monkeypatch):
     monkeypatch.setattr(app_module, "execute_query", lambda *a, **k: [{"ok": 1}])
 
@@ -9904,3 +10069,115 @@ def test_leave_project_db_error(monkeypatch, fake_user):
     assert "/project/1" in response.headers["Location"]
     flashes = _flashes_chunk6(client)
     assert any("failed to leave" in msg.lower() for _cat, msg in flashes)
+
+
+# --- Invite code TTL tests ---
+
+
+def test_invite_code_generate_sql_includes_created_at(monkeypatch, fake_user):
+    project = _project_settings_base_row()
+    captured_sql = []
+
+    def route_execute(sql, params, fetch):
+        if "SELECT * FROM projects WHERE id = %s AND user_id = %s" in sql:
+            return [project.copy()]
+        if "UPDATE projects SET invite_code" in sql:
+            captured_sql.append(sql)
+            return 1
+        raise AssertionError(f"Unexpected SQL: {sql}")
+
+    client = _make_authed_client(monkeypatch, fake_user, route_execute)
+    _set_csrf_chunk6(client)
+
+    client.post(
+        "/project/1/invite-code",
+        data={"csrf_token": "testtoken", "action": "generate"},
+    )
+
+    assert len(captured_sql) == 1
+    assert "invite_code_created_at = NOW()" in captured_sql[0]
+
+
+def test_invite_code_revoke_sql_clears_created_at(monkeypatch, fake_user):
+    project = _project_settings_base_row()
+    captured_sql = []
+
+    def route_execute(sql, params, fetch):
+        if "SELECT * FROM projects WHERE id = %s AND user_id = %s" in sql:
+            return [project.copy()]
+        if "UPDATE projects SET invite_code = NULL" in sql:
+            captured_sql.append(sql)
+            return 1
+        raise AssertionError(f"Unexpected SQL: {sql}")
+
+    client = _make_authed_client(monkeypatch, fake_user, route_execute)
+    _set_csrf_chunk6(client)
+
+    client.post(
+        "/project/1/invite-code",
+        data={"csrf_token": "testtoken", "action": "revoke"},
+    )
+
+    assert len(captured_sql) == 1
+    assert "invite_code_created_at = NULL" in captured_sql[0]
+
+
+def test_join_by_code_expired_shows_invalid(monkeypatch, fake_user):
+    def route_execute(sql, params, _fetch):
+        if "WHERE p.invite_code = %s" in sql:
+            assert "invite_code_created_at" in sql
+            assert "INTERVAL %s DAY" in sql
+            assert params == ("ABC12345", app_module._INVITE_CODE_TTL_DAYS)
+            return ()
+        raise AssertionError(f"Unexpected SQL: {sql}")
+
+    client = _make_authed_client(monkeypatch, fake_user, route_execute)
+    _set_csrf_chunk6(client)
+
+    response = client.post(
+        "/join",
+        data={"csrf_token": "testtoken", "invite_code": "ABC12345"},
+    )
+
+    assert response.status_code == 302
+    assert response.headers["Location"].endswith("/dashboard")
+    flashes = _flashes_chunk6(client)
+    assert any("invalid" in msg.lower() for _cat, msg in flashes)
+
+
+def test_invite_code_ttl_days_is_seven():
+    assert app_module._INVITE_CODE_TTL_DAYS == 7
+
+
+# --- XML escaping in sitemap/robots tests ---
+
+
+def test_sitemap_xml_escapes_url_root():
+    flask_app.config["TESTING"] = True
+    flask_app.config["SERVER_NAME"] = "evil.com/<script>"
+    try:
+        client = flask_app.test_client()
+        response = client.get("/sitemap.xml", base_url="http://evil.com/<script>/")
+        body = response.data.decode()
+
+        assert "<script>" not in body
+        assert "&lt;script&gt;" in body
+        root = ET.fromstring(body)
+        assert root.tag.endswith("urlset")
+    finally:
+        flask_app.config.pop("SERVER_NAME", None)
+
+
+def test_robots_txt_escapes_url_root():
+    flask_app.config["TESTING"] = True
+    flask_app.config["SERVER_NAME"] = "evil.com/<script>"
+    try:
+        client = flask_app.test_client()
+        response = client.get("/robots.txt", base_url="http://evil.com/<script>/")
+        body = response.data.decode()
+
+        assert "<script>" not in body
+        assert "&lt;script&gt;" in body
+        assert "Sitemap:" in body
+    finally:
+        flask_app.config.pop("SERVER_NAME", None)

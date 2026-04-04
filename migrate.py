@@ -370,6 +370,25 @@ _ALTER_MIGRATIONS = [
         "Add composite index on sdc_claims(face_id, written_at) for efficient per-face lookups",
         "ALTER TABLE sdc_claims ADD INDEX idx_sdc_claims_face (face_id, written_at)",
     ),
+    (
+        "Add classified_at column to faces for accurate leaderboard time filtering",
+        "ALTER TABLE faces ADD COLUMN classified_at DATETIME NULL DEFAULT NULL "
+        "COMMENT 'When face was classified (set once per classification, not auto-updated)' "
+        "AFTER classified_by_user_id",
+    ),
+    (
+        "Backfill classified_at from updated_at for already-classified faces",
+        "UPDATE faces SET classified_at = updated_at WHERE classified_by IS NOT NULL AND classified_at IS NULL",
+    ),
+    (
+        "Add composite index on faces(classified_by_user_id, classified_at) for leaderboard queries",
+        "ALTER TABLE faces ADD INDEX idx_faces_user_classified_at (classified_by_user_id, classified_at)",
+    ),
+    (
+        "Add invite_code_created_at column to projects for invite code TTL",
+        "ALTER TABLE projects ADD COLUMN invite_code_created_at DATETIME NULL DEFAULT NULL "
+        "COMMENT 'When invite_code was generated (for TTL expiry)' AFTER invite_code",
+    ),
 ]
 
 

@@ -57,7 +57,7 @@
     </div>
 </div>
 
-<script>
+<script nonce="{{ csp_nonce }}">
 var i18nCatInfo = {
     checking: {{ _('Checking…')|tojson }},
     files: {{ _('{files} files across {subcats} subcategories')|tojson }},

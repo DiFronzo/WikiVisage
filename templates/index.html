@@ -5,7 +5,7 @@
 {% block meta_description %}{{ _('Train an ML model to recognize specific people in Wikimedia Commons images. Classify faces, review model results, and write P180 depicts Structured Data to Commons automatically.') }}{% endblock %}
 
 {% block extra_head %}
-<style>
+<style nonce="{{ csp_nonce }}">
     .hero {
         padding: 4rem 0;
         text-align: center;

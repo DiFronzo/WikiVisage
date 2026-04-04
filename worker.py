@@ -969,7 +969,7 @@ def _process_single_image(
         # Multi-face bootstrapped images are left for manual classification.
         if bootstrapped and face_count == 1 and project_id is not None:
             auto_classified = execute_query(
-                "UPDATE faces SET is_target = 1, classified_by = 'bootstrap' "
+                "UPDATE faces SET is_target = 1, classified_by = 'bootstrap', classified_at = NOW() "
                 "WHERE image_id = %s AND is_target IS NULL AND superseded_by IS NULL",
                 (img_id,),
                 fetch=False,
@@ -1276,7 +1276,7 @@ def bootstrap_from_sparql(project: dict[str, Any]) -> int:
                         # Perform this in a single conditional UPDATE to avoid a per-image COUNT query.
                         auto = execute_query(
                             "UPDATE faces "
-                            "SET is_target = 1, classified_by = 'bootstrap' "
+                            "SET is_target = 1, classified_by = 'bootstrap', classified_at = NOW() "
                             "WHERE image_id = %s "
                             "AND is_target IS NULL "
                             "AND superseded_by IS NULL "
@@ -1547,7 +1547,8 @@ def run_autonomous_inference(project: dict[str, Any]) -> int:
             f"UPDATE faces SET "
             f"is_target = CASE id {target_cases} END, "
             f"confidence = CASE id {conf_cases} END, "
-            f"classified_by = 'model' "
+            f"classified_by = 'model', "
+            f"classified_at = NOW() "
             f"WHERE id IN ({id_placeholders}) "
             f"AND classified_by_user_id IS NULL "
             f"AND superseded_by IS NULL",

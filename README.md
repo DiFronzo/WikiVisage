@@ -34,7 +34,7 @@ Active learning facial recognition for Wikimedia Commons. Train an ML model to r
 </p>
 
 <p align="center" width="100%">
-<video title="WikiVisage demo video" src="https://github.com/user-attachments/assets/46c05ee5-4393-406f-a41d-0b8f331e66fc" width="80%" controls></video>
+<video src="https://github.com/user-attachments/assets/46c05ee5-4393-406f-a41d-0b8f331e66fc" width="80%" controls></video>
 </p>
 
 ## 🔗 Quick links

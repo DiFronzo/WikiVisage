@@ -5,7 +5,7 @@
 {% block meta_description %}{{ _('Top contributors classifying faces on Wikimedia Commons using WikiVisage.') }}{% endblock %}
 
 {% block extra_head %}
-<style>
+<style nonce="{{ csp_nonce }}">
     /* --- Leaderboard Card --- */
     .leaderboard-card {
         padding: 0;
@@ -91,6 +91,48 @@
         padding: 4rem 2rem;
     }
 
+    /* --- Period Filter Bar --- */
+    .filter-bar {
+        display: flex;
+        gap: 0;
+        margin-bottom: 2rem;
+    }
+    .filter-bar a {
+        flex: 1;
+        text-align: center;
+        padding: 0.75rem 1.5rem;
+        border: 2px solid var(--border);
+        color: var(--text-muted);
+        text-decoration: none;
+        font-weight: 700;
+        font-size: 0.875rem;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        transition: all 0.15s ease;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+    }
+    .filter-bar a:first-child {
+        border-radius: 0.5rem 0 0 0.5rem;
+    }
+    .filter-bar a:last-child {
+        border-radius: 0 0.5rem 0.5rem 0;
+    }
+    .filter-bar a:not(:first-child) {
+        border-left: none;
+    }
+    .filter-bar a:hover {
+        color: var(--primary);
+        background: color-mix(in srgb, var(--primary) 10%, transparent);
+    }
+    .filter-bar a.active {
+        color: var(--bg);
+        background: var(--primary);
+        border-color: var(--primary);
+    }
+    .filter-bar a.active + a {
+        border-left-color: var(--primary);
+    }
+
     @media (max-width: 600px) {
         .leaderboard-table th,
         .leaderboard-table td {
@@ -99,12 +141,23 @@
         }
         .leaderboard-table th { font-size: 0.625rem; }
         .stats-grid { grid-template-columns: 1fr !important; }
+        .filter-bar a {
+            padding: 0.625rem 0.5rem;
+            font-size: 0.75rem;
+            letter-spacing: 0.02em;
+        }
     }
 </style>
 {% endblock %}
 
 {% block content %}
 <h1>{{ _('Leaderboard') }}</h1>
+
+<div class="filter-bar">
+    <a href="{{ url_for('leaderboard', period='all') }}" class="{{ 'active' if period == 'all' else '' }}">{{ _('All Time') }}</a>
+    <a href="{{ url_for('leaderboard', period='month') }}" class="{{ 'active' if period == 'month' else '' }}">{{ _('Month') }}</a>
+    <a href="{{ url_for('leaderboard', period='daily') }}" class="{{ 'active' if period == 'daily' else '' }}">{{ _('Daily') }}</a>
+</div>
 
 <div class="stats-grid" style="margin-bottom: 3rem; grid-template-columns: repeat(3, 1fr);">
     <div class="stat-box stat-box-success">

@@ -56,6 +56,7 @@ CREATE TABLE IF NOT EXISTS projects (
     sdc_write_user_id   BIGINT UNSIGNED NULL COMMENT 'User who triggered SDC writes (their token is used)',
     sdc_write_error     VARCHAR(1024)   NULL COMMENT 'Error message from last SDC write attempt',
     invite_code         VARCHAR(8)       NULL DEFAULT NULL COMMENT 'Unique code for others to join this project',
+    invite_code_created_at DATETIME     NULL DEFAULT NULL COMMENT 'When invite_code was generated (for TTL expiry)',
     worker_claimed_by   VARCHAR(255)    NULL COMMENT 'Worker instance ID that claimed this project',
     worker_claimed_at   DATETIME        NULL COMMENT 'When the worker claimed this project',
     created_at          DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -117,6 +118,7 @@ CREATE TABLE IF NOT EXISTS faces (
     confidence      FLOAT           NULL COMMENT 'Face distance from known target centroid',
     classified_by   ENUM('human', 'model', 'bootstrap') NULL COMMENT 'How this face was classified',
     classified_by_user_id BIGINT UNSIGNED NULL COMMENT 'User who classified this face (human classifications)',
+    classified_at   DATETIME        NULL DEFAULT NULL COMMENT 'When face was classified (set once per classification, not auto-updated)',
     sdc_written     TINYINT(1)      NOT NULL DEFAULT 0 COMMENT 'Whether P180 claim was written to SDC',
     sdc_removal_pending TINYINT(1) NOT NULL DEFAULT 0 COMMENT '1=P180 claim removal queued (rejected bootstrap face)',
     superseded_by   BIGINT UNSIGNED NULL COMMENT 'FK to replacement face after bbox edit. NULL=active face',
@@ -129,6 +131,7 @@ CREATE TABLE IF NOT EXISTS faces (
     INDEX idx_faces_sdc (is_target, sdc_written),
     INDEX idx_faces_sdc_removal (sdc_removal_pending),
     INDEX idx_faces_classified_by_user (classified_by_user_id),
+    INDEX idx_faces_user_classified_at (classified_by_user_id, classified_at),
     INDEX idx_faces_superseded (superseded_by),
     INDEX idx_faces_image_target_superseded (image_id, is_target, superseded_by),
 

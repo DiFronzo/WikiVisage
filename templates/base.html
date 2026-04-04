@@ -11,7 +11,7 @@
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <meta name="description" content="{% block meta_description %}{{ _('Active learning facial recognition for Wikimedia Commons. Train a model to recognize people and add P180 depicts Structured Data automatically.') }}{% endblock %}">
-    <style>
+    <style nonce="{{ csp_nonce }}">
         :root {
             --bg: #090e17;
             --surface: #141f33;
@@ -543,7 +543,7 @@
             </div>
         </div>
     </div>
-    <style>
+    <style nonce="{{ csp_nonce }}">
         .cookie-banner {
             position: fixed;
             bottom: 0;
@@ -588,7 +588,7 @@
             <button id="pwa-install-btn" class="btn btn-primary">{{ _('Install') }}</button>
         </div>
     </div>
-    <style>
+    <style nonce="{{ csp_nonce }}">
         .pwa-banner {
             position: fixed;
             bottom: 0;
@@ -655,7 +655,7 @@
         }
     </style>
 
-    <script>
+    <script nonce="{{ csp_nonce }}">
         (function() {
             var consent = localStorage.getItem('cookie_consent');
             if (!consent) {
@@ -671,12 +671,12 @@
             document.getElementById('cookie-consent').style.display = 'none';
         }
     </script>
-    <script>
+    <script nonce="{{ csp_nonce }}">
         if ("serviceWorker" in navigator) {
             navigator.serviceWorker.register("/sw.js", { scope: "/" });
         }
     </script>
-    <script>
+    <script nonce="{{ csp_nonce }}">
         /* Pull-to-refresh for iOS standalone (PWA) mode.
            Safari iOS does not provide native pull-to-refresh in standalone mode,
            unlike Chrome on Android which does. This adds a custom touch-based
@@ -817,7 +817,7 @@
             }, { passive: true });
         })();
     </script>
-    <script>
+    <script nonce="{{ csp_nonce }}">
         (function() {
             if (window.matchMedia("(display-mode: standalone)").matches || navigator.standalone) return;
 
@@ -899,7 +899,7 @@
         <img src="{{ url_for('static', filename='jimmy-pet.png') }}" alt="" width="80" draggable="false"
              title="Photo: Gus Freedman, CC BY-SA 2.5" style="display:block;">
     </div>
-    <script>
+    <script nonce="{{ csp_nonce }}">
         (function() {
             if (window.matchMedia("(max-width: 600px)").matches) return;
             var petSrc = {{ url_for('static', filename='jimmy-pet.png')|tojson }};
