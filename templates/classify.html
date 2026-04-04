@@ -3,7 +3,7 @@
 {% block title %}{{ _('Classify') }} - {{ project.label or project.wikidata_qid }} - WikiVisage BETA{% endblock %}
 
 {% block extra_head %}
-<style>
+<style nonce="{{ csp_nonce }}">
     .classification-container {
         display: flex;
         flex-direction: column;
@@ -552,8 +552,8 @@
 <div class="loading-overlay" id="loadingOverlay" role="status" aria-live="polite">{{ _('Saving...') }}</div>
 
 {% if image %}
-<script src="{{ url_for('static', filename='wikivisage-common.js') }}"></script>
-<script>
+<script nonce="{{ csp_nonce }}" src="{{ url_for('static', filename='wikivisage-common.js') }}"></script>
+<script nonce="{{ csp_nonce }}">
     var csrfToken = {{ csrf_token()|tojson }};
     var i18n = {
         saving: {{ _('Saving...')|tojson }},

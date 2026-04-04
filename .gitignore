@@ -11,3 +11,5 @@ venv/
 .opencode/
 .worker_wake
 .coverage
+.playwright-mcp/
+test-results/

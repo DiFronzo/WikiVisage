@@ -4,7 +4,7 @@
 
 {% block extra_head %}
 {% if code == 404 %}
-<style>
+<style nonce="{{ csp_nonce }}">
 .scanner-container {
     position: relative;
     width: 180px;

@@ -3,7 +3,7 @@
 {% block title %}{{ project.label or project.wikidata_qid }} - WikiVisage BETA{% endblock %}
 
 {% block extra_head %}
-<style>
+<style nonce="{{ csp_nonce }}">
     .results-gallery {
         display: grid;
         grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
@@ -497,7 +497,7 @@
         .sdc-progress-text { font-size: 0.7rem; letter-spacing: 0.03em; }
     }
 </style>
-<script src="{{ url_for('static', filename='wikivisage-common.js') }}"></script>
+<script nonce="{{ csp_nonce }}" src="{{ url_for('static', filename='wikivisage-common.js') }}"></script>
 {% endblock %}
 
 {% block content %}
@@ -532,7 +532,7 @@
     </div>
     <button class="viewit-strip-close" aria-label="{{ _('Close') }}" onclick="this.parentElement.remove();try{localStorage.setItem('viewit_dismissed','1')}catch(e){}">&times;</button>
 </div>
-<script>try{if(localStorage.getItem('viewit_dismissed')==='1'){var s=document.getElementById('viewitStrip');if(s)s.remove()}}catch(e){}</script>
+<script nonce="{{ csp_nonce }}">try{if(localStorage.getItem('viewit_dismissed')==='1'){var s=document.getElementById('viewitStrip');if(s)s.remove()}}catch(e){}</script>
 
 <div class="card decorated-card" id="progressCard">
     {% if project.images_total == 0 %}
@@ -621,6 +621,8 @@
     <div class="stat-value" id="statSdcPending">{{ (stats.sdc_pending or 0) + (stats.sdc_removal_pending_faces or 0) }}</div>
         <div class="stat-label">{{ _('SDC Pending') }}</div>
     </div>
+    <span id="statSdcSendCount" style="display:none">{{ stats.sdc_pending or 0 }}</span>
+    <span id="statSdcRemovalCount" style="display:none">{{ stats.sdc_removal_pending_faces or 0 }}</span>
 </div>
 
 {% set by_human = stats.by_human or 0 %}
@@ -712,7 +714,7 @@
     </div>
     <button class="inference-banner-close" aria-label="{{ _('Close') }}" onclick="this.parentElement.remove();try{localStorage.setItem('inference_dismissed_{{ project.id }}','1')}catch(e){}">&times;</button>
 </div>
-<script>try{if(localStorage.getItem('inference_dismissed_{{ project.id }}')==='1'){var ib=document.getElementById('inferenceBanner');if(ib)ib.remove()}}catch(e){}</script>
+<script nonce="{{ csp_nonce }}">try{if(localStorage.getItem('inference_dismissed_{{ project.id }}')==='1'){var ib=document.getElementById('inferenceBanner');if(ib)ib.remove()}}catch(e){}</script>
 {% endif %}
 
 <div class="action-buttons">
@@ -837,7 +839,7 @@
 </div>
 
 {% if gallery_total > 0 %}
-<script>
+<script nonce="{{ csp_nonce }}">
     var csrfToken = {{ csrf_token()|tojson }};
     var apiReclassifyUrl = {{ url_for('api_reclassify')|tojson }};
     var apiUpdateBboxUrl = {{ url_for('api_update_face_bbox')|tojson }};
@@ -881,6 +883,12 @@
         var loading = card.querySelector('.result-loading');
         loading.classList.add('active');
 
+        var oldSource = card.dataset.source;
+        var wasSdcPending = card.dataset.sdcPending === '1';
+        var wasRemoval = card.dataset.sdcRemoval === '1';
+        var isBootstrapped = card.dataset.bootstrapped === '1';
+        var sdcWritten = card.dataset.sdcWritten === '1';
+
         postForm(apiReclassifyUrl, csrfToken, {
             face_id: faceId,
             is_target: isTarget
@@ -896,14 +904,13 @@
 
                 var methodLabel = card.querySelector('.result-method');
                 if (methodLabel) methodLabel.textContent = i18nReclassify.human;
-                
-                // Update SDC pending state
-                var wasSdcPending = card.dataset.sdcPending === '1';
-                var isBootstrapped = card.dataset.bootstrapped === '1';
-                var sdcWritten = card.dataset.sdcWritten === '1';
-                var source = card.dataset.source;
-                var nowSdcPending = (isTarget === 1 && !sdcWritten && source !== 'bootstrap' && !isBootstrapped) || data.sdc_removal_queued;
-                card.dataset.sdcPending = nowSdcPending ? '1' : '0';
+
+                var nowIsSend = (isTarget === 1 && !sdcWritten && oldSource !== 'bootstrap' && !isBootstrapped);
+                var nowIsRemoval = !!data.sdc_removal_queued;
+                var nowSdcPending = nowIsSend || nowIsRemoval;
+                card.dataset.sdcPending = nowIsSend ? '1' : '0';
+                card.dataset.sdcRemoval = nowIsRemoval ? '1' : '0';
+
                 var sdcBadge = card.querySelector('[data-sdc-badge]');
                 if (nowSdcPending && !sdcBadge) {
                     sdcBadge = document.createElement('span');
@@ -915,20 +922,41 @@
                     sdcBadge.remove();
                 }
 
-                // Adjust statSdcPending count and sync button state
+                var sendEl = document.getElementById('statSdcSendCount');
+                var removalEl = document.getElementById('statSdcRemovalCount');
+                if (sendEl) {
+                    var sendCount = parseInt(sendEl.textContent, 10) || 0;
+                    if (nowIsSend && !wasSdcPending) sendCount++;
+                    else if (!nowIsSend && wasSdcPending && !wasRemoval) sendCount = Math.max(0, sendCount - 1);
+                    sendEl.textContent = sendCount;
+                }
+                if (removalEl) {
+                    var removalCount = parseInt(removalEl.textContent, 10) || 0;
+                    if (nowIsRemoval && !wasRemoval) removalCount++;
+                    else if (!nowIsRemoval && wasRemoval) removalCount = Math.max(0, removalCount - 1);
+                    removalEl.textContent = removalCount;
+                }
                 var pendingEl = document.getElementById('statSdcPending');
-                if (pendingEl) {
-                    var count = parseInt(pendingEl.textContent, 10) || 0;
-                    if (nowSdcPending && !wasSdcPending) count++;
-                    else if (!nowSdcPending && wasSdcPending) count = Math.max(0, count - 1);
-                    pendingEl.textContent = count;
+                if (pendingEl && sendEl && removalEl) {
+                    pendingEl.textContent = (parseInt(sendEl.textContent, 10) || 0) + (parseInt(removalEl.textContent, 10) || 0);
                 }
                 syncSdcButtonState();
+                updateSdcStatusText();
 
                 var sdcNote = card.querySelector('.sdc-note');
                 if (data.sdc_removed) {
+                    // The server removed the P180 claim synchronously, so the
+                    // removal is no longer "pending". We already incremented
+                    // removalEl above (for sdc_removal_queued), so decrement
+                    // it back — the net effect is no change to the removal count.
                     sdcNote.textContent = i18nReclassify.sdcRemoved;
                     sdcNote.style.display = 'block';
+                    if (removalEl) {
+                        var rc = Math.max(0, (parseInt(removalEl.textContent, 10) || 0) - 1);
+                        removalEl.textContent = rc;
+                        if (pendingEl) pendingEl.textContent = (parseInt(sendEl.textContent, 10) || 0) + rc;
+                        updateSdcStatusText();
+                    }
                 } else if (data.sdc_removal_queued) {
                     sdcNote.textContent = i18nReclassify.sdcRemovalQueued;
                     sdcNote.style.display = 'block';
@@ -1241,6 +1269,7 @@
         card.dataset.imageId = face.image_id;
         card.dataset.sdcWritten = face.sdc_written;
         card.dataset.sdcPending = face.sdc_pending ? '1' : '0';
+        card.dataset.sdcRemoval = face.sdc_removal ? '1' : '0';
         card.dataset.bootstrapped = face.bootstrapped;
 
         var thumb = document.createElement('div');
@@ -1517,7 +1546,7 @@
 </script>
 {% endif %}
 
-<script>
+<script nonce="{{ csp_nonce }}">
     var sdcCsrfToken = {{ csrf_token()|tojson }};
     var apiWriteSdcUrl = {{ url_for('api_write_sdc', project_id=project.id)|tojson }};
     var apiStopSdcUrl = {{ url_for('api_stop_sdc', project_id=project.id)|tojson }};
@@ -1540,7 +1569,17 @@
         stopping: {{ _('Stopping...')|tojson }},
         stopped: {{ _('Upload stopped by user. {written} claims were written before stopping.')|tojson }},
         stopError: {{ _('Failed to stop upload. Please try again.')|tojson }},
-        queuedInfo: {{ _('Your edits have been queued. You do not need to stay on this page — the background worker will process them automatically.')|tojson }}
+        queuedInfo: {{ _('Your edits have been queued. You do not need to stay on this page — the background worker will process them automatically.')|tojson }},
+        facesReadyOne: {{ _('1 face ready to send.')|tojson }},
+        facesReadyMany: {{ _('{num} faces ready to send.')|tojson }},
+        facesReadyOnePart: {{ _('1 face ready to send')|tojson }},
+        facesReadyManyPart: {{ _('{num} faces ready to send')|tojson }},
+        removalReadyOnePart: {{ _('1 ready to be removed.')|tojson }},
+        removalReadyManyPart: {{ _('{num} ready to be removed.')|tojson }},
+        removalOnlyOne: {{ _('1 image ready to be removed.')|tojson }},
+        removalOnlyMany: {{ _('{num} images ready to be removed.')|tojson }},
+        andText: {{ _('and')|tojson }},
+        noFacesText: {{ _('No pending faces to write. All approved faces have already been sent.')|tojson }}
     };
 
     var sdcInitialPending = {{ (stats.sdc_pending or 0)|tojson }};
@@ -1555,9 +1594,50 @@
     function syncSdcButtonState() {
         var btn = document.getElementById('sdcWriteBtn');
         if (!btn || btn.textContent === i18nSdc.btnInProgress) return;
-        var el = document.getElementById('statSdcPending');
-        var pending = el ? parseInt(el.textContent, 10) || 0 : 0;
-        btn.disabled = (pending === 0);
+        var sendEl = document.getElementById('statSdcSendCount');
+        var removalEl = document.getElementById('statSdcRemovalCount');
+        var sends = sendEl ? parseInt(sendEl.textContent, 10) || 0 : 0;
+        var removals = removalEl ? parseInt(removalEl.textContent, 10) || 0 : 0;
+        btn.disabled = (sends === 0 && removals === 0);
+    }
+
+    // NOTE: Pluralization uses a simple === 1 check, which works for the
+    // current locales (en, nb, es, fr — all nplurals=2). If a language with
+    // complex plural rules is added (e.g. Polish, Arabic), this logic will
+    // need to be replaced with a proper plural resolver.
+    function updateSdcStatusText() {
+        var statusEl = document.getElementById('sdcStatus');
+        if (!statusEl) return;
+        var sendEl = document.getElementById('statSdcSendCount');
+        var removalEl = document.getElementById('statSdcRemovalCount');
+        var sends = sendEl ? parseInt(sendEl.textContent, 10) || 0 : 0;
+        var removals = removalEl ? parseInt(removalEl.textContent, 10) || 0 : 0;
+        var p = document.createElement('p');
+        if (sends > 0 && removals > 0) {
+            p.className = 'sdc-status-text';
+            var sendPart = sends === 1
+                ? i18nSdc.facesReadyOnePart
+                : i18nSdc.facesReadyManyPart.replace('{num}', sends);
+            var removalPart = removals === 1
+                ? i18nSdc.removalReadyOnePart
+                : i18nSdc.removalReadyManyPart.replace('{num}', removals);
+            p.textContent = sendPart + ' ' + i18nSdc.andText + ' ' + removalPart;
+        } else if (sends > 0) {
+            p.className = 'sdc-status-text';
+            p.textContent = sends === 1
+                ? i18nSdc.facesReadyOne
+                : i18nSdc.facesReadyMany.replace('{num}', sends);
+        } else if (removals > 0) {
+            p.className = 'sdc-status-text';
+            p.textContent = removals === 1
+                ? i18nSdc.removalOnlyOne
+                : i18nSdc.removalOnlyMany.replace('{num}', removals);
+        } else {
+            p.className = 'sdc-status-muted';
+            p.textContent = i18nSdc.noFacesText;
+        }
+        statusEl.innerHTML = '';
+        statusEl.appendChild(p);
     }
 
     // Helper: safely set message text without innerHTML
@@ -1852,13 +1932,17 @@
 
         function updateStats(fs) {
             if (!fs) return;
+            var sends = fs.sdc_pending || 0;
+            var removals = fs.sdc_removal_pending_faces || 0;
             var map = {
                 'statTotalFaces': fs.total_faces,
                 'statMatches': fs.confirmed_matches,
                 'statNonMatches': fs.confirmed_non_matches,
                 'statUnclassified': fs.unclassified,
                 'statSdcWritten': fs.sdc_written,
-                'statSdcPending': fs.sdc_pending,
+                'statSdcPending': sends + removals,
+                'statSdcSendCount': sends,
+                'statSdcRemovalCount': removals,
                 'statByHuman': fs.by_human,
                 'statByModel': fs.by_model,
                 'statByBootstrap': fs.by_bootstrap
@@ -1867,6 +1951,8 @@
                 var el = document.getElementById(id);
                 if (el) el.textContent = map[id] || 0;
             }
+            syncSdcButtonState();
+            updateSdcStatusText();
         }
 
         function pollProgress() {
@@ -1893,6 +1979,7 @@
 
                 updateStats(data.face_stats);
                 syncSdcButtonState();
+                updateSdcStatusText();
 
                 if (data.complete) {
                     bar.style.width = '100%';
@@ -2016,6 +2103,7 @@
                     if (el) el.textContent = statMap[id] || 0;
                 }
                 syncSdcButtonState();
+                updateSdcStatusText();
 
                 if (eligible > 0) {
                     // Still running

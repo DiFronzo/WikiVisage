@@ -26,6 +26,7 @@ from datetime import UTC, datetime, timedelta
 from functools import wraps
 from typing import Any
 from urllib.parse import quote, urljoin, urlparse
+from xml.sax.saxutils import escape as xml_escape
 
 from dotenv import load_dotenv
 
@@ -504,6 +505,14 @@ def inject_csrf_token() -> dict[str, Any]:
 
 
 @app.context_processor
+def inject_csp_nonce() -> dict[str, str]:
+    """Generate a per-request CSP nonce and make it available in all templates."""
+    if not hasattr(g, "csp_nonce"):
+        g.csp_nonce = secrets.token_urlsafe(32)
+    return {"csp_nonce": g.csp_nonce}
+
+
+@app.context_processor
 def inject_worker_status() -> dict[str, Any]:
     """Check worker heartbeat and inject worker_down flag into all templates."""
     try:
@@ -765,6 +774,7 @@ def _snap_thumb_width(width: int) -> int:
 
 
 _MAX_INVITE_CODE_RETRIES = 5
+_INVITE_CODE_TTL_DAYS = 7
 
 
 def _generate_invite_code() -> str:
@@ -1419,8 +1429,8 @@ def project_new():
             try:
                 execute_query(
                     "INSERT INTO projects (user_id, wikidata_qid, commons_category, label, "
-                    "distance_threshold, min_confirmed, p18_thumb_url, invite_code) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                    "distance_threshold, min_confirmed, p18_thumb_url, invite_code, invite_code_created_at) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())",
                     (
                         g.user["id"],
                         wikidata_qid,
@@ -1879,7 +1889,7 @@ def api_classify():
                 if is_review_mode:
                     cursor.execute(
                         "UPDATE faces SET classified_by = 'human', "
-                        "classified_by_user_id = %s "
+                        "classified_by_user_id = %s, classified_at = NOW() "
                         "WHERE image_id = %s AND is_target = 0 AND classified_by = 'model' "
                         "AND classified_by_user_id IS NULL AND superseded_by IS NULL",
                         (g.user["id"], image_id),
@@ -1887,7 +1897,7 @@ def api_classify():
                 else:
                     cursor.execute(
                         "UPDATE faces SET is_target = 0, classified_by = 'human', "
-                        "classified_by_user_id = %s "
+                        "classified_by_user_id = %s, classified_at = NOW() "
                         "WHERE image_id = %s AND is_target IS NULL AND superseded_by IS NULL",
                         (g.user["id"], image_id),
                     )
@@ -1940,7 +1950,7 @@ def api_classify():
                 if is_review_mode:
                     cursor.execute(
                         "UPDATE faces SET is_target = 1, classified_by = 'human', "
-                        "classified_by_user_id = %s "
+                        "classified_by_user_id = %s, classified_at = NOW() "
                         "WHERE id = %s AND image_id = %s "
                         "AND is_target = 0 AND classified_by = 'model' "
                         "AND classified_by_user_id IS NULL AND superseded_by IS NULL",
@@ -1949,7 +1959,7 @@ def api_classify():
                 else:
                     cursor.execute(
                         "UPDATE faces SET is_target = 1, classified_by = 'human', "
-                        "classified_by_user_id = %s "
+                        "classified_by_user_id = %s, classified_at = NOW() "
                         "WHERE id = %s AND image_id = %s AND is_target IS NULL",
                         (g.user["id"], selected_face_id, image_id),
                     )
@@ -1958,7 +1968,7 @@ def api_classify():
                 if is_review_mode:
                     cursor.execute(
                         "UPDATE faces SET classified_by = 'human', "
-                        "classified_by_user_id = %s "
+                        "classified_by_user_id = %s, classified_at = NOW() "
                         "WHERE image_id = %s AND id != %s "
                         "AND is_target = 0 AND classified_by = 'model' "
                         "AND classified_by_user_id IS NULL AND superseded_by IS NULL",
@@ -1967,7 +1977,7 @@ def api_classify():
                 else:
                     cursor.execute(
                         "UPDATE faces SET is_target = 0, classified_by = 'human', "
-                        "classified_by_user_id = %s "
+                        "classified_by_user_id = %s, classified_at = NOW() "
                         "WHERE image_id = %s AND id != %s AND is_target IS NULL AND superseded_by IS NULL",
                         (g.user["id"], image_id, selected_face_id),
                     )
@@ -2073,14 +2083,14 @@ def api_undo_classify():
                 if was_review:
                     cursor.execute(
                         f"UPDATE faces SET is_target = 0, classified_by = 'model', "
-                        f"classified_by_user_id = NULL, sdc_removal_pending = 0 "
+                        f"classified_by_user_id = NULL, sdc_removal_pending = 0, classified_at = NULL "
                         f"WHERE id IN ({placeholders}) AND image_id = %s",
                         (*original_ids, image_id),
                     )
                 else:
                     cursor.execute(
                         f"UPDATE faces SET is_target = NULL, classified_by = NULL, "
-                        f"classified_by_user_id = NULL, sdc_removal_pending = 0 "
+                        f"classified_by_user_id = NULL, sdc_removal_pending = 0, classified_at = NULL "
                         f"WHERE id IN ({placeholders}) AND image_id = %s",
                         (*original_ids, image_id),
                     )
@@ -2210,8 +2220,8 @@ def api_manual_face():
                 cursor.execute(
                     "INSERT INTO faces "
                     "(image_id, encoding, bbox_top, bbox_right, bbox_bottom, bbox_left, "
-                    "is_target, classified_by, classified_by_user_id) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, 1, 'human', %s)",
+                    "is_target, classified_by, classified_by_user_id, classified_at) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, 1, 'human', %s, NOW())",
                     (
                         image_id,
                         encoding_bytes,
@@ -2226,7 +2236,7 @@ def api_manual_face():
 
                 cursor.execute(
                     "UPDATE faces SET classified_by = 'human', "
-                    "classified_by_user_id = %s "
+                    "classified_by_user_id = %s, classified_at = NOW() "
                     "WHERE image_id = %s AND is_target = 0 AND classified_by = 'model' "
                     "AND classified_by_user_id IS NULL AND superseded_by IS NULL",
                     (g.user["id"], image_id),
@@ -2239,8 +2249,8 @@ def api_manual_face():
                 cursor.execute(
                     "INSERT INTO faces "
                     "(image_id, encoding, bbox_top, bbox_right, bbox_bottom, bbox_left, "
-                    "is_target, classified_by, classified_by_user_id) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, 1, 'human', %s)",
+                    "is_target, classified_by, classified_by_user_id, classified_at) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, 1, 'human', %s, NOW())",
                     (
                         image_id,
                         encoding_bytes,
@@ -2259,7 +2269,7 @@ def api_manual_face():
                     placeholders = ",".join(["%s"] * len(dismiss_face_ids))
                     cursor.execute(
                         "UPDATE faces SET is_target = 0, classified_by = 'human', "
-                        f"classified_by_user_id = %s WHERE id IN ({placeholders}) "
+                        f"classified_by_user_id = %s, classified_at = NOW() WHERE id IN ({placeholders}) "
                         "AND image_id = %s AND is_target IS NULL AND superseded_by IS NULL",
                         (g.user["id"], *dismiss_face_ids, image_id),
                     )
@@ -2472,7 +2482,7 @@ def api_reclassify():
             cursor.execute(
                 "UPDATE faces SET is_target = %s, classified_by = 'human', "
                 "classified_by_user_id = %s, sdc_written = %s, "
-                "sdc_removal_pending = %s "
+                "sdc_removal_pending = %s, classified_at = NOW() "
                 "WHERE id = %s AND (classified_by_user_id IS NULL OR classified_by_user_id = %s)",
                 (
                     is_target,
@@ -2629,8 +2639,8 @@ def api_update_face_bbox():
             cursor.execute(
                 "INSERT INTO faces "
                 "(image_id, encoding, bbox_top, bbox_right, bbox_bottom, bbox_left, "
-                " is_target, classified_by, confidence, classified_by_user_id, sdc_written) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, 'human', %s, %s, %s)",
+                " is_target, classified_by, confidence, classified_by_user_id, sdc_written, classified_at) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, 'human', %s, %s, %s, NOW())",
                 (
                     image_id,
                     encoding_bytes,
@@ -2985,12 +2995,13 @@ def api_gallery(project_id: int):
 
     faces = []
     for face in face_rows if face_rows else []:
-        is_sdc_pending = (
+        is_sdc_send = (
             face["is_target"] == 1
             and face["sdc_written"] == 0
             and face["classified_by"] != "bootstrap"
             and face["bootstrapped"] == 0
-        ) or (face["sdc_removal_pending"] == 1 and not face["has_confirmed_target_sibling"])
+        )
+        is_sdc_removal = face["sdc_removal_pending"] == 1 and not face["has_confirmed_target_sibling"]
         if face["is_target"] == 0 and face["classified_by_user_id"]:
             result_type = "rejected"
         elif face["is_target"] == 1:
@@ -3017,7 +3028,8 @@ def api_gallery(project_id: int):
                 "detection_height": face["detection_height"] or 0,
                 "thumb_url": commons_thumb_url(face["file_title"], 330),
                 "result": result_type,
-                "sdc_pending": is_sdc_pending,
+                "sdc_pending": is_sdc_send or is_sdc_removal,
+                "sdc_removal": is_sdc_removal,
             }
         )
 
@@ -3062,10 +3074,6 @@ def api_progress(project_id: int):
             pass
 
     face_stats = _get_face_stats(project_id)
-    if face_stats:
-        # Progress endpoint combines sdc_pending (writes) + sdc_removal_pending_faces
-        # into a single sdc_pending value for the JS client.
-        face_stats["sdc_pending"] = face_stats.get("sdc_pending", 0) + face_stats.get("sdc_removal_pending_faces", 0)
 
     inference_eligible = 0
     try:
@@ -3370,7 +3378,8 @@ def project_invite_code(project_id: int):
         for _attempt in range(_MAX_INVITE_CODE_RETRIES):
             try:
                 execute_query(
-                    "UPDATE projects SET invite_code = %s WHERE id = %s AND user_id = %s",
+                    "UPDATE projects SET invite_code = %s, invite_code_created_at = NOW() "
+                    "WHERE id = %s AND user_id = %s",
                     (code, project_id, g.user["id"]),
                     fetch=False,
                 )
@@ -3391,7 +3400,7 @@ def project_invite_code(project_id: int):
     elif action == "revoke":
         try:
             execute_query(
-                "UPDATE projects SET invite_code = NULL WHERE id = %s AND user_id = %s",
+                "UPDATE projects SET invite_code = NULL, invite_code_created_at = NULL WHERE id = %s AND user_id = %s",
                 (project_id, g.user["id"]),
                 fetch=False,
             )
@@ -3420,8 +3429,11 @@ def project_join():
         project = execute_query(
             "SELECT p.id, p.label, p.user_id, u.wiki_username FROM projects p "
             "JOIN users u ON p.user_id = u.id "
-            "WHERE p.invite_code = %s AND p.status != 'deleted' LIMIT 1",
-            (code,),
+            "WHERE p.invite_code = %s AND p.status != 'deleted' "
+            "AND (p.invite_code_created_at IS NULL "
+            "     OR p.invite_code_created_at >= NOW() - INTERVAL %s DAY) "
+            "LIMIT 1",
+            (code, _INVITE_CODE_TTL_DAYS),
         )
     except DatabaseError:
         logger.exception("Failed to look up invite code")
@@ -3509,7 +3521,8 @@ def project_rerun_inference(project_id: int):
             cursor.execute(
                 "UPDATE faces f "
                 "JOIN images i ON f.image_id = i.id "
-                "SET f.is_target = NULL, f.classified_by = NULL, f.confidence = NULL "
+                "SET f.is_target = NULL, f.classified_by = NULL, f.confidence = NULL, "
+                "f.classified_at = NULL "
                 "WHERE i.project_id = %s "
                 "AND f.classified_by = 'model' "
                 "AND f.classified_by_user_id IS NULL "
@@ -3675,37 +3688,73 @@ def account_settings():
 @app.route("/leaderboard")
 def leaderboard():
     """Community leaderboard ranking users by classifications and SDC tags."""
+    period = request.args.get("period", "all")
+    if period not in ("all", "month", "daily"):
+        period = "all"
+
     try:
-        rows = execute_query(
-            "SELECT "
-            "  u.wiki_username, "
-            "  COUNT(f.id) + COALESCE(us.classifications, 0) "
-            "    AS classifications, "
-            "  COALESCE(sdc.sdc_count, 0) "
-            "    + COALESCE(us.sdc_tags, 0) AS sdc_tags "
-            "FROM users u "
-            "LEFT JOIN faces f ON f.classified_by_user_id = u.id "
-            "  AND f.superseded_by IS NULL "
-            "LEFT JOIN user_stats us ON us.user_id = u.id "
-            "LEFT JOIN ("
-            "  SELECT f2.classified_by_user_id AS user_id, COUNT(*) AS sdc_count "
-            "  FROM sdc_claims sc "
-            "  JOIN faces f2 ON f2.id = sc.face_id "
-            "  WHERE sc.written_at IS NOT NULL "
-            "    AND f2.classified_by_user_id IS NOT NULL "
-            "  GROUP BY f2.classified_by_user_id"
-            ") sdc ON sdc.user_id = u.id "
-            "WHERE u.leaderboard_opt_out = 0 "
-            "  AND (f.id IS NOT NULL OR us.user_id IS NOT NULL "
-            "       OR sdc.user_id IS NOT NULL) "
-            "GROUP BY u.id, u.wiki_username, us.classifications, "
-            "         us.sdc_tags, sdc.sdc_count "
-            "ORDER BY (COUNT(f.id) + COALESCE(us.classifications, 0) "
-            "        + COALESCE(sdc.sdc_count, 0) "
-            "        + COALESCE(us.sdc_tags, 0)) DESC, "
-            "         (COUNT(f.id) + COALESCE(us.classifications, 0)) DESC "
-            "LIMIT 100",
-        )
+        if period == "all":
+            rows = execute_query(
+                "SELECT "
+                "  u.wiki_username, "
+                "  COUNT(f.id) + COALESCE(us.classifications, 0) "
+                "    AS classifications, "
+                "  COALESCE(sdc.sdc_count, 0) "
+                "    + COALESCE(us.sdc_tags, 0) AS sdc_tags "
+                "FROM users u "
+                "LEFT JOIN faces f ON f.classified_by_user_id = u.id "
+                "  AND f.superseded_by IS NULL "
+                "LEFT JOIN user_stats us ON us.user_id = u.id "
+                "LEFT JOIN ("
+                "  SELECT f2.classified_by_user_id AS user_id, COUNT(*) AS sdc_count "
+                "  FROM sdc_claims sc "
+                "  JOIN faces f2 ON f2.id = sc.face_id "
+                "  WHERE sc.written_at IS NOT NULL "
+                "    AND f2.classified_by_user_id IS NOT NULL "
+                "  GROUP BY f2.classified_by_user_id"
+                ") sdc ON sdc.user_id = u.id "
+                "WHERE u.leaderboard_opt_out = 0 "
+                "  AND (f.id IS NOT NULL OR us.user_id IS NOT NULL "
+                "       OR sdc.user_id IS NOT NULL) "
+                "GROUP BY u.id, u.wiki_username, us.classifications, "
+                "         us.sdc_tags, sdc.sdc_count "
+                "ORDER BY (COUNT(f.id) + COALESCE(us.classifications, 0) "
+                "        + COALESCE(sdc.sdc_count, 0) "
+                "        + COALESCE(us.sdc_tags, 0)) DESC, "
+                "         (COUNT(f.id) + COALESCE(us.classifications, 0)) DESC "
+                "LIMIT 100",
+            )
+        else:
+            if period == "month":
+                cutoff = datetime.now(UTC) - timedelta(days=30)
+            else:
+                cutoff = datetime.now(UTC) - timedelta(hours=24)
+            rows = execute_query(
+                "SELECT "
+                "  u.wiki_username, "
+                "  COUNT(f.id) AS classifications, "
+                "  COALESCE(sdc.sdc_count, 0) AS sdc_tags "
+                "FROM users u "
+                "LEFT JOIN faces f ON f.classified_by_user_id = u.id "
+                "  AND f.superseded_by IS NULL "
+                "  AND f.classified_at >= %s "
+                "LEFT JOIN ("
+                "  SELECT f2.classified_by_user_id AS user_id, COUNT(*) AS sdc_count "
+                "  FROM sdc_claims sc "
+                "  JOIN faces f2 ON f2.id = sc.face_id "
+                "  WHERE sc.written_at IS NOT NULL "
+                "    AND sc.written_at >= %s "
+                "    AND f2.classified_by_user_id IS NOT NULL "
+                "  GROUP BY f2.classified_by_user_id"
+                ") sdc ON sdc.user_id = u.id "
+                "WHERE u.leaderboard_opt_out = 0 "
+                "  AND (f.id IS NOT NULL OR sdc.user_id IS NOT NULL) "
+                "GROUP BY u.id, u.wiki_username, sdc.sdc_count "
+                "ORDER BY (COUNT(f.id) + COALESCE(sdc.sdc_count, 0)) DESC, "
+                "         COUNT(f.id) DESC "
+                "LIMIT 100",
+                (cutoff, cutoff),
+            )
     except DatabaseError:
         logger.exception("Failed to load leaderboard")
         rows = []
@@ -3716,7 +3765,7 @@ def leaderboard():
         totals["classifications"] += row["classifications"]
         totals["sdc_tags"] += row["sdc_tags"]
 
-    return render_template("leaderboard.html", rows=rows, totals=totals)
+    return render_template("leaderboard.html", rows=rows, totals=totals, period=period)
 
 
 # ---------------------------------------------------------------------------
@@ -3767,7 +3816,7 @@ def robots_txt():
         "Allow: /leaderboard",
         "Disallow: /",
         "",
-        f"Sitemap: {request.url_root}sitemap.xml",
+        f"Sitemap: {xml_escape(request.url_root)}sitemap.xml",
     ]
     return "\n".join(lines), 200, {"Content-Type": "text/plain; charset=utf-8"}
 
@@ -3776,9 +3825,9 @@ def robots_txt():
 @limiter.exempt
 def sitemap_xml():
     """Serve a minimal XML sitemap listing publicly crawlable pages."""
-    base = request.url_root.rstrip("/")
+    base = xml_escape(request.url_root.rstrip("/"))
     urls = ["/", "/leaderboard"]
-    xml_urls = "".join(f"<url><loc>{base}{path}</loc></url>" for path in urls)
+    xml_urls = "".join(f"<url><loc>{base}{xml_escape(path)}</loc></url>" for path in urls)
     xml = (
         '<?xml version="1.0" encoding="UTF-8"?>'
         '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
