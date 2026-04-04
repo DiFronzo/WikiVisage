@@ -154,9 +154,9 @@
 <h1>{{ _('Leaderboard') }}</h1>
 
 <div class="filter-bar">
-    <a href="{{ url_for('leaderboard', period='all') }}" class="{{ 'active' if period == 'all' }}">{{ _('All Time') }}</a>
-    <a href="{{ url_for('leaderboard', period='month') }}" class="{{ 'active' if period == 'month' }}">{{ _('Month') }}</a>
-    <a href="{{ url_for('leaderboard', period='daily') }}" class="{{ 'active' if period == 'daily' }}">{{ _('Daily') }}</a>
+    <a href="{{ url_for('leaderboard', period='all') }}" class="{{ 'active' if period == 'all' else '' }}">{{ _('All Time') }}</a>
+    <a href="{{ url_for('leaderboard', period='month') }}" class="{{ 'active' if period == 'month' else '' }}">{{ _('Month') }}</a>
+    <a href="{{ url_for('leaderboard', period='daily') }}" class="{{ 'active' if period == 'daily' else '' }}">{{ _('Daily') }}</a>
 </div>
 
 <div class="stats-grid" style="margin-bottom: 3rem; grid-template-columns: repeat(3, 1fr);">
