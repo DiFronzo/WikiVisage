@@ -999,8 +999,8 @@ msgid "All Time"
 msgstr "Todo el tiempo"
 
 #: templates/leaderboard.html:158
-msgid "Month"
-msgstr "Mes"
+msgid "Monthly"
+msgstr "Mensual"
 
 #: templates/leaderboard.html:159
 msgid "Daily"

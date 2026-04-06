@@ -19,6 +19,9 @@ on:
         description: "If db-reset is true, type WIPE to confirm"
         required: false
         default: ""
+permissions:
+  contents: read
+
 concurrency:
   group: deploy-production
   cancel-in-progress: false

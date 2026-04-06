@@ -442,6 +442,7 @@ def init_db(pool_size: int | None = None) -> None:
 
     # Get and validate configuration
     _db_config = _get_db_config()
+    db_name = _db_config["database"]
 
     # Create the pool
     _pool = Queue(maxsize=_pool_size)
@@ -465,8 +466,7 @@ def init_db(pool_size: int | None = None) -> None:
             result = cursor.fetchone()
             if result:
                 logger.info(
-                    f"Database connection pool initialized successfully. "
-                    f"Pool size: {_pool_size}, Database: {_db_config['database']}"
+                    f"Database connection pool initialized successfully. Pool size: {_pool_size}, Database: {db_name}"
                 )
             else:
                 raise DatabaseError("Connectivity test failed: No result returned")

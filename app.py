@@ -154,8 +154,15 @@ def set_language(lang: str):
     """Set the user's preferred language via cookie (if consent given)."""
     if lang not in LANGUAGES:
         lang = "en"
-    referrer = request.referrer or ""
-    if not referrer or not _is_safe_url(referrer):
+    referrer = (request.referrer or "").replace("\\", "")
+    if referrer:
+        parsed = urlparse(referrer)
+        if parsed.netloc:
+            if parsed.netloc == urlparse(request.host_url).netloc:
+                referrer = parsed.path or "/"
+            else:
+                referrer = ""
+    if not referrer or not _is_safe_redirect_target(referrer):
         referrer = url_for("index")
     resp = redirect(referrer)
     if not request.args.get("nocookie"):
@@ -241,6 +248,21 @@ def _is_safe_url(target: str) -> bool:
     test_url = urljoin(ref_url, target)
     parsed = urlparse(test_url)
     return parsed.scheme in ("http", "https") and parsed.netloc == urlparse(ref_url).netloc
+
+
+def _is_safe_redirect_target(target: str) -> bool:
+    """Verify *target* is a relative URL with no scheme or host.
+
+    Backslashes are stripped first to neutralise browser quirks where
+    ``\\`` is treated like ``/`` (which could smuggle a netloc).  The
+    URL is then parsed and accepted only when both ``scheme`` and
+    ``netloc`` are empty — i.e. it is a plain relative path.
+    """
+    if not target:
+        return False
+    cleaned = target.replace("\\", "")
+    parsed = urlparse(cleaned)
+    return not parsed.scheme and not parsed.netloc
 
 
 def _wikimedia_api_get(url: str, params: dict[str, str], timeout: int = 10) -> dict[str, Any]:
@@ -3849,6 +3871,8 @@ def commons_thumb_route(file_title: str):
     """
     width = request.args.get("width", 330, type=int)
     thumb_url = commons_thumb_url(file_title, width)
+    if not thumb_url.startswith("https://upload.wikimedia.org/"):
+        abort(400)
     return redirect(thumb_url)
 
 
@@ -3916,4 +3940,5 @@ def create_app() -> Flask:
 
 
 if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+    debug = os.environ.get("FLASK_DEBUG", "").lower() in {"1", "true", "yes"}
+    app.run(debug=debug, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
