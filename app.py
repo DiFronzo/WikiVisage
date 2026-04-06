@@ -72,6 +72,7 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", secrets.token_hex(32))
+app.debug = os.environ.get("FLASK_DEBUG", "").lower() in {"1", "true", "yes"}
 
 # Trust reverse-proxy headers (Toolforge nginx → gunicorn).
 # x_for=1, x_proto=1, x_host=1 so Flask sees the real client IP,
@@ -3940,5 +3941,4 @@ def create_app() -> Flask:
 
 
 if __name__ == "__main__":
-    debug = os.environ.get("FLASK_DEBUG", "").lower() in {"1", "true", "yes"}
-    app.run(debug=debug, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+    app.run(debug=app.debug, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
