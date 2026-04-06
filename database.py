@@ -442,7 +442,7 @@ def init_db(pool_size: int | None = None) -> None:
 
     # Get and validate configuration
     _db_config = _get_db_config()
-    db_name = os.environ.get("WIKIVISAGE_DB_NAME", "unknown")
+    db_name = _db_config["database"]
 
     # Create the pool
     _pool = Queue(maxsize=_pool_size)
