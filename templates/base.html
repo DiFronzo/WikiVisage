@@ -505,7 +505,7 @@
                     <a href="{{ url_for('login') }}" class="btn btn-primary btn-sm">{{ _('Log in') }}</a>
                 {% endif %}
                 <span class="nav-separator"></span>
-                <select class="lang-select" onchange="var v=this.value;if(/^[a-z]{2,3}$/.test(v)){var u='/set-language/'+encodeURIComponent(v);if(localStorage.getItem('cookie_consent')!=='accepted')u+='?nocookie=1';window.location.href=u}" aria-label="{{ _('Language') }}">
+                <select class="lang-select" onchange="var v=this.value;if(/^[a-z]{2,3}$/.test(v)){var u='/set-language/'+v;if(localStorage.getItem('cookie_consent')!=='accepted')u+='?nocookie=1';window.location.href=u}" aria-label="{{ _('Language') }}">
                     {% for code, name in languages.items() %}
                     <option value="{{ code }}" {% if current_locale == code %}selected{% endif %}>🌐 {{ name }}</option>
                     {% endfor %}
