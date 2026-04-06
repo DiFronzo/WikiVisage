@@ -161,6 +161,8 @@ def set_language(lang: str):
         if parsed.netloc:
             if parsed.netloc == urlparse(request.host_url).netloc:
                 referrer = parsed.path or "/"
+                if parsed.query:
+                    referrer = f"{referrer}?{parsed.query}"
             else:
                 referrer = ""
     if not referrer or not _is_safe_redirect_target(referrer):
