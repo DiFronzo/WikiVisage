@@ -8564,7 +8564,7 @@ def test_main_guard_runs_app(monkeypatch):
 
     app_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "app.py"))
 
-    with patch.dict(os.environ, {"PORT": "8765"}, clear=False):
+    with patch.dict(os.environ, {"PORT": "8765", "FLASK_DEBUG": "1"}, clear=False):
         with patch("database.init_db"):
             with patch("flask.app.Flask.run") as run_mock:
                 runpy.run_path(app_path, run_name="__main__")

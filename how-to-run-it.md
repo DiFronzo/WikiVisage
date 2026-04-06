@@ -125,7 +125,7 @@ toolforge jobs logs migrate
 
 ---
 
-## 7. Start the Web Service
+## 6. Start the Web Service
 
 ```bash
 toolforge webservice buildservice start --mount none
@@ -137,7 +137,7 @@ Your app will be live at: **https://wikivisage.toolforge.org**
 
 ---
 
-## 8. Start the Background Workers
+## 7. Start the Background Workers
 
 WikiVisage uses 2 concurrent worker instances for distributed processing. Workers claim projects via `SELECT … FOR UPDATE` with automatic stale-claim expiry (15 min).
 
@@ -173,7 +173,7 @@ toolforge jobs logs ml-worker-2
 
 ---
 
-## 9. Verify Everything
+## 8. Verify Everything
 
 1. **Health check**: Visit `https://wikivisage.toolforge.org/health` — should return `{"status": "healthy", "database": "connected"}`
 2. **Login**: Click "Log in with Wikimedia" — should redirect to Meta for OAuth, then back to the dashboard

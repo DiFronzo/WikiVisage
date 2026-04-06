@@ -108,10 +108,11 @@
         background: var(--success);
     }
     .classify-header {
-        display: flex;
+        display: grid;
+        grid-template-columns: 1fr auto;
         align-items: center;
-        justify-content: space-between;
-        flex-wrap: wrap;
+        gap: 0 0.5rem;
+        width: 100%;
         margin-top: 0.75rem;
         margin-bottom: 0.75rem;
     }
@@ -120,9 +121,13 @@
         margin: 0;
         line-height: 1.2;
         white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        min-width: 0;
     }
-    .classify-header .badge { font-size: 0.75rem; padding: 0.25rem 0.5rem; }
+    .classify-header .badge { font-size: 0.75rem; padding: 0.25rem 0.5rem; white-space: nowrap; }
     .classify-header .face-info {
+        grid-column: 1 / -1;
         font-family: monospace;
         color: var(--text-muted);
         font-size: 0.75rem;
@@ -130,15 +135,13 @@
         background: var(--surface);
         border: 1px solid var(--border);
         margin: 0;
+        margin-top: 0.4rem;
         white-space: nowrap;
         overflow: hidden;
         text-overflow: ellipsis;
-        flex-basis: 100%;
-        max-width: 100%;
         min-width: 0;
         box-sizing: border-box;
         text-align: center;
-        margin-top: 0.4rem;
     }
     .classify-header .face-info a { color: inherit; text-decoration: none; }
     .classify-hint {
@@ -360,8 +363,8 @@
         nav:not(:has(+ .system-banner)) { margin-bottom: 0.5rem !important; }
         
         .classify-header { margin-top: 0.5rem; margin-bottom: 0.25rem; padding: 0 0.5rem; }
-        .classify-header h1 { font-size: 0.95rem; white-space: normal; min-width: 0; }
-        .classify-header .face-info { margin-top: 0.25rem; white-space: normal; word-break: break-all; font-size: 0.7rem; }
+        .classify-header h1 { font-size: 0.95rem; min-width: 0; }
+        .classify-header .face-info { margin-top: 0.25rem; font-size: 0.7rem; }
         
         .classification-container { display: flex; flex-direction: column; width: 100%; }
         

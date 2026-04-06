@@ -58,7 +58,6 @@ The following are **out of scope**:
 - OAuth 2.0 with Wikimedia (access + refresh tokens, stored as VARBINARY in DB)
 - Token encryption at rest: OAuth tokens can be Fernet-encrypted via `WIKIVISAGE_TOKEN_KEY` env var (AES-128-CBC + HMAC-SHA256). Opt-in; legacy plaintext tokens are handled gracefully.
 - CSRF tokens on all POST routes
-- Whitelist enforcement on every request
 - Open redirect protection on login
 - Parameterized SQL queries (no string interpolation of values)
 - Rate limiting on sensitive endpoints (shared via Redis across gunicorn workers, falls back to in-memory)

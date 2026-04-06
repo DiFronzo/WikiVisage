@@ -929,7 +929,7 @@ msgid "All Time"
 msgstr ""
 
 #: templates/leaderboard.html:158
-msgid "Month"
+msgid "Monthly"
 msgstr ""
 
 #: templates/leaderboard.html:159

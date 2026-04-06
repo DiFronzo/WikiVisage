@@ -1005,8 +1005,8 @@ msgid "All Time"
 msgstr "Tout le temps"
 
 #: templates/leaderboard.html:158
-msgid "Month"
-msgstr "Mois"
+msgid "Monthly"
+msgstr "Mensuel"
 
 #: templates/leaderboard.html:159
 msgid "Daily"

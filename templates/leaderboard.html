@@ -155,7 +155,7 @@
 
 <div class="filter-bar">
     <a href="{{ url_for('leaderboard', period='all') }}" class="{{ 'active' if period == 'all' else '' }}">{{ _('All Time') }}</a>
-    <a href="{{ url_for('leaderboard', period='month') }}" class="{{ 'active' if period == 'month' else '' }}">{{ _('Month') }}</a>
+    <a href="{{ url_for('leaderboard', period='month') }}" class="{{ 'active' if period == 'month' else '' }}">{{ _('Monthly') }}</a>
     <a href="{{ url_for('leaderboard', period='daily') }}" class="{{ 'active' if period == 'daily' else '' }}">{{ _('Daily') }}</a>
 </div>
 
