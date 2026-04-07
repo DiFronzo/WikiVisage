@@ -8,12 +8,14 @@ Active-learning Flask app for Wikimedia Commons. Users classify faces via yes/no
 
 ```
 WikiVisage/
-├── app.py              # Flask web app: OAuth, routes, classification API (~3870 lines)
-├── worker.py           # Background ML pipeline: crawl, detect, infer (~2930 lines)
+├── app.py              # Flask web app: OAuth, routes, classification API (~3950 lines)
+├── worker.py           # Background ML pipeline: crawl, detect, infer (~3060 lines)
+├── config.py           # Shared config constants: WAKE_FILE_PATH, HEARTBEAT_FILE_DIR (~13 lines)
 ├── token_crypto.py     # Fernet encrypt/decrypt helpers for OAuth tokens at rest (~110 lines)
 ├── database.py         # MariaDB connection pool with retry logic (~510 lines)
+├── healthcheck.sh      # Toolforge liveness health check script (per-worker heartbeat file age check)
 ├── schema.sql          # DDL for 9 tables: users, sessions, projects, images, faces, user_stats, sdc_claims, project_members, worker_heartbeat
-├── migrate.py          # Idempotent schema migration with --reset flag (~430 lines)
+├── migrate.py          # Idempotent schema migration with --reset flag (~490 lines)
 ├── pyproject.toml      # Project config: Ruff linter/formatter rules, pytest config, markers
 ├── requirements.txt    # Python 3.11+, dlib-bin fork (no source compilation)
 ├── requirements-dev.txt # Dev/test deps: pytest, pytest-cov, ruff (includes requirements.txt)
@@ -25,14 +27,14 @@ WikiVisage/
 │   ├── nb/LC_MESSAGES/ # Norwegian Bokmål
 │   ├── es/LC_MESSAGES/ # Spanish
 │   └── fr/LC_MESSAGES/ # French
-├── tests/              # Hybrid test suite: 544 unit + 34 integration tests
+├── tests/              # Hybrid test suite: 565 unit + 34 integration tests
 │   ├── __init__.py
 │   ├── conftest.py     # Integration fixture infrastructure (~450 lines)
-│   ├── test_app.py     # 453 unit + 11 integration tests (~9640 lines)
+│   ├── test_app.py     # 461 unit + 11 integration tests (~10180 lines)
 │   ├── test_database.py # 14 unit + 9 integration tests (~360 lines)
 │   ├── test_migrate.py # 15 unit + 8 integration tests (~471 lines)
 │   ├── test_token_crypto.py # 22 unit tests (~175 lines)
-│   └── test_worker.py  # 40 unit + 6 integration tests (~1240 lines)
+│   └── test_worker.py  # 47 unit + 6 integration tests (~1700 lines)
 ├── templates/          # Jinja2 templates (10 files, all extend base.html)
 │   ├── base.html       # Layout: nav, flash messages, CSS variables. Blocks: title, extra_head, content
 │   ├── classify.html   # Active learning UI: face image, yes/no/skip/none buttons, keyboard shortcuts, undo
@@ -47,10 +49,10 @@ WikiVisage/
 ├── .github/
 │   └── workflows/
 │       ├── ci.yml      # CI: Ruff lint + pytest on Python 3.11/3.13 (integration tests skipped)
-│       └── deploy.yml  # CD: Release-triggered Toolforge deploy via SSH
+│       └── deploy.yml  # CD: Release-triggered Toolforge deploy via SSH (2 workers + health checks)
 ├── Procfile            # web: gunicorn (4 workers, app factory), worker: python -u worker.py
 ├── project.toml        # System deps via heroku/deb-packages: libopenblas0, liblapack3 (dlib runtime)
-├── jobs.yaml           # Toolforge jobs definition (ml-worker continuous job)
+├── jobs.yaml           # Toolforge jobs definition (2 ml-worker instances, health check scripts)
 ├── how-to-run-it.md    # Toolforge deployment guide
 ├── test-local.md       # Local development setup guide
 ├── LICENSE             # MIT license
@@ -69,7 +71,7 @@ Flask app served by gunicorn via app factory (`create_app()`). Handles OAuth 2.0
 - Rate limiting via Flask-Limiter (global 200/hour default, 10/min on bbox endpoints)
 - Security headers: `X-Content-Type-Options`, `X-Frame-Options`, `X-XSS-Protection`
 
-**Routes (36 total):**
+**Routes (37 total):**
 | Route | Method | Purpose |
 |-------|--------|---------|
 | `/` | GET | Landing page |
@@ -96,6 +98,7 @@ Flask app served by gunicorn via app factory (`create_app()`). Handles OAuth 2.0
 | `/project/<id>/settings` | GET/POST | Edit project params, view member list (owner-only) |
 | `/project/<id>/settings/remove-member` | POST | Remove a member from the project (owner-only, CSRF protected) |
 | `/project/<id>/settings/unban-member` | POST | Unban a member so they can rejoin the project (owner-only) |
+| `/project/<id>/leave` | POST | Leave a project (non-owner members only, CSRF protected) |
 | `/project/<id>/invite-code` | POST | Generate or revoke invite code for the project (owner-only) |
 | `/join` | POST | Join a project via invite code |
 | `/project/<id>/rerun-inference` | POST | Reset model-classified faces to re-run inference with current settings (owner-only) |
@@ -109,7 +112,7 @@ Flask app served by gunicorn via app factory (`create_app()`). Handles OAuth 2.0
 | `/sitemap.xml` | GET | XML sitemap for search engines |
 | `/commons-thumb/<path>` | GET | Redirect to Commons thumbnail URL (standard step sizes enforced) |
 
-**Error handlers:** 400, 403, 404, 500 — all render `error.html`.
+**Error handlers:** 400, 403, 404, 429, 500 — all render `error.html` (429 returns "Rate limit exceeded").
 
 **Access control helpers (membership-aware):**
 - `get_project_for_actor(project_id, user_id)` — Fetches a project if the user is the owner OR a member via `project_members`. Used by `project_detail`, `classify`, `api_sdc_status`, `api_gallery`, `api_progress`. Returns project dict or `None` (→ 404).
@@ -127,6 +130,10 @@ Flask app served by gunicorn via app factory (`create_app()`). Handles OAuth 2.0
 Long-running background process with concurrent execution. Polls DB every 60s (`POLL_INTERVAL`). Uses `ThreadPoolExecutor` at two levels:
 - **Project-level**: Up to `MAX_CONCURRENT_PROJECTS` (default 3) projects processed simultaneously
 - **Image-level**: Within each project, up to `IMAGE_THREADS` (default 4) images downloaded and face-detected in parallel
+
+**Multi-instance**: Two worker instances (`ml-worker-1`, `ml-worker-2`) run in production. Each takes a `--worker-id` CLI argument used for per-worker heartbeat files and distributed project claiming via `SELECT ... FOR UPDATE`.
+
+**Liveness health check**: Each worker periodically touches `$HOME/.wikivisage-worker-alive-{worker_id}` (via `_touch_heartbeat_file()`). Toolforge runs `healthcheck.sh {worker_id}` every 10s; 3 consecutive failures (file missing or >5 min old) trigger automatic restart. The heartbeat directory is configured in `config.py` as `HEARTBEAT_FILE_DIR`.
 
 Two query paths:
 1. **Active projects** → full pipeline: `traverse_category` → `process_images` → `bootstrap_from_sparql` → `run_autonomous_inference`
@@ -275,13 +282,14 @@ worker_heartbeat (single-row: id=1, last_seen DATETIME)
 - Do NOT translate: worker log messages, health endpoint JSON values, technical terms (Wikidata, Q-ID, Commons, SDC, P180, OAuth, CSRF, WikiVisage, BETA).
 
 ### Security
-- Open redirect protection: `_is_safe_url()` validates all redirect targets.
+- Open redirect protection: `_is_safe_url()` validates all redirect targets. Additional `urlparse` guard in `set_language` rejects referrers with scheme/netloc/`//` prefix.
 - Rate limiting: Global 200/hour default. `10/min` on `api_manual_face` and `api_update_face_bbox`. Uses Redis for shared storage across gunicorn workers (`WIKIVISAGE_REDIS_URL`). Falls back to `memory://` if Redis is unreachable.
 - CSRF: All POST routes protected via Flask-Session tokens.
 - Bbox validation: All face bounding box inputs validated against `MAX_BBOX_PX` and `MIN_BBOX_AREA`.
 - Security headers set on all responses: `Content-Security-Policy`, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `X-XSS-Protection: 1; mode=block`.
 - Token encryption at rest: OAuth access/refresh tokens can be Fernet-encrypted in the DB via `WIKIVISAGE_TOKEN_KEY` env var (opt-in). Handled by `token_crypto.py`. Decryption gracefully falls back to plaintext for legacy tokens.
 - SDC writes include `maxlag=5` parameter for Wikimedia API compliance.
+- Commons thumbnail proxy: URL validated via `urlparse` (scheme must be `https`, netloc must be `upload.wikimedia.org`).
 
 ### Error handling
 - `app.py`: Custom error handlers for 400/403/404/500 render `error.html`. Route handlers use try/except returning flash + redirect.
@@ -352,6 +360,9 @@ Worker uses `signal.SIGTERM`/`SIGINT` handlers setting `shutdown_requested = Tru
 ### Worker heartbeat & downtime banner
 The worker writes `REPLACE INTO worker_heartbeat (id, last_seen) VALUES (1, NOW())` at the start of each poll cycle. The web app checks `last_seen < NOW() - INTERVAL 5 MINUTE` via a context processor (`inject_worker_status`). If stale, `base.html` displays an amber banner: "The background worker appears to be offline." The banner is hidden on the landing page and leaderboard (not relevant there). Graceful on fresh installs — returns `worker_down=False` if no heartbeat row exists.
 
+### Toolforge health check (file-based liveness)
+Separate from the DB heartbeat above, each worker also writes a per-worker file at `$HOME/.wikivisage-worker-alive-{worker_id}` via `_touch_heartbeat_file()`. The `healthcheck.sh` script accepts a worker ID as `$1`, checks the file exists and was modified within 5 minutes (`find -mmin +5`). Toolforge's `--health-check-script` runs this every 10s; 3 consecutive failures trigger automatic pod restart. Per-worker files are critical because `$HOME` is shared NFS on Toolforge — a single file would be kept fresh by any surviving worker, hiding a dead one.
+
 ### Image download limits
 Both `app.py` and `worker.py` enforce a 50MB download size cap (`MAX_IMAGE_DOWNLOAD_BYTES`) via streaming download with early abort. The worker additionally validates image pixel dimensions before face detection (`MAX_IMAGE_PIXELS = 100M pixels`).
 
@@ -379,7 +390,7 @@ Each face encoding is 1024 bytes (128 float64). Even 10K faces ~ 10MB. No RAM co
 
 ## Testing
 
-Hybrid test suite: **544 unit tests** (run in CI) + **34 integration tests** (require local Docker MariaDB).
+Hybrid test suite: **565 unit tests** (run in CI) + **34 integration tests** (require local Docker MariaDB).
 
 ### Architecture
 
@@ -392,12 +403,12 @@ Hybrid test suite: **544 unit tests** (run in CI) + **34 integration tests** (re
 
 | File | Unit | Integration | Total |
 |------|------|-------------|-------|
-| `test_app.py` | 453 | 11 | 464 |
+| `test_app.py` | 461 | 11 | 472 |
 | `test_database.py` | 14 | 9 | 23 |
 | `test_migrate.py` | 15 | 8 | 23 |
 | `test_token_crypto.py` | 22 | 0 | 22 |
-| `test_worker.py` | 40 | 6 | 46 |
-| **Total** | **544** | **34** | **578** |
+| `test_worker.py` | 47 | 6 | 53 |
+| **Total** | **565** | **34** | **599** |
 
 ### Commands
 
@@ -453,18 +464,27 @@ Concurrency: `ci-${{ github.ref }}` with cancel-in-progress.
 
 ### CD (`.github/workflows/deploy.yml`)
 
-Triggered on GitHub release publish or manual `workflow_dispatch` (with a `tag` input). Steps:
+Triggered on GitHub release publish or manual `workflow_dispatch`. Inputs:
+- `tag` (required): Git tag to deploy (e.g. `v0.7.6`).
+- `db-reset` (optional): Choice `true`/`false` (default `false`). Runs `migrate.py --reset` to wipe and recreate all tables.
+- `db-reset-confirm` (optional): Must type `WIPE` to confirm when `db-reset` is `true`. Deploy fails without confirmation.
+
+Steps:
 1. Checkout repo + configure SSH to Toolforge bastion.
 2. Generate a deploy script locally, `scp` it to the bastion.
-3. Execute via `become wikivisage bash /tmp/deploy.sh '<tag>'`.
+3. Execute via `become wikivisage bash /tmp/deploy.sh '<tag>' '<db-reset>' '<actor>'`.
 4. Deploy script stages:
    - `toolforge build start --ref "$TAG"` — rebuild container image from the given git ref.
    - Poll `toolforge build show --json | jq -r '.build.status // empty'` every 15s (up to 600s timeout). Expects `ok`; fails on `error`/`timeout`/`cancelled`.
-   - `toolforge jobs run migrate` — run schema migration (`python migrate.py`).
-   - `toolforge jobs delete ml-worker` + `toolforge jobs run ml-worker` — restart background worker (delete+run because `jobs load` does NOT restart if the definition is unchanged).
+   - Delete both workers: `toolforge jobs delete ml-worker` + `toolforge jobs delete ml-worker-2`.
+   - `toolforge jobs run migrate` — run schema migration (`python migrate.py`, with `--reset` if `db-reset=true`).
+   - Start 2 worker instances with health checks:
+     - `toolforge jobs run ml-worker --command 'python -u worker.py --worker-id ml-worker-1' --continuous --mem 3Gi --cpu 2 --health-check-script './healthcheck.sh ml-worker-1'`
+     - `toolforge jobs run ml-worker-2 --command 'python -u worker.py --worker-id ml-worker-2' --continuous --mem 3Gi --cpu 2 --health-check-script './healthcheck.sh ml-worker-2'`
    - `toolforge webservice buildservice restart` — restart web.
+   - `dologmsg` — log deployment to Toolforge SAL.
 
-Concurrency: `deploy-production` with cancel-in-progress.
+Concurrency: `deploy-production` with `cancel-in-progress: false`.
 
 ## Internationalization (i18n)
 
@@ -550,7 +570,7 @@ The English `.po` file uses identity translations (`msgstr` = `msgid`). This ens
 ```bash
 # Local development
 python app.py                    # Web app on http://localhost:8000
-python worker.py                 # Background worker (separate terminal)
+python worker.py --worker-id local-1  # Background worker (separate terminal)
 python migrate.py                # Run schema migrations (idempotent)
 python migrate.py --reset        # Drop all tables and recreate from scratch
 
@@ -570,8 +590,7 @@ pybabel extract -F babel.cfg -o messages.pot .    # Extract strings
 pybabel update -i messages.pot -d translations    # Update .po files
 pybabel compile -d translations                   # Compile .mo files
 
-# Toolforge deployment
+# Toolforge deployment (manual — normally done via .github/workflows/deploy.yml)
 toolforge build start https://github.com/DiFronzo/WikiVisage.git
 toolforge webservice buildservice start
-toolforge jobs load jobs.yaml                                 # Start/update background worker from jobs.yaml
 ```
