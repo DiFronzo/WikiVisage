@@ -374,7 +374,7 @@
                             {% if project.user_id == current_user_id %}
                             <a href="{{ url_for('project_settings', project_id=project.id) }}" class="btn btn-sm" style="margin: 0 0.5rem 0.5rem 0;">{{ _('Settings') }}</a>
                             {% else %}
-                            <form method="POST" action="{{ url_for('project_leave', project_id=project.id) }}" style="display: inline; margin: 0;" onsubmit="return confirm('{{ _('Leave this project?') }}')">
+                            <form method="POST" action="{{ url_for('project_leave', project_id=project.id) }}" style="display: inline; margin: 0;" onsubmit="return confirm({{ _('Leave this project?')|tojson }})">
                                 <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                                 <button type="submit" class="btn btn-sm btn-danger">{{ _('Leave Project') }}</button>
                             </form>
