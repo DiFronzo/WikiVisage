@@ -21,6 +21,7 @@ with patch("database.init_db"):
         _refresh_claims,
         _release_all_claims,
         _release_project,
+        _touch_heartbeat_file,
         bootstrap_from_sparql,
         process_images,
         process_project,
@@ -1660,3 +1661,43 @@ def test_process_project_no_auto_complete_faces_at_min_confirmed():
     # faces >= min_confirmed → no auto-complete
     assert len(auto_complete_calls) == 0
     mock_inference.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# _touch_heartbeat_file
+# ---------------------------------------------------------------------------
+
+
+def test_touch_heartbeat_file_creates_file(tmp_path):
+    """_touch_heartbeat_file creates the heartbeat file with a timestamp."""
+    with patch("worker.HEARTBEAT_FILE_DIR", str(tmp_path)), patch("worker._worker_id", "test-worker"):
+        _touch_heartbeat_file()
+    hb_file = tmp_path / ".wikivisage-worker-alive-test-worker"
+    assert hb_file.exists()
+    float(hb_file.read_text())
+
+
+def test_touch_heartbeat_file_updates_mtime(tmp_path):
+    """Calling _touch_heartbeat_file twice overwrites the file content."""
+    with patch("worker.HEARTBEAT_FILE_DIR", str(tmp_path)), patch("worker._worker_id", "test-worker"):
+        _touch_heartbeat_file()
+        first_content = (tmp_path / ".wikivisage-worker-alive-test-worker").read_text()
+        _touch_heartbeat_file()
+        second_content = (tmp_path / ".wikivisage-worker-alive-test-worker").read_text()
+    assert float(second_content) >= float(first_content)
+
+
+def test_touch_heartbeat_file_swallows_oserror():
+    """_touch_heartbeat_file silently handles OSError (e.g. read-only path)."""
+    with patch("worker.HEARTBEAT_FILE_DIR", "/nonexistent/dir"), patch("worker._worker_id", "test-worker"):
+        _touch_heartbeat_file()
+
+
+def test_touch_heartbeat_file_uses_worker_id(tmp_path):
+    """Each worker writes to a unique file based on _worker_id."""
+    with patch("worker.HEARTBEAT_FILE_DIR", str(tmp_path)), patch("worker._worker_id", "ml-worker-1"):
+        _touch_heartbeat_file()
+    with patch("worker.HEARTBEAT_FILE_DIR", str(tmp_path)), patch("worker._worker_id", "ml-worker-2"):
+        _touch_heartbeat_file()
+    assert (tmp_path / ".wikivisage-worker-alive-ml-worker-1").exists()
+    assert (tmp_path / ".wikivisage-worker-alive-ml-worker-2").exists()

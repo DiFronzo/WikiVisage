@@ -167,6 +167,10 @@ def set_language(lang: str):
                 referrer = ""
     if not referrer or not _is_safe_redirect_target(referrer):
         referrer = url_for("index")
+    # Guard: only redirect to relative paths (no scheme, no netloc, no //)
+    parsed_ref = urlparse(referrer)
+    if parsed_ref.scheme or parsed_ref.netloc or referrer.startswith("//"):
+        referrer = url_for("index")
     resp = redirect(referrer)
     if not request.args.get("nocookie"):
         resp.set_cookie("locale", lang, max_age=60 * 60 * 24 * 365, httponly=True, samesite="Lax")
@@ -3874,7 +3878,8 @@ def commons_thumb_route(file_title: str):
     """
     width = request.args.get("width", 330, type=int)
     thumb_url = commons_thumb_url(file_title, width)
-    if not thumb_url.startswith("https://upload.wikimedia.org/"):
+    parsed = urlparse(thumb_url)
+    if parsed.scheme != "https" or parsed.netloc != "upload.wikimedia.org":
         abort(400)
     return redirect(thumb_url)
 

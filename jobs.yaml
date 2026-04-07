@@ -13,10 +13,11 @@
   image: tool-wikivisage/tool-wikivisage:latest
   continuous: true
   mem: 3Gi
+  health-check-script: ./healthcheck.sh ml-worker-1
 
 - name: ml-worker-2
   command: python -u worker.py --worker-id ml-worker-2
   image: tool-wikivisage/tool-wikivisage:latest
   continuous: true
   mem: 3Gi
-
+  health-check-script: ./healthcheck.sh ml-worker-2

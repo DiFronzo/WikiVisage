@@ -36,7 +36,7 @@ from PIL import Image
 from requests.adapters import HTTPAdapter
 from requests.packages.urllib3.util.retry import Retry
 
-from config import WAKE_FILE_PATH
+from config import HEARTBEAT_FILE_DIR, WAKE_FILE_PATH
 from database import DatabaseError, close_pool, execute_query, execute_transaction, init_db
 from token_crypto import TokenDecryptionError, decrypt_token, encrypt_token
 
@@ -112,6 +112,16 @@ shutdown_requested = False
 
 # Unique identifier for this worker instance (set in main())
 _worker_id: str = ""
+
+
+def _touch_heartbeat_file() -> None:
+    """Touch a per-worker heartbeat file so the Toolforge health-check-script can verify liveness."""
+    try:
+        path = os.path.join(HEARTBEAT_FILE_DIR, f".wikivisage-worker-alive-{_worker_id}")
+        with open(path, "w") as f:
+            f.write(str(time.time()))
+    except OSError:
+        pass
 
 
 def _create_session() -> requests.Session:
@@ -2819,6 +2829,7 @@ def main():
                     "REPLACE INTO worker_heartbeat (id, last_seen) VALUES (1, NOW())",
                     fetch=False,
                 )
+                _touch_heartbeat_file()
 
                 # ---- Purge soft-deleted projects FIRST (quick, unblocks re-creation) ----
                 try:
@@ -2895,6 +2906,7 @@ def main():
                                         "REPLACE INTO worker_heartbeat (id, last_seen) VALUES (1, NOW())",
                                         fetch=False,
                                     )
+                                    _touch_heartbeat_file()
                                 except Exception:
                                     pass
                                 _refresh_claims()
@@ -2970,6 +2982,7 @@ def main():
                                         "REPLACE INTO worker_heartbeat (id, last_seen) VALUES (1, NOW())",
                                         fetch=False,
                                     )
+                                    _touch_heartbeat_file()
                                 except Exception:
                                     pass
                                 _refresh_claims()
