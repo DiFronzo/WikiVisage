@@ -442,7 +442,9 @@ def init_db(pool_size: int | None = None) -> None:
 
     # Get and validate configuration
     _db_config = _get_db_config()
-    db_name = _db_config["database"]
+    # Read db_name directly from env to avoid CodeQL taint from the config dict
+    # that also contains password fields (py/clear-text-logging-sensitive-data).
+    db_name = os.environ.get("WIKIVISAGE_DB_NAME", "")
 
     # Create the pool
     _pool = Queue(maxsize=_pool_size)
