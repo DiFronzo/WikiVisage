@@ -63,12 +63,14 @@
         padding-top: 1.5rem;
         opacity: 0;
         transform: translateY(-10px);
-        transition: opacity 0.2s ease, transform 0.2s ease;
+        transition: opacity 0.2s ease, transform 0.2s ease, visibility 0s 0.2s;
+        visibility: hidden;
     }
     .join-drawer.open .join-drawer-inner {
         opacity: 1;
         transform: translateY(0);
-        transition: opacity 0.3s ease 0.1s, transform 0.3s cubic-bezier(0.4, 0, 0.2, 1) 0.1s;
+        visibility: visible;
+        transition: opacity 0.3s ease 0.1s, transform 0.3s cubic-bezier(0.4, 0, 0.2, 1) 0.1s, visibility 0s;
     }
 
     .join-strip {
@@ -367,12 +369,15 @@
                         </p>
                         {% endif %}
                         
-                        <div style="display: flex; gap: 0.5rem; flex-wrap: wrap;">
-                            <a href="{{ url_for('classify', project_id=project.id) }}" class="btn btn-primary btn-sm">{{ _('Classify') }}</a>
+                        <div>
+                            <a href="{{ url_for('classify', project_id=project.id) }}" class="btn btn-primary btn-sm" style="margin: 0 0.5rem 0.5rem 0;">{{ _('Classify') }}</a>
                             {% if project.user_id == current_user_id %}
-                            <a href="{{ url_for('project_settings', project_id=project.id) }}" class="btn btn-sm">{{ _('Settings') }}</a>
+                            <a href="{{ url_for('project_settings', project_id=project.id) }}" class="btn btn-sm" style="margin: 0 0.5rem 0.5rem 0;">{{ _('Settings') }}</a>
                             {% else %}
-                            <span class="btn btn-sm" style="opacity: 0.4; cursor: not-allowed; pointer-events: none;">{{ _('Settings') }}</span>
+                            <form method="POST" action="{{ url_for('project_leave', project_id=project.id) }}" style="display: inline; margin: 0;" onsubmit="return confirm({{ _('Leave this project?')|tojson }})">
+                                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                <button type="submit" class="btn btn-sm btn-danger">{{ _('Leave Project') }}</button>
+                            </form>
                             {% endif %}
                         </div>
                     </div>
