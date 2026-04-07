@@ -505,7 +505,7 @@
                     <a href="{{ url_for('login') }}" class="btn btn-primary btn-sm">{{ _('Log in') }}</a>
                 {% endif %}
                 <span class="nav-separator"></span>
-                <select class="lang-select" onchange="var v=this.value;if(/^[a-z]{2,3}$/.test(v)){var u='/set-language/'+v;if(localStorage.getItem('cookie_consent')!=='accepted')u+='?nocookie=1';window.location.href=u}" aria-label="{{ _('Language') }}">
+                <select class="lang-select" onchange="handleLanguageChange(this)" aria-label="{{ _('Language') }}">
                     {% for code, name in languages.items() %}
                     <option value="{{ code }}" {% if current_locale == code %}selected{% endif %}>🌐 {{ name }}</option>
                     {% endfor %}
@@ -513,6 +513,20 @@
             </div>
         </div>
     </nav>
+
+    <script>
+        function handleLanguageChange(selectEl) {
+            var v = selectEl && selectEl.value;
+            if (!v || !/^[a-z]{2,3}$/.test(v)) {
+                return;
+            }
+            var u = '/set-language/' + v;
+            if (localStorage.getItem('cookie_consent') !== 'accepted') {
+                u += '?nocookie=1';
+            }
+            window.location.href = u;
+        }
+    </script>
 
     {% if worker_down and request.endpoint not in ('index', 'leaderboard', 'account_settings') %}
     <div class="system-banner"><span>⚠ {{ _('The background worker appears to be offline. Image processing and face detection are paused.') }}</span><button class="banner-close" onclick="this.parentElement.remove()" aria-label="{{ _('Close') }}">&times;</button></div>
