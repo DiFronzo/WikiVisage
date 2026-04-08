@@ -512,21 +512,20 @@
                 </select>
             </div>
         </div>
+        <script>
+            function handleLanguageChange(selectEl) {
+                var v = selectEl && selectEl.value;
+                if (!v || !/^[a-z]{2,3}$/.test(v)) {
+                    return;
+                }
+                var u = '/set-language/' + v;
+                if (localStorage.getItem('cookie_consent') !== 'accepted') {
+                    u += '?nocookie=1';
+                }
+                window.location.href = u;
+            }
+        </script>
     </nav>
-
-    <script>
-        function handleLanguageChange(selectEl) {
-            var v = selectEl && selectEl.value;
-            if (!v || !/^[a-z]{2,3}$/.test(v)) {
-                return;
-            }
-            var u = '/set-language/' + v;
-            if (localStorage.getItem('cookie_consent') !== 'accepted') {
-                u += '?nocookie=1';
-            }
-            window.location.href = u;
-        }
-    </script>
 
     {% if worker_down and request.endpoint not in ('index', 'leaderboard', 'account_settings') %}
     <div class="system-banner"><span>⚠ {{ _('The background worker appears to be offline. Image processing and face detection are paused.') }}</span><button class="banner-close" onclick="this.parentElement.remove()" aria-label="{{ _('Close') }}">&times;</button></div>
