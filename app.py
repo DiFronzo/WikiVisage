@@ -25,7 +25,7 @@ import time
 from datetime import UTC, datetime, timedelta
 from functools import wraps
 from typing import Any
-from urllib.parse import quote, urljoin, urlparse
+from urllib.parse import quote, urljoin, urlparse, urlunparse
 from xml.sax.saxutils import escape as xml_escape
 
 from dotenv import load_dotenv
@@ -3881,7 +3881,9 @@ def commons_thumb_route(file_title: str):
     parsed = urlparse(thumb_url)
     if parsed.scheme != "https" or parsed.netloc != "upload.wikimedia.org":
         abort(400)
-    return redirect(thumb_url)
+    # Reconstruct from validated components to break taint flow (CodeQL py/url-redirection)
+    safe_url = urlunparse(("https", "upload.wikimedia.org", parsed.path, "", "", ""))
+    return redirect(safe_url)
 
 
 # ---------------------------------------------------------------------------
