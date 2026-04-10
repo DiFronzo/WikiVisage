@@ -296,11 +296,11 @@ _ALLOWED_DOWNLOAD_HOSTS = frozenset({"commons.wikimedia.org", "upload.wikimedia.
 
 
 def _reject_private_ip(hostname: str) -> None:
-    """Raise ValueError if *hostname* resolves to a private/reserved IP (DNS rebinding defense)."""
+    """Raise ValueError if *hostname* resolves to a non-global IP (DNS rebinding defense)."""
     for info in socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM):
         addr = ipaddress.ip_address(info[4][0])
-        if addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved:
-            raise ValueError(f"Download host {hostname} resolved to private/reserved IP: {addr}")
+        if not addr.is_global:
+            raise ValueError(f"Download host {hostname} resolved to non-global IP: {addr}")
 
 
 def _download_image(url: str, max_bytes: int = MAX_IMAGE_DOWNLOAD_BYTES) -> bytes:
