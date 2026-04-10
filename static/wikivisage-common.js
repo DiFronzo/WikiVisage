@@ -35,8 +35,17 @@ function postForm(url, csrfToken, fields) {
         if (fields.hasOwnProperty(key)) formData.append(key, fields[key]);
     }
     return fetch(url, { method: 'POST', body: formData }).then(function(r) {
-        if (!r.ok) throw new Error('Network response was not ok');
-        return r.json();
+        return r.json().catch(function() {
+            return { error: 'Server error (HTTP ' + r.status + ')' };
+        }).then(function(data) {
+            if (!r.ok) {
+                var err = new Error(data.error || 'Network response was not ok');
+                err.data = data;
+                err.status = r.status;
+                throw err;
+            }
+            return data;
+        });
     });
 }
 

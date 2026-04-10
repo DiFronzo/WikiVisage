@@ -795,11 +795,12 @@ def test_csp_header_does_not_contain_nonce():
 
 
 class _FakeResponse:
-    def __init__(self, headers=None, chunks=None, error=None):
+    def __init__(self, headers=None, chunks=None, error=None, url="https://upload.wikimedia.org/file.jpg"):
         self.headers = headers or {}
         self._chunks = chunks or []
         self._error = error
         self.closed = False
+        self.url = url
 
     def raise_for_status(self):
         if self._error:
@@ -816,6 +817,7 @@ class _FakeResponse:
 def test_download_image_success(monkeypatch):
     resp = _FakeResponse(headers={"Content-Length": "6"}, chunks=[b"ab", b"cd", b"ef"])
     monkeypatch.setattr(app_module.requests, "get", lambda *_a, **_k: resp)
+    monkeypatch.setattr(app_module, "_reject_private_ip", lambda _h: None)
 
     data = app_module._download_image("https://upload.wikimedia.org/file.jpg", max_bytes=10)
     assert data == b"abcdef"
@@ -824,6 +826,7 @@ def test_download_image_success(monkeypatch):
 def test_download_image_content_length_too_large(monkeypatch):
     resp = _FakeResponse(headers={"Content-Length": "11"}, chunks=[b"abc"])
     monkeypatch.setattr(app_module.requests, "get", lambda *_a, **_k: resp)
+    monkeypatch.setattr(app_module, "_reject_private_ip", lambda _h: None)
 
     with pytest.raises(ValueError, match="Image too large"):
         app_module._download_image("https://upload.wikimedia.org/file.jpg", max_bytes=10)
@@ -833,6 +836,7 @@ def test_download_image_content_length_too_large(monkeypatch):
 def test_download_image_stream_exceeds_limit(monkeypatch):
     resp = _FakeResponse(headers={}, chunks=[b"12345", b"67890", b"x"])
     monkeypatch.setattr(app_module.requests, "get", lambda *_a, **_k: resp)
+    monkeypatch.setattr(app_module, "_reject_private_ip", lambda _h: None)
 
     with pytest.raises(ValueError, match="exceeded"):
         app_module._download_image("https://upload.wikimedia.org/file.jpg", max_bytes=10)
@@ -842,9 +846,71 @@ def test_download_image_stream_exceeds_limit(monkeypatch):
 def test_download_image_raises_http_error(monkeypatch):
     resp = _FakeResponse(error=requests.HTTPError("bad response"))
     monkeypatch.setattr(app_module.requests, "get", lambda *_a, **_k: resp)
+    monkeypatch.setattr(app_module, "_reject_private_ip", lambda _h: None)
 
     with pytest.raises(requests.HTTPError):
         app_module._download_image("https://upload.wikimedia.org/file.jpg")
+
+
+def test_download_image_blocks_untrusted_host():
+    with pytest.raises(ValueError, match="Blocked download from untrusted host"):
+        app_module._download_image("https://evil.example.com/file.jpg")
+
+
+def test_download_image_rejects_redirect_to_untrusted_host(monkeypatch):
+    resp = _FakeResponse(
+        headers={"Content-Length": "6"},
+        chunks=[b"ab", b"cd", b"ef"],
+        url="https://evil.example.com/redirected.jpg",
+    )
+    monkeypatch.setattr(app_module.requests, "get", lambda *_a, **_k: resp)
+    monkeypatch.setattr(app_module, "_reject_private_ip", lambda _h: None)
+
+    with pytest.raises(ValueError, match="Redirect to untrusted host"):
+        app_module._download_image("https://upload.wikimedia.org/file.jpg")
+    assert resp.closed is True
+
+
+def test_download_image_allows_redirect_to_trusted_host(monkeypatch):
+    resp = _FakeResponse(
+        headers={"Content-Length": "3"},
+        chunks=[b"abc"],
+        url="https://commons.wikimedia.org/redirected.jpg",
+    )
+    monkeypatch.setattr(app_module.requests, "get", lambda *_a, **_k: resp)
+    monkeypatch.setattr(app_module, "_reject_private_ip", lambda _h: None)
+
+    data = app_module._download_image("https://upload.wikimedia.org/file.jpg", max_bytes=10)
+    assert data == b"abc"
+
+
+def test_reject_private_ip_blocks_loopback(monkeypatch):
+    monkeypatch.setattr(
+        app_module.socket,
+        "getaddrinfo",
+        lambda *_a, **_k: [(2, 1, 6, "", ("127.0.0.1", 0))],
+    )
+    with pytest.raises(ValueError, match="private/reserved IP"):
+        app_module._reject_private_ip("upload.wikimedia.org")
+
+
+def test_reject_private_ip_blocks_rfc1918(monkeypatch):
+    monkeypatch.setattr(
+        app_module.socket,
+        "getaddrinfo",
+        lambda *_a, **_k: [(2, 1, 6, "", ("10.0.0.1", 0))],
+    )
+    with pytest.raises(ValueError, match="private/reserved IP"):
+        app_module._reject_private_ip("upload.wikimedia.org")
+
+
+def test_reject_private_ip_allows_public(monkeypatch):
+    monkeypatch.setattr(
+        app_module.socket,
+        "getaddrinfo",
+        lambda *_a, **_k: [(2, 1, 6, "", ("91.198.174.192", 0))],
+    )
+    app_module._reject_private_ip("upload.wikimedia.org")
 
 
 def test_login_required_redirects_unauthenticated(monkeypatch):
@@ -5789,6 +5855,7 @@ def test_api_reclassify_approve_from_model_face(monkeypatch):
         mock_conn = MagicMock()
         mock_cursor = MagicMock()
         mock_cursor.rowcount = 1
+        mock_cursor.fetchall.return_value = []
         return fn(mock_conn, mock_cursor)
 
     monkeypatch.setattr(app_module, "execute_transaction", _transaction)
@@ -5801,6 +5868,7 @@ def test_api_reclassify_approve_from_model_face(monkeypatch):
     assert payload["classified_by"] == "model"
     assert payload["sdc_removed"] is False
     assert payload["sdc_removal_queued"] is False
+    assert payload["updated_faces"] == []
 
 
 def test_api_reclassify_reject_bootstrap_no_sibling_sdc_removal_queued(monkeypatch):
@@ -5962,6 +6030,7 @@ def test_api_reclassify_same_user_reclick_noop_success(monkeypatch):
         mock_cursor = MagicMock()
         mock_cursor.rowcount = 0
         mock_cursor.fetchone.return_value = {"classified_by_user_id": 1}
+        mock_cursor.fetchall.return_value = []
         return fn(mock_conn, mock_cursor)
 
     monkeypatch.setattr(app_module, "execute_transaction", _transaction)
@@ -5980,6 +6049,7 @@ def test_api_reclassify_counter_increment_on_approve(monkeypatch):
         mock_conn = MagicMock()
         mock_cursor = MagicMock()
         mock_cursor.rowcount = 1
+        mock_cursor.fetchall.return_value = []
         result = fn(mock_conn, mock_cursor)
         captured["calls"] = mock_cursor.execute.call_args_list
         return result
@@ -9728,6 +9798,7 @@ def test_api_reclassify_approve_marks_sdc_written_when_p180_exists(monkeypatch):
         mock_conn = MagicMock()
         mock_cursor = MagicMock()
         mock_cursor.rowcount = 1
+        mock_cursor.fetchall.return_value = []
         return fn(mock_conn, mock_cursor)
 
     monkeypatch.setattr(app_module, "execute_transaction", _transaction)
@@ -9771,6 +9842,7 @@ def test_api_reclassify_approve_no_sdc_written_when_p180_missing(monkeypatch):
         mock_conn = MagicMock()
         mock_cursor = MagicMock()
         mock_cursor.rowcount = 1
+        mock_cursor.fetchall.return_value = []
         return fn(mock_conn, mock_cursor)
 
     monkeypatch.setattr(app_module, "execute_transaction", _transaction)
@@ -9816,6 +9888,7 @@ def test_api_reclassify_approve_skips_p180_check_when_already_sdc_written(monkey
         mock_conn = MagicMock()
         mock_cursor = MagicMock()
         mock_cursor.rowcount = 1
+        mock_cursor.fetchall.return_value = []
         return fn(mock_conn, mock_cursor)
 
     monkeypatch.setattr(app_module, "execute_transaction", _transaction)
@@ -10488,3 +10561,135 @@ def test_app_refresh_token_rowcount_zero_reads_fresh(monkeypatch):
     # When rowcount==0, fresh token from DB should be returned via the user dict
     assert result is not None
     assert result.get("access_token") == "fresh-token"
+
+
+# --- Gallery API filtered SDC pending tests ---
+
+
+def test_api_gallery_filtered_sdc_pending_with_source_filter(monkeypatch, fake_user):
+    call_log = []
+
+    def route_execute(sql, params, fetch):
+        call_log.append(sql)
+        if "FROM projects p LEFT JOIN project_members" in sql:
+            return [{"id": 1, "user_id": 1, "status": "active"}]
+        if "SELECT COUNT(*) AS cnt FROM faces" in sql:
+            return [{"cnt": 3}]
+        if "COUNT(*) AS total" in sql and "sdc_pending" not in sql:
+            return [{"cnt": 3}]
+        if "COUNT(*) AS total" in sql and "sdc_pending" in sql:
+            return [
+                {
+                    "total": 10,
+                    "matches": 6,
+                    "non_matches": 3,
+                    "rejected": 1,
+                    "source_model": 4,
+                    "source_bootstrap": 2,
+                    "source_human": 4,
+                    "sdc_pending": 5,
+                }
+            ]
+        if "sdc_pending" in sql and "COUNT(*) AS total" not in sql:
+            return [{"sdc_pending": 2}]
+        if "SELECT f.id" in sql:
+            return []
+        return [] if fetch else 0
+
+    flask_app.config["SERVER_NAME"] = "localhost"
+    try:
+        client = _make_authed_client(monkeypatch, fake_user, route_execute)
+        response = client.get("/api/project/1/gallery?page=1&source=model")
+        payload = response.get_json()
+    finally:
+        flask_app.config.pop("SERVER_NAME", None)
+
+    assert response.status_code == 200
+    assert "counts" in payload
+    assert payload["counts"]["sdc_pending"] == 5
+    assert payload["counts"]["filtered_sdc_pending"] == 2
+
+
+def test_api_gallery_filtered_sdc_pending_no_filter_equals_global(monkeypatch, fake_user):
+    def route_execute(sql, params, fetch):
+        if "FROM projects p LEFT JOIN project_members" in sql:
+            return [{"id": 1, "user_id": 1, "status": "active"}]
+        if "SELECT COUNT(*) AS cnt FROM faces" in sql:
+            return [{"cnt": 5}]
+        if "COUNT(*) AS total" in sql:
+            return [
+                {
+                    "total": 10,
+                    "matches": 6,
+                    "non_matches": 3,
+                    "rejected": 1,
+                    "source_model": 4,
+                    "source_bootstrap": 2,
+                    "source_human": 4,
+                    "sdc_pending": 5,
+                }
+            ]
+        if "SELECT f.id" in sql:
+            return []
+        return [] if fetch else 0
+
+    flask_app.config["SERVER_NAME"] = "localhost"
+    try:
+        client = _make_authed_client(monkeypatch, fake_user, route_execute)
+        response = client.get("/api/project/1/gallery?page=1")
+        payload = response.get_json()
+    finally:
+        flask_app.config.pop("SERVER_NAME", None)
+
+    assert response.status_code == 200
+    assert "counts" in payload
+    assert payload["counts"]["filtered_sdc_pending"] == payload["counts"]["sdc_pending"]
+
+
+def test_api_reclassify_approve_rejects_sibling_target_faces(monkeypatch):
+    face_row = _default_reclassify_face_row(old_is_target=0, classified_by="model")
+    flask_app.config["SERVER_NAME"] = "localhost"
+    try:
+        client, _ = _authed_client(monkeypatch, route_execute_query=_reclassify_query_router(face_row=face_row))
+
+        executed_sql = []
+
+        def _transaction(fn):
+            mock_conn = MagicMock()
+            mock_cursor = MagicMock()
+            mock_cursor.rowcount = 1
+            mock_cursor.fetchall.return_value = [{"id": 100, "sdc_written": 0}, {"id": 101, "sdc_written": 1}]
+
+            def capture_execute(sql, params=None):
+                executed_sql.append(sql)
+                mock_cursor.rowcount = 1
+
+            mock_cursor.execute = capture_execute
+            return fn(mock_conn, mock_cursor)
+
+        monkeypatch.setattr(app_module, "execute_transaction", _transaction)
+        resp = client.post("/api/reclassify", data={"csrf_token": "testtoken", "face_id": "1", "is_target": "1"})
+    finally:
+        flask_app.config.pop("SERVER_NAME", None)
+
+    assert resp.status_code == 200
+
+    payload = resp.get_json()
+    assert len(payload["updated_faces"]) == 2
+    assert {uf["face_id"] for uf in payload["updated_faces"]} == {100, 101}
+
+    # Verify sdc_removal_queued matches pre-demotion sdc_written state per sibling
+    sdc_by_face = {uf["face_id"]: uf["sdc_removal_queued"] for uf in payload["updated_faces"]}
+    assert sdc_by_face[100] is False, "Face 100 had sdc_written=0, should not queue removal"
+    assert sdc_by_face[101] is True, "Face 101 had sdc_written=1, should queue removal"
+
+    sibling_reject_sqls = [s for s in executed_sql if "is_target = 0" in s and "image_id" in s and "id !=" in s]
+    assert len(sibling_reject_sqls) > 0, "Expected UPDATE to reject sibling target faces"
+
+    # Verify sdc_written=0 and sdc_removal_pending CASE are in the demotion UPDATE
+    demotion_sql = sibling_reject_sqls[0]
+    assert "sdc_written = 0" in demotion_sql, "Expected sdc_written reset on demoted siblings"
+    assert "sdc_removal_pending" in demotion_sql, "Expected sdc_removal_pending handling on demoted siblings"
+
+    counter_decrement_sqls = [s for s in executed_sql if "GREATEST" in s]
+    assert len(counter_decrement_sqls) > 0, "Expected faces_confirmed decrement for rejected siblings"
