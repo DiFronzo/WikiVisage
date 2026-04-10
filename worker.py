@@ -238,14 +238,15 @@ def _download_image(url: str, max_bytes: int = MAX_IMAGE_DOWNLOAD_BYTES) -> byte
     if parsed_url.scheme != "https" or parsed_url.hostname not in _ALLOWED_DOWNLOAD_HOSTS:
         raise ValueError(f"Blocked download from untrusted host: {parsed_url.hostname}")
     session = _get_session()
-    resp = session.get(
-        url,
-        headers={"User-Agent": USER_AGENT},
-        timeout=30,
-        stream=True,
-        allow_redirects=False,
-    )
+    resp = None
     try:
+        resp = session.get(
+            url,
+            headers={"User-Agent": USER_AGENT},
+            timeout=30,
+            stream=True,
+            allow_redirects=False,
+        )
         # Handle at most one redirect manually so the Location host is validated
         # *before* the request is issued (SSRF defense — post-hoc resp.url check
         # is too late because the redirect has already been followed).
@@ -282,7 +283,8 @@ def _download_image(url: str, max_bytes: int = MAX_IMAGE_DOWNLOAD_BYTES) -> byte
                 raise ValueError(f"Image download exceeded {max_bytes} bytes limit")
             chunks.append(chunk)
     finally:
-        resp.close()
+        if resp is not None:
+            resp.close()
 
     return b"".join(chunks)
 
