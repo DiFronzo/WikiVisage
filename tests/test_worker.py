@@ -1874,12 +1874,14 @@ def test_download_image_content_length_too_large_raises():
     from worker import _download_image
 
     mock_resp = MagicMock()
+    mock_resp.is_redirect = False
     mock_resp.headers = {"Content-Length": str(100 * 1024 * 1024)}  # 100 MB
     mock_resp.raise_for_status = MagicMock()
     mock_resp.close = MagicMock()
 
     with (
         patch("worker._get_session") as mock_session,
+        patch("worker._reject_private_ip"),
     ):
         mock_session.return_value.get.return_value = mock_resp
         with pytest.raises(ValueError, match="too large"):
@@ -1892,6 +1894,7 @@ def test_download_image_streaming_size_exceeded_raises():
     chunks = [b"x" * 1024 * 1024] * 60  # 60 MB in 1 MB chunks
 
     mock_resp = MagicMock()
+    mock_resp.is_redirect = False
     mock_resp.headers = {}
     mock_resp.raise_for_status = MagicMock()
     mock_resp.close = MagicMock()
@@ -1899,6 +1902,7 @@ def test_download_image_streaming_size_exceeded_raises():
 
     with (
         patch("worker._get_session") as mock_session,
+        patch("worker._reject_private_ip"),
     ):
         mock_session.return_value.get.return_value = mock_resp
         with pytest.raises(ValueError, match="exceeded"):
@@ -1910,6 +1914,7 @@ def test_download_image_success():
 
     image_data = b"FAKE_IMAGE_DATA"
     mock_resp = MagicMock()
+    mock_resp.is_redirect = False
     mock_resp.headers = {}
     mock_resp.raise_for_status = MagicMock()
     mock_resp.close = MagicMock()
@@ -1917,6 +1922,7 @@ def test_download_image_success():
 
     with (
         patch("worker._get_session") as mock_session,
+        patch("worker._reject_private_ip"),
     ):
         mock_session.return_value.get.return_value = mock_resp
         result = _download_image("https://upload.wikimedia.org/image.jpg")
