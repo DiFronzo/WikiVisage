@@ -31,7 +31,7 @@ Worker uses `ThreadPoolExecutor` at two levels: up to 3 projects concurrently, u
 ## Current Status
 
 - **Version:** `0.8.1` (source of truth: `pyproject.toml`)
-- **Tests:** 679 total (645 unit + 34 integration)
+- **Tests:** 683 total (649 unit + 34 integration)
 - **Python:** 3.11+
 - **Tables:** 9 (`users`, `sessions`, `projects`, `images`, `faces`, `user_stats`, `sdc_claims`, `project_members`, `worker_heartbeat`)
 - **Templates:** 10 files (all extend `base.html`)
@@ -41,8 +41,8 @@ Worker uses `ThreadPoolExecutor` at two levels: up to 3 projects concurrently, u
 
 | File | Unit | Integration | Total |
 |------|------|-------------|-------|
-| `test_app.py` | 485 | 11 | 496 |
-| `test_worker.py` | 97 | 6 | 103 |
+| `test_app.py` | 487 | 11 | 498 |
+| `test_worker.py` | 99 | 6 | 105 |
 | `test_database.py` | 27 | 9 | 36 |
 | `test_migrate.py` | 15 | 8 | 23 |
 | `test_token_crypto.py` | 21 | 0 | 21 |

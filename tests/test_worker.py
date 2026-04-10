@@ -1870,6 +1870,13 @@ def test_download_image_non_https_raises():
         _download_image("ftp://upload.wikimedia.org/image.jpg")
 
 
+def test_download_image_http_scheme_raises():
+    from worker import _download_image
+
+    with pytest.raises(ValueError, match="untrusted host"):
+        _download_image("http://upload.wikimedia.org/image.jpg")
+
+
 def test_download_image_content_length_too_large_raises():
     from worker import _download_image
 
@@ -2917,6 +2924,17 @@ def test_worker_download_image_rejects_redirect_to_untrusted():
     mock_resp = MagicMock()
     mock_resp.is_redirect = True
     mock_resp.headers = {"Location": "https://evil.example.com/redirected.jpg"}
+    mock_session = MagicMock()
+    mock_session.get.return_value = mock_resp
+    with patch.object(_worker_module, "_get_session", return_value=mock_session):
+        with pytest.raises(ValueError, match="Redirect to untrusted host"):
+            _worker_module._download_image("https://upload.wikimedia.org/file.jpg")
+
+
+def test_worker_download_image_rejects_redirect_to_http_scheme():
+    mock_resp = MagicMock()
+    mock_resp.is_redirect = True
+    mock_resp.headers = {"Location": "http://upload.wikimedia.org/redirected.jpg"}
     mock_session = MagicMock()
     mock_session.get.return_value = mock_resp
     with patch.object(_worker_module, "_get_session", return_value=mock_session):

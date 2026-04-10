@@ -856,9 +856,27 @@ def test_download_image_blocks_untrusted_host():
         app_module._download_image("https://evil.example.com/file.jpg")
 
 
+def test_download_image_rejects_http_scheme():
+    with pytest.raises(ValueError, match="Blocked download from untrusted host"):
+        app_module._download_image("http://upload.wikimedia.org/file.jpg")
+
+
 def test_download_image_rejects_redirect_to_untrusted_host(monkeypatch):
     resp = _FakeResponse(
         headers={"Location": "https://evil.example.com/redirected.jpg"},
+        chunks=[],
+        is_redirect=True,
+    )
+    monkeypatch.setattr(app_module.requests, "get", lambda *_a, **_k: resp)
+
+    with pytest.raises(ValueError, match="Redirect to untrusted host"):
+        app_module._download_image("https://upload.wikimedia.org/file.jpg")
+    assert resp.closed is True
+
+
+def test_download_image_rejects_redirect_to_http_scheme(monkeypatch):
+    resp = _FakeResponse(
+        headers={"Location": "http://upload.wikimedia.org/redirected.jpg"},
         chunks=[],
         is_redirect=True,
     )

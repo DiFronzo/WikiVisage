@@ -27,14 +27,14 @@ WikiVisage/
 │   ├── nb/LC_MESSAGES/ # Norwegian Bokmål
 │   ├── es/LC_MESSAGES/ # Spanish
 │   └── fr/LC_MESSAGES/ # French
-├── tests/              # Hybrid test suite: 645 unit + 34 integration tests
+├── tests/              # Hybrid test suite: 649 unit + 34 integration tests
 │   ├── __init__.py
 │   ├── conftest.py     # Integration fixture infrastructure (~450 lines)
-│   ├── test_app.py     # 485 unit + 11 integration tests (~10674 lines)
+│   ├── test_app.py     # 487 unit + 11 integration tests (~10674 lines)
 │   ├── test_database.py # 27 unit + 9 integration tests (~600 lines)
 │   ├── test_migrate.py # 15 unit + 8 integration tests (~471 lines)
 │   ├── test_token_crypto.py # 21 unit tests (~170 lines)
-│   └── test_worker.py  # 97 unit + 6 integration tests (~2924 lines)
+│   └── test_worker.py  # 99 unit + 6 integration tests (~2924 lines)
 ├── templates/          # Jinja2 templates (10 files, all extend base.html)
 │   ├── base.html       # Layout: nav, flash messages, CSS variables. Blocks: title, extra_head, content
 │   ├── classify.html   # Active learning UI: face image, yes/no/skip/none buttons, keyboard shortcuts, undo
@@ -390,7 +390,7 @@ Each face encoding is 1024 bytes (128 float64). Even 10K faces ~ 10MB. No RAM co
 
 ## Testing
 
-Hybrid test suite: **645 unit tests** (run in CI) + **34 integration tests** (require local Docker MariaDB).
+Hybrid test suite: **649 unit tests** (run in CI) + **34 integration tests** (require local Docker MariaDB).
 
 ### Architecture
 
@@ -403,12 +403,12 @@ Hybrid test suite: **645 unit tests** (run in CI) + **34 integration tests** (re
 
 | File | Unit | Integration | Total |
 |------|------|-------------|-------|
-| `test_app.py` | 485 | 11 | 496 |
+| `test_app.py` | 487 | 11 | 498 |
 | `test_database.py` | 27 | 9 | 36 |
 | `test_migrate.py` | 15 | 8 | 23 |
 | `test_token_crypto.py` | 21 | 0 | 21 |
-| `test_worker.py` | 97 | 6 | 103 |
-| **Total** | **645** | **34** | **679** |
+| `test_worker.py` | 99 | 6 | 105 |
+| **Total** | **649** | **34** | **683** |
 
 ### Commands
 
