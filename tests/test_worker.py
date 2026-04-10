@@ -2330,9 +2330,7 @@ def test_traverse_category_respects_image_limit():
     # API returns more files than remaining capacity
     api_resp = MagicMock()
     api_resp.json.return_value = {
-        "query": {
-            "categorymembers": [{"ns": 6, "title": f"File:Img{i}.jpg", "pageid": 5000 + i} for i in range(10)]
-        }
+        "query": {"categorymembers": [{"ns": 6, "title": f"File:Img{i}.jpg", "pageid": 5000 + i} for i in range(10)]}
     }
 
     with (
