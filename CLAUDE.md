@@ -31,7 +31,7 @@ Worker uses `ThreadPoolExecutor` at two levels: up to 3 projects concurrently, u
 ## Current Status
 
 - **Version:** `0.7.5` (source of truth: `pyproject.toml`)
-- **Tests:** 595 total (561 unit + 34 integration)
+- **Tests:** 684 total (650 unit + 34 integration)
 - **Python:** 3.11+
 - **Tables:** 9 (`users`, `sessions`, `projects`, `images`, `faces`, `user_stats`, `sdc_claims`, `project_members`, `worker_heartbeat`)
 - **Templates:** 10 files (all extend `base.html`)
@@ -41,11 +41,11 @@ Worker uses `ThreadPoolExecutor` at two levels: up to 3 projects concurrently, u
 
 | File | Unit | Integration | Total |
 |------|------|-------------|-------|
-| `test_app.py` | 467 | 11 | 478 |
-| `test_worker.py` | 43 | 6 | 49 |
-| `test_database.py` | 14 | 9 | 23 |
+| `test_app.py` | 488 | 11 | 499 |
+| `test_worker.py` | 99 | 6 | 105 |
+| `test_database.py` | 27 | 9 | 36 |
 | `test_migrate.py` | 15 | 8 | 23 |
-| `test_token_crypto.py` | 22 | 0 | 22 |
+| `test_token_crypto.py` | 21 | 0 | 21 |
 
 ## Build & Test
 
@@ -84,8 +84,8 @@ Integration tests require Docker MariaDB (`docker run -d --name wikivisage-db -e
 
 | Area | Files |
 |------|-------|
-| Web app | `app.py` (~3920 lines) - Flask routes, OAuth, classification API |
-| Worker | `worker.py` (~3050 lines) - ML pipeline, face detection, inference |
+| Web app | `app.py` (~4060 lines) - Flask routes, OAuth, classification API |
+| Worker | `worker.py` (~3100 lines) - ML pipeline, face detection, inference |
 | Database | `database.py` (~510 lines) - Connection pool, `execute_query`/`execute_insert`/`execute_transaction` |
 | Token encryption | `token_crypto.py` (~110 lines) - Fernet encrypt/decrypt for OAuth tokens at rest |
 | Schema | `schema.sql` - DDL for 9 tables |
