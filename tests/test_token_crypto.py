@@ -33,10 +33,10 @@ def _with_token_key():
 
 @pytest.fixture()
 def _with_bad_key():
-    """Set an invalid key, then reload the module — now raises RuntimeError."""
-    with patch.dict(os.environ, {"WIKIVISAGE_TOKEN_KEY": "not-a-valid-fernet-key"}):
-        import token_crypto
+    """Load the module first, then expose it under an invalid-key environment."""
+    import token_crypto
 
+    with patch.dict(os.environ, {"WIKIVISAGE_TOKEN_KEY": "not-a-valid-fernet-key"}):
         yield token_crypto
 
 
