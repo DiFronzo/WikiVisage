@@ -2940,3 +2940,43 @@ def test_worker_download_image_rejects_redirect_to_http_scheme():
     with patch.object(_worker_module, "_get_session", return_value=mock_session):
         with pytest.raises(ValueError, match="Redirect to untrusted host"):
             _worker_module._download_image("https://upload.wikimedia.org/file.jpg")
+
+
+def test_worker_download_image_multi_hop_redirect_succeeds():
+    hop1 = MagicMock()
+    hop1.is_redirect = True
+    hop1.headers = {"Location": "https://commons.wikimedia.org/w/index.php?title=Special:Redirect/file/X.jpg"}
+    hop1.close = MagicMock()
+
+    hop2 = MagicMock()
+    hop2.is_redirect = True
+    hop2.headers = {"Location": "https://upload.wikimedia.org/wikipedia/commons/a/X.jpg"}
+    hop2.close = MagicMock()
+
+    content_resp = MagicMock()
+    content_resp.is_redirect = False
+    content_resp.headers = {"Content-Length": "4"}
+    content_resp.raise_for_status = MagicMock()
+    content_resp.iter_content.return_value = iter([b"data"])
+    content_resp.close = MagicMock()
+
+    mock_session = MagicMock()
+    mock_session.get.side_effect = [hop1, hop2, content_resp]
+    with patch.object(_worker_module, "_get_session", return_value=mock_session):
+        result = _worker_module._download_image("https://commons.wikimedia.org/wiki/Special:FilePath/X.jpg")
+    assert result == b"data"
+    hop1.close.assert_called_once()
+    hop2.close.assert_called_once()
+
+
+def test_worker_download_image_too_many_redirects_raises():
+    mock_resp = MagicMock()
+    mock_resp.is_redirect = True
+    mock_resp.headers = {"Location": "https://upload.wikimedia.org/loop"}
+    mock_resp.close = MagicMock()
+
+    mock_session = MagicMock()
+    mock_session.get.return_value = mock_resp
+    with patch.object(_worker_module, "_get_session", return_value=mock_session):
+        with pytest.raises(ValueError, match="Too many redirects"):
+            _worker_module._download_image("https://upload.wikimedia.org/file.jpg")

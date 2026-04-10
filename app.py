@@ -303,33 +303,28 @@ def _download_image(url: str, max_bytes: int = MAX_IMAGE_DOWNLOAD_BYTES) -> byte
     if parsed_url.scheme != "https" or parsed_url.hostname not in _ALLOWED_DOWNLOAD_HOSTS:
         raise ValueError(f"Blocked download from untrusted host: {parsed_url.hostname}")
     resp = None
+    current_url = url
+    max_redirects = 5
     try:
-        resp = requests.get(
-            url,
-            headers={"User-Agent": USER_AGENT},
-            timeout=30,
-            stream=True,
-            allow_redirects=False,
-        )
-        # Handle at most one redirect manually so the Location host is validated
-        # *before* the request is issued (SSRF defense — post-hoc resp.url check
-        # is too late because the redirect has already been followed).
-        if resp.is_redirect:
-            resp.close()
-            location = resp.headers.get("Location", "")
-            parsed_redirect = urlparse(location)
-            if parsed_redirect.scheme != "https" or parsed_redirect.hostname not in _ALLOWED_DOWNLOAD_HOSTS:
-                raise ValueError(f"Redirect to untrusted host: {parsed_redirect.hostname}")
+        for _hop in range(max_redirects + 1):
             resp = requests.get(
-                location,
+                current_url,
                 headers={"User-Agent": USER_AGENT},
                 timeout=30,
                 stream=True,
                 allow_redirects=False,
             )
-            if resp.is_redirect:
-                resp.close()
-                raise ValueError("Too many redirects from allowed download host")
+            if not resp.is_redirect:
+                break
+            # Validate redirect target before following
+            resp.close()
+            location = resp.headers.get("Location", "")
+            parsed_redirect = urlparse(location)
+            if parsed_redirect.scheme != "https" or parsed_redirect.hostname not in _ALLOWED_DOWNLOAD_HOSTS:
+                raise ValueError(f"Redirect to untrusted host: {parsed_redirect.hostname}")
+            current_url = location
+        else:
+            raise ValueError(f"Too many redirects ({max_redirects}) from allowed download hosts")
 
         resp.raise_for_status()
 
