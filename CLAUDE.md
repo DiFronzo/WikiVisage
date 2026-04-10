@@ -30,7 +30,7 @@ Worker uses `ThreadPoolExecutor` at two levels: up to 3 projects concurrently, u
 
 ## Current Status
 
-- **Version:** `0.7.5` (source of truth: `pyproject.toml`)
+- **Version:** `0.8.1` (source of truth: `pyproject.toml`)
 - **Tests:** 679 total (645 unit + 34 integration)
 - **Python:** 3.11+
 - **Tables:** 9 (`users`, `sessions`, `projects`, `images`, `faces`, `user_stats`, `sdc_claims`, `project_members`, `worker_heartbeat`)
