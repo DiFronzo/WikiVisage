@@ -1,4 +1,5 @@
 import io
+import ipaddress
 import json
 import logging
 import multiprocessing
@@ -177,9 +178,11 @@ def _api_request(
 
         try:
             if method.lower() == "get":
-                resp = session.get(url, params=params, headers=headers, timeout=timeout)
+                resp = session.get(url, params=params, headers=headers, timeout=timeout, allow_redirects=False)
             else:
-                resp = session.post(url, data=data, params=params, headers=headers, timeout=timeout)
+                resp = session.post(
+                    url, data=data, params=params, headers=headers, timeout=timeout, allow_redirects=False
+                )
 
             # Check for MediaWiki maxlag before raise_for_status().
             # MediaWiki returns HTTP 503 with Retry-After header for maxlag,
@@ -225,6 +228,14 @@ def _api_request(
 _ALLOWED_DOWNLOAD_HOSTS = frozenset({"commons.wikimedia.org", "upload.wikimedia.org"})
 
 
+def _reject_private_ip(hostname: str) -> None:
+    """Raise ValueError if *hostname* resolves to a private/reserved IP (DNS rebinding defense)."""
+    for info in socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM):
+        addr = ipaddress.ip_address(info[4][0])
+        if addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved:
+            raise ValueError(f"Download host {hostname} resolved to private/reserved IP: {addr}")
+
+
 def _download_image(url: str, max_bytes: int = MAX_IMAGE_DOWNLOAD_BYTES) -> bytes:
     """Download an image with streaming size cap to prevent OOM.
 
@@ -234,6 +245,7 @@ def _download_image(url: str, max_bytes: int = MAX_IMAGE_DOWNLOAD_BYTES) -> byte
     parsed_url = urlparse(url)
     if parsed_url.scheme not in ("http", "https") or parsed_url.hostname not in _ALLOWED_DOWNLOAD_HOSTS:
         raise ValueError(f"Blocked download from untrusted host: {parsed_url.hostname}")
+    _reject_private_ip(parsed_url.hostname)
     session = _get_session()
     resp = session.get(
         url,
@@ -242,6 +254,12 @@ def _download_image(url: str, max_bytes: int = MAX_IMAGE_DOWNLOAD_BYTES) -> byte
         stream=True,
     )
     resp.raise_for_status()
+
+    # Reject redirects to untrusted hosts (SSRF defense)
+    final_host = urlparse(resp.url).hostname
+    if final_host not in _ALLOWED_DOWNLOAD_HOSTS:
+        resp.close()
+        raise ValueError(f"Redirect to untrusted host: {final_host}")
 
     # Check Content-Length header first (fast reject)
     content_length = resp.headers.get("Content-Length")
@@ -1448,7 +1466,7 @@ def run_autonomous_inference(project: dict[str, Any]) -> int:
                 f"Skipping confirmed face with invalid encoding length ({len(enc) if enc else 'None'} bytes)"
             )
             continue
-        confirmed_encodings.append(np.frombuffer(enc, dtype=np.float64))
+        confirmed_encodings.append(np.frombuffer(enc, dtype=np.float64).copy())
 
     if not confirmed_encodings:
         logger.warning(f"Project {project['id']}: all confirmed encodings invalid, skipping inference")
@@ -1507,7 +1525,7 @@ def run_autonomous_inference(project: dict[str, Any]) -> int:
                 f"Skipping candidate face {row['id']} with invalid encoding ({len(enc) if enc else 'None'} bytes)"
             )
             continue
-        encoding = np.frombuffer(enc, dtype=np.float64)
+        encoding = np.frombuffer(enc, dtype=np.float64).copy()
         distance = face_recognition.face_distance([centroid], encoding)[0]
         face_distances.append((row["id"], row["image_id"], float(distance)))
 
@@ -2283,8 +2301,9 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
 def _claim_active_projects(max_count: int) -> list[dict[str, Any]]:
     """Atomically claim up to *max_count* unclaimed (or stale-claimed) active projects.
 
-    Uses SELECT … FOR UPDATE inside a transaction so two workers racing on the
-    same poll cycle will never both claim the same project.
+    Uses SELECT … FOR UPDATE SKIP LOCKED inside a transaction so two workers
+    racing on the same poll cycle will never both claim the same project, and
+    neither will block waiting for the other's lock.
 
     Only claims projects that have remaining work: at least one pending image
     to process OR at least one unclassified face.  This avoids wasting worker
@@ -2311,7 +2330,7 @@ def _claim_active_projects(max_count: int) -> list[dict[str, Any]]:
             "ORDER BY COALESCE(p.worker_claimed_at, '1970-01-01') ASC, "
             "p.images_total ASC, p.id DESC "
             "LIMIT %s "
-            "FOR UPDATE",
+            "FOR UPDATE SKIP LOCKED",
             (CLAIM_EXPIRY_MINUTES, max_count),
         )
         rows = cursor.fetchall()
@@ -2370,7 +2389,7 @@ def _claim_inference_projects(max_count: int) -> list[dict[str, Any]]:
             ") "
             "ORDER BY COALESCE(p.worker_claimed_at, '1970-01-01') ASC, p.id ASC "
             "LIMIT %s "
-            "FOR UPDATE",
+            "FOR UPDATE SKIP LOCKED",
             (CLAIM_EXPIRY_MINUTES, max_count),
         )
         rows = cursor.fetchall()
@@ -2421,7 +2440,7 @@ def _claim_sdc_projects() -> tuple[list[dict[str, Any]], set[int]]:
             "     OR p.worker_claimed_at < NOW() - INTERVAL %s MINUTE) "
             "ORDER BY COALESCE(p.worker_claimed_at, '1970-01-01') ASC "
             "LIMIT %s "
-            "FOR UPDATE",
+            "FOR UPDATE SKIP LOCKED",
             (_worker_id, _worker_id, CLAIM_EXPIRY_MINUTES, MAX_CONCURRENT_PROJECTS),
         )
         rows = cursor.fetchall()
@@ -2586,19 +2605,15 @@ def process_project(project: dict[str, Any], *, skip_discovery: bool = False) ->
             if not row:
                 logger.info(f"Project {project_id} not found, stopping processing")
                 return False
-
             status = row[0]["status"]
             claimed_by = row[0].get("worker_claimed_by")
-
             if status != "active":
                 logger.info(f"Project {project_id} is no longer active (status={status}), stopping processing")
                 return False
-
             if claimed_by != _worker_id:
                 logger.info(f"Project {project_id} not claimed by us (claimed_by={claimed_by}), stopping processing")
                 return False
-
-            # Refresh our claim timestamp so it doesn't expire mid-processing
+            # Refresh claim timestamp so it doesn't expire while we work
             execute_query(
                 "UPDATE projects SET worker_claimed_at = NOW() WHERE id = %s AND worker_claimed_by = %s",
                 (project_id, _worker_id),
@@ -2762,6 +2777,9 @@ def main():
         if idx + 1 < len(sys.argv):
             wid = sys.argv[idx + 1]
     _worker_id = wid or f"{socket.gethostname()}-{os.getpid()}"
+    # Sanitize worker ID to prevent path traversal in heartbeat file path
+    if not re.fullmatch(r"[a-zA-Z0-9._-]+", _worker_id):
+        raise SystemExit(f"Invalid worker ID (must be alphanumeric/dot/hyphen/underscore): {_worker_id!r}")
     logger.info(
         f"Starting WikiVisage Worker {_worker_id} "
         f"(max_projects={MAX_CONCURRENT_PROJECTS}, image_threads={IMAGE_THREADS})"
