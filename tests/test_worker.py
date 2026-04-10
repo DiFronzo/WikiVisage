@@ -1701,3 +1701,1162 @@ def test_touch_heartbeat_file_uses_worker_id(tmp_path):
         _touch_heartbeat_file()
     assert (tmp_path / ".wikivisage-worker-alive-ml-worker-1").exists()
     assert (tmp_path / ".wikivisage-worker-alive-ml-worker-2").exists()
+
+
+# ---------------------------------------------------------------------------
+# Tests for _build_skip_extensions_regex
+# ---------------------------------------------------------------------------
+
+
+def test_build_skip_extensions_regex_empty_set():
+    from worker import _build_skip_extensions_regex
+
+    pattern = _build_skip_extensions_regex(set())
+    assert pattern == r"(?!)"
+    import re
+
+    assert not re.search(pattern, "File:something.webm")
+    assert not re.search(pattern, "anything")
+
+
+def test_build_skip_extensions_regex_nonempty():
+    import re
+
+    from worker import _build_skip_extensions_regex
+
+    pattern = _build_skip_extensions_regex({".webm", ".ogg"})
+    assert re.search(pattern, "File:clip.webm")
+    assert re.search(pattern, "File:audio.ogg")
+    assert not re.search(pattern, "File:photo.jpg")
+
+
+# ---------------------------------------------------------------------------
+# Tests for _api_request
+# ---------------------------------------------------------------------------
+
+
+def test_api_request_maxlag_503_retries():
+    """_api_request should retry on 503 with Retry-After header (maxlag)."""
+    from worker import _api_request
+
+    ok_resp = MagicMock()
+    ok_resp.status_code = 200
+    ok_resp.headers = {}
+    ok_resp.raise_for_status = MagicMock()
+
+    lag_resp = MagicMock()
+    lag_resp.status_code = 503
+    lag_resp.headers = {"Retry-After": "0.01"}
+    lag_resp.close = MagicMock()
+
+    call_count = [0]
+
+    def mock_get(*args, **kwargs):
+        call_count[0] += 1
+        if call_count[0] == 1:
+            return lag_resp
+        return ok_resp
+
+    with (
+        patch("worker._get_session") as mock_session,
+        patch("worker.time.sleep"),
+        patch("worker.shutdown_requested", False),
+    ):
+        mock_session.return_value.get = mock_get
+        result = _api_request("https://commons.wikimedia.org/w/api.php")
+
+    assert result is ok_resp
+    assert call_count[0] == 2
+
+
+def test_api_request_maxlag_200_json_retries():
+    """_api_request should retry when 200 response contains maxlag error in JSON."""
+    from worker import _api_request
+
+    lag_resp = MagicMock()
+    lag_resp.status_code = 200
+    lag_resp.headers = {"Retry-After": "0.01"}
+    lag_resp.json.return_value = {"error": {"code": "maxlag", "info": "lag"}}
+    lag_resp.raise_for_status = MagicMock()
+    lag_resp.close = MagicMock()
+
+    ok_resp = MagicMock()
+    ok_resp.status_code = 200
+    ok_resp.headers = {}
+    ok_resp.raise_for_status = MagicMock()
+
+    call_count = [0]
+
+    def mock_get(*args, **kwargs):
+        call_count[0] += 1
+        if call_count[0] == 1:
+            return lag_resp
+        return ok_resp
+
+    with (
+        patch("worker._get_session") as mock_session,
+        patch("worker.time.sleep"),
+        patch("worker.shutdown_requested", False),
+    ):
+        mock_session.return_value.get = mock_get
+        result = _api_request("https://commons.wikimedia.org/w/api.php")
+
+    assert result is ok_resp
+
+
+def test_api_request_raises_after_exhausted_retries():
+    """_api_request should raise Exception after 3 failed attempts."""
+    import requests as req
+
+    from worker import _api_request
+
+    with (
+        patch("worker._get_session") as mock_session,
+        patch("worker.time.sleep"),
+        patch("worker.shutdown_requested", False),
+    ):
+        mock_session.return_value.get.side_effect = req.exceptions.RequestException("timeout")
+        with pytest.raises(Exception, match="Failed to execute API request after 3 attempts"):
+            _api_request("https://commons.wikimedia.org/w/api.php")
+
+
+def test_api_request_shutdown_raises_interrupted():
+    """_api_request should raise InterruptedError when shutdown_requested is True."""
+    from worker import _api_request
+
+    with (
+        patch("worker.shutdown_requested", True),
+    ):
+        with pytest.raises(InterruptedError, match="shutting down"):
+            _api_request("https://commons.wikimedia.org/w/api.php")
+
+
+def test_api_request_post_method():
+    """_api_request should use session.post when method='post'."""
+    from worker import _api_request
+
+    ok_resp = MagicMock()
+    ok_resp.status_code = 200
+    ok_resp.headers = {}
+    ok_resp.raise_for_status = MagicMock()
+
+    with (
+        patch("worker._get_session") as mock_session,
+        patch("worker.shutdown_requested", False),
+    ):
+        mock_session.return_value.post.return_value = ok_resp
+        result = _api_request("https://commons.wikimedia.org/w/api.php", method="post", data={"key": "val"})
+
+    assert result is ok_resp
+    mock_session.return_value.post.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Tests for _download_image
+# ---------------------------------------------------------------------------
+
+
+def test_download_image_untrusted_host_raises():
+    from worker import _download_image
+
+    with pytest.raises(ValueError, match="untrusted host"):
+        _download_image("https://evil.example.com/image.jpg")
+
+
+def test_download_image_non_https_raises():
+    from worker import _download_image
+
+    with pytest.raises(ValueError, match="untrusted host"):
+        _download_image("ftp://upload.wikimedia.org/image.jpg")
+
+
+def test_download_image_content_length_too_large_raises():
+    from worker import _download_image
+
+    mock_resp = MagicMock()
+    mock_resp.headers = {"Content-Length": str(100 * 1024 * 1024)}  # 100 MB
+    mock_resp.raise_for_status = MagicMock()
+    mock_resp.close = MagicMock()
+
+    with (
+        patch("worker._get_session") as mock_session,
+    ):
+        mock_session.return_value.get.return_value = mock_resp
+        with pytest.raises(ValueError, match="too large"):
+            _download_image("https://upload.wikimedia.org/image.jpg", max_bytes=50 * 1024 * 1024)
+
+
+def test_download_image_streaming_size_exceeded_raises():
+    from worker import _download_image
+
+    chunks = [b"x" * 1024 * 1024] * 60  # 60 MB in 1 MB chunks
+
+    mock_resp = MagicMock()
+    mock_resp.headers = {}
+    mock_resp.raise_for_status = MagicMock()
+    mock_resp.close = MagicMock()
+    mock_resp.iter_content.return_value = iter(chunks)
+
+    with (
+        patch("worker._get_session") as mock_session,
+    ):
+        mock_session.return_value.get.return_value = mock_resp
+        with pytest.raises(ValueError, match="exceeded"):
+            _download_image("https://upload.wikimedia.org/image.jpg", max_bytes=50 * 1024 * 1024)
+
+
+def test_download_image_success():
+    from worker import _download_image
+
+    image_data = b"FAKE_IMAGE_DATA"
+    mock_resp = MagicMock()
+    mock_resp.headers = {}
+    mock_resp.raise_for_status = MagicMock()
+    mock_resp.close = MagicMock()
+    mock_resp.iter_content.return_value = iter([image_data])
+
+    with (
+        patch("worker._get_session") as mock_session,
+    ):
+        mock_session.return_value.get.return_value = mock_resp
+        result = _download_image("https://upload.wikimedia.org/image.jpg")
+
+    assert result == image_data
+
+
+# ---------------------------------------------------------------------------
+# Tests for _validate_image_dimensions
+# ---------------------------------------------------------------------------
+
+
+def test_validate_image_dimensions_too_large_raises():
+    import io
+
+    from PIL import Image
+
+    from worker import _validate_image_dimensions
+
+    img = Image.new("RGB", (15000, 8000))  # 120 megapixels > 100MP limit
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG")
+    with pytest.raises(ValueError, match="too large"):
+        _validate_image_dimensions(buf.getvalue())
+
+
+def test_validate_image_dimensions_valid_passes():
+    import io
+
+    from PIL import Image
+
+    from worker import _validate_image_dimensions
+
+    img = Image.new("RGB", (800, 600))
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG")
+    _validate_image_dimensions(buf.getvalue())  # Should not raise
+
+
+# ---------------------------------------------------------------------------
+# Tests for _get_csrf_token
+# ---------------------------------------------------------------------------
+
+
+def test_get_csrf_token_success():
+    from worker import _get_csrf_token
+
+    mock_resp = MagicMock()
+    mock_resp.json.return_value = {"query": {"tokens": {"csrftoken": "csrf+\\"}}}
+
+    with patch("worker._api_request", return_value=mock_resp):
+        token = _get_csrf_token("fake-access-token")
+
+    assert token == "csrf+\\"
+
+
+def test_get_csrf_token_propagates_exception():
+    from worker import _get_csrf_token
+
+    with patch("worker._api_request", side_effect=RuntimeError("network error")):
+        with pytest.raises(RuntimeError):
+            _get_csrf_token("fake-token")
+
+
+# ---------------------------------------------------------------------------
+# Tests for _refresh_worker_token
+# ---------------------------------------------------------------------------
+
+
+def test_refresh_worker_token_no_user():
+    from worker import _refresh_worker_token
+
+    with patch("worker.execute_query", return_value=[]):
+        result = _refresh_worker_token(99)
+
+    assert result is None
+
+
+def test_refresh_worker_token_still_valid():
+    """Token not yet expired — return it without refresh."""
+    from datetime import UTC, datetime, timedelta
+
+    from worker import _refresh_worker_token
+
+    future = datetime.now(UTC) + timedelta(hours=2)
+    user = {
+        "access_token": "plaintext-token",
+        "refresh_token": "plaintext-refresh",
+        "token_expires_at": future,
+    }
+
+    with (
+        patch("worker.execute_query", return_value=[user]),
+        patch("worker.decrypt_token", side_effect=lambda t: t),
+    ):
+        result = _refresh_worker_token(1)
+
+    assert result == "plaintext-token"
+
+
+def test_refresh_worker_token_no_refresh_token():
+    """Expired token but no refresh token — return None."""
+    from datetime import UTC, datetime, timedelta
+
+    from worker import _refresh_worker_token
+
+    past = datetime.now(UTC) - timedelta(hours=1)
+    user = {
+        "access_token": "plaintext-token",
+        "refresh_token": "",
+        "token_expires_at": past,
+    }
+
+    with (
+        patch("worker.execute_query", return_value=[user]),
+        patch("worker.decrypt_token", side_effect=lambda t: t),
+    ):
+        result = _refresh_worker_token(1)
+
+    assert result is None
+
+
+def test_refresh_worker_token_api_failure():
+    """Network error during refresh — return None."""
+    from datetime import UTC, datetime, timedelta
+
+    from worker import _refresh_worker_token
+
+    past = datetime.now(UTC) - timedelta(hours=1)
+    user = {
+        "access_token": "plaintext-token",
+        "refresh_token": "plaintext-refresh",
+        "token_expires_at": past,
+    }
+
+    mock_resp = MagicMock()
+    mock_resp.raise_for_status.side_effect = Exception("API error")
+    mock_resp.close = MagicMock()
+
+    with (
+        patch("worker.execute_query", return_value=[user]),
+        patch("worker.decrypt_token", side_effect=lambda t: t),
+        patch("worker._get_session") as mock_session,
+    ):
+        mock_session.return_value.post.return_value = mock_resp
+        result = _refresh_worker_token(1)
+
+    assert result is None
+
+
+def test_refresh_worker_token_missing_access_token_in_response():
+    """Token refresh response missing access_token field — return None."""
+    from datetime import UTC, datetime, timedelta
+
+    from worker import _refresh_worker_token
+
+    past = datetime.now(UTC) - timedelta(hours=1)
+    user = {
+        "access_token": "plaintext-token",
+        "refresh_token": "plaintext-refresh",
+        "token_expires_at": past,
+    }
+
+    mock_resp = MagicMock()
+    mock_resp.raise_for_status = MagicMock()
+    mock_resp.json.return_value = {}  # No access_token field
+    mock_resp.close = MagicMock()
+
+    with (
+        patch("worker.execute_query", return_value=[user]),
+        patch("worker.decrypt_token", side_effect=lambda t: t),
+        patch("worker.encrypt_token", side_effect=lambda t: t),
+        patch("worker._get_session") as mock_session,
+    ):
+        mock_session.return_value.post.return_value = mock_resp
+        result = _refresh_worker_token(1)
+
+    assert result is None
+
+
+def test_refresh_worker_token_rowcount_zero_reads_fresh():
+    """When rowcount==0 (another process refreshed), re-read token from DB."""
+    from datetime import UTC, datetime, timedelta
+
+    from worker import _refresh_worker_token
+
+    past = datetime.now(UTC) - timedelta(hours=1)
+    user = {
+        "access_token": "old-token",
+        "refresh_token": "old-refresh",
+        "token_expires_at": past,
+    }
+    fresh_row = {"access_token": "fresh-token"}
+
+    query_calls = [0]
+
+    def mock_execute_query(sql, params=None, fetch=True):
+        query_calls[0] += 1
+        if "SELECT access_token, refresh_token, token_expires_at" in sql and query_calls[0] == 1:
+            return [user]
+        if "UPDATE users SET access_token" in sql:
+            return 0  # rowcount == 0: another process refreshed
+        if "SELECT access_token FROM users" in sql:
+            return [fresh_row]
+        return []
+
+    mock_resp = MagicMock()
+    mock_resp.raise_for_status = MagicMock()
+    mock_resp.json.return_value = {"access_token": "new-token", "refresh_token": "new-refresh", "expires_in": 14400}
+    mock_resp.close = MagicMock()
+
+    with (
+        patch("worker.execute_query", side_effect=mock_execute_query),
+        patch("worker.decrypt_token", side_effect=lambda t: t),
+        patch("worker.encrypt_token", side_effect=lambda t: t),
+        patch("worker._get_session") as mock_session,
+    ):
+        mock_session.return_value.post.return_value = mock_resp
+        result = _refresh_worker_token(1)
+
+    assert result == "fresh-token"
+
+
+# ---------------------------------------------------------------------------
+# Tests for traverse_category
+# ---------------------------------------------------------------------------
+
+
+def test_traverse_category_already_at_limit():
+    """When project already has MAX_IMAGES_PER_PROJECT images, skip traversal."""
+    from worker import traverse_category
+
+    project = {"id": 1, "commons_category": "TestCat"}
+
+    with patch("worker.execute_query", return_value=[{"cnt": _worker_module.MAX_IMAGES_PER_PROJECT}]):
+        result = traverse_category(project)
+
+    assert result == 0
+
+
+def test_traverse_category_basic_files():
+    """Traverse a category with image files — inserts them and returns count."""
+    from worker import traverse_category
+
+    project = {"id": 1, "commons_category": "TestCat"}
+
+    db_calls = []
+
+    def mock_execute_query(sql, params=None, fetch=True):
+        db_calls.append(sql.strip())
+        if "COUNT(*)" in sql:
+            return [{"cnt": 0}]
+        if "INSERT IGNORE INTO images" in sql:
+            return 2  # 2 rows inserted
+        if "UPDATE projects SET images_total" in sql:
+            return 1
+        return []
+
+    api_resp = MagicMock()
+    api_resp.json.return_value = {
+        "query": {
+            "categorymembers": [
+                {"ns": 6, "title": "File:Photo1.jpg", "pageid": 1001},
+                {"ns": 6, "title": "File:Photo2.jpg", "pageid": 1002},
+            ]
+        }
+    }
+
+    with (
+        patch("worker.execute_query", side_effect=mock_execute_query),
+        patch("worker._api_request", return_value=api_resp),
+        patch("worker.shutdown_requested", False),
+    ):
+        result = traverse_category(project)
+
+    assert result == 2
+
+
+def test_traverse_category_skips_non_image_extensions():
+    """Traverse a category — skip video/audio files."""
+    from worker import traverse_category
+
+    project = {"id": 1, "commons_category": "TestCat"}
+
+    db_calls = []
+
+    def mock_execute_query(sql, params=None, fetch=True):
+        db_calls.append(sql.strip())
+        if "COUNT(*)" in sql:
+            return [{"cnt": 0}]
+        if "INSERT IGNORE INTO images" in sql:
+            return 1
+        if "UPDATE projects SET images_total" in sql:
+            return 1
+        return []
+
+    api_resp = MagicMock()
+    api_resp.json.return_value = {
+        "query": {
+            "categorymembers": [
+                {"ns": 6, "title": "File:Video.webm", "pageid": 2001},
+                {"ns": 6, "title": "File:Audio.ogg", "pageid": 2002},
+                {"ns": 6, "title": "File:Photo.jpg", "pageid": 2003},
+            ]
+        }
+    }
+
+    with (
+        patch("worker.execute_query", side_effect=mock_execute_query),
+        patch("worker._api_request", return_value=api_resp),
+        patch("worker.shutdown_requested", False),
+    ):
+        traverse_category(project)
+
+    # Only one INSERT should happen (for the jpg), with one image
+    inserts = [sql for sql in db_calls if "INSERT IGNORE INTO images" in sql]
+    assert len(inserts) == 1
+
+
+def test_traverse_category_handles_subcategories():
+    """Traverse discovers subcategories and queues them."""
+    from worker import traverse_category
+
+    project = {"id": 1, "commons_category": "ParentCat"}
+
+    call_count = [0]
+
+    def mock_execute_query(sql, params=None, fetch=True):
+        if "COUNT(*)" in sql:
+            return [{"cnt": 0}]
+        if "INSERT IGNORE INTO images" in sql:
+            return 1
+        if "UPDATE projects SET images_total" in sql:
+            return 1
+        return []
+
+    def mock_api_request(url, params=None, **kwargs):
+        resp = MagicMock()
+        call_count[0] += 1
+        cmtitle = params.get("cmtitle", "")
+        if "ParentCat" in cmtitle:
+            resp.json.return_value = {
+                "query": {
+                    "categorymembers": [
+                        {"ns": 14, "title": "Category:SubCat"},
+                    ]
+                }
+            }
+        elif "SubCat" in cmtitle:
+            resp.json.return_value = {
+                "query": {
+                    "categorymembers": [
+                        {"ns": 6, "title": "File:Image.jpg", "pageid": 3001},
+                    ]
+                }
+            }
+        else:
+            resp.json.return_value = {"query": {"categorymembers": []}}
+        return resp
+
+    with (
+        patch("worker.execute_query", side_effect=mock_execute_query),
+        patch("worker._api_request", side_effect=mock_api_request),
+        patch("worker.shutdown_requested", False),
+        patch("worker.time.sleep"),
+    ):
+        result = traverse_category(project)
+
+    assert result == 1
+    assert call_count[0] >= 2  # At least parent + subcat
+
+
+def test_traverse_category_api_exception_breaks_inner_loop():
+    """When API call fails, traversal logs error and continues to next category."""
+    from worker import traverse_category
+
+    project = {"id": 1, "commons_category": "TestCat"}
+
+    with (
+        patch("worker.execute_query", return_value=[{"cnt": 0}]),
+        patch("worker._api_request", side_effect=RuntimeError("API down")),
+        patch("worker.shutdown_requested", False),
+    ):
+        result = traverse_category(project)
+
+    assert result == 0
+
+
+def test_traverse_category_respects_image_limit():
+    """Traverse stops adding images once remaining capacity is reached."""
+    from worker import traverse_category
+
+    project = {"id": 1, "commons_category": "BigCat"}
+    # Project already has MAX-2 images
+    existing = _worker_module.MAX_IMAGES_PER_PROJECT - 2
+
+    db_calls = []
+
+    def mock_execute_query(sql, params=None, fetch=True):
+        if "COUNT(*)" in sql:
+            return [{"cnt": existing}]
+        if "INSERT IGNORE INTO images" in sql:
+            # Pretend all inserted
+            flat = params
+            return len([x for x in range(0, len(flat), 3)])
+        if "UPDATE projects SET images_total" in sql:
+            return 1
+        db_calls.append(sql)
+        return []
+
+    # API returns more files than remaining capacity
+    api_resp = MagicMock()
+    api_resp.json.return_value = {
+        "query": {
+            "categorymembers": [{"ns": 6, "title": f"File:Img{i}.jpg", "pageid": 5000 + i} for i in range(10)]
+        }
+    }
+
+    with (
+        patch("worker.execute_query", side_effect=mock_execute_query),
+        patch("worker._api_request", return_value=api_resp),
+        patch("worker.shutdown_requested", False),
+    ):
+        traverse_category(project)
+    # No assertion needed — just verify no exception and it terminates
+
+
+# ---------------------------------------------------------------------------
+# Tests for bootstrap_from_sparql
+# ---------------------------------------------------------------------------
+
+
+def test_bootstrap_new_images_inserted():
+    """bootstrap_from_sparql inserts new images and returns flagged count."""
+
+    project = {"id": 1, "wikidata_qid": "Q42", "commons_category": "Douglas Adams"}
+
+    db_calls = []
+
+    def mock_execute_query(sql, params=None, fetch=True):
+        db_calls.append((sql.strip(), params))
+        if "SELECT COUNT(*) AS cnt FROM images" in sql:
+            return [{"cnt": 0}]
+        if "SELECT id, status FROM images" in sql:
+            return []  # Image does not exist
+        if "INSERT IGNORE INTO images" in sql:
+            return 1  # One row inserted
+        if "UPDATE projects SET images_total" in sql:
+            return 1
+        return []
+
+    api_resp = MagicMock()
+    api_resp.json.return_value = {
+        "query": {
+            "search": [
+                {"pageid": 100, "title": "File:Adams.jpg"},
+            ]
+        }
+    }
+
+    with (
+        patch("worker.execute_query", side_effect=mock_execute_query),
+        patch("worker._api_request", return_value=api_resp),
+        patch("worker.shutdown_requested", False),
+    ):
+        result = bootstrap_from_sparql(project)
+
+    assert result == 1
+
+
+def test_bootstrap_existing_image_gets_flagged():
+    """bootstrap_from_sparql flags existing images and marks processed ones as sdc_written."""
+
+    project = {"id": 1, "wikidata_qid": "Q42", "commons_category": "Douglas Adams"}
+
+    db_calls = []
+
+    def mock_execute_query(sql, params=None, fetch=True):
+        db_calls.append((sql.strip(), params))
+        if "SELECT COUNT(*) AS cnt FROM images" in sql:
+            return [{"cnt": 5}]
+        if "SELECT id, status FROM images" in sql:
+            return [{"id": 99, "status": "processed"}]
+        if "UPDATE images SET bootstrapped = 1" in sql:
+            return 1
+        if "UPDATE faces SET sdc_written = 1" in sql:
+            return 0  # No target faces to mark
+        if "UPDATE faces" in sql and "classified_by = 'bootstrap'" in sql:
+            return 0  # No single-face images
+        if "UPDATE projects SET images_total" in sql:
+            return 1
+        return []
+
+    api_resp = MagicMock()
+    api_resp.json.return_value = {
+        "query": {
+            "search": [
+                {"pageid": 200, "title": "File:Existing.jpg"},
+            ]
+        }
+    }
+
+    with (
+        patch("worker.execute_query", side_effect=mock_execute_query),
+        patch("worker._api_request", return_value=api_resp),
+        patch("worker.shutdown_requested", False),
+    ):
+        result = bootstrap_from_sparql(project)
+
+    assert result == 1
+    flag_calls = [(s, p) for s, p in db_calls if "UPDATE images SET bootstrapped = 1" in s]
+    assert len(flag_calls) == 1
+
+
+def test_bootstrap_skips_video_extensions():
+    """bootstrap_from_sparql skips video/audio files."""
+
+    project = {"id": 1, "wikidata_qid": "Q42", "commons_category": "TestCat"}
+
+    db_calls = []
+
+    def mock_execute_query(sql, params=None, fetch=True):
+        db_calls.append(sql.strip())
+        if "SELECT COUNT(*) AS cnt FROM images" in sql:
+            return [{"cnt": 0}]
+        return []
+
+    api_resp = MagicMock()
+    api_resp.json.return_value = {
+        "query": {
+            "search": [
+                {"pageid": 301, "title": "File:Video.webm"},
+                {"pageid": 302, "title": "File:Audio.ogg"},
+            ]
+        }
+    }
+
+    with (
+        patch("worker.execute_query", side_effect=mock_execute_query),
+        patch("worker._api_request", return_value=api_resp),
+        patch("worker.shutdown_requested", False),
+    ):
+        result = bootstrap_from_sparql(project)
+
+    assert result == 0
+
+
+def test_bootstrap_pagination():
+    """bootstrap_from_sparql follows pagination (sroffset) to fetch all pages."""
+
+    project = {"id": 1, "wikidata_qid": "Q42", "commons_category": "TestCat"}
+
+    api_call_count = [0]
+
+    def mock_execute_query(sql, params=None, fetch=True):
+        if "SELECT COUNT(*) AS cnt FROM images" in sql:
+            return [{"cnt": 0}]
+        if "SELECT id, status FROM images" in sql:
+            return []
+        if "INSERT IGNORE INTO images" in sql:
+            return 1
+        if "UPDATE projects SET images_total" in sql:
+            return 1
+        return []
+
+    def mock_api_request(url, params=None, **kwargs):
+        resp = MagicMock()
+        api_call_count[0] += 1
+        if api_call_count[0] == 1:
+            resp.json.return_value = {
+                "query": {"search": [{"pageid": 401, "title": "File:Page1.jpg"}]},
+                "continue": {"sroffset": 1},
+            }
+        else:
+            resp.json.return_value = {
+                "query": {"search": [{"pageid": 402, "title": "File:Page2.jpg"}]},
+            }
+        return resp
+
+    with (
+        patch("worker.execute_query", side_effect=mock_execute_query),
+        patch("worker._api_request", side_effect=mock_api_request),
+        patch("worker.shutdown_requested", False),
+    ):
+        result = bootstrap_from_sparql(project)
+
+    assert result == 2
+    assert api_call_count[0] == 2
+
+
+def test_bootstrap_api_exception_returns_zero():
+    """bootstrap_from_sparql returns 0 when API throws an exception."""
+
+    project = {"id": 1, "wikidata_qid": "Q42", "commons_category": "TestCat"}
+
+    with (
+        patch("worker.execute_query", return_value=[{"cnt": 0}]),
+        patch("worker._api_request", side_effect=RuntimeError("network error")),
+        patch("worker.shutdown_requested", False),
+    ):
+        result = bootstrap_from_sparql(project)
+
+    assert result == 0
+
+
+# ---------------------------------------------------------------------------
+# Tests for _process_single_image error path
+# ---------------------------------------------------------------------------
+
+
+def test_process_single_image_download_error_marks_image_as_error():
+    """When download fails, image status is set to 'error'."""
+    db_calls = []
+
+    def mock_execute_query(sql, params=None, fetch=True):
+        db_calls.append((sql.strip(), params))
+        return None
+
+    with (
+        patch("worker.execute_query", side_effect=mock_execute_query),
+        patch("worker._download_image", side_effect=RuntimeError("download failed")),
+    ):
+        result = _process_single_image(55, "File:Broken.jpg")
+
+    assert result is False
+    error_updates = [(s, p) for s, p in db_calls if "UPDATE images SET status = 'error'" in s]
+    assert len(error_updates) == 1
+    assert error_updates[0][1][1] == 55
+
+
+def test_process_single_image_no_faces_no_auto_classify():
+    """When no faces are detected, no is_target update is made."""
+    db_calls = []
+
+    def mock_execute_query(sql, params=None, fetch=True):
+        db_calls.append((sql.strip(), params))
+        return None
+
+    with (
+        patch("worker.execute_query", side_effect=mock_execute_query),
+        patch("worker._download_image", return_value=b"fake"),
+        patch("worker._validate_image_dimensions"),
+        patch("worker._run_face_detection", return_value=([], [], 800, 600)),
+    ):
+        result = _process_single_image(56, "File:Empty.jpg", bootstrapped=True, project_id=10)
+
+    assert result is True
+    auto_class = [s for s, _ in db_calls if "UPDATE faces SET is_target" in s]
+    assert len(auto_class) == 0
+
+
+# ---------------------------------------------------------------------------
+# Tests for process_images skip logic
+# ---------------------------------------------------------------------------
+
+
+def test_process_images_no_pending_bootstrap_at_cap_skips_leftover():
+    """When bootstrap_remaining==0 and no non-bootstrap pending, leftover bootstrap images are skipped."""
+    project = {"id": 99}
+
+    skipped_bootstrap_calls = []
+
+    def mock_execute_query(sql, params=None, fetch=True):
+        # bs_ratio = 400/1000 = 0.4 <= 0.5, so bootstrap_cap = base_cap = 900
+        # bs_already_processed = 900 >= 900, so bootstrap_remaining = 0
+        if "SUM(CASE WHEN bootstrapped = 1 AND status != 'pending'" in sql:
+            return [{"bs_done": 900, "total": 1000}]
+        if "COUNT(*) AS cnt FROM images" in sql and "bootstrapped = 1" in sql:
+            return [{"cnt": 400}]  # bs_ratio = 0.4 → base_cap = 900
+        if "bootstrapped = 0" in sql and "LIMIT" in sql:
+            return []
+        if "bootstrapped = 1" in sql and "LIMIT" in sql:
+            return []
+        if "UPDATE images SET status = 'skipped'" in sql:
+            skipped_bootstrap_calls.append(sql)
+            return 5  # 5 leftover bootstrap images skipped
+        if "UPDATE projects SET images_processed" in sql:
+            return 1
+        return ()
+
+    with (
+        patch("worker.execute_query", side_effect=mock_execute_query),
+        patch("worker._process_single_image"),
+        patch("worker.shutdown_requested", False),
+    ):
+        count = process_images(project)
+
+    assert count == 0
+    assert len(skipped_bootstrap_calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# Tests for write_sdc_claims early exits
+# ---------------------------------------------------------------------------
+
+
+def test_write_sdc_no_access_token_sets_error():
+    """write_sdc_claims aborts and sets error when access token cannot be obtained."""
+    project = {"id": 5, "user_id": 1, "wikidata_qid": "Q42"}
+
+    db_calls = []
+
+    def mock_execute_query(sql, params=None, fetch=True):
+        db_calls.append((sql.strip(), params))
+        return 1
+
+    with (
+        patch("worker.execute_query", side_effect=mock_execute_query),
+        patch("worker._refresh_worker_token", return_value=None),
+        patch("worker.shutdown_requested", False),
+    ):
+        result = write_sdc_claims(project)
+
+    assert result == 0
+    error_updates = [(s, p) for s, p in db_calls if "sdc_write_error" in s and "UPDATE projects" in s]
+    assert len(error_updates) == 1
+    assert "Token expired" in error_updates[0][0]  # error message is in SQL, not params
+
+
+def test_write_sdc_csrf_failure_sets_error():
+    """write_sdc_claims aborts and sets error when CSRF token fetch fails."""
+    project = {"id": 5, "user_id": 1, "wikidata_qid": "Q42"}
+
+    db_calls = []
+
+    def mock_execute_query(sql, params=None, fetch=True):
+        db_calls.append((sql.strip(), params))
+        return 1
+
+    with (
+        patch("worker.execute_query", side_effect=mock_execute_query),
+        patch("worker._refresh_worker_token", return_value="fake-token"),
+        patch("worker._get_csrf_token", side_effect=RuntimeError("csrf error")),
+        patch("worker.shutdown_requested", False),
+    ):
+        result = write_sdc_claims(project)
+
+    assert result == 0
+    error_updates = [(s, p) for s, p in db_calls if "sdc_write_error" in s and "UPDATE projects" in s]
+    assert len(error_updates) == 1
+    assert "CSRF" in error_updates[0][0]  # error message is in SQL, not params
+
+
+def test_write_sdc_invalid_qid_sets_error():
+    """write_sdc_claims aborts with error when project QID is malformed."""
+    project = {"id": 5, "user_id": 1, "wikidata_qid": "INVALID"}
+
+    db_calls = []
+
+    def mock_execute_query(sql, params=None, fetch=True):
+        db_calls.append((sql.strip(), params))
+        return 1
+
+    with (
+        patch("worker.execute_query", side_effect=mock_execute_query),
+        patch("worker._refresh_worker_token", return_value="fake-token"),
+        patch("worker._get_csrf_token", return_value="fake-csrf"),
+        patch("worker.shutdown_requested", False),
+    ):
+        result = write_sdc_claims(project)
+
+    assert result == 0
+    error_updates = [(s, p) for s, p in db_calls if "Invalid QID" in str(s)]
+    assert len(error_updates) == 1
+
+
+def test_write_sdc_user_cancelled_returns_early():
+    """write_sdc_claims returns when sdc_write_requested is set to 0 (user cancelled)."""
+    project = {"id": 5, "user_id": 1, "wikidata_qid": "Q42"}
+
+    db_calls = []
+
+    def mock_execute_query(sql, params=None, fetch=True):
+        db_calls.append((sql.strip(), params))
+        if "sdc_write_requested" in sql and "SELECT" in sql:
+            return [{"sdc_write_requested": 0}]  # User cancelled
+        return 1
+
+    with (
+        patch("worker.execute_query", side_effect=mock_execute_query),
+        patch("worker._refresh_worker_token", return_value="fake-token"),
+        patch("worker._get_csrf_token", return_value="fake-csrf"),
+        patch("worker.shutdown_requested", False),
+    ):
+        result = write_sdc_claims(project)
+
+    assert result == 0
+
+
+def test_write_sdc_successful_write_increments_counter():
+    """write_sdc_claims writes P180 claim and returns total_written=1."""
+    project = {"id": 5, "user_id": 1, "wikidata_qid": "Q42"}
+
+    db_calls = []
+    face_batch_returned = [False]
+
+    def mock_execute_query(sql, params=None, fetch=True):
+        db_calls.append((sql.strip(), params))
+        if "sdc_write_requested" in sql and "SELECT" in sql:
+            return [{"sdc_write_requested": 1}]
+        if "SELECT f.id as face_id" in sql:
+            if not face_batch_returned[0]:
+                face_batch_returned[0] = True
+                return [{"face_id": 100, "image_id": 200, "commons_page_id": 9999}]
+            return []
+        if "sdc_removal_pending" in sql and "DISTINCT" in sql:
+            return []
+        if "INSERT IGNORE INTO sdc_claims" in sql:
+            return 1  # Successfully claimed
+        if "UPDATE faces SET sdc_written" in sql:
+            return 1
+        if "UPDATE sdc_claims SET written_at" in sql:
+            return 1
+        if "UPDATE projects SET sdc_write_requested = 0" in sql:
+            return 1
+        return 0
+
+    api_call_count = [0]
+
+    def mock_api(url, params=None, data=None, headers=None, method="get", **kwargs):
+        resp = MagicMock()
+        api_call_count[0] += 1
+        if api_call_count[0] == 1:
+            resp.json.return_value = {"claims": {}}  # No existing claim
+        else:
+            resp.json.return_value = {"success": 1}  # Write succeeds
+        return resp
+
+    with (
+        patch("worker.execute_query", side_effect=mock_execute_query),
+        patch("worker._refresh_worker_token", return_value="fake-token"),
+        patch("worker._get_csrf_token", return_value="fake-csrf"),
+        patch("worker._api_request", side_effect=mock_api),
+        patch("worker.shutdown_requested", False),
+        patch("worker.time.sleep"),
+    ):
+        result = write_sdc_claims(project)
+
+    assert result == 1
+
+    face_sdc_updates = [(s, p) for s, p in db_calls if "UPDATE faces SET sdc_written" in s]
+    assert len(face_sdc_updates) == 1
+
+
+# ---------------------------------------------------------------------------
+# Tests for run_autonomous_inference edge cases
+# ---------------------------------------------------------------------------
+
+
+def test_inference_skips_invalid_confirmed_encodings():
+    """Confirmed faces with invalid encoding lengths are skipped."""
+    project = {"id": 20, "min_confirmed": 2, "distance_threshold": 0.6}
+
+    confirmed_rows = [
+        {"encoding": b"short"},  # Invalid: not 1024 bytes
+        {"encoding": _make_encoding(1)},  # Valid
+        {"encoding": _make_encoding(2)},  # Valid
+    ]
+    unclassified_rows = []
+
+    def mock_execute_query(sql, params=None, fetch=True):
+        if "SELECT COUNT(*) AS cnt FROM faces f" in sql:
+            return [{"cnt": 2}]
+        if "SELECT f.encoding FROM faces f" in sql and "f.is_target = 1" in sql:
+            return confirmed_rows
+        if "SELECT f.id, f.image_id, f.encoding FROM faces f" in sql:
+            return unclassified_rows
+        if "UPDATE projects SET last_inference" in sql:
+            return 1
+        return []
+
+    with (
+        patch("worker.execute_query", side_effect=mock_execute_query),
+        patch("worker.shutdown_requested", False),
+    ):
+        result = run_autonomous_inference(project)
+
+    # Invalid encoding is skipped — but 2 valid ones remain, so inference runs
+    assert result == 0  # No candidates to classify
+
+
+def test_inference_all_confirmed_encodings_invalid_returns_zero():
+    """When all confirmed encodings are invalid, inference returns 0."""
+    project = {"id": 21, "min_confirmed": 1, "distance_threshold": 0.6}
+
+    confirmed_rows = [
+        {"encoding": b"bad"},
+        {"encoding": None},
+    ]
+
+    def mock_execute_query(sql, params=None, fetch=True):
+        if "SELECT COUNT(*) AS cnt FROM faces f" in sql:
+            return [{"cnt": 2}]
+        if "SELECT f.encoding FROM faces f" in sql and "f.is_target = 1" in sql:
+            return confirmed_rows
+        return []
+
+    with (
+        patch("worker.execute_query", side_effect=mock_execute_query),
+        patch("worker.shutdown_requested", False),
+    ):
+        result = run_autonomous_inference(project)
+
+    assert result == 0
+
+
+def test_inference_skips_invalid_candidate_encodings():
+    """Candidate faces with invalid encoding lengths are skipped without crashing."""
+    project = {"id": 22, "min_confirmed": 2, "distance_threshold": 0.6}
+
+    confirmed_rows = [{"encoding": _make_encoding(i)} for i in range(3)]
+    unclassified_rows = [
+        {"id": 500, "image_id": 1, "encoding": b"bad"},  # Invalid — should be skipped
+        {"id": 501, "image_id": 2, "encoding": _make_encoding(500)},  # Valid
+    ]
+    update_calls = []
+
+    def mock_execute_query(sql, params=None, fetch=True):
+        if "SELECT COUNT(*) AS cnt FROM faces f" in sql:
+            return [{"cnt": 3}]
+        if "SELECT f.encoding FROM faces f" in sql and "f.is_target = 1" in sql:
+            return confirmed_rows
+        if "SELECT f.id, f.image_id, f.encoding FROM faces f" in sql:
+            return unclassified_rows
+        if "UPDATE faces SET" in sql:
+            update_calls.append(params)
+            return 1
+        if "UPDATE projects SET last_inference" in sql:
+            return 1
+        return []
+
+    with (
+        patch("worker.execute_query", side_effect=mock_execute_query),
+        patch(
+            "worker.face_recognition.face_distance",
+            return_value=np.array([0.3], dtype=np.float64),
+        ),
+        patch("worker.shutdown_requested", False),
+    ):
+        result = run_autonomous_inference(project)
+
+    # Only the valid candidate (id=501) should be classified
+    assert result == 1

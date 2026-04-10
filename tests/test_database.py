@@ -355,3 +355,247 @@ def test_execute_query_with_parameterized_insert(db_pool, db_conn):
     rows = db_pool.execute_query("SELECT * FROM users WHERE wiki_user_id = %s", (100004,))
     assert len(rows) == 1
     assert rows[0]["wiki_username"] == "name-with-'quote'"
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for _execute_with_retry
+# ---------------------------------------------------------------------------
+
+from pymysql.err import OperationalError
+
+
+def _fake_op_error():
+    """Build a fake pymysql OperationalError."""
+    return OperationalError(2006, "Server gone away")
+
+
+class _FakePCWithCursor:
+    """Fake _PooledConnection that also supports cursor context manager."""
+
+    def __init__(self, *, is_open=True, rollback_raises=False):
+        self.conn = _FakeConn(is_open=is_open, rollback_raises=rollback_raises)
+
+    @property
+    def is_expired(self):
+        return False
+
+
+def test_execute_with_retry_success_on_first_attempt(monkeypatch):
+    """`_execute_with_retry` returns the result immediately on success."""
+
+    def _success():
+        return 42
+
+    result = database._execute_with_retry(_success)
+    assert result == 42
+
+
+def test_execute_with_retry_retries_on_operational_error(monkeypatch):
+    """`_execute_with_retry` retries when OperationalError is raised."""
+    call_count = [0]
+
+    def _flaky():
+        call_count[0] += 1
+        if call_count[0] < 3:
+            raise OperationalError(2006, "gone away")
+        return "ok"
+
+    monkeypatch.setattr(database, "INITIAL_BACKOFF", 0.001)
+    monkeypatch.setattr(database.time, "sleep", lambda *a: None)
+
+    result = database._execute_with_retry(_flaky)
+    assert result == "ok"
+    assert call_count[0] == 3
+
+
+def test_execute_with_retry_raises_database_error_after_exhaustion(monkeypatch):
+    """`_execute_with_retry` raises DatabaseError after all retries fail."""
+    monkeypatch.setattr(database, "INITIAL_BACKOFF", 0.001)
+    monkeypatch.setattr(database.time, "sleep", lambda *a: None)
+
+    def _always_fails():
+        raise OperationalError(2006, "gone away")
+
+    with pytest.raises(database.DatabaseError):
+        database._execute_with_retry(_always_fails)
+
+
+def test_execute_with_retry_allow_retry_false_no_retries(monkeypatch):
+    """`_execute_with_retry` with allow_retry=False executes once and raises immediately."""
+    call_count = [0]
+
+    def _flaky():
+        call_count[0] += 1
+        raise OperationalError(2006, "gone away")
+
+    monkeypatch.setattr(database, "INITIAL_BACKOFF", 0.001)
+    monkeypatch.setattr(database.time, "sleep", lambda *a: None)
+
+    with pytest.raises(database.DatabaseError):
+        database._execute_with_retry(_flaky, allow_retry=False)
+
+    assert call_count[0] == 1
+
+
+def test_execute_with_retry_retries_on_pool_exhausted(monkeypatch):
+    """`_execute_with_retry` retries when PoolExhaustedError is raised."""
+    call_count = [0]
+
+    def _flaky():
+        call_count[0] += 1
+        if call_count[0] < 2:
+            raise database.PoolExhaustedError("exhausted")
+        return "done"
+
+    monkeypatch.setattr(database, "INITIAL_BACKOFF", 0.001)
+    monkeypatch.setattr(database.time, "sleep", lambda *a: None)
+
+    result = database._execute_with_retry(_flaky)
+    assert result == "done"
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for execute_query, execute_insert, execute_transaction
+# ---------------------------------------------------------------------------
+
+
+def test_execute_query_raises_database_error_on_failure(monkeypatch):
+    """`execute_query` wraps exceptions as DatabaseError."""
+    monkeypatch.setattr(database, "_pool", None)
+
+    with pytest.raises(database.DatabaseError):
+        database.execute_query("SELECT 1")
+
+
+def test_execute_insert_raises_database_error_on_failure(monkeypatch):
+    """`execute_insert` wraps exceptions as DatabaseError."""
+    monkeypatch.setattr(database, "_pool", None)
+
+    with pytest.raises(database.DatabaseError):
+        database.execute_insert("INSERT INTO users VALUES (%s)", (1,))
+
+
+def test_execute_transaction_raises_database_error_on_failure(monkeypatch):
+    """`execute_transaction` wraps exceptions as DatabaseError."""
+    monkeypatch.setattr(database, "_pool", None)
+
+    def ops(conn, cursor):
+        cursor.execute("SELECT 1")
+
+    with pytest.raises(database.DatabaseError):
+        database.execute_transaction(ops)
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for get_connection
+# ---------------------------------------------------------------------------
+
+
+def test_get_connection_rollback_on_exception(monkeypatch):
+    """`get_connection` calls rollback when an exception is raised inside the block."""
+    rollback_called = [False]
+
+    class FakeConn:
+        open = True
+
+        def rollback(self):
+            rollback_called[0] = True
+
+        def close(self):
+            pass
+
+        def cursor(self):
+
+            class FakeCursor:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *a):
+                    pass
+
+            return FakeCursor()
+
+    pool = Queue(maxsize=2)
+    fake_conn = FakeConn()
+    pc = database._PooledConnection(fake_conn)
+    # Make connection appear healthy and not expired
+    monkeypatch.setattr(database, "_is_connection_healthy", lambda _pc: True)
+    pool.put_nowait(pc)
+    monkeypatch.setattr(database, "_pool", pool)
+
+    with pytest.raises(RuntimeError):
+        with database.get_connection() as _:
+            raise RuntimeError("oops")
+
+    assert rollback_called[0]
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for close_pool
+# ---------------------------------------------------------------------------
+
+
+def test_close_pool_no_op_when_pool_is_none(monkeypatch):
+    """`close_pool` exits early without error when pool is already None."""
+    monkeypatch.setattr(database, "_pool", None)
+    database.close_pool()  # Must not raise
+    assert database._pool is None
+
+
+def test_close_pool_drains_all_connections(monkeypatch):
+    """`close_pool` closes all connections and sets _pool to None."""
+    pool = Queue(maxsize=3)
+    closed_flags = []
+
+    for _ in range(3):
+
+        class TrackConn:
+            def close(self):
+                closed_flags.append(True)
+
+        pool.put_nowait(database._PooledConnection(TrackConn()))
+
+    monkeypatch.setattr(database, "_pool", pool)
+    database.close_pool()
+
+    assert database._pool is None
+    assert len(closed_flags) == 3
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for _get_connection_from_pool
+# ---------------------------------------------------------------------------
+
+
+def test_get_connection_from_pool_exhausted_raises(monkeypatch):
+    """`_get_connection_from_pool` raises PoolExhaustedError when pool is empty."""
+    pool = Queue(maxsize=2)
+    monkeypatch.setattr(database, "_pool", pool)
+
+    with pytest.raises(database.PoolExhaustedError):
+        database._get_connection_from_pool(timeout=0.01)
+
+
+def test_get_connection_from_pool_evicts_dead_connection(monkeypatch):
+    """`_get_connection_from_pool` replaces a dead connection with a fresh one."""
+    dead_conn = _FakeConn()
+
+    class DeadPC(database._PooledConnection):
+        pass
+
+    dead_pc = database._PooledConnection(dead_conn)
+
+    # Make is_healthy return False to simulate dead connection
+    monkeypatch.setattr(database, "_is_connection_healthy", lambda pc: False)
+
+    fresh_conn = _FakeConn()
+    fresh_pc = database._PooledConnection(fresh_conn)
+    monkeypatch.setattr(database, "_create_connection", lambda: fresh_pc)
+
+    pool = Queue(maxsize=2)
+    pool.put_nowait(dead_pc)
+    monkeypatch.setattr(database, "_pool", pool)
+
+    result = database._get_connection_from_pool(timeout=1.0)
+    assert result is fresh_pc
+    assert dead_conn._closed

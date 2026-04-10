@@ -10181,3 +10181,310 @@ def test_robots_txt_escapes_url_root():
         assert "Sitemap:" in body
     finally:
         flask_app.config.pop("SERVER_NAME", None)
+
+
+# ---------------------------------------------------------------------------
+# Tests for set_language redirect edge cases
+# ---------------------------------------------------------------------------
+
+
+def test_set_language_external_netloc_referrer_redirects_to_index(monkeypatch):
+    """set_language strips external referrers and falls back to index."""
+    flask_app.config["TESTING"] = True
+    flask_app.config.setdefault("SERVER_NAME", None)
+    client = flask_app.test_client()
+
+    monkeypatch.setattr(app_module, "execute_query", lambda *a, **kw: [])
+
+    # External host in referrer — should be redirected to '/' (index), not to evil.com
+    response = client.get(
+        "/set-language/en",
+        headers={"Referer": "https://evil.example.com/phish"},
+    )
+
+    assert response.status_code == 302
+    location = response.headers["Location"]
+    # Must NOT redirect to external domain
+    assert "evil.example.com" not in location
+
+
+def test_set_language_scheme_in_referrer_redirects_to_index(monkeypatch):
+    """set_language rejects referrers that contain scheme (e.g. http://...) after stripping netloc."""
+    flask_app.config["TESTING"] = True
+    flask_app.config.setdefault("SERVER_NAME", None)
+    client = flask_app.test_client()
+
+    monkeypatch.setattr(app_module, "execute_query", lambda *a, **kw: [])
+
+    response = client.get(
+        "/set-language/nb",
+        headers={"Referer": "javascript:alert(1)"},
+    )
+
+    assert response.status_code == 302
+    location = response.headers["Location"]
+    assert "javascript" not in location
+
+
+def test_set_language_double_slash_referrer_redirects_to_index(monkeypatch):
+    """set_language rejects referrers starting with '//' (protocol-relative URLs)."""
+    flask_app.config["TESTING"] = True
+    flask_app.config.setdefault("SERVER_NAME", None)
+    client = flask_app.test_client()
+
+    monkeypatch.setattr(app_module, "execute_query", lambda *a, **kw: [])
+
+    response = client.get(
+        "/set-language/en",
+        headers={"Referer": "//evil.example.com/path"},
+    )
+
+    assert response.status_code == 302
+    location = response.headers["Location"]
+    assert "evil.example.com" not in location
+
+
+# ---------------------------------------------------------------------------
+# Tests for before_request with TokenDecryptionError
+# ---------------------------------------------------------------------------
+
+
+def test_before_request_token_decryption_error_clears_session(monkeypatch):
+    """When token decryption fails, session is cleared and g.user is set to None."""
+    from token_crypto import TokenDecryptionError
+
+    flask_app.config["TESTING"] = True
+    flask_app.config.setdefault("SERVER_NAME", None)
+    client = flask_app.test_client()
+
+    fake_user_row = {
+        "id": 1,
+        "wiki_user_id": 123,
+        "wiki_username": "tester",
+        "access_token": "encrypted-garbage",
+        "refresh_token": "encrypted-garbage",
+        "token_expires_at": None,
+    }
+
+    monkeypatch.setattr(app_module, "execute_query", lambda *a, **kw: [fake_user_row])
+    monkeypatch.setattr(app_module, "decrypt_token", lambda t: (_ for _ in ()).throw(TokenDecryptionError("bad")))
+
+    with client.session_transaction() as sess:
+        sess["user_id"] = 1
+
+    response = client.get("/")
+
+    assert response.status_code == 200
+    # Session should now be cleared (user_id removed)
+    with client.session_transaction() as sess:
+        assert "user_id" not in sess
+
+
+# ---------------------------------------------------------------------------
+# Tests for project_new cross-user duplicate flows
+# ---------------------------------------------------------------------------
+
+
+def test_project_new_cross_user_duplicate_already_member_redirects(monkeypatch):
+    """If user is already a member of a cross-user project, redirect to that project."""
+    flask_app.config["TESTING"] = True
+    flask_app.config.setdefault("SERVER_NAME", None)
+    client = flask_app.test_client()
+
+    fake_user = {
+        "id": 2,
+        "wiki_user_id": 200,
+        "wiki_username": "joiner",
+        "access_token": "token",
+        "refresh_token": "refresh",
+        "token_expires_at": None,
+    }
+
+    def mock_execute_query(sql, params=None, fetch=True):
+        # before_request loads user
+        if "SELECT id, wiki_user_id, wiki_username, access_token" in sql:
+            return [fake_user]
+        # worker heartbeat check
+        if "worker_heartbeat" in sql:
+            return []
+        # Own-duplicate check: user has no own project
+        if "SELECT id FROM projects WHERE user_id" in sql:
+            return []
+        # Cross-user: another user (id=1) has the same project
+        if "SELECT p.id, p.label, u.wiki_username" in sql:
+            return [{"id": 10, "label": "Test", "wiki_username": "owner1"}]
+        # Membership check: user IS already a member
+        if "SELECT status FROM project_members" in sql:
+            return [{"status": "member"}]
+        return []
+
+    monkeypatch.setattr(app_module, "execute_query", mock_execute_query)
+    monkeypatch.setattr(app_module, "decrypt_token", lambda t: t)
+    monkeypatch.setattr(app_module, "_is_human_entity", lambda qid: True)
+    monkeypatch.setattr(app_module, "_commons_category_exists", lambda cat: True)
+    monkeypatch.setattr(app_module, "_commons_category_has_files", lambda cat: True)
+
+    with client.session_transaction() as sess:
+        sess["user_id"] = 2
+        sess["csrf_token"] = "tok"
+
+    response = client.post(
+        "/project/new",
+        data={
+            "wikidata_qid": "Q42",
+            "commons_category": "Test Category",
+            "label": "Test",
+            "distance_threshold": "0.6",
+            "min_confirmed": "5",
+            "csrf_token": "tok",
+        },
+    )
+
+    # Should redirect to the existing project
+    assert response.status_code == 302
+    assert "/project/10" in response.headers["Location"]
+
+
+def test_project_new_cross_user_duplicate_shows_join_option(monkeypatch):
+    """If another user has the project and current user is not a member, show join option."""
+    flask_app.config["TESTING"] = True
+    flask_app.config.setdefault("SERVER_NAME", None)
+    client = flask_app.test_client()
+
+    fake_user = {
+        "id": 3,
+        "wiki_user_id": 300,
+        "wiki_username": "newcomer",
+        "access_token": "token",
+        "refresh_token": "refresh",
+        "token_expires_at": None,
+    }
+
+    def mock_execute_query(sql, params=None, fetch=True):
+        if "SELECT id, wiki_user_id, wiki_username, access_token" in sql:
+            return [fake_user]
+        if "worker_heartbeat" in sql:
+            return []
+        # Own-duplicate check: no own project
+        if "SELECT id FROM projects WHERE user_id" in sql:
+            return []
+        # Cross-user: another user owns the same project
+        if "SELECT p.id, p.label, u.wiki_username" in sql:
+            return [{"id": 20, "label": "Test", "wiki_username": "otherowner"}]
+        # Membership check: NOT a member
+        if "SELECT status FROM project_members" in sql:
+            return []
+        return []
+
+    monkeypatch.setattr(app_module, "execute_query", mock_execute_query)
+    monkeypatch.setattr(app_module, "decrypt_token", lambda t: t)
+    monkeypatch.setattr(app_module, "_is_human_entity", lambda qid: True)
+    monkeypatch.setattr(app_module, "_commons_category_exists", lambda cat: True)
+    monkeypatch.setattr(app_module, "_commons_category_has_files", lambda cat: True)
+
+    with client.session_transaction() as sess:
+        sess["user_id"] = 3
+        sess["csrf_token"] = "tok"
+
+    response = client.post(
+        "/project/new",
+        data={
+            "wikidata_qid": "Q42",
+            "commons_category": "Test Category",
+            "label": "Test",
+            "distance_threshold": "0.6",
+            "min_confirmed": "5",
+            "csrf_token": "tok",
+        },
+    )
+
+    assert response.status_code == 200
+    # Join option message should appear in the rendered template
+    assert b"otherowner" in response.data or b"project_new" in response.data
+
+
+# ---------------------------------------------------------------------------
+# Tests for _is_safe_url (imported as _is_safe_url from app module)
+# ---------------------------------------------------------------------------
+
+
+def test_is_safe_url_relative_path():
+    with flask_app.test_request_context("/"):
+        assert _is_safe_url("/dashboard") is True
+
+
+def test_is_safe_url_external_scheme():
+    with flask_app.test_request_context("/"):
+        assert _is_safe_url("http://evil.com") is False
+
+
+def test_is_safe_url_javascript_scheme():
+    with flask_app.test_request_context("/"):
+        assert _is_safe_url("javascript:alert(1)") is False
+
+
+def test_is_safe_url_empty_string():
+    with flask_app.test_request_context("/"):
+        assert _is_safe_url("") is False
+
+
+def test_is_safe_url_double_slash():
+    with flask_app.test_request_context("/"):
+        assert _is_safe_url("//evil.com/path") is False
+
+
+# ---------------------------------------------------------------------------
+# Tests for token refresh rowcount==0 path in app.py _refresh_access_token
+# ---------------------------------------------------------------------------
+
+
+def test_app_refresh_token_rowcount_zero_reads_fresh(monkeypatch):
+    """When UPDATE rowcount==0 in app token refresh, fresh token is re-read from DB."""
+    flask_app.config["TESTING"] = True
+
+    # Import the private refresh function
+    from datetime import UTC, datetime, timedelta
+
+    from app import _refresh_access_token
+
+    past = datetime.now(UTC) - timedelta(hours=1)
+    user = {
+        "id": 1,
+        "wiki_username": "tester",
+        "access_token": "old-token",
+        "refresh_token": "old-refresh",
+        "token_expires_at": past,
+    }
+
+    query_calls = [0]
+
+    def mock_execute_query(sql, params=None, fetch=True):
+        query_calls[0] += 1
+        if "UPDATE users SET access_token" in sql:
+            return 0  # rowcount == 0 — another process refreshed first
+        if "SELECT access_token, refresh_token, token_expires_at FROM users" in sql:
+            return [{"access_token": "fresh-token", "refresh_token": "fresh-refresh", "token_expires_at": None}]
+        return []
+
+    new_token_data = {
+        "access_token": "new-token",
+        "refresh_token": "new-refresh",
+        "expires_in": 14400,
+    }
+
+    with (
+        flask_app.test_request_context(),
+        patch("app.execute_query", side_effect=mock_execute_query),
+        patch("app.encrypt_token", side_effect=lambda t: t),
+        patch("app.decrypt_token", side_effect=lambda t: t),
+        patch("app.OAuth2Session") as mock_oauth_cls,
+    ):
+        mock_oauth_instance = MagicMock()
+        mock_oauth_instance.refresh_token.return_value = new_token_data
+        mock_oauth_cls.return_value = mock_oauth_instance
+
+        result = _refresh_access_token(user)
+
+    # When rowcount==0, fresh token from DB should be returned via the user dict
+    assert result is not None
+    assert result.get("access_token") == "fresh-token"
