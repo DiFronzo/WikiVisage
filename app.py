@@ -2592,8 +2592,8 @@ def api_reclassify():
                     cursor.execute(
                         "UPDATE faces SET is_target = 0, classified_by = 'human', "
                         "classified_by_user_id = %s, classified_at = NOW(), "
-                        "sdc_written = 0, "
-                        "sdc_removal_pending = CASE WHEN sdc_written = 1 THEN 1 ELSE sdc_removal_pending END "
+                        "sdc_removal_pending = CASE WHEN sdc_written = 1 THEN 1 ELSE sdc_removal_pending END, "
+                        "sdc_written = 0 "
                         "WHERE image_id = %s AND id != %s AND is_target = 1 "
                         "AND superseded_by IS NULL",
                         (g.user["id"], face_row["image_id"], face_id),
