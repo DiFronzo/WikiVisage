@@ -1,5 +1,4 @@
 import io
-import ipaddress
 import json
 import logging
 import multiprocessing
@@ -228,72 +227,64 @@ def _api_request(
 _ALLOWED_DOWNLOAD_HOSTS = frozenset({"commons.wikimedia.org", "upload.wikimedia.org"})
 
 
-def _reject_private_ip(hostname: str) -> None:
-    """Raise ValueError if *hostname* resolves to a non-global IP (DNS rebinding defense)."""
-    for info in socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM):
-        addr = ipaddress.ip_address(info[4][0])
-        if not addr.is_global:
-            raise ValueError(f"Download host {hostname} resolved to non-global IP: {addr}")
-
-
 def _download_image(url: str, max_bytes: int = MAX_IMAGE_DOWNLOAD_BYTES) -> bytes:
     """Download an image with streaming size cap to prevent OOM.
 
     Uses _get_session() for connection pooling / retry. Raises ValueError
-    if the URL points to an untrusted host or if the response exceeds max_bytes.
+    if the URL points to an untrusted host, uses a non-HTTPS scheme, or if
+    the response exceeds max_bytes.
     """
     parsed_url = urlparse(url)
-    if parsed_url.scheme not in ("http", "https") or parsed_url.hostname not in _ALLOWED_DOWNLOAD_HOSTS:
+    if parsed_url.scheme != "https" or parsed_url.hostname not in _ALLOWED_DOWNLOAD_HOSTS:
         raise ValueError(f"Blocked download from untrusted host: {parsed_url.hostname}")
-    _reject_private_ip(parsed_url.hostname)
     session = _get_session()
-    resp = session.get(
-        url,
-        headers={"User-Agent": USER_AGENT},
-        timeout=30,
-        stream=True,
-        allow_redirects=False,
-    )
-
-    # Handle at most one redirect manually so the Location host is validated
-    # *before* the request is issued (SSRF defense — post-hoc resp.url check
-    # is too late because the redirect has already been followed).
-    if resp.is_redirect:
-        resp.close()
-        location = resp.headers.get("Location", "")
-        parsed_redirect = urlparse(location)
-        if parsed_redirect.hostname not in _ALLOWED_DOWNLOAD_HOSTS:
-            raise ValueError(f"Redirect to untrusted host: {parsed_redirect.hostname}")
-        _reject_private_ip(parsed_redirect.hostname)
+    resp = None
+    try:
         resp = session.get(
-            location,
+            url,
             headers={"User-Agent": USER_AGENT},
             timeout=30,
             stream=True,
             allow_redirects=False,
         )
+        # Handle at most one redirect manually so the Location host is validated
+        # *before* the request is issued (SSRF defense — post-hoc resp.url check
+        # is too late because the redirect has already been followed).
         if resp.is_redirect:
             resp.close()
-            raise ValueError("Too many redirects from allowed download host")
+            location = resp.headers.get("Location", "")
+            parsed_redirect = urlparse(location)
+            if parsed_redirect.scheme != "https" or parsed_redirect.hostname not in _ALLOWED_DOWNLOAD_HOSTS:
+                raise ValueError(f"Redirect to untrusted host: {parsed_redirect.hostname}")
+            resp = session.get(
+                location,
+                headers={"User-Agent": USER_AGENT},
+                timeout=30,
+                stream=True,
+                allow_redirects=False,
+            )
+            if resp.is_redirect:
+                resp.close()
+                raise ValueError("Too many redirects from allowed download host")
 
-    resp.raise_for_status()
+        resp.raise_for_status()
 
-    # Check Content-Length header first (fast reject)
-    content_length = resp.headers.get("Content-Length")
-    if content_length and int(content_length) > max_bytes:
-        resp.close()
-        raise ValueError(f"Image too large: {int(content_length)} bytes (limit {max_bytes})")
+        # Check Content-Length header first (fast reject)
+        content_length = resp.headers.get("Content-Length")
+        if content_length and int(content_length) > max_bytes:
+            raise ValueError(f"Image too large: {int(content_length)} bytes (limit {max_bytes})")
 
-    # Stream with enforced cap
-    chunks: list[bytes] = []
-    downloaded = 0
-    for chunk in resp.iter_content(chunk_size=65536):
-        downloaded += len(chunk)
-        if downloaded > max_bytes:
+        # Stream with enforced cap
+        chunks: list[bytes] = []
+        downloaded = 0
+        for chunk in resp.iter_content(chunk_size=65536):
+            downloaded += len(chunk)
+            if downloaded > max_bytes:
+                raise ValueError(f"Image download exceeded {max_bytes} bytes limit")
+            chunks.append(chunk)
+    finally:
+        if resp is not None:
             resp.close()
-            raise ValueError(f"Image download exceeded {max_bytes} bytes limit")
-        chunks.append(chunk)
-    resp.close()
 
     return b"".join(chunks)
 

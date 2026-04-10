@@ -820,7 +820,6 @@ class _FakeResponse:
 def test_download_image_success(monkeypatch):
     resp = _FakeResponse(headers={"Content-Length": "6"}, chunks=[b"ab", b"cd", b"ef"])
     monkeypatch.setattr(app_module.requests, "get", lambda *_a, **_k: resp)
-    monkeypatch.setattr(app_module, "_reject_private_ip", lambda _h: None)
 
     data = app_module._download_image("https://upload.wikimedia.org/file.jpg", max_bytes=10)
     assert data == b"abcdef"
@@ -829,7 +828,6 @@ def test_download_image_success(monkeypatch):
 def test_download_image_content_length_too_large(monkeypatch):
     resp = _FakeResponse(headers={"Content-Length": "11"}, chunks=[b"abc"])
     monkeypatch.setattr(app_module.requests, "get", lambda *_a, **_k: resp)
-    monkeypatch.setattr(app_module, "_reject_private_ip", lambda _h: None)
 
     with pytest.raises(ValueError, match="Image too large"):
         app_module._download_image("https://upload.wikimedia.org/file.jpg", max_bytes=10)
@@ -839,7 +837,6 @@ def test_download_image_content_length_too_large(monkeypatch):
 def test_download_image_stream_exceeds_limit(monkeypatch):
     resp = _FakeResponse(headers={}, chunks=[b"12345", b"67890", b"x"])
     monkeypatch.setattr(app_module.requests, "get", lambda *_a, **_k: resp)
-    monkeypatch.setattr(app_module, "_reject_private_ip", lambda _h: None)
 
     with pytest.raises(ValueError, match="exceeded"):
         app_module._download_image("https://upload.wikimedia.org/file.jpg", max_bytes=10)
@@ -849,7 +846,6 @@ def test_download_image_stream_exceeds_limit(monkeypatch):
 def test_download_image_raises_http_error(monkeypatch):
     resp = _FakeResponse(error=requests.HTTPError("bad response"))
     monkeypatch.setattr(app_module.requests, "get", lambda *_a, **_k: resp)
-    monkeypatch.setattr(app_module, "_reject_private_ip", lambda _h: None)
 
     with pytest.raises(requests.HTTPError):
         app_module._download_image("https://upload.wikimedia.org/file.jpg")
@@ -860,6 +856,11 @@ def test_download_image_blocks_untrusted_host():
         app_module._download_image("https://evil.example.com/file.jpg")
 
 
+def test_download_image_rejects_http_scheme():
+    with pytest.raises(ValueError, match="Blocked download from untrusted host"):
+        app_module._download_image("http://upload.wikimedia.org/file.jpg")
+
+
 def test_download_image_rejects_redirect_to_untrusted_host(monkeypatch):
     resp = _FakeResponse(
         headers={"Location": "https://evil.example.com/redirected.jpg"},
@@ -867,7 +868,19 @@ def test_download_image_rejects_redirect_to_untrusted_host(monkeypatch):
         is_redirect=True,
     )
     monkeypatch.setattr(app_module.requests, "get", lambda *_a, **_k: resp)
-    monkeypatch.setattr(app_module, "_reject_private_ip", lambda _h: None)
+
+    with pytest.raises(ValueError, match="Redirect to untrusted host"):
+        app_module._download_image("https://upload.wikimedia.org/file.jpg")
+    assert resp.closed is True
+
+
+def test_download_image_rejects_redirect_to_http_scheme(monkeypatch):
+    resp = _FakeResponse(
+        headers={"Location": "http://upload.wikimedia.org/redirected.jpg"},
+        chunks=[],
+        is_redirect=True,
+    )
+    monkeypatch.setattr(app_module.requests, "get", lambda *_a, **_k: resp)
 
     with pytest.raises(ValueError, match="Redirect to untrusted host"):
         app_module._download_image("https://upload.wikimedia.org/file.jpg")
@@ -892,39 +905,9 @@ def test_download_image_allows_redirect_to_trusted_host(monkeypatch):
         return redirect_resp if call_count == 1 else content_resp
 
     monkeypatch.setattr(app_module.requests, "get", _fake_get)
-    monkeypatch.setattr(app_module, "_reject_private_ip", lambda _h: None)
 
     data = app_module._download_image("https://upload.wikimedia.org/file.jpg", max_bytes=10)
     assert data == b"abc"
-
-
-def test_reject_private_ip_blocks_loopback(monkeypatch):
-    monkeypatch.setattr(
-        app_module.socket,
-        "getaddrinfo",
-        lambda *_a, **_k: [(2, 1, 6, "", ("127.0.0.1", 0))],
-    )
-    with pytest.raises(ValueError, match="non-global IP"):
-        app_module._reject_private_ip("upload.wikimedia.org")
-
-
-def test_reject_private_ip_blocks_rfc1918(monkeypatch):
-    monkeypatch.setattr(
-        app_module.socket,
-        "getaddrinfo",
-        lambda *_a, **_k: [(2, 1, 6, "", ("10.0.0.1", 0))],
-    )
-    with pytest.raises(ValueError, match="non-global IP"):
-        app_module._reject_private_ip("upload.wikimedia.org")
-
-
-def test_reject_private_ip_allows_public(monkeypatch):
-    monkeypatch.setattr(
-        app_module.socket,
-        "getaddrinfo",
-        lambda *_a, **_k: [(2, 1, 6, "", ("91.198.174.192", 0))],
-    )
-    app_module._reject_private_ip("upload.wikimedia.org")
 
 
 def test_login_required_redirects_unauthenticated(monkeypatch):
