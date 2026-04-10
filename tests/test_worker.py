@@ -1761,7 +1761,7 @@ def test_api_request_post_disables_redirects():
 
 def test_worker_reject_private_ip_blocks_loopback():
     with patch.object(_worker_module.socket, "getaddrinfo", return_value=[(2, 1, 6, "", ("127.0.0.1", 0))]):
-        with pytest.raises(ValueError, match="private/reserved IP"):
+        with pytest.raises(ValueError, match="non-global IP"):
             _worker_module._reject_private_ip("upload.wikimedia.org")
 
 
@@ -1775,10 +1775,8 @@ def test_worker_reject_private_ip_allows_public():
 
 def test_worker_download_image_rejects_redirect_to_untrusted():
     mock_resp = MagicMock()
-    mock_resp.url = "https://evil.example.com/redirected.jpg"
-    mock_resp.headers = {"Content-Length": "6"}
-    mock_resp.raise_for_status = MagicMock()
-    mock_resp.iter_content = MagicMock(return_value=iter([b"abcdef"]))
+    mock_resp.is_redirect = True
+    mock_resp.headers = {"Location": "https://evil.example.com/redirected.jpg"}
     mock_session = MagicMock()
     mock_session.get.return_value = mock_resp
     with (

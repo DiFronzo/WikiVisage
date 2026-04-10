@@ -252,14 +252,31 @@ def _download_image(url: str, max_bytes: int = MAX_IMAGE_DOWNLOAD_BYTES) -> byte
         headers={"User-Agent": USER_AGENT},
         timeout=30,
         stream=True,
+        allow_redirects=False,
     )
-    resp.raise_for_status()
 
-    # Reject redirects to untrusted hosts (SSRF defense)
-    final_host = urlparse(resp.url).hostname
-    if final_host not in _ALLOWED_DOWNLOAD_HOSTS:
+    # Handle at most one redirect manually so the Location host is validated
+    # *before* the request is issued (SSRF defense — post-hoc resp.url check
+    # is too late because the redirect has already been followed).
+    if resp.is_redirect:
         resp.close()
-        raise ValueError(f"Redirect to untrusted host: {final_host}")
+        location = resp.headers.get("Location", "")
+        parsed_redirect = urlparse(location)
+        if parsed_redirect.hostname not in _ALLOWED_DOWNLOAD_HOSTS:
+            raise ValueError(f"Redirect to untrusted host: {parsed_redirect.hostname}")
+        _reject_private_ip(parsed_redirect.hostname)
+        resp = session.get(
+            location,
+            headers={"User-Agent": USER_AGENT},
+            timeout=30,
+            stream=True,
+            allow_redirects=False,
+        )
+        if resp.is_redirect:
+            resp.close()
+            raise ValueError("Too many redirects from allowed download host")
+
+    resp.raise_for_status()
 
     # Check Content-Length header first (fast reject)
     content_length = resp.headers.get("Content-Length")
