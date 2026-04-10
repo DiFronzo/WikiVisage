@@ -1709,12 +1709,12 @@ def test_touch_heartbeat_file_uses_worker_id(tmp_path):
 
 
 def test_build_skip_extensions_regex_empty_set():
+    import re
+
     from worker import _build_skip_extensions_regex
 
     pattern = _build_skip_extensions_regex(set())
     assert pattern == r"(?!)"
-    import re
-
     assert not re.search(pattern, "File:something.webm")
     assert not re.search(pattern, "anything")
 

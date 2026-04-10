@@ -2,6 +2,7 @@ import time
 from queue import Queue
 
 import pytest
+from pymysql.err import OperationalError
 
 import database
 
@@ -360,8 +361,6 @@ def test_execute_query_with_parameterized_insert(db_pool, db_conn):
 # ---------------------------------------------------------------------------
 # Unit tests for _execute_with_retry
 # ---------------------------------------------------------------------------
-
-from pymysql.err import OperationalError
 
 
 def _fake_op_error():
