@@ -910,6 +910,40 @@ def test_download_image_allows_redirect_to_trusted_host(monkeypatch):
     assert data == b"abc"
 
 
+def test_download_image_multi_hop_redirect_succeeds(monkeypatch):
+    hop1 = _FakeResponse(
+        headers={"Location": "https://commons.wikimedia.org/w/index.php?title=Special:Redirect/file/X.jpg"},
+        chunks=[],
+        is_redirect=True,
+    )
+    hop2 = _FakeResponse(
+        headers={"Location": "https://upload.wikimedia.org/wikipedia/commons/a/X.jpg"},
+        chunks=[],
+        is_redirect=True,
+    )
+    content = _FakeResponse(headers={"Content-Length": "4"}, chunks=[b"data"])
+    responses = iter([hop1, hop2, content])
+
+    monkeypatch.setattr(app_module.requests, "get", lambda *_a, **_k: next(responses))
+
+    data = app_module._download_image("https://commons.wikimedia.org/wiki/Special:FilePath/X.jpg", max_bytes=100)
+    assert data == b"data"
+    assert hop1.closed is True
+    assert hop2.closed is True
+
+
+def test_download_image_too_many_redirects_raises(monkeypatch):
+    redirect = _FakeResponse(
+        headers={"Location": "https://upload.wikimedia.org/loop"},
+        chunks=[],
+        is_redirect=True,
+    )
+    monkeypatch.setattr(app_module.requests, "get", lambda *_a, **_k: redirect)
+
+    with pytest.raises(ValueError, match="Too many redirects"):
+        app_module._download_image("https://upload.wikimedia.org/file.jpg")
+
+
 def test_login_required_redirects_unauthenticated(monkeypatch):
     with flask_app.test_request_context("/protected?x=1"):
         g.user = None

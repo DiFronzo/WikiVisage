@@ -109,7 +109,7 @@ WikiVisage/
 ├── translations/        # i18n: en, nb, es, fr
 ├── requirements.txt     # Runtime dependencies
 ├── requirements-dev.txt # Dev/test deps (pytest, ruff)
-└── tests/               # 679 tests (unit + integration)
+└── tests/               # 687 tests (unit + integration)
 ```
 
 ## 🧑‍💻 Setup
