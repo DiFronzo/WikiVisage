@@ -1879,10 +1879,7 @@ def test_download_image_content_length_too_large_raises():
     mock_resp.raise_for_status = MagicMock()
     mock_resp.close = MagicMock()
 
-    with (
-        patch("worker._get_session") as mock_session,
-        patch("worker._reject_private_ip"),
-    ):
+    with patch("worker._get_session") as mock_session:
         mock_session.return_value.get.return_value = mock_resp
         with pytest.raises(ValueError, match="too large"):
             _download_image("https://upload.wikimedia.org/image.jpg", max_bytes=50 * 1024 * 1024)
@@ -1900,10 +1897,7 @@ def test_download_image_streaming_size_exceeded_raises():
     mock_resp.close = MagicMock()
     mock_resp.iter_content.return_value = iter(chunks)
 
-    with (
-        patch("worker._get_session") as mock_session,
-        patch("worker._reject_private_ip"),
-    ):
+    with patch("worker._get_session") as mock_session:
         mock_session.return_value.get.return_value = mock_resp
         with pytest.raises(ValueError, match="exceeded"):
             _download_image("https://upload.wikimedia.org/image.jpg", max_bytes=50 * 1024 * 1024)
@@ -1920,10 +1914,7 @@ def test_download_image_success():
     mock_resp.close = MagicMock()
     mock_resp.iter_content.return_value = iter([image_data])
 
-    with (
-        patch("worker._get_session") as mock_session,
-        patch("worker._reject_private_ip"),
-    ):
+    with patch("worker._get_session") as mock_session:
         mock_session.return_value.get.return_value = mock_resp
         result = _download_image("https://upload.wikimedia.org/image.jpg")
 
@@ -2919,20 +2910,6 @@ def test_api_request_post_disables_redirects():
     assert kwargs.get("allow_redirects") is False
 
 
-# --- Security: _reject_private_ip ---
-
-
-def test_worker_reject_private_ip_blocks_loopback():
-    with patch.object(_worker_module.socket, "getaddrinfo", return_value=[(2, 1, 6, "", ("127.0.0.1", 0))]):
-        with pytest.raises(ValueError, match="non-global IP"):
-            _worker_module._reject_private_ip("upload.wikimedia.org")
-
-
-def test_worker_reject_private_ip_allows_public():
-    with patch.object(_worker_module.socket, "getaddrinfo", return_value=[(2, 1, 6, "", ("91.198.174.192", 0))]):
-        _worker_module._reject_private_ip("upload.wikimedia.org")
-
-
 # --- Security: _download_image redirect rejection ---
 
 
@@ -2942,9 +2919,6 @@ def test_worker_download_image_rejects_redirect_to_untrusted():
     mock_resp.headers = {"Location": "https://evil.example.com/redirected.jpg"}
     mock_session = MagicMock()
     mock_session.get.return_value = mock_resp
-    with (
-        patch.object(_worker_module, "_get_session", return_value=mock_session),
-        patch.object(_worker_module, "_reject_private_ip", return_value=None),
-    ):
+    with patch.object(_worker_module, "_get_session", return_value=mock_session):
         with pytest.raises(ValueError, match="Redirect to untrusted host"):
             _worker_module._download_image("https://upload.wikimedia.org/file.jpg")

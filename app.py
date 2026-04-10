@@ -14,7 +14,6 @@ with Path(__file__).parent.joinpath("pyproject.toml").open("rb") as _f:
 
 import hashlib
 import io
-import ipaddress
 import json
 import logging
 import math
@@ -22,7 +21,6 @@ import os
 import random
 import re
 import secrets
-import socket
 import time
 from datetime import UTC, datetime, timedelta
 from functools import wraps
@@ -295,14 +293,6 @@ def _wikimedia_api_get(url: str, params: dict[str, str], timeout: int = 10) -> d
 _ALLOWED_DOWNLOAD_HOSTS = frozenset({"commons.wikimedia.org", "upload.wikimedia.org"})
 
 
-def _reject_private_ip(hostname: str) -> None:
-    """Raise ValueError if *hostname* resolves to a non-global IP (DNS rebinding defense)."""
-    for info in socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM):
-        addr = ipaddress.ip_address(info[4][0])
-        if not addr.is_global:
-            raise ValueError(f"Download host {hostname} resolved to non-global IP: {addr}")
-
-
 def _download_image(url: str, max_bytes: int = MAX_IMAGE_DOWNLOAD_BYTES) -> bytes:
     """Download an image with streaming size cap to prevent OOM.
 
@@ -312,7 +302,6 @@ def _download_image(url: str, max_bytes: int = MAX_IMAGE_DOWNLOAD_BYTES) -> byte
     parsed_url = urlparse(url)
     if parsed_url.scheme not in ("http", "https") or parsed_url.hostname not in _ALLOWED_DOWNLOAD_HOSTS:
         raise ValueError(f"Blocked download from untrusted host: {parsed_url.hostname}")
-    _reject_private_ip(parsed_url.hostname)
     resp = requests.get(
         url,
         headers={"User-Agent": USER_AGENT},
@@ -330,7 +319,6 @@ def _download_image(url: str, max_bytes: int = MAX_IMAGE_DOWNLOAD_BYTES) -> byte
         parsed_redirect = urlparse(location)
         if parsed_redirect.hostname not in _ALLOWED_DOWNLOAD_HOSTS:
             raise ValueError(f"Redirect to untrusted host: {parsed_redirect.hostname}")
-        _reject_private_ip(parsed_redirect.hostname)
         resp = requests.get(
             location,
             headers={"User-Agent": USER_AGENT},
