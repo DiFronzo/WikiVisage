@@ -50,7 +50,8 @@
         opacity: 0;
         transition: opacity 0.2s;
     }
-    .result-card:hover .result-actions {
+    .result-card:hover .result-actions,
+    .result-card:focus-within .result-actions {
         opacity: 1;
     }
     .btn-icon {
@@ -879,6 +880,8 @@
 
     function reclassifyFace(btn, isTarget) {
         var card = btn.closest('.result-card');
+        if (card.dataset.reclassifyInFlight === '1') return;
+        card.dataset.reclassifyInFlight = '1';
         var faceId = card.dataset.faceId;
         var loading = card.querySelector('.result-loading');
         loading.classList.add('active');
@@ -895,11 +898,13 @@
         }).then(function(data) {
             loading.classList.remove('active');
             if (data.status === 'ok') {
+                card.dataset.reclassifyInFlight = '0';
                 card.dataset.result = isTarget === 1 ? 'match' : 'rejected';
                 card.dataset.source = 'human';
                 
                 var badge = card.querySelector('.badge');
-                badge.className = 'badge ' + (isTarget === 1 ? 'badge-active' : 'badge-paused');
+                badge.classList.remove('badge-active', 'badge-paused', 'badge-bootstrap');
+                badge.classList.add(isTarget === 1 ? 'badge-active' : 'badge-paused');
                 badge.textContent = isTarget === 1 ? i18nReclassify.verified + ' \u2713' : i18nReclassify.rejected;
 
                 var methodLabel = card.querySelector('.result-method');
@@ -963,12 +968,46 @@
                 } else if (sdcNote) {
                     sdcNote.style.display = 'none';
                 }
+
+                // Update sibling cards that were demoted by the server
+                if (data.updated_faces && data.updated_faces.length > 0) {
+                    data.updated_faces.forEach(function(uf) {
+                        var siblingCard = document.querySelector('.result-card[data-face-id="' + uf.face_id + '"]');
+                        if (!siblingCard) return;
+                        siblingCard.dataset.result = 'rejected';
+                        siblingCard.dataset.source = 'human';
+                        siblingCard.dataset.sdcWritten = '0';
+                        siblingCard.dataset.sdcRemoval = uf.sdc_removal_queued ? '1' : '0';
+                        siblingCard.dataset.sdcPending = uf.sdc_removal_queued ? '1' : '0';
+                        var sibBadge = siblingCard.querySelector('.badge');
+                        if (sibBadge) {
+                            sibBadge.classList.remove('badge-active', 'badge-paused', 'badge-bootstrap');
+                            sibBadge.classList.add('badge-paused');
+                            sibBadge.textContent = i18nReclassify.rejected;
+                        }
+                        var sibSdcBadge = siblingCard.querySelector('[data-sdc-badge]');
+                        if (uf.sdc_removal_queued && !sibSdcBadge) {
+                            sibSdcBadge = document.createElement('span');
+                            sibSdcBadge.className = 'badge badge-sdc-pending badge-sm';
+                            sibSdcBadge.setAttribute('data-sdc-badge', '');
+                            sibSdcBadge.textContent = i18nReclassify.sdcPending;
+                            var sibInfo = siblingCard.querySelector('.result-info');
+                            if (sibInfo && sibBadge) sibInfo.insertBefore(sibSdcBadge, sibBadge.nextSibling);
+                        } else if (!uf.sdc_removal_queued && sibSdcBadge) {
+                            sibSdcBadge.remove();
+                        }
+                        var sibMethod = siblingCard.querySelector('.result-method');
+                        if (sibMethod) sibMethod.textContent = i18nReclassify.human;
+                    });
+                }
             } else {
                 alert(data.error || i18nReclassify.saveError);
+                card.dataset.reclassifyInFlight = '0';
             }
         }).catch(function(e) {
             console.error(e);
             loading.classList.remove('active');
+            card.dataset.reclassifyInFlight = '0';
             alert(i18nReclassify.saveError);
         });
     }
@@ -1267,10 +1306,10 @@
         card.dataset.source = face.classified_by;
         card.dataset.faceId = face.id;
         card.dataset.imageId = face.image_id;
-        card.dataset.sdcWritten = face.sdc_written;
+        card.dataset.sdcWritten = face.sdc_written ? '1' : '0';
         card.dataset.sdcPending = face.sdc_pending ? '1' : '0';
         card.dataset.sdcRemoval = face.sdc_removal ? '1' : '0';
-        card.dataset.bootstrapped = face.bootstrapped;
+        card.dataset.bootstrapped = face.bootstrapped ? '1' : '0';
 
         var thumb = document.createElement('div');
         thumb.className = 'result-thumb';
@@ -1364,7 +1403,8 @@
 
         var method = document.createElement('span');
         method.className = 'result-method';
-        method.textContent = face.classified_by;
+        var methodLabels = { model: i18nGallery.model, bootstrap: i18nGallery.bootstrap, human: i18nGallery.human };
+        method.textContent = methodLabels[face.classified_by] || face.classified_by;
         info.appendChild(method);
 
         card.appendChild(info);
@@ -1377,9 +1417,13 @@
     }
 
     var galleryLoading = false;
+    var galleryAbortController = null;
 
     function loadGalleryPage(page) {
-        if (galleryLoading) return;
+        if (galleryAbortController) {
+            galleryAbortController.abort();
+        }
+        galleryAbortController = new AbortController();
         galleryLoading = true;
         
         var params = new URLSearchParams();
@@ -1392,13 +1436,14 @@
 
         var gallery = document.getElementById('resultsGallery');
         
-        fetch(apiGalleryUrl + '?' + params.toString())
+        fetch(apiGalleryUrl + '?' + params.toString(), { signal: galleryAbortController.signal })
             .then(function(r) {
                 if (!r.ok) throw new Error('HTTP ' + r.status);
                 return r.json();
             })
             .then(function(data) {
                 galleryLoading = false;
+                galleryAbortController = null;
                 gallery.innerHTML = '';
                 
                 if (data.faces.length === 0) {
@@ -1435,7 +1480,9 @@
                 });
             })
             .catch(function(e) {
+                if (e.name === 'AbortError') return;
                 galleryLoading = false;
+                galleryAbortController = null;
                 console.error('Gallery load error:', e);
                 gallery.innerHTML = '';
                 var errMsg = document.createElement('p');
@@ -1460,7 +1507,8 @@
 
         var sdcBtn = document.getElementById('sdcToggle');
         var sdcLabel = sdcBtn.textContent.replace(/\s*\(\d+\)\s*$/, '');
-        sdcBtn.textContent = sdcLabel + ' (' + counts.sdc_pending + ')';
+        var filteredSdc = counts.filtered_sdc_pending !== undefined ? counts.filtered_sdc_pending : counts.sdc_pending;
+        sdcBtn.textContent = sdcLabel + ' (' + filteredSdc + ')';
     }
 
     function renderPagination(totalPages, totalItems) {
@@ -1500,7 +1548,7 @@
     }
 
     function goToPage(page) {
-        if (page < 1 || galleryLoading) return;
+        if (page < 1) return;
         loadGalleryPage(page);
         document.getElementById('resultsGallery').scrollIntoView({ behavior: 'smooth', block: 'start' });
     }

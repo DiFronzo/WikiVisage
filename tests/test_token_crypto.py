@@ -33,11 +33,10 @@ def _with_token_key():
 
 @pytest.fixture()
 def _with_bad_key():
-    """Set an invalid key, then reload the module."""
-    with patch.dict(os.environ, {"WIKIVISAGE_TOKEN_KEY": "not-a-valid-fernet-key"}):
-        import token_crypto
+    """Load the module first, then expose it under an invalid-key environment."""
+    import token_crypto
 
-        importlib.reload(token_crypto)
+    with patch.dict(os.environ, {"WIKIVISAGE_TOKEN_KEY": "not-a-valid-fernet-key"}):
         yield token_crypto
 
 
@@ -146,13 +145,9 @@ class TestEncryptionEnabled:
 
 
 class TestInvalidKey:
-    def test_encrypt_passthrough_on_bad_key(self, _with_bad_key):
-        token = "my-oauth-token"
-        assert _with_bad_key.encrypt_token(token) == token
-
-    def test_decrypt_passthrough_on_bad_key(self, _with_bad_key):
-        token = "my-oauth-token"
-        assert _with_bad_key.decrypt_token(token) == token
+    def test_reload_with_bad_key_raises_runtime_error(self, _with_bad_key):
+        with pytest.raises(RuntimeError, match="WIKIVISAGE_TOKEN_KEY is set but invalid"):
+            importlib.reload(_with_bad_key)
 
 
 # --- _looks_like_fernet helper ---

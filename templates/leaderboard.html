@@ -142,8 +142,8 @@
         .leaderboard-table th { font-size: 0.625rem; }
         .stats-grid { grid-template-columns: 1fr !important; }
         .filter-bar a {
-            padding: 0.625rem 0.5rem;
-            font-size: 0.75rem;
+            padding: 0.625rem 0.75rem;
+            font-size: 0.8rem;
             letter-spacing: 0.02em;
         }
     }
@@ -212,7 +212,7 @@
 </div>
 {% else %}
 <div class="card empty-leaderboard">
-    <h2 style="border: none;">{{ _('No contributions yet') }}</h2>
+    <h2 style="border: none;">{% if period == 'daily' %}{{ _('No daily contributions yet') }}{% elif period == 'month' %}{{ _('No monthly contributions yet') }}{% else %}{{ _('No contributions yet') }}{% endif %}</h2>
     <p style="color: var(--text-muted); margin-bottom: 2rem;">
         {{ _('Start classifying faces in a project to appear on the leaderboard.') }}
     </p>

@@ -14,6 +14,7 @@ with Path(__file__).parent.joinpath("pyproject.toml").open("rb") as _f:
 
 import hashlib
 import io
+import ipaddress
 import json
 import logging
 import math
@@ -21,6 +22,7 @@ import os
 import random
 import re
 import secrets
+import socket
 import time
 from datetime import UTC, datetime, timedelta
 from functools import wraps
@@ -71,7 +73,14 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-app.secret_key = os.environ.get("FLASK_SECRET_KEY", secrets.token_hex(32))
+_flask_secret = os.environ.get("FLASK_SECRET_KEY")
+if not _flask_secret:
+    _flask_secret = secrets.token_hex(32)
+    logging.getLogger(__name__).warning(
+        "FLASK_SECRET_KEY not set — using a random key. "
+        "Sessions will not survive restarts or work across gunicorn workers."
+    )
+app.secret_key = _flask_secret
 app.debug = os.environ.get("FLASK_DEBUG", "").lower() in {"1", "true", "yes"}
 
 # Trust reverse-proxy headers (Toolforge nginx → gunicorn).
@@ -116,7 +125,7 @@ try:
     _r = _redis_mod.from_url(_REDIS_URL, socket_connect_timeout=2)
     _r.ping()
 except Exception:
-    logger.warning("Redis unavailable at %s — rate limiter using per-process memory storage", _REDIS_URL)
+    logger.error("Redis unavailable at %s — rate limiter using per-process memory storage", _REDIS_URL)
     _limiter_storage_uri = "memory://"
 
 limiter = Limiter(
@@ -286,6 +295,14 @@ def _wikimedia_api_get(url: str, params: dict[str, str], timeout: int = 10) -> d
 _ALLOWED_DOWNLOAD_HOSTS = frozenset({"commons.wikimedia.org", "upload.wikimedia.org"})
 
 
+def _reject_private_ip(hostname: str) -> None:
+    """Raise ValueError if *hostname* resolves to a non-global IP (DNS rebinding defense)."""
+    for info in socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM):
+        addr = ipaddress.ip_address(info[4][0])
+        if not addr.is_global:
+            raise ValueError(f"Download host {hostname} resolved to non-global IP: {addr}")
+
+
 def _download_image(url: str, max_bytes: int = MAX_IMAGE_DOWNLOAD_BYTES) -> bytes:
     """Download an image with streaming size cap to prevent OOM.
 
@@ -295,12 +312,36 @@ def _download_image(url: str, max_bytes: int = MAX_IMAGE_DOWNLOAD_BYTES) -> byte
     parsed_url = urlparse(url)
     if parsed_url.scheme not in ("http", "https") or parsed_url.hostname not in _ALLOWED_DOWNLOAD_HOSTS:
         raise ValueError(f"Blocked download from untrusted host: {parsed_url.hostname}")
+    _reject_private_ip(parsed_url.hostname)
     resp = requests.get(
         url,
         headers={"User-Agent": USER_AGENT},
         timeout=30,
         stream=True,
+        allow_redirects=False,
     )
+
+    # Handle at most one redirect manually so the Location host is validated
+    # *before* the request is issued (SSRF defense — post-hoc resp.url check
+    # is too late because the redirect has already been followed).
+    if resp.is_redirect:
+        resp.close()
+        location = resp.headers.get("Location", "")
+        parsed_redirect = urlparse(location)
+        if parsed_redirect.hostname not in _ALLOWED_DOWNLOAD_HOSTS:
+            raise ValueError(f"Redirect to untrusted host: {parsed_redirect.hostname}")
+        _reject_private_ip(parsed_redirect.hostname)
+        resp = requests.get(
+            location,
+            headers={"User-Agent": USER_AGENT},
+            timeout=30,
+            stream=True,
+            allow_redirects=False,
+        )
+        if resp.is_redirect:
+            resp.close()
+            raise ValueError("Too many redirects from allowed download host")
+
     resp.raise_for_status()
 
     # Check Content-Length header first (fast reject)
@@ -2506,8 +2547,14 @@ def api_reclassify():
                 ), 502
 
     try:
+        demoted_ids: list[int] = []
+        demoted_sdc: dict[int, int] = {}
 
         def _reclassify(conn, cursor):
+            nonlocal demoted_ids, demoted_sdc
+            demoted_ids = []  # Reset in case of (theoretical) re-entry
+            demoted_sdc = {}
+
             cursor.execute(
                 "UPDATE faces SET is_target = %s, classified_by = 'human', "
                 "classified_by_user_id = %s, sdc_written = %s, "
@@ -2548,6 +2595,33 @@ def api_reclassify():
                     "AND superseded_by IS NULL AND id != %s",
                     (face_row["image_id"], face_id),
                 )
+                # Lock sibling target faces to prevent concurrent reclassify races
+                cursor.execute(
+                    "SELECT id, sdc_written FROM faces "
+                    "WHERE image_id = %s AND id != %s AND is_target = 1 "
+                    "AND superseded_by IS NULL FOR UPDATE",
+                    (face_row["image_id"], face_id),
+                )
+                sibling_rows = cursor.fetchall()
+                if sibling_rows:
+                    demoted_ids = [row["id"] for row in sibling_rows]
+                    demoted_sdc = {row["id"]: row["sdc_written"] for row in sibling_rows}
+                    cursor.execute(
+                        "UPDATE faces SET is_target = 0, classified_by = 'human', "
+                        "classified_by_user_id = %s, classified_at = NOW(), "
+                        "sdc_removal_pending = CASE WHEN sdc_written = 1 THEN 1 ELSE sdc_removal_pending END, "
+                        "sdc_written = 0 "
+                        "WHERE image_id = %s AND id != %s AND is_target = 1 "
+                        "AND superseded_by IS NULL",
+                        (g.user["id"], face_row["image_id"], face_id),
+                    )
+                    demoted_count = cursor.rowcount
+                    if demoted_count > 0:
+                        cursor.execute(
+                            "UPDATE projects SET faces_confirmed = "
+                            "GREATEST(0, CAST(faces_confirmed AS SIGNED) - %s) WHERE id = %s",
+                            (demoted_count, face_row["project_id"]),
+                        )
             elif is_target == 0 and old_is_target == 1:
                 cursor.execute(
                     "UPDATE projects SET faces_confirmed = "
@@ -2578,6 +2652,10 @@ def api_reclassify():
             "classified_by": face_row["classified_by"],
             "sdc_removed": sdc_removed,
             "sdc_removal_queued": sdc_removal_queued,
+            "updated_faces": [
+                {"face_id": fid, "is_target": 0, "sdc_removal_queued": bool(demoted_sdc.get(fid))}
+                for fid in demoted_ids
+            ],
         }
     )
 
@@ -2911,25 +2989,22 @@ def api_gallery(project_id: int):
     )
     params: list = [project_id]
 
-    filter_clauses: list[str] = []
-    if result_filter == "match":
-        filter_clauses.append("f.is_target = 1")
-    elif result_filter == "non-match":
-        filter_clauses.append("f.is_target != 1")
-        filter_clauses.append("NOT (f.is_target = 0 AND f.classified_by_user_id IS NOT NULL)")
-    elif result_filter == "rejected":
-        filter_clauses.append("f.is_target = 0")
-        filter_clauses.append("f.classified_by_user_id IS NOT NULL")
+    _RESULT_FILTERS: dict[str, list[str]] = {
+        "match": ["f.is_target = 1"],
+        "non-match": ["f.is_target != 1", "NOT (f.is_target = 0 AND f.classified_by_user_id IS NOT NULL)"],
+        "rejected": ["f.is_target = 0", "f.classified_by_user_id IS NOT NULL"],
+    }
+    _SOURCE_FILTERS: dict[str, list[str]] = {
+        "model": ["f.classified_by = 'model'", "f.classified_by_user_id IS NULL"],
+        "bootstrap": ["f.classified_by = 'bootstrap'", "f.classified_by_user_id IS NULL"],
+        "human": ["f.classified_by_user_id IS NOT NULL"],
+    }
 
-    if source_filter == "model":
-        filter_clauses.append("f.classified_by = 'model'")
-        filter_clauses.append("f.classified_by_user_id IS NULL")
-    elif source_filter == "bootstrap":
-        filter_clauses.append("f.classified_by = 'bootstrap'")
-        filter_clauses.append("f.classified_by_user_id IS NULL")
-    elif source_filter == "human":
-        filter_clauses.append("f.classified_by_user_id IS NOT NULL")
+    result_source_clauses: list[str] = []
+    result_source_clauses.extend(_RESULT_FILTERS.get(result_filter, []))
+    result_source_clauses.extend(_SOURCE_FILTERS.get(source_filter, []))
 
+    filter_clauses: list[str] = list(result_source_clauses)
     if sdc_filter == "sdc-pending":
         filter_clauses.append(
             "(f.is_target = 1 AND f.sdc_written = 0 AND f.classified_by != 'bootstrap' AND i.bootstrapped = 0"
@@ -2966,6 +3041,7 @@ def api_gallery(project_id: int):
                 "                  SELECT 1 FROM faces f2 "
                 "                  WHERE f2.image_id = f.image_id "
                 "                    AND f2.is_target = 1 "
+                "                    AND f2.superseded_by IS NULL "
                 "                    AND f2.id != f.id"
                 "            )) THEN 1 ELSE 0 END) AS sdc_pending "
                 f"FROM faces f JOIN images i ON f.image_id = i.id WHERE {base_where}",  # noqa: S608
@@ -2983,6 +3059,27 @@ def api_gallery(project_id: int):
                     "source_human": c["source_human"] or 0,
                     "sdc_pending": c["sdc_pending"] or 0,
                 }
+            if result_source_clauses:
+                filtered_where = base_where + " AND " + " AND ".join(result_source_clauses)
+                filtered_data = execute_query(
+                    "SELECT "
+                    "  SUM(CASE WHEN (f.is_target = 1 AND f.sdc_written = 0 AND f.classified_by != 'bootstrap' AND i.bootstrapped = 0) "
+                    "            OR (f.sdc_removal_pending = 1 AND NOT EXISTS ("
+                    "                  SELECT 1 FROM faces f2 "
+                    "                  WHERE f2.image_id = f.image_id "
+                    "                    AND f2.is_target = 1 "
+                    "                    AND f2.superseded_by IS NULL "
+                    "                    AND f2.id != f.id"
+                    "            )) THEN 1 ELSE 0 END) AS sdc_pending "
+                    f"FROM faces f JOIN images i ON f.image_id = i.id WHERE {filtered_where}",  # noqa: S608
+                    (project_id,),
+                )
+                if filtered_data:
+                    counts["filtered_sdc_pending"] = filtered_data[0]["sdc_pending"] or 0
+                else:
+                    counts["filtered_sdc_pending"] = 0
+            else:
+                counts["filtered_sdc_pending"] = counts.get("sdc_pending", 0)
         except DatabaseError:
             pass
 
@@ -3888,6 +3985,12 @@ def commons_thumb_route(file_title: str):
 
 # ---------------------------------------------------------------------------
 # Error handlers
+# ---------------------------------------------------------------------------
+# Security note: 400/403 handlers render e.description which comes from
+# abort() calls.  All abort() descriptions in this codebase are translated
+# constants (never user input), and Jinja2 auto-escapes {{ message }}.
+# If adding new abort() calls, never pass unsanitised user input as the
+# description argument.
 # ---------------------------------------------------------------------------
 
 

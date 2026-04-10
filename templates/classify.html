@@ -712,6 +712,8 @@
     {% if faces | length == 1 %}
     document.addEventListener('keydown', function(e) {
         if (drawMode) return;
+        var tag = (e.target.tagName || '').toLowerCase();
+        if (tag === 'input' || tag === 'textarea' || tag === 'select' || e.target.isContentEditable) return;
         if (e.key === 'y' || e.key === 'Y' || e.key === 'ArrowLeft') {
             selectFace({{ faces[0].face_id }});
         } else if (e.key === 'n' || e.key === 'N' || e.key === 'ArrowRight') {
@@ -728,6 +730,8 @@
             if (e.key === 'Escape') toggleDrawMode();
             return;
         }
+        var tag = (e.target.tagName || '').toLowerCase();
+        if (tag === 'input' || tag === 'textarea' || tag === 'select' || e.target.isContentEditable) return;
         if (e.key === 'n' || e.key === 'N') {
             selectFace('none');
         } else if (e.key === 's' || e.key === 'S') {

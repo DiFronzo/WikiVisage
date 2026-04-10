@@ -41,11 +41,10 @@ if _TOKEN_KEY:
         _fernet = Fernet(_TOKEN_KEY.encode() if isinstance(_TOKEN_KEY, str) else _TOKEN_KEY)
         logger.info("Token encryption enabled (WIKIVISAGE_TOKEN_KEY is set)")
     except Exception:
-        logger.exception(
-            "WIKIVISAGE_TOKEN_KEY is set but invalid — tokens will NOT be encrypted. "
+        raise RuntimeError(
+            "WIKIVISAGE_TOKEN_KEY is set but invalid — refusing to start with broken encryption. "
             'Generate a valid key with: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"'
-        )
-        _fernet = None
+        ) from None
 else:
     logger.info("Token encryption disabled (WIKIVISAGE_TOKEN_KEY not set)")
 
