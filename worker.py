@@ -2,6 +2,7 @@ import io
 import json
 import logging
 import multiprocessing
+import multiprocessing.connection
 import os
 import queue
 import random
@@ -585,52 +586,62 @@ FACE_DETECT_TIMEOUT = 120  # seconds — kill subprocess if face detection hangs
 
 
 def _face_detect_worker_loop(
-    task_queue: multiprocessing.Queue,
-    result_queue: multiprocessing.Queue,
+    task_conn: multiprocessing.connection.Connection,
+    result_conn: multiprocessing.connection.Connection,
     worker_id: int,
 ) -> None:
     """Long-lived subprocess loop: receive image bytes, detect faces, send results.
 
-    Runs until it receives a None sentinel on task_queue. Each task is
+    Runs until it receives a None sentinel on task_conn. Each task is
     (request_id, image_bytes). Results are (request_id, "ok", locations,
     encodings_bytes, width, height) or (request_id, "error", error_string).
+
+    Uses Pipe connections instead of multiprocessing.Queue to avoid POSIX
+    semaphores on /dev/shm (unavailable/tiny on Toolforge Kubernetes pods).
     """
     # Heavy imports happen once per subprocess lifetime — this is the whole point
     import face_recognition as fr
     import numpy  # noqa: F401 — imported to ensure numpy is initialized
 
-    while True:
-        try:
-            task = task_queue.get()
-            if task is None:
-                break  # Sentinel: clean shutdown
-
-            request_id, image_bytes = task
-
+    try:
+        while True:
             try:
-                image_data = fr.load_image_file(io.BytesIO(image_bytes))
-                img_height, img_width = image_data.shape[:2]
-                face_locations = fr.face_locations(image_data, model="hog")
-                face_encodings = fr.face_encodings(image_data, face_locations)
+                task = task_conn.recv()
+                if task is None:
+                    break  # Sentinel: clean shutdown
 
-                encodings_as_bytes = [enc.tobytes() for enc in face_encodings]
-                result_queue.put(
-                    (
-                        request_id,
-                        "ok",
-                        face_locations,
-                        encodings_as_bytes,
-                        img_width,
-                        img_height,
+                request_id, image_bytes = task
+
+                try:
+                    image_data = fr.load_image_file(io.BytesIO(image_bytes))
+                    img_height, img_width = image_data.shape[:2]
+                    face_locations = fr.face_locations(image_data, model="hog")
+                    face_encodings = fr.face_encodings(image_data, face_locations)
+
+                    encodings_as_bytes = [enc.tobytes() for enc in face_encodings]
+                    result_conn.send(
+                        (
+                            request_id,
+                            "ok",
+                            face_locations,
+                            encodings_as_bytes,
+                            img_width,
+                            img_height,
+                        )
                     )
-                )
-            except Exception as e:
-                result_queue.put((request_id, "error", str(e)))
+                except Exception as e:
+                    result_conn.send((request_id, "error", str(e)))
 
-        except Exception:
-            # Queue error or other fatal issue — subprocess exits, will be respawned
-            logging.getLogger(__name__).exception("Fatal error in face detection subprocess, exiting")
-            break
+            except EOFError:
+                # Parent closed the pipe — clean exit
+                break
+            except Exception:
+                # Pipe error or other fatal issue — subprocess exits, will be respawned
+                logging.getLogger(__name__).exception("Fatal error in face detection subprocess, exiting")
+                break
+    finally:
+        task_conn.close()
+        result_conn.close()
 
 
 class PoolUnavailableError(RuntimeError):
@@ -646,9 +657,13 @@ class FaceDetectPool:
     (which re-imports dlib/face_recognition) by keeping N subprocesses alive.
     Each subprocess imports the heavy libraries once at startup.
 
+    Uses per-worker Pipe pairs for IPC instead of multiprocessing.Queue to
+    avoid POSIX semaphores backed by /dev/shm (unavailable or tiny on
+    Toolforge Kubernetes pods).
+
     Thread-safe: multiple IMAGE_THREADS can call detect_faces() concurrently.
-    A background dispatch thread routes results from the shared subprocess
-    result queue to per-request queues, avoiding stash/requeue races.
+    A background dispatch thread routes results from worker result pipes to
+    per-request queues, avoiding stash/requeue races.
 
     Provides crash isolation: if a subprocess segfaults on a bad image,
     it is automatically respawned for the next request.
@@ -656,12 +671,17 @@ class FaceDetectPool:
 
     def __init__(self, pool_size: int = IMAGE_THREADS):
         self._pool_size = pool_size
-        self._task_queue: multiprocessing.Queue = multiprocessing.Queue()
-        self._result_queue: multiprocessing.Queue = multiprocessing.Queue()
+        # Per-worker: (task_parent_conn, result_parent_conn)
+        self._worker_pipes: list[
+            tuple[multiprocessing.connection.Connection, multiprocessing.connection.Connection]
+        ] = []
+        self._send_locks: list[threading.Lock] = []
         self._workers: list[multiprocessing.Process] = []
         self._workers_lock = threading.Lock()
         self._request_counter = 0
         self._counter_lock = threading.Lock()
+        self._next_worker = 0
+        self._next_worker_lock = threading.Lock()
         # Per-request result routing: request_id -> queue.Queue holding the result
         self._pending: dict[int, queue.Queue] = {}
         self._pending_lock = threading.Lock()
@@ -686,16 +706,36 @@ class FaceDetectPool:
         self._started = True
 
     def _spawn_worker(self, worker_id: int) -> None:
-        """Spawn a single worker subprocess. Caller must hold self._workers_lock."""
+        """Spawn a single worker subprocess with fresh Pipe pairs. Caller must hold self._workers_lock."""
+        task_parent, task_child = multiprocessing.Pipe()
+        result_parent, result_child = multiprocessing.Pipe()
+
         proc = multiprocessing.Process(
             target=_face_detect_worker_loop,
-            args=(self._task_queue, self._result_queue, worker_id),
+            args=(task_child, result_child, worker_id),
         )
         proc.start()
+
+        # Close child-end connections in parent (only the subprocess needs them)
+        task_child.close()
+        result_child.close()
+
         if worker_id < len(self._workers):
-            self._workers[worker_id] = proc
+            # Synchronize pipe replacement with in-flight sends for this worker.
+            # Lock order must match detect_faces(): workers_lock -> send_lock.
+            with self._send_locks[worker_id]:
+                old_task, old_result = self._worker_pipes[worker_id]
+                for conn in (old_task, old_result):
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                self._workers[worker_id] = proc
+                self._worker_pipes[worker_id] = (task_parent, result_parent)
         else:
             self._workers.append(proc)
+            self._worker_pipes.append((task_parent, result_parent))
+            self._send_locks.append(threading.Lock())
         logger.debug(f"Spawned face detection subprocess {worker_id} (pid={proc.pid})")
 
     def _ensure_workers_alive(self) -> None:
@@ -708,29 +748,42 @@ class FaceDetectPool:
                     self._spawn_worker(i)
 
     def _dispatch_results(self) -> None:
-        """Background thread: drain _result_queue and route to per-request queues.
+        """Background thread: read results from all worker Pipe connections and route to per-request queues.
 
-        Each result tuple starts with request_id. We look up the corresponding
-        per-request queue in self._pending and deliver the result. If no pending
-        request matches (e.g. caller timed out and unregistered), the result is
-        discarded with a warning.
+        Uses multiprocessing.connection.wait() to efficiently poll multiple
+        pipe endpoints. When a worker dies, recv() raises EOFError and the
+        connection is skipped (the main thread will respawn the worker with
+        a fresh pipe on the next detect_faces() call).
         """
         while not self._shutdown_event.is_set():
-            try:
-                # Short timeout so we can check shutdown_event periodically
-                result = self._result_queue.get(timeout=1.0)
-            except Exception:
-                # queue.Empty on timeout — loop back and check shutdown
+            with self._workers_lock:
+                result_conns = [pipes[1] for pipes in self._worker_pipes]
+
+            if not result_conns:
+                time.sleep(0.1)
                 continue
 
-            request_id = result[0]
-            with self._pending_lock:
-                result_q = self._pending.get(request_id)
+            try:
+                ready = multiprocessing.connection.wait(result_conns, timeout=1.0)
+            except (OSError, ValueError):
+                continue
 
-            if result_q is not None:
-                result_q.put(result)
-            else:
-                logger.warning(f"Face detection result for unknown request_id={request_id} (caller may have timed out)")
+            for conn in ready:
+                try:
+                    result = conn.recv()
+                except (EOFError, OSError):
+                    continue
+
+                request_id = result[0]
+                with self._pending_lock:
+                    result_q = self._pending.get(request_id)
+
+                if result_q is not None:
+                    result_q.put(result)
+                else:
+                    logger.warning(
+                        f"Face detection result for unknown request_id={request_id} (caller may have timed out)"
+                    )
 
     def is_healthy(self) -> bool:
         """Check if the pool is started and the dispatcher thread is alive."""
@@ -740,8 +793,9 @@ class FaceDetectPool:
         """Submit image for face detection and wait for result.
 
         Thread-safe: each caller gets a unique request_id and a private result
-        queue. The dispatch thread routes the subprocess result to the correct
-        caller without stashing or requeuing.
+        queue. Tasks are round-robin assigned to worker subprocesses via their
+        individual Pipe connections. The dispatch thread routes the subprocess
+        result to the correct caller.
 
         Returns (locations, encoding_bytes_list, width, height).
         Raises PoolUnavailableError if the pool is not started or dispatcher is dead.
@@ -765,8 +819,20 @@ class FaceDetectPool:
             self._pending[request_id] = result_q
 
         try:
-            # Submit task to subprocess pool
-            self._task_queue.put((request_id, image_bytes))
+            # Round-robin worker selection
+            with self._next_worker_lock:
+                worker_idx = self._next_worker % self._pool_size
+                self._next_worker += 1
+
+            # Send task to selected worker's pipe.
+            # Lock order must match _spawn_worker() replacement path to avoid deadlocks.
+            with self._workers_lock:
+                with self._send_locks[worker_idx]:
+                    task_conn = self._worker_pipes[worker_idx][0]
+                try:
+                    task_conn.send((request_id, image_bytes))
+                except (BrokenPipeError, OSError) as e:
+                    raise RuntimeError(f"Worker {worker_idx} pipe broken: {e}")
 
             # Wait for our result — the dispatch thread will deliver it
             try:
@@ -792,7 +858,7 @@ class FaceDetectPool:
         """Gracefully shut down all worker subprocesses and the dispatch thread.
 
         Ordering: mark not-started (reject new work) → send sentinels to
-        workers → join workers → stop dispatcher → cleanup.  The dispatcher
+        workers → join workers → stop dispatcher → close pipes. The dispatcher
         must stay alive while workers drain so in-flight results are still
         routed to their callers.
         """
@@ -805,9 +871,10 @@ class FaceDetectPool:
 
         # 2. Send sentinel to each worker subprocess so they exit cleanly
         with self._workers_lock:
-            for _ in self._workers:
+            for i, (task_conn, _) in enumerate(self._worker_pipes):
                 try:
-                    self._task_queue.put(None)
+                    with self._send_locks[i]:
+                        task_conn.send(None)
                 except Exception:
                     pass
 
@@ -824,16 +891,17 @@ class FaceDetectPool:
         if self._dispatcher_thread is not None:
             self._dispatcher_thread.join(timeout=5)
 
-        # 5. Close and join multiprocessing queues to release OS resources
-        for q in (self._task_queue, self._result_queue):
-            try:
-                q.close()
-                q.join_thread()
-            except Exception:
-                pass
-
+        # 5. Close all parent-side pipe connections to release OS resources
         with self._workers_lock:
+            for task_conn, result_conn in self._worker_pipes:
+                for conn in (task_conn, result_conn):
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
             self._workers.clear()
+            self._worker_pipes.clear()
+            self._send_locks.clear()
         logger.info("Face detection subprocess pool shut down")
 
 

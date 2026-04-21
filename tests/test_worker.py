@@ -12,6 +12,7 @@ import numpy as np
 with patch("database.init_db"):
     import worker as _worker_module
     from worker import (
+        FaceDetectPool,
         _claim_active_projects,
         _claim_inference_projects,
         _claim_sdc_projects,
@@ -402,6 +403,57 @@ def test_process_images_caps_bootstrap_when_already_processed():
 
     assert count == 0
     assert not bootstrap_pending_queried, "Bootstrap pending query should not be executed when cap is already met"
+
+
+def test_face_detect_pool_start_detect_shutdown_uses_pipe_lifecycle():
+    task_parent = MagicMock()
+    task_child = MagicMock()
+    result_parent = MagicMock()
+    result_child = MagicMock()
+    proc = MagicMock()
+    proc.pid = 1234
+    proc.is_alive.side_effect = [True, False]
+    dispatcher = MagicMock()
+    dispatcher.is_alive.return_value = True
+    fake_result_q = MagicMock()
+    fake_result_q.get.return_value = (1, "ok", [(1, 2, 3, 4)], [b"enc"], 100, 80)
+
+    with (
+        patch("worker.multiprocessing.Pipe", side_effect=[(task_parent, task_child), (result_parent, result_child)]),
+        patch("worker.multiprocessing.Process", return_value=proc),
+        patch("worker.threading.Thread", return_value=dispatcher),
+        patch("worker.queue.Queue", return_value=fake_result_q),
+    ):
+        pool = FaceDetectPool(pool_size=1)
+        pool.start()
+        result = pool.detect_faces(b"image-bytes")
+        pool.shutdown()
+
+    assert result == ([(1, 2, 3, 4)], [b"enc"], 100, 80)
+    task_parent.send.assert_any_call((1, b"image-bytes"))
+    task_parent.send.assert_any_call(None)
+    task_child.close.assert_called_once()
+    result_child.close.assert_called_once()
+
+
+def test_face_detect_pool_dispatch_routes_result_to_pending_request_queue():
+    pool = FaceDetectPool(pool_size=1)
+    result_conn = MagicMock()
+    result_payload = (7, "ok", [], [], 10, 10)
+    result_conn.recv.return_value = result_payload
+    pending_q = MagicMock()
+
+    pool._worker_pipes = [(MagicMock(), result_conn)]
+    pool._pending = {7: pending_q}
+
+    def _wait_once(_conns, timeout):
+        pool._shutdown_event.set()
+        return [result_conn]
+
+    with patch("worker.multiprocessing.connection.wait", side_effect=_wait_once):
+        pool._dispatch_results()
+
+    pending_q.put.assert_called_once_with(result_payload)
 
 
 import pytest
