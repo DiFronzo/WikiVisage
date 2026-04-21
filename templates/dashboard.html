@@ -10,78 +10,97 @@
     .header-actions.dash-header-inner {
         margin-bottom: 0 !important;
     }
-    .hero-btn {
-        padding: 1rem 2rem !important;
-        font-size: 1.125rem !important;
-        box-shadow: 4px 4px 0px rgba(20, 184, 166, 0.2);
-        transition: all 0.15s ease;
+
+    .dash-btn-row {
+        display: flex;
+        align-items: stretch;
+        flex-wrap: wrap;
     }
-    .hero-btn:hover {
+    .btn-group {
+        display: flex;
+        align-items: stretch;
+        box-shadow: 4px 4px 0px rgba(20, 184, 166, 0.2);
+        transition: box-shadow 0.15s ease, transform 0.15s ease;
+    }
+    .btn-group:hover {
         transform: translate(-2px, -2px);
         box-shadow: 6px 6px 0px rgba(20, 184, 166, 0.35);
     }
-    .hero-btn:active {
+    .btn-group:active {
         transform: translate(2px, 2px);
         box-shadow: 2px 2px 0px var(--primary);
     }
-    .dash-btn-row {
-        display: flex;
-        gap: 1.25rem;
-        align-items: center;
-        flex-wrap: wrap;
+    .hero-btn {
+        padding: 1rem 2rem !important;
+        font-size: 1.125rem !important;
+        box-shadow: none !important;
+        transform: none !important;
+        border-right: none !important;
     }
-
     .toggle-join-btn {
-        background: transparent;
-        color: var(--text-muted);
-        border-color: var(--text-muted);
-        border-style: dashed;
-        box-shadow: 4px 4px 0px rgba(255, 255, 255, 0.15);
-        transition: all 0.2s ease;
-    }
-    .toggle-join-btn:hover, .toggle-join-btn.open {
-        color: var(--text-main);
-        border-color: var(--text-main);
-        border-style: solid;
+        padding: 0 0.9rem;
         background: var(--surface);
-        box-shadow: 6px 6px 0px rgba(255, 255, 255, 0.25);
+        border: 3px solid var(--primary);
+        border-left: 3px dashed var(--primary);
+        color: var(--primary);
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        transition: background 0.15s ease, color 0.15s ease;
+        position: relative;
+        margin-left: 6px;
+    }
+    .toggle-join-btn:hover {
+        background: var(--primary);
+        color: var(--bg);
+    }
+    .toggle-join-btn.open {
+        background: var(--primary);
+        color: var(--bg);
+    }
+    .arrow-icon {
+        width: 9px;
+        height: 9px;
+        border-right: 3px solid currentColor;
+        border-bottom: 3px solid currentColor;
+        transform: rotate(-45deg);
+        display: inline-block;
+        transition: transform 0.35s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+    .toggle-join-btn.open .arrow-icon {
+        transform: rotate(45deg);
     }
 
-    .join-drawer {
+    .join-slideout-wrap {
         display: grid;
-        grid-template-rows: 0fr;
-        transition: grid-template-rows 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+        grid-template-columns: 0fr;
+        transition: grid-template-columns 0.45s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+    .join-slideout-wrap.open {
+        grid-template-columns: 1fr;
+    }
+    .join-slideout {
+        min-width: 0;
         overflow: hidden;
     }
-    .join-drawer.open {
-        grid-template-rows: 1fr;
-    }
-    .join-drawer-inner {
-        min-height: 0;
+    .join-slideout-inner {
         display: flex;
-        justify-content: flex-start;
-        padding-top: 1.5rem;
+        align-items: flex-end;
+        padding-left: 1.25rem;
         opacity: 0;
-        transform: translateY(-10px);
-        transition: opacity 0.2s ease, transform 0.2s ease, visibility 0s 0.2s;
-        visibility: hidden;
+        transition: opacity 0.15s ease;
     }
-    .join-drawer.open .join-drawer-inner {
+    .join-slideout-wrap.open .join-slideout-inner {
         opacity: 1;
-        transform: translateY(0);
-        visibility: visible;
-        transition: opacity 0.3s ease 0.1s, transform 0.3s cubic-bezier(0.4, 0, 0.2, 1) 0.1s, visibility 0s;
+        transition: opacity 0.3s ease 0.2s;
     }
 
-    .join-strip {
-        width: 28rem;
-        max-width: 100%;
-    }
     .join-form {
         display: flex;
         align-items: flex-end;
-        width: 100%;
         margin: 0;
+        white-space: nowrap;
     }
     .join-prompt {
         color: var(--primary);
@@ -94,7 +113,6 @@
         user-select: none;
     }
     .join-input-group {
-        flex: 1;
         display: flex;
         align-items: flex-end;
         border-bottom: 4px solid var(--border);
@@ -115,7 +133,6 @@
         width: 100%;
     }
     .join-input {
-        flex: 1;
         min-width: 0;
         width: 10ch;
         background: transparent;
@@ -137,41 +154,46 @@
     .join-btn {
         margin: 0 0 0.25rem 0.75rem;
         flex-shrink: 0;
-        border-color: var(--primary);
+        border: 2px solid var(--primary);
         background: var(--bg);
         color: var(--primary);
-        box-shadow: -4px 4px 0px var(--primary);
-        transform: translate(4px, -4px);
+        box-shadow: none;
+        transform: none;
         position: relative;
         z-index: 1;
-        transition: all 0.15s ease;
-        padding: 0.75rem 1.5rem !important; /* Size up the submit button */
-        font-size: 1rem !important;
+        transition: background 0.15s ease, color 0.15s ease, box-shadow 0.15s ease;
+        padding: 0.5rem 1.25rem !important;
+        font-size: 0.95rem !important;
     }
     .join-btn:hover {
         background: var(--primary);
         color: var(--bg);
-        transform: translate(2px, -2px);
-        box-shadow: -2px 2px 0px var(--border);
+        box-shadow: 2px 2px 0px var(--border);
     }
     .join-btn:active {
-        transform: translate(0px, 0px);
-        box-shadow: 0px 0px 0px var(--border);
+        box-shadow: none;
     }
     @media (max-width: 600px) {
-        .header-actions.dash-header-inner,
-        .dash-btn-row {
-            display: contents;
+        .join-slideout-wrap {
+            width: 100%;
+            grid-template-columns: 1fr;
+            grid-template-rows: 0fr;
+            transition: grid-template-rows 0.35s cubic-bezier(0.4, 0, 0.2, 1);
         }
-        .dash-header-wrapper {
-            display: flex;
-            flex-direction: column;
-            align-items: flex-start;
+        .join-slideout-wrap.open {
+            grid-template-columns: 1fr;
+            grid-template-rows: 1fr;
         }
-        .toggle-join-btn { order: 2; }
-        .join-drawer { order: 3; width: 100%; }
-        .dash-header-wrapper .hero-btn { order: 4; margin-top: 1.25rem; }
-        .join-strip { width: 100%; }
+        .join-slideout {
+            min-height: 0;
+        }
+        .join-slideout-inner {
+            padding-left: 0;
+            padding-top: 1.25rem;
+        }
+        .join-form {
+            white-space: normal;
+        }
         .join-btn {
             margin-left: 0.25rem;
             transform: translate(0, 0);
@@ -270,22 +292,25 @@
     <div class="header-actions dash-header-inner">
         <h1>{{ _('Welcome, %(username)s', username=g.user.wiki_username) }}</h1>
         <div class="dash-btn-row">
-            <button type="button" class="btn toggle-join-btn" id="toggleJoinBtn">{{ _('Join Project') }}</button>
-            <a href="{{ url_for('project_new') }}" class="btn btn-primary hero-btn">{{ _('New Project') }}</a>
-        </div>
-    </div>
-    
-    <div class="join-drawer" id="joinDrawer">
-        <div class="join-drawer-inner">
-            <div class="join-strip">
-                <form method="POST" action="{{ url_for('project_join') }}" class="join-form">
-                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                    <span class="join-prompt">&gt;</span>
-                    <div class="join-input-group">
-                        <input type="text" name="invite_code" class="join-input" id="joinInputEl" placeholder="{{ _('Enter invite code') }}" maxlength="8" required autocomplete="off" spellcheck="false">
-                        <button type="submit" class="btn join-btn">{{ _('Join') }}</button>
+            <div class="btn-group">
+                <a href="{{ url_for('project_new') }}" class="btn btn-primary hero-btn">{{ _('New Project') }}</a>
+                <button type="button" class="btn toggle-join-btn" id="toggleJoinBtn">
+                    <span class="arrow-icon"></span>
+                </button>
+            </div>
+            <div class="join-slideout-wrap" id="joinDrawer">
+                <div class="join-slideout">
+                    <div class="join-slideout-inner">
+                        <form method="POST" action="{{ url_for('project_join') }}" class="join-form">
+                            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                            <span class="join-prompt">&gt;</span>
+                            <div class="join-input-group">
+                                <input type="text" name="invite_code" class="join-input" id="joinInputEl" placeholder="{{ _('Enter invite code') }}" maxlength="8" required autocomplete="off" spellcheck="false">
+                                <button type="submit" class="btn join-btn">{{ _('Join') }}</button>
+                            </div>
+                        </form>
                     </div>
-                </form>
+                </div>
             </div>
         </div>
     </div>
@@ -296,17 +321,27 @@
         var toggleBtn = document.getElementById('toggleJoinBtn');
         var drawer = document.getElementById('joinDrawer');
         var input = document.getElementById('joinInputEl');
-        
-        toggleBtn.addEventListener('click', function() {
+
+        function closeDrawer() {
+            drawer.classList.remove('open');
+            toggleBtn.classList.remove('open');
+        }
+
+        toggleBtn.addEventListener('click', function(e) {
+            e.stopPropagation();
             var isOpen = drawer.classList.contains('open');
             if (isOpen) {
-                drawer.classList.remove('open');
-                toggleBtn.classList.remove('open');
+                closeDrawer();
             } else {
                 drawer.classList.add('open');
                 toggleBtn.classList.add('open');
-                // Wait for the slide animation to reveal before focusing
-                setTimeout(function() { input.focus(); }, 250);
+                setTimeout(function() { input.focus(); }, 350);
+            }
+        });
+
+        document.addEventListener('click', function(e) {
+            if (drawer.classList.contains('open') && !drawer.contains(e.target)) {
+                closeDrawer();
             }
         });
     });
