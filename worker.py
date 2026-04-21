@@ -721,14 +721,17 @@ class FaceDetectPool:
         result_child.close()
 
         if worker_id < len(self._workers):
-            old_task, old_result = self._worker_pipes[worker_id]
-            for conn in (old_task, old_result):
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-            self._workers[worker_id] = proc
-            self._worker_pipes[worker_id] = (task_parent, result_parent)
+            # Synchronize pipe replacement with in-flight sends for this worker.
+            # Lock order must match detect_faces(): workers_lock -> send_lock.
+            with self._send_locks[worker_id]:
+                old_task, old_result = self._worker_pipes[worker_id]
+                for conn in (old_task, old_result):
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                self._workers[worker_id] = proc
+                self._worker_pipes[worker_id] = (task_parent, result_parent)
         else:
             self._workers.append(proc)
             self._worker_pipes.append((task_parent, result_parent))
@@ -821,9 +824,10 @@ class FaceDetectPool:
                 worker_idx = self._next_worker % self._pool_size
                 self._next_worker += 1
 
-            # Send task to the selected worker's pipe (lock protects concurrent sends)
-            with self._send_locks[worker_idx]:
-                with self._workers_lock:
+            # Send task to selected worker's pipe.
+            # Lock order must match _spawn_worker() replacement path to avoid deadlocks.
+            with self._workers_lock:
+                with self._send_locks[worker_idx]:
                     task_conn = self._worker_pipes[worker_idx][0]
                 try:
                     task_conn.send((request_id, image_bytes))
@@ -867,9 +871,10 @@ class FaceDetectPool:
 
         # 2. Send sentinel to each worker subprocess so they exit cleanly
         with self._workers_lock:
-            for task_conn, _ in self._worker_pipes:
+            for i, (task_conn, _) in enumerate(self._worker_pipes):
                 try:
-                    task_conn.send(None)
+                    with self._send_locks[i]:
+                        task_conn.send(None)
                 except Exception:
                     pass
 

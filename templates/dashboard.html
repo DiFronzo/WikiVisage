@@ -294,11 +294,18 @@
         <div class="dash-btn-row">
             <div class="btn-group">
                 <a href="{{ url_for('project_new') }}" class="btn btn-primary hero-btn">{{ _('New Project') }}</a>
-                <button type="button" class="btn toggle-join-btn" id="toggleJoinBtn">
+                <button
+                    type="button"
+                    class="btn toggle-join-btn"
+                    id="toggleJoinBtn"
+                    aria-label="{{ _('Join project') }}"
+                    aria-controls="joinDrawer"
+                    aria-expanded="false"
+                >
                     <span class="arrow-icon"></span>
                 </button>
             </div>
-            <div class="join-slideout-wrap" id="joinDrawer">
+            <div class="join-slideout-wrap" id="joinDrawer" aria-hidden="true" inert>
                 <div class="join-slideout">
                     <div class="join-slideout-inner">
                         <form method="POST" action="{{ url_for('project_join') }}" class="join-form">
@@ -322,9 +329,21 @@
         var drawer = document.getElementById('joinDrawer');
         var input = document.getElementById('joinInputEl');
 
+        function setDrawerOpen(isOpen) {
+            drawer.classList.toggle('open', isOpen);
+            toggleBtn.classList.toggle('open', isOpen);
+            toggleBtn.setAttribute('aria-expanded', isOpen ? 'true' : 'false');
+            drawer.setAttribute('aria-hidden', isOpen ? 'false' : 'true');
+            if (isOpen) {
+                drawer.removeAttribute('inert');
+                setTimeout(function() { input.focus(); }, 350);
+            } else {
+                drawer.setAttribute('inert', '');
+            }
+        }
+
         function closeDrawer() {
-            drawer.classList.remove('open');
-            toggleBtn.classList.remove('open');
+            setDrawerOpen(false);
         }
 
         toggleBtn.addEventListener('click', function(e) {
@@ -333,9 +352,7 @@
             if (isOpen) {
                 closeDrawer();
             } else {
-                drawer.classList.add('open');
-                toggleBtn.classList.add('open');
-                setTimeout(function() { input.focus(); }, 350);
+                setDrawerOpen(true);
             }
         });
 
