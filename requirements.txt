@@ -24,7 +24,7 @@ dlib-bin>=19.24.6
 face-recognition @ git+https://github.com/DiFronzo/face_recognition@d632e2e8d5b5b286d944c333f3ff4433dafabb19
 
 # Image processing
-Pillow>=10.4.0
+Pillow>=12.2.0
 scipy>=1.14.0
 
 # Rate limiting
