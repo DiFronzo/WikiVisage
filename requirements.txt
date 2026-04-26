@@ -10,7 +10,7 @@ gunicorn==25.3.0
 
 # OAuth 2.0
 requests-oauthlib==2.0.0
-requests>=2.32.0
+requests>=2.33.1
 
 # Database
 PyMySQL==1.1.2
