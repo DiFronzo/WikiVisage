@@ -10,7 +10,7 @@ gunicorn==25.3.0
 
 # OAuth 2.0
 requests-oauthlib==2.0.0
-requests>=2.32.0
+requests>=2.33.1
 
 # Database
 PyMySQL==1.1.2
@@ -20,16 +20,16 @@ cryptography>=43.0.0
 # face-recognition depends on "dlib" (source-only, needs CMake/C++ to compile).
 # This fork is identical but depends on "dlib-bin" (pre-compiled wheels) instead,
 # avoiding both build-time OOM on Toolforge and local compilation failures.
-dlib-bin>=19.24.6
+dlib-bin>=20.0.1
 face-recognition @ git+https://github.com/DiFronzo/face_recognition@d632e2e8d5b5b286d944c333f3ff4433dafabb19
 
 # Image processing
-Pillow>=10.4.0
-scipy>=1.14.0
+Pillow>=12.2.0
+scipy>=1.17.1
 
 # Rate limiting
 Flask-Limiter==4.1.1
-redis>=5.0.0
+redis>=7.4.0
 
 # Internationalization
 Flask-Babel==4.0.0
