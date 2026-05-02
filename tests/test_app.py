@@ -5365,6 +5365,7 @@ def _default_bbox_face_row(**overrides):
         "project_id": 1,
         "wikidata_qid": "Q42",
         "image_status": "processed",
+        "prev_classifier_username": None,
     }
     row.update(overrides)
     return row
@@ -6047,14 +6048,45 @@ def test_api_reclassify_already_reviewed_by_another_user_returns_409(monkeypatch
         mock_conn = MagicMock()
         mock_cursor = MagicMock()
         mock_cursor.rowcount = 0
-        mock_cursor.fetchone.return_value = {"classified_by_user_id": 999}
+        mock_cursor.fetchone.return_value = {
+            "classified_by_user_id": 999,
+            "wiki_username": "OtherContributor",
+        }
         return fn(mock_conn, mock_cursor)
 
     monkeypatch.setattr(app_module, "execute_transaction", _transaction)
     resp = client.post("/api/reclassify", data={"csrf_token": "testtoken", "face_id": "1", "is_target": "1"})
 
     assert resp.status_code == 409
-    assert resp.get_json()["error"] == "This face has already been reviewed by another user"
+    body = resp.get_json()
+    assert body["reason"] == "already_reviewed"
+    # Friendly, actionable message that names the previous classifier
+    assert "OtherContributor" in body["error"]
+
+
+def test_api_reclassify_already_reviewed_unknown_user_returns_generic_409(monkeypatch):
+    """If the previous classifier's username can't be resolved (e.g. user
+    deleted, FK already SET NULL), still return a clean 409 with a generic
+    actionable message."""
+    client, _ = _authed_client(monkeypatch, route_execute_query=_reclassify_query_router())
+
+    def _transaction(fn):
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_cursor.rowcount = 0
+        mock_cursor.fetchone.return_value = {
+            "classified_by_user_id": 999,
+            "wiki_username": None,
+        }
+        return fn(mock_conn, mock_cursor)
+
+    monkeypatch.setattr(app_module, "execute_transaction", _transaction)
+    resp = client.post("/api/reclassify", data={"csrf_token": "testtoken", "face_id": "1", "is_target": "1"})
+
+    assert resp.status_code == 409
+    body = resp.get_json()
+    assert body["reason"] == "already_reviewed"
+    assert "another contributor" in body["error"].lower()
 
 
 def test_api_reclassify_same_user_reclick_noop_success(monkeypatch):
@@ -6270,6 +6302,12 @@ def test_api_update_face_bbox_success_new_face_inserted_original_superseded(monk
         mock_conn = MagicMock()
         mock_cursor = MagicMock()
         mock_cursor.lastrowid = 321
+        # In-tx re-check fetches the previous classifier; default row has
+        # classified_by_user_id=None so the re-check should also see None.
+        mock_cursor.fetchone.return_value = {
+            "classified_by_user_id": None,
+            "wiki_username": None,
+        }
         result = fn(mock_conn, mock_cursor)
         captured["calls"] = mock_cursor.execute.call_args_list
         return result
@@ -6350,6 +6388,145 @@ def test_api_update_face_bbox_image_not_processed(monkeypatch):
 
     assert resp.status_code == 409
     assert resp.get_json()["error"] == "Image has not finished processing yet"
+
+
+def test_api_update_face_bbox_blocks_other_users_face_with_username(monkeypatch):
+    """Pre-check: a member trying to edit a face classified by ANOTHER user
+    is blocked with a 409 naming the previous classifier. The download +
+    encoding pipeline must NOT run."""
+    face_row = _default_bbox_face_row(
+        classified_by_user_id=2,
+        prev_classifier_username="OtherUser",
+    )
+    client, _ = _authed_client(monkeypatch, route_execute_query=_bbox_query_router(face_row=face_row))
+
+    download_called = {"hit": False}
+
+    def _should_not_be_called(*_a, **_k):
+        download_called["hit"] = True
+        raise AssertionError("download must not run when guard rejects")
+
+    monkeypatch.setattr(app_module, "_download_image", _should_not_be_called)
+
+    resp = client.post("/api/update-face-bbox", data=_update_bbox_form())
+
+    assert resp.status_code == 409
+    payload = resp.get_json()
+    assert payload["reason"] == "already_reviewed"
+    assert "OtherUser" in payload["error"]
+    assert download_called["hit"] is False
+
+
+def test_api_update_face_bbox_blocks_other_users_face_null_username_fallback(monkeypatch):
+    """Pre-check: cross-user block still works when the previous classifier's
+    wiki_username is NULL (e.g., user row deleted). Returns the generic
+    fallback message instead of crashing."""
+    face_row = _default_bbox_face_row(
+        classified_by_user_id=2,
+        prev_classifier_username=None,
+    )
+    client, _ = _authed_client(monkeypatch, route_execute_query=_bbox_query_router(face_row=face_row))
+
+    resp = client.post("/api/update-face-bbox", data=_update_bbox_form())
+
+    assert resp.status_code == 409
+    payload = resp.get_json()
+    assert payload["reason"] == "already_reviewed"
+    assert payload["error"] == "This face has already been classified by another contributor."
+
+
+def test_api_update_face_bbox_allows_self_edit(monkeypatch):
+    """Members CAN edit a face they themselves classified."""
+    face_row = _default_bbox_face_row(classified_by_user_id=1)  # same as logged-in user
+    client, _ = _authed_client(monkeypatch, route_execute_query=_bbox_query_router(face_row=face_row))
+    monkeypatch.setattr(app_module, "_download_image", lambda *_a, **_k: b"image-bytes")
+
+    def _transaction(fn):
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_cursor.lastrowid = 999
+        # In-tx re-check fetchone() must return the same owner so guard passes
+        mock_cursor.fetchone.return_value = {
+            "classified_by_user_id": 1,
+            "wiki_username": "tester",
+        }
+        return fn(mock_conn, mock_cursor)
+
+    monkeypatch.setattr(app_module, "execute_transaction", _transaction)
+    fake_encoding = np.random.rand(128).astype(np.float64)
+    mock_fr = _build_face_recognition_mock(encodings=[fake_encoding])
+
+    with patch.dict("sys.modules", {"face_recognition": mock_fr}):
+        resp = client.post("/api/update-face-bbox", data=_update_bbox_form())
+
+    assert resp.status_code == 200
+    assert resp.get_json()["new_face_id"] == 999
+
+
+def test_api_update_face_bbox_allows_edit_of_unclassified_face(monkeypatch):
+    """Members CAN edit a face whose classified_by_user_id is NULL
+    (e.g., model-classified or bootstrap-classified faces)."""
+    face_row = _default_bbox_face_row(classified_by_user_id=None)
+    client, _ = _authed_client(monkeypatch, route_execute_query=_bbox_query_router(face_row=face_row))
+    monkeypatch.setattr(app_module, "_download_image", lambda *_a, **_k: b"image-bytes")
+
+    def _transaction(fn):
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_cursor.lastrowid = 777
+        mock_cursor.fetchone.return_value = {
+            "classified_by_user_id": None,
+            "wiki_username": None,
+        }
+        return fn(mock_conn, mock_cursor)
+
+    monkeypatch.setattr(app_module, "execute_transaction", _transaction)
+    fake_encoding = np.random.rand(128).astype(np.float64)
+    mock_fr = _build_face_recognition_mock(encodings=[fake_encoding])
+
+    with patch.dict("sys.modules", {"face_recognition": mock_fr}):
+        resp = client.post("/api/update-face-bbox", data=_update_bbox_form())
+
+    assert resp.status_code == 200
+    assert resp.get_json()["new_face_id"] == 777
+
+
+def test_api_update_face_bbox_intx_recheck_blocks_toctou_race(monkeypatch):
+    """Defense-in-depth: pre-check passes (NULL classifier), but between the
+    pre-check and the transaction another user classifies the face. The
+    in-transaction re-check must catch this and return 409."""
+    face_row = _default_bbox_face_row(classified_by_user_id=None)
+    client, _ = _authed_client(monkeypatch, route_execute_query=_bbox_query_router(face_row=face_row))
+    monkeypatch.setattr(app_module, "_download_image", lambda *_a, **_k: b"image-bytes")
+
+    def _transaction(fn):
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_cursor.lastrowid = 0
+        # Simulate race: another user (id=2) has classified between pre-check and now
+        mock_cursor.fetchone.return_value = {
+            "classified_by_user_id": 2,
+            "wiki_username": "Racer",
+        }
+        # The function should raise ValueError before reaching INSERT
+        try:
+            fn(mock_conn, mock_cursor)
+        except ValueError as exc:
+            # _run_authorized_transaction wraps these in DatabaseError via
+            # the cause chain — re-raise that wrapping to mimic real behavior
+            raise app_module.DatabaseError("Transaction execution failed") from exc
+
+    monkeypatch.setattr(app_module, "execute_transaction", _transaction)
+    fake_encoding = np.random.rand(128).astype(np.float64)
+    mock_fr = _build_face_recognition_mock(encodings=[fake_encoding])
+
+    with patch.dict("sys.modules", {"face_recognition": mock_fr}):
+        resp = client.post("/api/update-face-bbox", data=_update_bbox_form())
+
+    assert resp.status_code == 409
+    payload = resp.get_json()
+    assert payload["reason"] == "already_reviewed"
+    assert "Racer" in payload["error"]
 
 
 @pytest.fixture
@@ -10829,3 +11006,89 @@ class TestRunAuthorizedTransaction:
         monkeypatch.setattr(app_module, "execute_transaction", fake_tx)
         with pytest.raises(DatabaseError):
             app_module._run_authorized_transaction(lambda c, cur: None)
+
+    def test_unwraps_value_error_from_cause_chain(self, monkeypatch):
+        """Regression: ``execute_transaction`` wraps every exception in
+        ``DatabaseError(...) from e``. Route handlers signal control flow via
+        ``ValueError`` (e.g. ``ValueError("already_reviewed")`` in
+        ``_reclassify``); the helper must unwrap it so the route's
+        ``except ValueError`` handler runs and returns 4xx instead of 500."""
+        from database import DatabaseError
+
+        cause = ValueError("already_reviewed")
+
+        def fake_tx(_op):
+            raise DatabaseError(f"Transaction execution failed: {cause}") from cause
+
+        monkeypatch.setattr(app_module, "execute_transaction", fake_tx)
+        with pytest.raises(ValueError) as excinfo:
+            app_module._run_authorized_transaction(lambda c, cur: None)
+        assert str(excinfo.value) == "already_reviewed"
+        # Unwrapped ValueError must keep DatabaseError as its cause for tracing
+        assert isinstance(excinfo.value.__cause__, DatabaseError)
+
+    def test_unwraps_value_error_through_nested_cause_chain(self, monkeypatch):
+        """ValueError nested deeper than one level is still recovered."""
+        from database import DatabaseError
+
+        original = ValueError("custom_signal")
+        intermediate = RuntimeError("middle")
+        intermediate.__cause__ = original
+
+        def fake_tx(_op):
+            raise DatabaseError("wrapped twice") from intermediate
+
+        monkeypatch.setattr(app_module, "execute_transaction", fake_tx)
+        with pytest.raises(ValueError) as excinfo:
+            app_module._run_authorized_transaction(lambda c, cur: None)
+        assert str(excinfo.value) == "custom_signal"
+
+    def test_access_revoked_takes_precedence_over_value_error(self, monkeypatch):
+        """If both AccessRevoked and ValueError are in the chain, 403 wins
+        (security > control-flow)."""
+        from werkzeug.exceptions import HTTPException
+
+        from database import DatabaseError
+
+        revoked = app_module.AccessRevoked("revoked")
+        value_err = ValueError("would_be_409")
+        revoked.__cause__ = value_err
+
+        def fake_tx(_op):
+            raise DatabaseError("wrapped") from revoked
+
+        monkeypatch.setattr(app_module, "execute_transaction", fake_tx)
+        with pytest.raises(HTTPException) as excinfo:
+            app_module._run_authorized_transaction(lambda c, cur: None)
+        assert excinfo.value.code == 403
+
+
+class TestFindInCauseChain:
+    def test_returns_match_at_top(self):
+        e = ValueError("hit")
+        assert app_module._find_in_cause_chain(e, ValueError) is e
+
+    def test_walks_chain_to_find_type(self):
+        from database import DatabaseError
+
+        original = ValueError("deep")
+        wrapper = DatabaseError("outer")
+        wrapper.__cause__ = original
+        found = app_module._find_in_cause_chain(wrapper, ValueError)
+        assert found is original
+
+    def test_returns_none_when_type_absent(self):
+        from database import DatabaseError
+
+        e = DatabaseError("no value error here")
+        assert app_module._find_in_cause_chain(e, ValueError) is None
+
+    def test_no_infinite_loop_on_self_referential_cause(self):
+        e = RuntimeError("loop")
+        e.__cause__ = e
+        # Should terminate, not hang. RuntimeError is not ValueError.
+        assert app_module._find_in_cause_chain(e, ValueError) is None
+
+    def test_handles_none_input(self):
+        # Defensive: walking None should just return None
+        assert app_module._find_in_cause_chain(None, ValueError) is None  # type: ignore[arg-type]

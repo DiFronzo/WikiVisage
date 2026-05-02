@@ -1258,16 +1258,37 @@ def _is_access_revoked(exc: BaseException) -> bool:
     return False
 
 
+def _find_in_cause_chain(exc: BaseException, exc_type: type) -> BaseException | None:
+    """Walk ``__cause__`` chain looking for an exception of *exc_type*.
+
+    ``execute_transaction`` wraps every exception in ``DatabaseError(...) from e``,
+    so callers that signal control flow via ``ValueError`` (or similar) inside a
+    transaction need this to recover the original exception."""
+    cur: BaseException | None = exc
+    seen: set[int] = set()
+    while cur is not None and id(cur) not in seen:
+        if isinstance(cur, exc_type):
+            return cur
+        seen.add(id(cur))
+        cur = cur.__cause__
+    return None
+
+
 def _run_authorized_transaction(operations: Callable[[Any, Any], Any]) -> Any:
     """Run *operations* in a DB transaction, translating an in-transaction
-    ``AccessRevoked`` into HTTP 403. Other ``DatabaseError`` exceptions
-    propagate so callers can handle them as before."""
+    ``AccessRevoked`` into HTTP 403 and re-raising any in-transaction
+    ``ValueError`` unwrapped so route handlers can catch it normally.
+    Other ``DatabaseError`` exceptions propagate so callers can handle them
+    as before."""
     try:
         return execute_transaction(operations)
     except DatabaseError as e:
         if _is_access_revoked(e):
             logger.warning("Access revoked mid-transaction; aborting with 403")
             abort(403)
+        original_value_error = _find_in_cause_chain(e, ValueError)
+        if original_value_error is not None:
+            raise original_value_error from e
         raise
 
 
@@ -2788,7 +2809,9 @@ def api_reclassify():
                 # same user clicked the same action again (no columns changed).
                 # Re-check to distinguish the two cases.
                 cursor.execute(
-                    "SELECT classified_by_user_id FROM faces WHERE id = %s",
+                    "SELECT f.classified_by_user_id, u.wiki_username "
+                    "FROM faces f LEFT JOIN users u ON u.id = f.classified_by_user_id "
+                    "WHERE f.id = %s",
                     (face_id,),
                 )
                 check = cursor.fetchone()
@@ -2796,7 +2819,11 @@ def api_reclassify():
                     # Same user, same value — treat as no-op success
                     pass
                 else:
-                    raise ValueError("already_reviewed")
+                    # Smuggle the previous classifier's username through the
+                    # ValueError so the route handler can build a friendly,
+                    # actionable 409 message.
+                    other_user = (check or {}).get("wiki_username") or ""
+                    raise ValueError(f"already_reviewed:{other_user}")
 
             if is_target == 1 and old_is_target != 1:
                 cursor.execute(
@@ -2851,8 +2878,17 @@ def api_reclassify():
                 sdc_written = 1
 
     except ValueError as e:
-        if str(e) == "already_reviewed":
-            return jsonify({"error": _("This face has already been reviewed by another user")}), 409
+        msg = str(e)
+        if msg.startswith("already_reviewed"):
+            other_user = msg.split(":", 1)[1] if ":" in msg else ""
+            if other_user:
+                error_msg = _(
+                    "This face was already classified by %(user)s. Only they can change their own classification.",
+                    user=other_user,
+                )
+            else:
+                error_msg = _("This face has already been classified by another contributor.")
+            return jsonify({"error": error_msg, "reason": "already_reviewed"}), 409
         raise
     except DatabaseError:
         logger.exception("Failed to reclassify face")
@@ -2905,17 +2941,21 @@ def api_update_face_bbox():
     if bbox_error:
         return jsonify({"error": bbox_error}), 400
 
-    # Verify ownership: face → image → project → user (or member)
+    # Verify ownership: face → image → project → user (or member).
+    # Also fetch previous classifier's wiki_username so we can build a friendly
+    # cross-user 409 message without a second query.
     try:
         rows = execute_query(
             "SELECT f.id, f.image_id, f.is_target, f.classified_by, f.confidence, "
             "  f.classified_by_user_id, f.sdc_written, i.file_title, i.commons_page_id, "
             "  i.status AS image_status, "
-            "  p.id AS project_id, p.wikidata_qid "
+            "  p.id AS project_id, p.wikidata_qid, "
+            "  u.wiki_username AS prev_classifier_username "
             "FROM faces f "
             "JOIN images i ON f.image_id = i.id "
             "JOIN projects p ON i.project_id = p.id "
             "LEFT JOIN project_members pm ON pm.project_id = p.id AND pm.user_id = %s AND pm.status = 'active' "
+            "LEFT JOIN users u ON u.id = f.classified_by_user_id "
             "WHERE f.id = %s AND (p.user_id = %s OR pm.user_id IS NOT NULL) "
             "AND f.superseded_by IS NULL AND p.status != 'deleted'",
             (g.user["id"], face_id, g.user["id"]),
@@ -2928,6 +2968,23 @@ def api_update_face_bbox():
     face_row = rows[0]
     if face_row.get("image_status") != "processed":
         return jsonify({"error": _("Image has not finished processing yet")}), 409
+
+    # Pre-check cross-user guard BEFORE downloading the image and running dlib
+    # encoding. Mirrors the in-transaction guard in reclassify: members can
+    # only edit faces they classified themselves (or NULL/model/bootstrap).
+    # An in-transaction re-check below closes the TOCTOU window.
+    orig_classified_by_user_id = face_row.get("classified_by_user_id")
+    if orig_classified_by_user_id is not None and orig_classified_by_user_id != g.user["id"]:
+        prev_user = face_row.get("prev_classifier_username") or ""
+        if prev_user:
+            error_msg = _(
+                "This face was already classified by %(user)s. Only they can change their own classification.",
+                user=prev_user,
+            )
+        else:
+            error_msg = _("This face has already been classified by another contributor.")
+        return jsonify({"error": error_msg, "reason": "already_reviewed"}), 409
+
     image_id = face_row["image_id"]
     orig_is_target = face_row["is_target"]
     orig_confidence = face_row["confidence"]
@@ -2958,6 +3015,25 @@ def api_update_face_bbox():
 
         def _update_bbox(conn, cursor):
             _assert_project_access_locked(cursor, face_row["project_id"], g.user["id"])
+
+            # In-transaction re-check of the cross-user guard. Closes the
+            # TOCTOU window between the pre-check above and the INSERT below:
+            # another user could have classified this face in between.
+            cursor.execute(
+                "SELECT f.classified_by_user_id, u.wiki_username "
+                "FROM faces f LEFT JOIN users u ON u.id = f.classified_by_user_id "
+                "WHERE f.id = %s AND f.superseded_by IS NULL",
+                (face_id,),
+            )
+            check = cursor.fetchone()
+            if not check:
+                # Face was superseded or deleted while we were downloading
+                raise ValueError("face_gone")
+            current_owner = check["classified_by_user_id"]
+            if current_owner is not None and current_owner != g.user["id"]:
+                other_user = check.get("wiki_username") or ""
+                raise ValueError(f"already_reviewed:{other_user}")
+
             cursor.execute(
                 "INSERT INTO faces "
                 "(image_id, encoding, bbox_top, bbox_right, bbox_bottom, bbox_left, "
@@ -3001,6 +3077,21 @@ def api_update_face_bbox():
     except requests.RequestException as e:
         logger.error(f"Failed to download image for bbox update: {e}")
         return jsonify({"error": _("Failed to download image from Commons")}), 502
+    except ValueError as e:
+        msg = str(e)
+        if msg.startswith("already_reviewed"):
+            other_user = msg.split(":", 1)[1] if ":" in msg else ""
+            if other_user:
+                error_msg = _(
+                    "This face was already classified by %(user)s. Only they can change their own classification.",
+                    user=other_user,
+                )
+            else:
+                error_msg = _("This face has already been classified by another contributor.")
+            return jsonify({"error": error_msg, "reason": "already_reviewed"}), 409
+        if msg == "face_gone":
+            return jsonify({"error": _("Face not found or access denied")}), 404
+        raise
     except DatabaseError:
         logger.exception("Failed to insert updated face")
         return jsonify({"error": _("Failed to save face")}), 500

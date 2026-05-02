@@ -1008,7 +1008,11 @@
             console.error(e);
             loading.classList.remove('active');
             card.dataset.reclassifyInFlight = '0';
-            alert(i18nReclassify.saveError);
+            // postForm() throws on non-2xx; surface the server's actual error
+            // message (e.g. "This face was already classified by X") instead
+            // of the generic saveError fallback.
+            var msg = (e && e.data && e.data.error) || (e && e.message) || i18nReclassify.saveError;
+            alert(msg);
         });
     }
 
@@ -1283,7 +1287,10 @@
         }).catch(function(e) {
             console.error(e);
             loading.classList.remove('active');
-            alert(i18nReclassify.bboxError);
+            // Surface the server's actual error message (postForm() throws
+            // on non-2xx) instead of the generic bboxError fallback.
+            var msg = (e && e.data && e.data.error) || (e && e.message) || i18nReclassify.bboxError;
+            alert(msg);
         });
     }
 
