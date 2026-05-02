@@ -8,15 +8,16 @@ Active-learning Flask app for Wikimedia Commons. Users classify faces via yes/no
 
 ```
 WikiVisage/
-├── app.py              # Flask web app: OAuth, routes, classification API (~4041 lines)
-├── worker.py           # Background ML pipeline: crawl, detect, infer (~3081 lines)
+├── app.py              # Flask web app: OAuth (PKCE), routes, classification API, CSP (~4279 lines)
+├── worker.py           # Background ML pipeline: crawl, detect (RLIMIT-hardened), infer (~3329 lines)
 ├── config.py           # Shared config constants: WAKE_FILE_PATH, HEARTBEAT_FILE_DIR (~13 lines)
-├── token_crypto.py     # Fernet encrypt/decrypt helpers for OAuth tokens at rest (~110 lines)
+├── token_crypto.py     # Fernet encrypt/decrypt helpers for OAuth tokens at rest (~125 lines)
+├── redis_lock.py       # Best-effort Redis single-flight lock; used to serialize OAuth refresh (~100 lines)
 ├── database.py         # MariaDB connection pool with retry logic (~510 lines)
 ├── healthcheck.sh      # Toolforge liveness health check script (per-worker heartbeat file age check)
 ├── schema.sql          # DDL for 9 tables: users, sessions, projects, images, faces, user_stats, sdc_claims, project_members, worker_heartbeat
 ├── migrate.py          # Idempotent schema migration with --reset flag (~490 lines)
-├── pyproject.toml      # Project config: Ruff linter/formatter rules, pytest config, markers
+├── pyproject.toml      # Project config: Ruff linter/formatter rules, pytest config, markers, version
 ├── requirements.txt    # Python 3.11+, dlib-bin fork (no source compilation)
 ├── requirements-dev.txt # Dev/test deps: pytest, pytest-cov, ruff (includes requirements.txt)
 ├── babel.cfg           # pybabel extraction config (explicit file list, excludes venv)
@@ -27,14 +28,15 @@ WikiVisage/
 │   ├── nb/LC_MESSAGES/ # Norwegian Bokmål
 │   ├── es/LC_MESSAGES/ # Spanish
 │   └── fr/LC_MESSAGES/ # French
-├── tests/              # Hybrid test suite: 653 unit + 34 integration tests
+├── tests/              # Hybrid test suite: 707 unit + 34 integration tests
 │   ├── __init__.py
 │   ├── conftest.py     # Integration fixture infrastructure (~450 lines)
-│   ├── test_app.py     # 489 unit + 11 integration tests (~10726 lines)
+│   ├── test_app.py     # 498 unit + 11 integration tests (~10831 lines)
 │   ├── test_database.py # 27 unit + 9 integration tests (~600 lines)
 │   ├── test_migrate.py # 15 unit + 8 integration tests (~471 lines)
-│   ├── test_token_crypto.py # 21 unit tests (~170 lines)
-│   └── test_worker.py  # 101 unit + 6 integration tests (~2982 lines)
+│   ├── test_token_crypto.py # 26 unit tests (~227 lines)
+│   ├── test_worker.py  # 110 unit + 6 integration tests (~3101 lines)
+│   └── test_security_round2.py # 31 round-2 security regression tests (CSP, PKCE, single-flight, /health, M3/M4) (~594 lines)
 ├── templates/          # Jinja2 templates (10 files, all extend base.html)
 │   ├── base.html       # Layout: nav, flash messages, CSS variables. Blocks: title, extra_head, content
 │   ├── classify.html   # Active learning UI: face image, yes/no/skip/none buttons, keyboard shortcuts, undo
@@ -68,8 +70,10 @@ Flask app served by gunicorn via app factory (`create_app()`). Handles OAuth 2.0
 **Security middleware:**
 - Open redirect protection on login (`_is_safe_url()`)
 - CSRF protection on all POST routes (per-request CSRF token stored in Flask's signed session cookie)
+- PKCE (RFC 7636, S256) on the OAuth authorization code flow as defense-in-depth against intercepted authorization codes
 - Rate limiting via Flask-Limiter (global 200/hour default, 10/min on bbox endpoints)
-- Security headers: `X-Content-Type-Options`, `X-Frame-Options`, `X-XSS-Protection`
+- Security headers: `Content-Security-Policy` (with `object-src 'none'`, `base-uri 'none'`, `frame-ancestors 'none'`), `X-Content-Type-Options`, `X-Frame-Options`, `X-XSS-Protection`, `Referrer-Policy`, `Permissions-Policy`
+- OAuth refresh single-flight via Redis lock (`redis_lock.single_flight()`, 15s TTL, key `wikivisage:lock:oauth-refresh:<user_id>`) — prevents concurrent token-refresh requests from invalidating each other's freshly rotated refresh tokens. Degrades to no-op if Redis is unreachable; DB-level CAS on `token_expires_at` remains as a second line of defense.
 
 **Routes (37 total):**
 | Route | Method | Purpose |
@@ -107,7 +111,7 @@ Flask app served by gunicorn via app factory (`create_app()`). Handles OAuth 2.0
 | `/leaderboard` | GET | Top classifiers |
 | `/sw.js` | GET | Serve service worker from root scope |
 | `/.well-known/appspecific/com.chrome.devtools.json` | GET | Silence Chrome DevTools auto-request |
-| `/health` | GET | Health check (JSON) |
+| `/health` | GET | Health check (JSON: `status`, `database`, `limiter` (`redis`/`memory`), `degraded` boolean) |
 | `/robots.txt` | GET | Custom robots.txt (overrides Toolforge default Disallow: /) |
 | `/sitemap.xml` | GET | XML sitemap for search engines |
 | `/commons-thumb/<path>` | GET | Redirect to Commons thumbnail URL (standard step sizes enforced) |
@@ -147,13 +151,13 @@ Two query paths:
 | `traverse_category` | Crawls Commons category API, inserts image rows (batch INSERT IGNORE). Caps at `MAX_IMAGES_PER_PROJECT` (9000). Filters out video/audio (keeps images only). |
 | `_download_image` | Downloads image with streaming 50MB size cap (`MAX_IMAGE_DOWNLOAD_BYTES`) |
 | `_validate_image_dimensions` | Checks image pixel area before face detection (rejects >100 megapixels) |
-| `_detect_faces_in_subprocess` | Runs dlib face detection in isolated subprocess (survives segfaults) |
+| `_detect_faces_in_subprocess` | Runs dlib face detection in isolated subprocess (survives segfaults). Hardened via `_harden_face_detect_subprocess()` preexec hook: env scrubbed, RLIMIT_AS=2 GiB, RLIMIT_CPU=180s, RLIMIT_FSIZE=1 MiB |
 | `_run_face_detection` | Spawns subprocess, handles timeout/crash, returns locations + encodings |
 | `_process_single_image` | Downloads one image, validates dimensions, runs HOG face detection in subprocess, stores encoding (thread-safe) |
 | `process_images` | Spawns `IMAGE_THREADS` parallel threads to process pending images in a batch |
 | `bootstrap_from_sparql` | Seeds model from existing P180 depicts claims via SPARQL |
 | `run_autonomous_inference` | Centroid-distance classification on unclassified faces (needs >= `min_confirmed` target faces) |
-| `write_sdc_claims` | Writes P180 claims to Commons SDC via Wikibase API (idempotent). Triggered by `sdc_write_requested` flag set from web UI. |
+| `write_sdc_claims` | Writes P180 claims to Commons SDC via Wikibase API (idempotent). Triggered by `sdc_write_requested` flag set from web UI. Re-checks `sdc_write_requested` every 5 faces (`_PER_FACE_CANCEL_CHECK_EVERY`) so the user can stop a running batch quickly. Treats `no-such-entity` / `no-such-claim` / `no-such-statement` / `notfound` as already-gone successes (`_ALREADY_GONE_CODES`). |
 | `_api_request` | Wrapper for Commons/Wikidata API calls with maxlag, retry, and User-Agent |
 | `_get_csrf_token` | Fetches CSRF token for Wikibase API writes |
 
@@ -390,11 +394,11 @@ Each face encoding is 1024 bytes (128 float64). Even 10K faces ~ 10MB. No RAM co
 
 ## Testing
 
-Hybrid test suite: **653 unit tests** (run in CI) + **34 integration tests** (require local Docker MariaDB).
+Hybrid test suite: **707 unit tests** (run in CI) + **34 integration tests** (require local Docker MariaDB).
 
 ### Architecture
 
-- **Unit tests**: Pure mocks, no DB. Run everywhere (CI, local). Cover thumb snapping, URL safety, CSRF validation, error classes, migration parsing, route logic, token encryption.
+- **Unit tests**: Pure mocks, no DB. Run everywhere (CI, local). Cover thumb snapping, URL safety, CSRF validation, error classes, migration parsing, route logic, token encryption, CSP hardening, PKCE, single-flight Redis lock, idempotent SDC removal, mid-batch cancel.
 - **Integration tests**: Hit a real MariaDB via Docker. Marked with `@pytest.mark.integration`. Skipped in CI (GitHub Actions) — only run locally when `WIKIVISAGE_TEST_DB=1` is set.
 - **Test DB**: `wikiface_test` — created fresh per pytest session, dropped on teardown. Never touches `wikiface_dev`.
 - **Config**: `pyproject.toml` has `testpaths = ["tests"]`, `pythonpath = ["."]`, and integration marker.
@@ -403,12 +407,13 @@ Hybrid test suite: **653 unit tests** (run in CI) + **34 integration tests** (re
 
 | File | Unit | Integration | Total |
 |------|------|-------------|-------|
-| `test_app.py` | 489 | 11 | 500 |
+| `test_app.py` | 498 | 11 | 509 |
 | `test_database.py` | 27 | 9 | 36 |
 | `test_migrate.py` | 15 | 8 | 23 |
-| `test_token_crypto.py` | 21 | 0 | 21 |
-| `test_worker.py` | 101 | 6 | 107 |
-| **Total** | **653** | **34** | **687** |
+| `test_security_round2.py` | 31 | 0 | 31 |
+| `test_token_crypto.py` | 26 | 0 | 26 |
+| `test_worker.py` | 110 | 6 | 116 |
+| **Total** | **707** | **34** | **741** |
 
 ### Commands
 

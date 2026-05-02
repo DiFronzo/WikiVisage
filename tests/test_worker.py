@@ -2154,29 +2154,39 @@ def test_refresh_worker_token_missing_access_token_in_response():
 
 
 def test_refresh_worker_token_rowcount_zero_reads_fresh():
-    """When rowcount==0 (another process refreshed), re-read token from DB."""
+    """When rowcount==0 (another process refreshed), re-read token from DB.
+
+    Round 2 (H2 single-flight refactor): the re-read path now goes through
+    ``_read_decrypted_user_tokens``, which SELECTs all three credential
+    columns. The mock returns a fresh row with all three so both the initial
+    read AND the post-CAS re-read succeed.
+    """
     from datetime import UTC, datetime, timedelta
 
     from worker import _refresh_worker_token
 
     past = datetime.now(UTC) - timedelta(hours=1)
-    user = {
+    future = datetime.now(UTC) + timedelta(hours=4)
+    initial_row = {
         "access_token": "old-token",
         "refresh_token": "old-refresh",
         "token_expires_at": past,
     }
-    fresh_row = {"access_token": "fresh-token"}
+    fresh_row = {
+        "access_token": "fresh-token",
+        "refresh_token": "fresh-refresh",
+        "token_expires_at": future,
+    }
 
-    query_calls = [0]
+    select_calls = [0]
 
     def mock_execute_query(sql, params=None, fetch=True):
-        query_calls[0] += 1
-        if "SELECT access_token, refresh_token, token_expires_at" in sql and query_calls[0] == 1:
-            return [user]
+        if "SELECT access_token, refresh_token, token_expires_at" in sql:
+            select_calls[0] += 1
+            # First SELECT = initial credential read; second = post-CAS re-read.
+            return [initial_row] if select_calls[0] == 1 else [fresh_row]
         if "UPDATE users SET access_token" in sql:
             return 0  # rowcount == 0: another process refreshed
-        if "SELECT access_token FROM users" in sql:
-            return [fresh_row]
         return []
 
     mock_resp = MagicMock()
@@ -2189,6 +2199,9 @@ def test_refresh_worker_token_rowcount_zero_reads_fresh():
         patch("worker.decrypt_token", side_effect=lambda t: t),
         patch("worker.encrypt_token", side_effect=lambda t: t),
         patch("worker._get_session") as mock_session,
+        # Round 2 H2: refresh now acquires a single-flight lock. Force the
+        # acquire path so we exercise the full UPDATE → rowcount==0 → re-read.
+        patch("worker._get_redis_client", return_value=None),
     ):
         mock_session.return_value.post.return_value = mock_resp
         result = _refresh_worker_token(1)
@@ -3032,3 +3045,57 @@ def test_worker_download_image_too_many_redirects_raises():
     with patch.object(_worker_module, "_get_session", return_value=mock_session):
         with pytest.raises(ValueError, match="Too many redirects"):
             _worker_module._download_image("https://upload.wikimedia.org/file.jpg")
+
+
+# ---------------------------------------------------------------------------
+# Security: face encoding validation (anti-poisoning)
+# ---------------------------------------------------------------------------
+
+
+def test_validate_encoding_accepts_valid_128d_array():
+    arr = np.linspace(-0.5, 0.5, 128, dtype=np.float64)
+    result = _worker_module._validate_encoding(arr.tobytes(), face_id=1)
+    assert result is not None
+    assert result.shape == (128,)
+    assert np.allclose(result, arr)
+    # Must be writable (np.frombuffer returns read-only views; we .copy())
+    assert result.flags.writeable
+
+
+def test_validate_encoding_rejects_none():
+    assert _worker_module._validate_encoding(None, face_id="x") is None
+
+
+def test_validate_encoding_rejects_wrong_length():
+    assert _worker_module._validate_encoding(b"\x00" * 512, face_id=2) is None
+    assert _worker_module._validate_encoding(b"\x00" * 2048, face_id=3) is None
+    assert _worker_module._validate_encoding(b"", face_id=4) is None
+
+
+def test_validate_encoding_rejects_nan():
+    arr = np.zeros(128, dtype=np.float64)
+    arr[42] = np.nan
+    assert _worker_module._validate_encoding(arr.tobytes(), face_id=5) is None
+
+
+def test_validate_encoding_rejects_inf():
+    arr = np.zeros(128, dtype=np.float64)
+    arr[7] = np.inf
+    assert _worker_module._validate_encoding(arr.tobytes(), face_id=6) is None
+    arr[7] = -np.inf
+    assert _worker_module._validate_encoding(arr.tobytes(), face_id=7) is None
+
+
+def test_validate_encoding_rejects_out_of_range_values():
+    """Encodings outside [-10, 10] are rejected as obviously poisoned."""
+    arr = np.zeros(128, dtype=np.float64)
+    arr[0] = 100.0
+    assert _worker_module._validate_encoding(arr.tobytes(), face_id=8) is None
+    arr[0] = -50.5
+    assert _worker_module._validate_encoding(arr.tobytes(), face_id=9) is None
+
+
+def test_validate_encoding_accepts_edge_values():
+    """Boundary values just inside the [-10, 10] bound are accepted."""
+    arr = np.full(128, 9.99, dtype=np.float64)
+    assert _worker_module._validate_encoding(arr.tobytes(), face_id=10) is not None

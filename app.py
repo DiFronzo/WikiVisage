@@ -12,6 +12,7 @@ from pathlib import Path
 with Path(__file__).parent.joinpath("pyproject.toml").open("rb") as _f:
     APP_VERSION: str = tomllib.load(_f)["project"]["version"]
 
+import base64
 import hashlib
 import io
 import json
@@ -22,6 +23,7 @@ import random
 import re
 import secrets
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from functools import wraps
 from typing import Any
@@ -58,6 +60,7 @@ from database import (
     execute_transaction,
     init_db,
 )
+from redis_lock import single_flight
 from token_crypto import TokenDecryptionError, decrypt_token, encrypt_token
 
 # ---------------------------------------------------------------------------
@@ -116,12 +119,20 @@ app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(hours=8)
 # Falls back to memory:// for local development where Redis may not be available.
 _REDIS_URL = os.environ.get("WIKIVISAGE_REDIS_URL", "redis://redis.svc.tools.eqiad1.wikimedia.cloud:6379")
 _limiter_storage_uri = _REDIS_URL
+# `redis_client` is shared with the OAuth single-flight lock (see redis_lock.py).
+# None means we degraded to memory:// — the lock becomes a no-op (best-effort).
+redis_client: Any = None
+# True iff the rate limiter is using shared Redis storage. Surfaced in /health
+# so monitoring can alert when we're degraded to per-process memory limits.
+_LIMITER_REDIS_OK = False
 
 try:
     import redis as _redis_mod
 
     _r = _redis_mod.from_url(_REDIS_URL, socket_connect_timeout=2)
     _r.ping()
+    redis_client = _r
+    _LIMITER_REDIS_OK = True
 except Exception:
     logger.error("Redis unavailable at %s — rate limiter using per-process memory storage", _REDIS_URL)
     _limiter_storage_uri = "memory://"
@@ -442,14 +453,56 @@ def _make_oauth_session(state: str | None = None) -> OAuth2Session:
     return sess
 
 
+def _reread_user_credentials(user: dict[str, Any]) -> dict[str, Any] | None:
+    """Re-read access/refresh/expiry from DB and update `user` in place.
+
+    Used after losing a single-flight race (another process refreshed first) or
+    when the optimistic CAS reports 0 rows updated. Returns the updated `user`
+    dict or None if the row vanished.
+    """
+    fresh = execute_query(
+        "SELECT access_token, refresh_token, token_expires_at FROM users WHERE id = %s",
+        (user["id"],),
+        fetch=True,
+    )
+    if not fresh:
+        return None
+    row = fresh[0]
+    at = row["access_token"]
+    if isinstance(at, bytes):
+        at = at.decode("utf-8")
+    rt = row["refresh_token"]
+    if isinstance(rt, bytes):
+        rt = rt.decode("utf-8")
+    try:
+        user["access_token"] = decrypt_token(at)
+        user["refresh_token"] = decrypt_token(rt)
+    except TokenDecryptionError:
+        logger.error("Cannot decrypt re-read tokens for user %s", user.get("wiki_username"))
+        return None
+    user["token_expires_at"] = row["token_expires_at"]
+    return user
+
+
 def _refresh_access_token(user: dict[str, Any]) -> dict[str, Any] | None:
     """
     Refresh the user's access token if it is expired or about to expire.
 
-    Uses optimistic concurrency: after refreshing, the DB UPDATE compares
-    the old token_expires_at value.  If another process already refreshed
-    (changing token_expires_at), the UPDATE affects 0 rows and we re-read
-    the freshly-refreshed credentials from the DB instead.
+    Concurrency model (defense in depth, all three layers):
+      1. Redis single-flight lock keyed on user_id — ensures only one process
+         POSTs to the OAuth `/token` endpoint with a given refresh_token.
+         Wikimedia rotates the refresh_token on every exchange; without this
+         lock, two concurrent calls would race and the second one's success
+         would invalidate the first's freshly issued tokens, silently logging
+         the user out and breaking SDC writes mid-batch.
+      2. Optimistic concurrency at the DB layer — UPDATE compares the old
+         token_expires_at; 0 rows updated means another process won the race.
+      3. Fallback re-read from DB — if either guard trips, we read the
+         freshly-stored tokens and continue with them.
+
+    The single-flight lock is best-effort: if Redis is down, we proceed without
+    it and rely on layers 2 and 3. This preserves liveness during a Redis outage
+    at the cost of occasional silent logouts (the pre-fix behavior).
 
     Returns updated user dict or None if refresh failed.
     """
@@ -463,64 +516,73 @@ def _refresh_access_token(user: dict[str, Any]) -> dict[str, Any] | None:
     if (expires_at - now).total_seconds() > TOKEN_REFRESH_BUFFER:
         return user  # Still valid
 
-    old_expires_str = expires_at.strftime("%Y-%m-%d %H:%M:%S")
-    logger.info(f"Refreshing access token for user {user['wiki_username']}")
+    # Single-flight: only one process per (user_id) calls the OAuth provider.
+    # TTL of 15s comfortably exceeds a normal token-exchange round-trip but
+    # guarantees a crashed holder cannot wedge other refreshes for long.
+    lock_name = f"oauth-refresh:{user['id']}"
+    with single_flight(redis_client, lock_name, ttl_seconds=15) as got_lock:
+        if not got_lock:
+            # Another process is mid-refresh. Wait briefly for it to commit
+            # to the DB, then re-read the new credentials.
+            logger.info("Token refresh in flight for user %s — waiting on peer", user["wiki_username"])
+            time.sleep(1.0)
+            updated = _reread_user_credentials(user)
+            if updated is None:
+                return None
+            # Verify the peer actually refreshed (their UPDATE may have failed).
+            new_expires = updated["token_expires_at"]
+            if isinstance(new_expires, str):
+                new_expires = datetime.fromisoformat(new_expires)
+            if new_expires.tzinfo is None:
+                new_expires = new_expires.replace(tzinfo=UTC)
+            if (new_expires - datetime.now(UTC)).total_seconds() > TOKEN_REFRESH_BUFFER:
+                return updated
+            # Peer didn't refresh in time — fall through and try ourselves.
+            # (Lock has been released because we exited the `with` block.)
+            logger.warning("Peer refresh did not complete for user %s; retrying ourselves", user["wiki_username"])
+            return _refresh_access_token(updated)
 
-    try:
-        oauth = OAuth2Session(client_id=OAUTH_CLIENT_ID)
-        new_token = oauth.refresh_token(
-            OAUTH_TOKEN_URL,
-            refresh_token=user["refresh_token"],
-            client_id=OAUTH_CLIENT_ID,
-            client_secret=OAUTH_CLIENT_SECRET,
-        )
+        old_expires_str = expires_at.strftime("%Y-%m-%d %H:%M:%S")
+        logger.info(f"Refreshing access token for user {user['wiki_username']}")
 
-        new_expires_at = datetime.now(UTC) + timedelta(seconds=new_token.get("expires_in", 14400))
-
-        # Optimistic concurrency: only update if no other process refreshed first
-        rowcount = execute_query(
-            "UPDATE users SET access_token = %s, refresh_token = %s, token_expires_at = %s "
-            "WHERE id = %s AND token_expires_at = %s",
-            (
-                encrypt_token(new_token["access_token"]),
-                encrypt_token(new_token.get("refresh_token", user["refresh_token"])),
-                new_expires_at.strftime("%Y-%m-%d %H:%M:%S"),
-                user["id"],
-                old_expires_str,
-            ),
-            fetch=False,
-        )
-
-        if rowcount == 0:
-            # Another process already refreshed — re-read from DB
-            logger.info(f"Token already refreshed by another process for user {user['wiki_username']}")
-            fresh = execute_query(
-                "SELECT access_token, refresh_token, token_expires_at FROM users WHERE id = %s",
-                (user["id"],),
-                fetch=True,
+        try:
+            oauth = OAuth2Session(client_id=OAUTH_CLIENT_ID)
+            new_token = oauth.refresh_token(
+                OAUTH_TOKEN_URL,
+                refresh_token=user["refresh_token"],
+                client_id=OAUTH_CLIENT_ID,
+                client_secret=OAUTH_CLIENT_SECRET,
             )
-            if fresh:
-                row = fresh[0]
-                at = row["access_token"]
-                if isinstance(at, bytes):
-                    at = at.decode("utf-8")
-                rt = row["refresh_token"]
-                if isinstance(rt, bytes):
-                    rt = rt.decode("utf-8")
-                user["access_token"] = decrypt_token(at)
-                user["refresh_token"] = decrypt_token(rt)
-                user["token_expires_at"] = row["token_expires_at"]
-                return user
+
+            new_expires_at = datetime.now(UTC) + timedelta(seconds=new_token.get("expires_in", 14400))
+
+            # DB-layer CAS is still useful as a last-line guard against a Redis outage
+            # that let two refreshes through.
+            rowcount = execute_query(
+                "UPDATE users SET access_token = %s, refresh_token = %s, token_expires_at = %s "
+                "WHERE id = %s AND token_expires_at = %s",
+                (
+                    encrypt_token(new_token["access_token"]),
+                    encrypt_token(new_token.get("refresh_token", user["refresh_token"])),
+                    new_expires_at.strftime("%Y-%m-%d %H:%M:%S"),
+                    user["id"],
+                    old_expires_str,
+                ),
+                fetch=False,
+            )
+
+            if rowcount == 0:
+                logger.info(f"Token already refreshed by another process for user {user['wiki_username']}")
+                return _reread_user_credentials(user)
+
+            user["access_token"] = new_token["access_token"]
+            user["refresh_token"] = new_token.get("refresh_token", user["refresh_token"])
+            user["token_expires_at"] = new_expires_at
+            return user
+
+        except Exception:
+            logger.exception("Failed to refresh access token")
             return None
-
-        user["access_token"] = new_token["access_token"]
-        user["refresh_token"] = new_token.get("refresh_token", user["refresh_token"])
-        user["token_expires_at"] = new_expires_at
-        return user
-
-    except Exception:
-        logger.exception("Failed to refresh access token")
-        return None
 
 
 def _get_valid_token() -> str | None:
@@ -559,10 +621,22 @@ def inject_csrf_token() -> dict[str, Any]:
     return {"csrf_token": _csrf_token}
 
 
+@app.before_request
+def _generate_csp_nonce() -> None:
+    """Generate a per-request CSP nonce on every request.
+
+    Must run as a before_request (not only as a context_processor) so JSON-only
+    routes, error responses, and redirects also get a nonce in their CSP header.
+    Templates still read it via the context processor below.
+    """
+    g.csp_nonce = secrets.token_urlsafe(32)
+
+
 @app.context_processor
 def inject_csp_nonce() -> dict[str, str]:
-    """Generate a per-request CSP nonce and make it available in all templates."""
+    """Expose the per-request CSP nonce to all templates."""
     if not hasattr(g, "csp_nonce"):
+        # Defensive fallback: should already be set by _generate_csp_nonce.
         g.csp_nonce = secrets.token_urlsafe(32)
     return {"csp_nonce": g.csp_nonce}
 
@@ -600,6 +674,25 @@ def set_security_headers(response):
         response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
     response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    # CSP notes:
+    # - 'unsafe-inline' is retained because templates still contain inline onclick/onsubmit
+    #   handlers and style="" attributes (refactor is tracked separately). Adding the
+    #   per-request nonce alongside lets us migrate scripts/styles incrementally; modern
+    #   browsers honour the nonce when both are present.
+    # - object-src 'none' blocks <object>/<embed>/<applet> plugin loads.
+    # - base-uri 'none' prevents an injected <base> tag from rewriting all relative URLs
+    #   on the page, which is a known XSS escalation vector.
+    # - frame-ancestors 'none' makes X-Frame-Options redundant but both are kept for
+    #   older browsers.
+    # NOTE: We intentionally do NOT include a 'nonce-...' source alongside
+    # 'unsafe-inline'. Per CSP Level 3, browsers ignore 'unsafe-inline' when a
+    # nonce or hash source is present, which would silently break ~106 inline
+    # style="" attributes and ~41 inline event handlers across our templates
+    # (logout button, mobile nav toggle, language selector, PWA install banner,
+    # etc.). The genuine H1 hardening wins -- object-src/base-uri/frame-ancestors
+    # 'none' -- are retained and are independent of the nonce mechanism.
+    # Tightening to nonce-only would require a full template refactor (tracked
+    # separately).
     response.headers["Content-Security-Policy"] = (
         "default-src 'self'; "
         "script-src 'self' 'unsafe-inline'; "
@@ -607,6 +700,8 @@ def set_security_headers(response):
         "img-src 'self' https://*.wikimedia.org data:; "
         "connect-src 'self'; "
         "font-src 'self'; "
+        "object-src 'none'; "
+        "base-uri 'none'; "
         "frame-ancestors 'none'"
     )
     return response
@@ -913,13 +1008,31 @@ app.jinja_env.globals["commons_thumb_url"] = commons_thumb_url
 @app.route("/login")
 @limiter.limit("10 per minute")
 def login():
-    """Initiate OAuth 2.0 authorization flow."""
+    """Initiate OAuth 2.0 authorization flow.
+
+    Uses PKCE (RFC 7636, S256) as defense-in-depth: even if the authorization
+    code is intercepted (e.g. via a referrer leak or a malicious redirect_uri
+    on a misconfigured consumer), the attacker cannot exchange it for tokens
+    without also knowing the per-flow `code_verifier` we keep in the session.
+    """
     if g.user:
         return redirect(url_for("dashboard"))
 
+    # Generate PKCE pair. The verifier MUST be 43-128 chars from the unreserved
+    # URL set; secrets.token_urlsafe(64) yields ~86 chars from [A-Za-z0-9_-].
+    code_verifier = secrets.token_urlsafe(64)
+    code_challenge = (
+        base64.urlsafe_b64encode(hashlib.sha256(code_verifier.encode("ascii")).digest()).rstrip(b"=").decode("ascii")
+    )
+
     oauth = _make_oauth_session()
-    authorization_url, state = oauth.authorization_url(OAUTH_AUTHORIZE_URL)
+    authorization_url, state = oauth.authorization_url(
+        OAUTH_AUTHORIZE_URL,
+        code_challenge=code_challenge,
+        code_challenge_method="S256",
+    )
     session["oauth_state"] = state
+    session["oauth_code_verifier"] = code_verifier
     session["login_next"] = request.args.get("next", "")
     return redirect(authorization_url)
 
@@ -929,6 +1042,7 @@ def login():
 def oauth_callback():
     """Handle OAuth 2.0 callback and create/update user record."""
     stored_state = session.pop("oauth_state", None)
+    code_verifier = session.pop("oauth_code_verifier", None)
     if not stored_state:
         flash(_("Invalid OAuth state. Please try again."), "error")
         return redirect(url_for("index"))
@@ -936,11 +1050,17 @@ def oauth_callback():
     oauth = _make_oauth_session(state=stored_state)
 
     try:
-        token = oauth.fetch_token(
-            OAUTH_TOKEN_URL,
-            client_secret=OAUTH_CLIENT_SECRET,
-            authorization_response=request.url,
-        )
+        # Pass code_verifier so the provider can validate against the
+        # code_challenge we sent at /login. Wikimedia's OAuth2 endpoint
+        # accepts this as a standard PKCE parameter; consumers that haven't
+        # opted into PKCE simply ignore the extra field.
+        token_kwargs: dict[str, Any] = {
+            "client_secret": OAUTH_CLIENT_SECRET,
+            "authorization_response": request.url,
+        }
+        if code_verifier:
+            token_kwargs["code_verifier"] = code_verifier
+        token = oauth.fetch_token(OAUTH_TOKEN_URL, **token_kwargs)
     except Exception:
         logger.exception("Failed to fetch OAuth token")
         flash(_("Authentication failed. Please try again."), "error")
@@ -1009,13 +1129,12 @@ def oauth_callback():
         flash(_("Database error. Please try again."), "error")
         return redirect(url_for("index"))
 
-    # Prevent session fixation: clear old session data before establishing
-    # the authenticated session. Preserve CSRF token for continuity.
-    csrf = session.get("csrf_token")
+    # Prevent session fixation: clear old session data and regenerate the CSRF
+    # token on login. Preserving the pre-login CSRF token would let an attacker
+    # who fixated a session before login retain a valid CSRF token afterwards.
     login_next = session.pop("login_next", "")
     session.clear()
-    if csrf:
-        session["csrf_token"] = csrf
+    session["csrf_token"] = secrets.token_hex(32)
     session.permanent = True
     session["user_id"] = user_id
 
@@ -1081,6 +1200,69 @@ def verify_image_access(image_id: int, project_id: int, user_id: int) -> dict | 
         (user_id, image_id, project_id, user_id),
     )
     return rows[0] if rows else None
+
+
+class AccessRevoked(Exception):
+    """Raised inside a transaction when a user's access to a project was
+    revoked between the initial pre-transaction permission check and the
+    actual mutation. Callers should translate this to HTTP 403."""
+
+
+def _assert_project_access_locked(cursor: Any, project_id: int, user_id: int) -> None:
+    """Re-verify project access INSIDE an open transaction with row locking.
+
+    Closes a TOCTOU window: an owner could revoke a user's membership
+    between ``get_project_for_actor`` / ``verify_image_access`` (which
+    run on a separate connection before the transaction) and the actual
+    INSERT/UPDATE. By taking ``FOR UPDATE`` locks on the project row and
+    membership row, we guarantee the user's access is still valid at
+    commit time, or the revoking transaction will block until we finish.
+
+    Raises:
+        AccessRevoked: if the user is neither the owner nor an active
+            member of a non-deleted project at this instant.
+    """
+    cursor.execute(
+        "SELECT 1 FROM projects p "
+        "LEFT JOIN project_members pm "
+        "  ON pm.project_id = p.id AND pm.user_id = %s AND pm.status = 'active' "
+        "WHERE p.id = %s AND p.status != 'deleted' "
+        "  AND (p.user_id = %s OR pm.user_id IS NOT NULL) "
+        "FOR UPDATE",
+        (user_id, project_id, user_id),
+    )
+    if cursor.fetchone() is None:
+        raise AccessRevoked(f"User {user_id} no longer has access to project {project_id}")
+
+
+def _is_access_revoked(exc: BaseException) -> bool:
+    """Return True if *exc* (or its cause chain) is an AccessRevoked error.
+
+    ``execute_transaction`` wraps every exception in ``DatabaseError(...) from e``,
+    so we walk ``__cause__`` to detect a TOCTOU access-revocation that fired
+    inside the transaction.
+    """
+    cur: BaseException | None = exc
+    seen: set[int] = set()
+    while cur is not None and id(cur) not in seen:
+        if isinstance(cur, AccessRevoked):
+            return True
+        seen.add(id(cur))
+        cur = cur.__cause__
+    return False
+
+
+def _run_authorized_transaction(operations: Callable[[Any, Any], Any]) -> Any:
+    """Run *operations* in a DB transaction, translating an in-transaction
+    ``AccessRevoked`` into HTTP 403. Other ``DatabaseError`` exceptions
+    propagate so callers can handle them as before."""
+    try:
+        return execute_transaction(operations)
+    except DatabaseError as e:
+        if _is_access_revoked(e):
+            logger.warning("Access revoked mid-transaction; aborting with 403")
+            abort(403)
+        raise
 
 
 def has_sibling_match(image_id: int, exclude_face_id: int) -> bool:
@@ -1934,6 +2116,7 @@ def api_classify():
         if selected_face_id == "none":
 
             def _classify_none(conn, cursor):
+                _assert_project_access_locked(cursor, project_id, g.user["id"])
                 cursor.execute(
                     f"SELECT id FROM faces WHERE image_id = %s AND {face_filter_sql}",
                     (image_id,),
@@ -1978,7 +2161,7 @@ def api_classify():
 
                 return ids
 
-            affected_ids = execute_transaction(_classify_none)
+            affected_ids = _run_authorized_transaction(_classify_none)
 
             session["last_classify"] = {
                 "project_id": project_id,
@@ -1995,6 +2178,7 @@ def api_classify():
                 return jsonify({"error": _("Invalid face ID")}), 400
 
             def _classify_target(conn, cursor):
+                _assert_project_access_locked(cursor, project_id, g.user["id"])
                 cursor.execute(
                     f"SELECT id FROM faces WHERE image_id = %s AND {face_filter_sql}",
                     (image_id,),
@@ -2048,7 +2232,7 @@ def api_classify():
 
                 return ids
 
-            affected_ids = execute_transaction(_classify_target)
+            affected_ids = _run_authorized_transaction(_classify_target)
 
             if affected_ids:
                 _maybe_mark_sdc_written(selected_face_id, image_id, project_id)
@@ -2125,6 +2309,7 @@ def api_undo_classify():
         )
 
         def _undo(conn, cursor):
+            _assert_project_access_locked(cursor, project_id, g.user["id"])
             if manual_face_ids:
                 m_placeholders = ",".join(["%s"] * len(manual_face_ids))
                 cursor.execute(
@@ -2156,7 +2341,7 @@ def api_undo_classify():
                     (project_id,),
                 )
 
-        execute_transaction(_undo)
+        _run_authorized_transaction(_undo)
         session.pop("last_classify", None)
 
     except DatabaseError:
@@ -2261,6 +2446,7 @@ def api_manual_face():
         encoding_bytes = encodings[0].tobytes()
 
         def _insert_manual_face(conn, cursor):
+            _assert_project_access_locked(cursor, project_id, g.user["id"])
             review_confirmed_ids = []
             if is_review_mode:
                 cursor.execute(
@@ -2331,7 +2517,7 @@ def api_manual_face():
 
             return new_face_id, review_confirmed_ids
 
-        new_face_id, review_confirmed_ids = execute_transaction(_insert_manual_face)
+        new_face_id, review_confirmed_ids = _run_authorized_transaction(_insert_manual_face)
 
         if new_face_id:
             _maybe_mark_sdc_written(new_face_id, image_id, project_id)
@@ -2365,11 +2551,28 @@ def api_manual_face():
 
 def _remove_sdc_claim(commons_page_id: int, wikidata_qid: str, access_token: str) -> bool:
     """Remove a P180 depicts claim for a specific QID from a Commons file.
-    Returns True if claim was removed or didn't exist, False on error."""
+
+    Returns True on success — including the "benign" cases where the claim or
+    the entire entity already doesn't exist (someone else removed it, the file
+    was deleted on Commons, etc.). The user's intent ("this claim should not
+    exist") is satisfied either way, so surfacing an error to the UI just
+    confuses operators.
+
+    Returns False only on errors we cannot interpret as "already in the desired
+    state": auth failures, network errors, maxlag, unexpected API responses.
+    """
     mid = f"M{commons_page_id}"
     headers = {
         "Authorization": f"Bearer {access_token}",
         "User-Agent": USER_AGENT,
+    }
+    # Wikibase error codes that mean "claim/entity is already gone" — caller's
+    # desired end state is reached, so we report success.
+    _ALREADY_GONE_CODES = {
+        "no-such-entity",
+        "no-such-claim",
+        "no-such-statement",
+        "notfound",
     }
 
     try:
@@ -2387,6 +2590,16 @@ def _remove_sdc_claim(commons_page_id: int, wikidata_qid: str, access_token: str
         )
         claim_resp.raise_for_status()
         claim_data = claim_resp.json()
+
+        # Entity-level miss: the M-id has no SDC entity at all (file deleted /
+        # never had structured data). Nothing to remove.
+        if "error" in claim_data:
+            err_code = claim_data["error"].get("code", "")
+            if err_code in _ALREADY_GONE_CODES:
+                logger.info(f"SDC entity {mid} already gone ({err_code}); treating removal as success")
+                return True
+            logger.error(f"SDC wbgetclaims error for {mid}: {claim_data['error']}")
+            return False
 
         claims = claim_data.get("claims", {}).get("P180", [])
         target_guid = None
@@ -2434,6 +2647,15 @@ def _remove_sdc_claim(commons_page_id: int, wikidata_qid: str, access_token: str
         result = remove_resp.json()
 
         if "error" in result:
+            err_code = result["error"].get("code", "")
+            if err_code in _ALREADY_GONE_CODES:
+                # Race: another actor removed the claim between our wbgetclaims
+                # and wbremoveclaims. The end state is what we wanted.
+                logger.info(
+                    f"SDC claim {target_guid} for {mid}/{wikidata_qid} already removed by peer "
+                    f"({err_code}); treating as success"
+                )
+                return True
             logger.error(f"SDC removal error for {mid}/{wikidata_qid}: {result['error']}")
             return False
 
@@ -2536,6 +2758,7 @@ def api_reclassify():
         demoted_sdc: dict[int, int] = {}
 
         def _reclassify(conn, cursor):
+            _assert_project_access_locked(cursor, face_row["project_id"], g.user["id"])
             nonlocal demoted_ids, demoted_sdc
             demoted_ids = []  # Reset in case of (theoretical) re-entry
             demoted_sdc = {}
@@ -2614,7 +2837,7 @@ def api_reclassify():
                     (face_row["project_id"],),
                 )
 
-        execute_transaction(_reclassify)
+        _run_authorized_transaction(_reclassify)
 
         # When approving, check if P180 already exists on Commons
         if is_target == 1 and commons_page_id and not sdc_written:
@@ -2728,6 +2951,7 @@ def api_update_face_bbox():
         encoding_bytes = encodings[0].tobytes()
 
         def _update_bbox(conn, cursor):
+            _assert_project_access_locked(cursor, face_row["project_id"], g.user["id"])
             cursor.execute(
                 "INSERT INTO faces "
                 "(image_id, encoding, bbox_top, bbox_right, bbox_bottom, bbox_left, "
@@ -2755,7 +2979,7 @@ def api_update_face_bbox():
             )
             return new_face_id
 
-        new_face_id = execute_transaction(_update_bbox)
+        new_face_id = _run_authorized_transaction(_update_bbox)
 
         if new_face_id and orig_is_target == 1 and not orig_sdc_written:
             _maybe_mark_sdc_written(new_face_id, image_id, face_row["project_id"])
@@ -3629,6 +3853,7 @@ def project_rerun_inference(project_id: int):
     try:
 
         def _reset_inference(conn, cursor):
+            _assert_project_access_locked(cursor, project_id, g.user["id"])
             cursor.execute(
                 "UPDATE faces f "
                 "JOIN images i ON f.image_id = i.id "
@@ -3650,7 +3875,7 @@ def project_rerun_inference(project_id: int):
                 )
             return rows_reset
 
-        affected = execute_transaction(_reset_inference)
+        affected = _run_authorized_transaction(_reset_inference)
         if affected:
             flash(
                 _(
@@ -3905,11 +4130,24 @@ def chrome_devtools_json():
 @app.route("/health")
 @limiter.exempt
 def health():
-    """Health check endpoint for Toolforge monitoring."""
+    """Health check endpoint for Toolforge monitoring.
+
+    Reports degraded (200 OK with `degraded: true`) if the rate limiter
+    fell back to per-process memory storage at startup — this means we lost
+    cross-worker rate limit coordination and the OAuth refresh single-flight
+    lock is a no-op. The DB is still healthy, so we don't return 503; ops
+    can scrape `degraded` and alert.
+    """
     try:
         rows = execute_query("SELECT 1 AS ok")
         if rows and rows[0].get("ok") == 1:
-            return jsonify({"status": "healthy", "database": "connected"}), 200
+            payload = {
+                "status": "healthy",
+                "database": "connected",
+                "limiter": "redis" if _LIMITER_REDIS_OK else "memory",
+                "degraded": not _LIMITER_REDIS_OK,
+            }
+            return jsonify(payload), 200
     except Exception:
         logger.exception("Health check failed")
         return jsonify({"status": "unhealthy", "error": "database unavailable"}), 503

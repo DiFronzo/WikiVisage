@@ -30,8 +30,8 @@ Worker uses `ThreadPoolExecutor` at two levels: up to 3 projects concurrently, u
 
 ## Current Status
 
-- **Version:** `0.8.1` (source of truth: `pyproject.toml`)
-- **Tests:** 687 total (653 unit + 34 integration)
+- **Version:** `0.9.0` (source of truth: `pyproject.toml`)
+- **Tests:** 741 total (707 unit + 34 integration)
 - **Python:** 3.11+
 - **Tables:** 9 (`users`, `sessions`, `projects`, `images`, `faces`, `user_stats`, `sdc_claims`, `project_members`, `worker_heartbeat`)
 - **Templates:** 10 files (all extend `base.html`)
@@ -41,11 +41,12 @@ Worker uses `ThreadPoolExecutor` at two levels: up to 3 projects concurrently, u
 
 | File | Unit | Integration | Total |
 |------|------|-------------|-------|
-| `test_app.py` | 489 | 11 | 500 |
-| `test_worker.py` | 101 | 6 | 107 |
+| `test_app.py` | 498 | 11 | 509 |
+| `test_worker.py` | 110 | 6 | 116 |
 | `test_database.py` | 27 | 9 | 36 |
 | `test_migrate.py` | 15 | 8 | 23 |
-| `test_token_crypto.py` | 21 | 0 | 21 |
+| `test_security_round2.py` | 31 | 0 | 31 |
+| `test_token_crypto.py` | 26 | 0 | 26 |
 
 ## Build & Test
 
@@ -84,16 +85,17 @@ Integration tests require Docker MariaDB (`docker run -d --name wikivisage-db -e
 
 | Area | Files |
 |------|-------|
-| Web app | `app.py` (~4041 lines) - Flask routes, OAuth, classification API |
-| Worker | `worker.py` (~3081 lines) - ML pipeline, face detection, inference |
+| Web app | `app.py` (~4279 lines) - Flask routes, OAuth (PKCE), classification API, CSP, /health |
+| Worker | `worker.py` (~3329 lines) - ML pipeline, RLIMIT-hardened face detection subprocess, inference, mid-batch SDC cancel |
 | Database | `database.py` (~510 lines) - Connection pool, `execute_query`/`execute_insert`/`execute_transaction` |
-| Token encryption | `token_crypto.py` (~110 lines) - Fernet encrypt/decrypt for OAuth tokens at rest |
+| Token encryption | `token_crypto.py` (~125 lines) - Fernet encrypt/decrypt for OAuth tokens at rest |
+| OAuth refresh lock | `redis_lock.py` (~100 lines) - Best-effort Redis single-flight (`single_flight()` ctx manager) |
 | Schema | `schema.sql` - DDL for 9 tables |
 | Migrations | `migrate.py` (~490 lines) - Idempotent schema migration with `--reset` flag |
 | Config | `pyproject.toml` - Ruff + pytest config, version |
 | Templates | `templates/base.html` (layout + CSS variables), `templates/classify.html` (active learning UI), `templates/project_detail.html` (stats + model results gallery) |
 | Shared JS | `static/wikivisage-common.js` - `snapThumbWidth()`, `commonsThumbUrl()`, `postForm()`, `bboxToDisplayRect()` |
-| Tests | `tests/conftest.py` (~450 lines) - Integration fixture hierarchy |
+| Tests | `tests/conftest.py` (~450 lines) - Integration fixture hierarchy; `tests/test_security_round2.py` (~594 lines) - CSP, PKCE, single-flight, /health, idempotent SDC removal regression tests |
 | CI | `.github/workflows/ci.yml` - Ruff lint + pytest on Python 3.11/3.13 |
 | CD | `.github/workflows/deploy.yml` - Release-triggered Toolforge deploy via SSH |
 | Jobs | `jobs.yaml` - 2 worker instances (`ml-worker`, `ml-worker-2`) |
@@ -134,10 +136,16 @@ Commons enforces standard step sizes. Non-standard widths return 429.
 
 - CSRF tokens on all POST routes (Flask-Session)
 - Rate limiting: global 200/hour, 10/min on bbox endpoints. Redis shared storage, falls back to in-memory.
-- Security headers: `Content-Security-Policy`, `X-Content-Type-Options`, `X-Frame-Options`, `X-XSS-Protection`
+- Security headers: `Content-Security-Policy` (with `object-src 'none'`, `base-uri 'none'`, `frame-ancestors 'none'`), `X-Content-Type-Options`, `X-Frame-Options`, `X-XSS-Protection`, `Referrer-Policy`, `Permissions-Policy`
 - Open redirect protection on login (`_is_safe_url()`)
 - Bbox validation: `MAX_BBOX_PX` (10000) and `MIN_BBOX_AREA` (100)
 - OAuth token encryption at rest via `WIKIVISAGE_TOKEN_KEY` env var (opt-in Fernet)
+- PKCE (RFC 7636, S256) on the OAuth authorization code flow as defense-in-depth
+- OAuth refresh single-flight via Redis lock (`redis_lock.single_flight()`, 15s TTL) — prevents concurrent token refreshes from invalidating each other's rotated refresh tokens
+- Worker face-detection subprocess hardening: env scrubbed via preexec hook; `RLIMIT_AS=2 GiB`, `RLIMIT_CPU=180s`, `RLIMIT_FSIZE=1 MiB`
+- SDC writes treat `no-such-entity` / `no-such-claim` / `no-such-statement` / `notfound` as already-gone successes (idempotent removals)
+- SDC write batches re-check `sdc_write_requested` every 5 faces so the user can stop a running batch quickly
+- `/health` reports `degraded: true` (200 OK) when the rate limiter fell back to in-memory storage (Redis unreachable) — so the OAuth refresh single-flight is also a no-op
 - `maxlag=5` on all Wikimedia API writes
 
 ## Schema Changes

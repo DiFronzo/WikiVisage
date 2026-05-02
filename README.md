@@ -51,9 +51,11 @@ Active learning facial recognition for Wikimedia Commons. Train an ML model to r
 - 🧵 **Background worker**: crawls Commons categories, downloads images, detects faces (HOG), and stores 128D encodings
 - 🔀 **Multi-instance workers**: distributed locking lets multiple workers process projects concurrently without conflicts
 - 🧪 **Persistent subprocess pool**: face detection runs in long-lived subprocesses, eliminating per-image dlib import overhead
+- 🛡️ **Hardened detection sandbox**: detection subprocesses run with scrubbed env and `RLIMIT_AS` / `RLIMIT_CPU` / `RLIMIT_FSIZE` ceilings to contain malformed-image attacks
 - 🧷 **Bootstrap from existing tags**: seeds the model via SPARQL when P180 depicts claims already exist on Commons
 - 🤖 **Autonomous inference**: centroid-distance classification once you have enough confirmed examples
-- ✍️ **User-triggered Commons edits**: click "Send Edits to Wikimedia Commons" to write depicts claims via the Wikibase API
+- ✍️ **User-triggered Commons edits**: click "Send Edits to Wikimedia Commons" to write depicts claims via the Wikibase API (interruptible mid-batch; idempotent on already-removed claims)
+- 🔐 **Hardened OAuth flow**: PKCE (S256) plus Redis-backed single-flight token refresh to survive concurrent gunicorn workers
 - 🌍 **i18n-ready**: translations included (en, nb, es, fr)
 
 ## 🧭 How it works
@@ -109,7 +111,7 @@ WikiVisage/
 ├── translations/        # i18n: en, nb, es, fr
 ├── requirements.txt     # Runtime dependencies
 ├── requirements-dev.txt # Dev/test deps (pytest, ruff)
-└── tests/               # 687 tests (unit + integration)
+└── tests/               # 741 tests (707 unit + 34 integration)
 ```
 
 ## 🧑‍💻 Setup

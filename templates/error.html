@@ -188,7 +188,7 @@
         <h1 class="error-title-404">404</h1>
         <h2 class="error-subtitle-404">{{ _('Face Not Found') }}</h2>
         <div class="terminal-text">&gt; {{ _('ERR_TARGET_ESCAPED_CLASSIFICATION') }}</div>
-        <p class="error-desc-404">{{ _('The page you are looking for has eluded our detection algorithms. It might have been deleted, moved, or never existed.') }}<br><br><em>({{ message }})</em></p>
+        <p class="error-desc-404">{{ _('The page you are looking for has eluded our detection algorithms. It might have been deleted, moved, or never existed.') }}</p>
         <a href="{{ url_for('index') }}" class="btn btn-primary">{{ _('Go Back Home') }}</a>
     {% else %}
         <h1 style="color: var(--danger); font-size: 4rem; margin-bottom: 0.5rem; border: none;">{{ code }}</h1>

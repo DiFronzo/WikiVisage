@@ -1814,7 +1814,11 @@ def test_oauth_callback_existing_user_updates_and_sets_session(monkeypatch):
     assert any(sql.startswith("UPDATE users SET") for sql, _params, _fetch in calls)
     with client.session_transaction() as sess:
         assert sess["user_id"] == 77
-        assert sess["csrf_token"] == "keep-me"
+        # Security: the pre-login CSRF token must NOT be preserved across login.
+        # Preserving it would let an attacker who fixated a session before login
+        # retain a valid CSRF token afterwards. See _is_safe_url tests + login handler.
+        assert sess["csrf_token"] != "keep-me"
+        assert isinstance(sess["csrf_token"], str) and len(sess["csrf_token"]) >= 32
 
 
 def test_oauth_callback_new_user_inserts_and_reads_back_id(monkeypatch):
@@ -7688,7 +7692,13 @@ def test_health_healthy_db(monkeypatch):
     response = client.get("/health")
 
     assert response.status_code == 200
-    assert response.get_json() == {"status": "healthy", "database": "connected"}
+    payload = response.get_json()
+    # Round-2 M1 added `limiter` and `degraded` fields. Assert the stable subset
+    # rather than full equality so future fields don't break this test.
+    assert payload["status"] == "healthy"
+    assert payload["database"] == "connected"
+    assert payload["limiter"] in ("redis", "memory")
+    assert isinstance(payload["degraded"], bool)
 
 
 def test_health_unhealthy_db_exception(monkeypatch):
@@ -7745,7 +7755,13 @@ def test_error_handler_404():
     response = client.get("/this-route-does-not-exist")
 
     assert response.status_code == 404
-    assert b"Page not found" in response.data
+    # The 404 page renders the branded "Face Not Found" UI rather than the raw
+    # werkzeug "Page not found" description (which was removed as redundant —
+    # users see the title, scanner animation, and ERR_TARGET_ESCAPED_CLASSIFICATION
+    # chip; the literal HTTP description added no information).
+    assert b"Face Not Found" in response.data
+    assert b"ERR_TARGET_ESCAPED_CLASSIFICATION" in response.data
+    assert b"404" in response.data
 
 
 def test_error_handler_429(monkeypatch):
@@ -10724,3 +10740,92 @@ def test_api_reclassify_approve_rejects_sibling_target_faces(monkeypatch):
 
     counter_decrement_sqls = [s for s in executed_sql if "GREATEST" in s]
     assert len(counter_decrement_sqls) > 0, "Expected faces_confirmed decrement for rejected siblings"
+
+
+# ---------------------------------------------------------------------------
+# Security: TOCTOU access-revocation re-check inside transactions
+# ---------------------------------------------------------------------------
+
+
+class TestAssertProjectAccessLocked:
+    """``_assert_project_access_locked`` issues a ``SELECT ... FOR UPDATE`` and
+    raises ``AccessRevoked`` if the actor no longer has access. This closes a
+    TOCTOU window where a project owner could revoke a member between the
+    pre-transaction permission check and the actual mutation."""
+
+    def test_raises_when_no_row(self):
+        cursor = MagicMock()
+        cursor.fetchone.return_value = None
+        with pytest.raises(app_module.AccessRevoked):
+            app_module._assert_project_access_locked(cursor, project_id=42, user_id=7)
+        # Verify FOR UPDATE locking was used
+        sql = cursor.execute.call_args[0][0]
+        assert "FOR UPDATE" in sql
+        assert "project_members" in sql
+        # Bind order: (user_id, project_id, user_id)
+        assert cursor.execute.call_args[0][1] == (7, 42, 7)
+
+    def test_passes_when_row_returned(self):
+        cursor = MagicMock()
+        cursor.fetchone.return_value = (1,)
+        # Should not raise
+        app_module._assert_project_access_locked(cursor, project_id=42, user_id=7)
+
+
+class TestIsAccessRevoked:
+    def test_direct_access_revoked(self):
+        exc = app_module.AccessRevoked("nope")
+        assert app_module._is_access_revoked(exc) is True
+
+    def test_wrapped_in_database_error(self):
+        from database import DatabaseError
+
+        cause = app_module.AccessRevoked("nope")
+        try:
+            raise DatabaseError("boom") from cause
+        except DatabaseError as e:
+            assert app_module._is_access_revoked(e) is True
+
+    def test_unrelated_exception(self):
+        assert app_module._is_access_revoked(ValueError("x")) is False
+        from database import DatabaseError
+
+        assert app_module._is_access_revoked(DatabaseError("x")) is False
+
+    def test_no_infinite_loop_on_self_referential_cause(self):
+        e = ValueError("loop")
+        e.__cause__ = e  # pathological self-cycle
+        # Should terminate, not hang
+        assert app_module._is_access_revoked(e) is False
+
+
+class TestRunAuthorizedTransaction:
+    def test_passes_through_normal_result(self, monkeypatch):
+        monkeypatch.setattr(app_module, "execute_transaction", lambda op: "result")
+        assert app_module._run_authorized_transaction(lambda c, cur: None) == "result"
+
+    def test_aborts_403_on_access_revoked(self, monkeypatch):
+        from database import DatabaseError
+
+        cause = app_module.AccessRevoked("revoked")
+
+        def fake_tx(_op):
+            raise DatabaseError("wrapped") from cause
+
+        monkeypatch.setattr(app_module, "execute_transaction", fake_tx)
+        # abort(403) raises a Werkzeug HTTPException with code 403
+        from werkzeug.exceptions import HTTPException
+
+        with pytest.raises(HTTPException) as excinfo:
+            app_module._run_authorized_transaction(lambda c, cur: None)
+        assert excinfo.value.code == 403
+
+    def test_reraises_other_database_errors(self, monkeypatch):
+        from database import DatabaseError
+
+        def fake_tx(_op):
+            raise DatabaseError("real db error")
+
+        monkeypatch.setattr(app_module, "execute_transaction", fake_tx)
+        with pytest.raises(DatabaseError):
+            app_module._run_authorized_transaction(lambda c, cur: None)
