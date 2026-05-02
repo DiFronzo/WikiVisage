@@ -271,8 +271,10 @@ class TestSingleFlightLock:
             assert got is True
 
     def test_releases_only_own_token(self):
-        """The release path must verify the token before DEL — prevents
+        """The release path must use an atomic Lua compare-and-delete — prevents
         releasing a lock that already expired and was reacquired by a peer."""
+        from redis_lock import _LUA_RELEASE
+
         client = MagicMock()
         client.set.return_value = True
         captured_token = {}
@@ -282,26 +284,29 @@ class TestSingleFlightLock:
             return True
 
         client.set.side_effect = capture_set
-        # Simulate that during release, the value in Redis still matches our token
         with redis_lock.single_flight(client, "user:1") as got:
             assert got is True
-            client.get.return_value = captured_token["v"].encode("utf-8")
-        client.delete.assert_called_once_with("wikivisage:lock:user:1")
+        # Verify the Lua script is invoked with the correct key and token.
+        client.eval.assert_called_once_with(_LUA_RELEASE, 1, "wikivisage:lock:user:1", captured_token["v"])
+        # Direct DEL should never be called — the Lua script performs it atomically.
+        client.delete.assert_not_called()
 
     def test_does_not_release_foreign_token(self):
-        """If a peer's token is stored under our key (we expired and they took
-        it), we must NOT call DEL."""
+        """If the lock expired and was reacquired by a peer, we must not DEL it.
+        The Lua script handles the comparison atomically — direct DEL is never used."""
         client = MagicMock()
         client.set.return_value = True
-        client.get.return_value = b"someone-elses-token"
         with redis_lock.single_flight(client, "user:1") as _got:
             pass
+        # Lua eval is called (the script handles the compare internally).
+        assert client.eval.call_count == 1
+        # Direct DEL must never be issued from Python code.
         client.delete.assert_not_called()
 
     def test_release_redis_outage_is_swallowed(self):
         client = MagicMock()
         client.set.return_value = True
-        client.get.side_effect = ConnectionError("redis down at release")
+        client.eval.side_effect = ConnectionError("redis down at release")
         # Must not raise out of the with-block
         with redis_lock.single_flight(client, "user:1") as got:
             assert got is True

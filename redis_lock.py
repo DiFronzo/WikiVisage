@@ -12,8 +12,11 @@ Design constraints:
   True). The DB-level optimistic concurrency check (CAS on `token_expires_at`)
   remains as a second line of defense, so a Redis outage degrades us back to
   the pre-fix behavior rather than breaking auth entirely.
-- Stateless: no Lua scripts, no pub/sub. A single `SET key value NX EX ttl`.
+- Stateless: connection sharing only. A single `SET key value NX EX ttl`.
 - Auto-expiring: TTL ensures a crashed holder cannot wedge the lock forever.
+- Atomic release: a Lua script performs the compare-and-delete atomically so
+  an expired-then-reacquired lock is never accidentally released by the old
+  holder.
 - Connection sharing: callers pass an existing redis client (already created
   for the rate limiter in app.py / could be created lazily in worker.py).
 
@@ -36,6 +39,19 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 _LOCK_KEY_PREFIX = "wikivisage:lock:"
+
+# Lua script for atomic compare-and-delete.
+# Returns 1 if the key was deleted (we owned it), 0 otherwise.
+# This closes the TOCTOU race between GET+compare and DEL: if the lock expired
+# and was re-acquired by another process between our GET and our DEL, the
+# script detects the mismatch and leaves the new owner's lock intact.
+_LUA_RELEASE = """
+if redis.call("get", KEYS[1]) == ARGV[1] then
+    return redis.call("del", KEYS[1])
+else
+    return 0
+end
+"""
 
 
 @contextlib.contextmanager
@@ -83,18 +99,10 @@ def single_flight(
         yield acquired
     finally:
         if acquired:
-            # Release only if the value matches our token (prevents accidental
-            # release of a lock that already expired and was re-acquired).
+            # Atomic compare-and-delete via Lua to prevent releasing a lock that
+            # expired and was re-acquired by another process between our GET and
+            # our DEL.
             try:
-                # Lua-free CAS: GET-and-compare-then-DEL has a race, but the worst
-                # case is releasing an expired lock that someone else just took,
-                # which is acceptable for our 10s TTL workload. Using a small
-                # Lua script would close the race; keeping it simple for now.
-                current = redis_client.get(key)
-                if current is not None:
-                    if isinstance(current, bytes):
-                        current = current.decode("utf-8", errors="replace")
-                    if current == token:
-                        redis_client.delete(key)
+                redis_client.eval(_LUA_RELEASE, 1, key, token)
             except Exception:
                 logger.warning("Redis unreachable while releasing lock %r — letting TTL expire it", key)

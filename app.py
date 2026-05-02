@@ -552,6 +552,7 @@ def _refresh_access_token(user: dict[str, Any]) -> dict[str, Any] | None:
                 refresh_token=user["refresh_token"],
                 client_id=OAUTH_CLIENT_ID,
                 client_secret=OAUTH_CLIENT_SECRET,
+                timeout=10,  # Must complete well within the 15s single-flight lock TTL.
             )
 
             new_expires_at = datetime.now(UTC) + timedelta(seconds=new_token.get("expires_in", 14400))
@@ -623,11 +624,16 @@ def inject_csrf_token() -> dict[str, Any]:
 
 @app.before_request
 def _generate_csp_nonce() -> None:
-    """Generate a per-request CSP nonce on every request.
+    """Generate a per-request CSP nonce and store it on g.
 
-    Must run as a before_request (not only as a context_processor) so JSON-only
-    routes, error responses, and redirects also get a nonce in their CSP header.
-    Templates still read it via the context processor below.
+    Must run as a before_request so that g.csp_nonce is available to
+    set_security_headers() (after_request) and to templates via the
+    inject_csp_nonce context processor. Note: the nonce is NOT currently
+    emitted in the Content-Security-Policy header because 'unsafe-inline' is
+    still required by several inline handlers across the templates; adding a
+    nonce alongside 'unsafe-inline' would have no effect per CSP Level 3
+    (browsers ignore 'unsafe-inline' when a nonce/hash is present). The nonce
+    is preserved here to support a future incremental migration to nonce-only.
     """
     g.csp_nonce = secrets.token_urlsafe(32)
 

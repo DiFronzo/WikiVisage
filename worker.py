@@ -94,6 +94,19 @@ _redis_client: Any = None
 _redis_init_attempted = False
 
 
+def _redact_redis_url(url: str) -> str:
+    """Return the Redis URL with any password replaced by *** for safe logging."""
+    try:
+        parsed = urlparse(url)
+        if parsed.password:
+            # urlparse exposes the password separately; rebuild netloc with it masked.
+            safe_netloc = parsed.netloc.replace(f":{parsed.password}@", ":***@")
+            return parsed._replace(netloc=safe_netloc).geturl()
+    except Exception:
+        pass
+    return url
+
+
 def _get_redis_client() -> Any:
     """Lazily connect to Redis for cross-process locks. Cached after first call."""
     global _redis_client, _redis_init_attempted
@@ -109,7 +122,7 @@ def _get_redis_client() -> Any:
     except Exception:
         logging.getLogger(__name__).warning(
             "Worker: Redis unavailable at %s — OAuth refresh single-flight lock disabled (DB CAS still active)",
-            _REDIS_URL,
+            _redact_redis_url(_REDIS_URL),
         )
         _redis_client = None
     return _redis_client
@@ -470,7 +483,7 @@ def _refresh_worker_token(user_id: int) -> str | None:
                     "client_secret": OAUTH_CLIENT_SECRET,
                 },
                 headers={"User-Agent": USER_AGENT},
-                timeout=30,
+                timeout=10,  # Must complete well within the 15s single-flight lock TTL.
             )
             try:
                 resp.raise_for_status()
@@ -1083,6 +1096,18 @@ def _detect_faces_in_subprocess(
     NOTE: This is the FALLBACK path used only when the persistent pool is not
     available (e.g. during single-image retries after pool crash).
     """
+    # Sandbox FIRST — scrub env secrets and apply resource limits before
+    # processing any untrusted image bytes.  face_recognition is already
+    # imported at module level (unavoidable with spawn-based subprocesses),
+    # but hardening still prevents a code-exec exploit from accessing env
+    # secrets and caps runaway resource consumption.
+    _harden_face_detect_subprocess()
+
+    # Cap PIL decompression bombs here as well (mirrors pool worker behaviour).
+    from PIL import Image as _PILImage  # noqa: PLC0415
+
+    _PILImage.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
+
     try:
         image_data = face_recognition.load_image_file(io.BytesIO(image_bytes))
         img_height, img_width = image_data.shape[:2]

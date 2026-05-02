@@ -1020,7 +1020,7 @@ def test_refresh_access_token_handles_string_naive_datetime(monkeypatch):
         def __init__(self, client_id):
             captured["client_id"] = client_id
 
-        def refresh_token(self, token_url, refresh_token, client_id, client_secret):
+        def refresh_token(self, token_url, refresh_token, client_id, client_secret, **kwargs):
             captured["token_url"] = token_url
             captured["refresh_token"] = refresh_token
             captured["refresh_client_id"] = client_id

@@ -57,7 +57,7 @@ The following are **out of scope**:
 
 - OAuth 2.0 with Wikimedia (access + refresh tokens, stored as VARBINARY in DB)
 - PKCE (RFC 7636, S256) on the OAuth authorization code flow as defense-in-depth against intercepted authorization codes
-- Token encryption at rest: OAuth tokens can be Fernet-encrypted via `WIKIVISAGE_TOKEN_KEY` env var (AES-128-CBC + HMAC-SHA256). Opt-in; legacy plaintext tokens are handled gracefully.
+- Token encryption at rest: OAuth tokens are Fernet-encrypted via `WIKIVISAGE_TOKEN_KEY` env var (AES-128-CBC + HMAC-SHA256). **Required in production** — the app refuses to start on Toolforge (non-debug mode) without this variable set. Legacy plaintext tokens are handled gracefully on first read (they are re-encrypted on the next token refresh).
 - OAuth refresh single-flight via Redis lock (`redis_lock.single_flight()`, 15s TTL) — prevents concurrent token-refresh requests from invalidating each other's freshly rotated refresh tokens. Best-effort: degrades to a no-op if Redis is unreachable; DB-level CAS on `token_expires_at` remains as a second line of defense.
 - CSRF tokens on all POST routes
 - Open redirect protection on login
