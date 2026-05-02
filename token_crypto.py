@@ -46,7 +46,24 @@ if _TOKEN_KEY:
             'Generate a valid key with: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"'
         ) from None
 else:
-    logger.info("Token encryption disabled (WIKIVISAGE_TOKEN_KEY not set)")
+    # Detect production environments — Toolforge sets KUBERNETES_SERVICE_HOST,
+    # and our deployment also exports TOOLFORGE_TOOL_NAME / TOOL_DATA_DIR.
+    _is_production = bool(
+        os.environ.get("KUBERNETES_SERVICE_HOST")
+        or os.environ.get("TOOLFORGE_TOOL_NAME")
+        or os.environ.get("TOOL_DATA_DIR")
+    )
+    if _is_production:
+        raise RuntimeError(
+            "WIKIVISAGE_TOKEN_KEY is required in production. "
+            "OAuth tokens must not be stored in plaintext on Toolforge. "
+            'Generate a key with: python -c "from cryptography.fernet import Fernet; '
+            'print(Fernet.generate_key().decode())"'
+        )
+    logger.warning(
+        "Token encryption disabled (WIKIVISAGE_TOKEN_KEY not set). "
+        "OAuth tokens will be stored in PLAINTEXT — acceptable for local dev only."
+    )
 
 
 def encrypt_token(plaintext: str) -> str:

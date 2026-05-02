@@ -39,6 +39,7 @@ from requests.packages.urllib3.util.retry import Retry
 
 from config import HEARTBEAT_FILE_DIR, WAKE_FILE_PATH
 from database import DatabaseError, close_pool, execute_query, execute_transaction, init_db
+from redis_lock import single_flight
 from token_crypto import TokenDecryptionError, decrypt_token, encrypt_token
 
 # Configure Logging
@@ -86,8 +87,74 @@ TOKEN_REFRESH_BUFFER = 300
 MAX_TOKEN_RETRIES = 2
 
 
+# Lazy redis client for the OAuth single-flight lock. None means we skipped/failed
+# to connect; the lock degrades to a no-op (DB CAS still protects correctness).
+_REDIS_URL = os.environ.get("WIKIVISAGE_REDIS_URL", "redis://redis.svc.tools.eqiad1.wikimedia.cloud:6379")
+_redis_client: Any = None
+_redis_init_attempted = False
+
+
+def _redact_redis_url(url: str) -> str:
+    """Return the Redis URL with any password replaced by *** for safe logging."""
+    try:
+        parsed = urlparse(url)
+        if parsed.password:
+            # urlparse exposes the password separately; rebuild netloc with it masked.
+            safe_netloc = parsed.netloc.replace(f":{parsed.password}@", ":***@")
+            return parsed._replace(netloc=safe_netloc).geturl()
+    except Exception:
+        pass
+    return url
+
+
+def _get_redis_client() -> Any:
+    """Lazily connect to Redis for cross-process locks. Cached after first call."""
+    global _redis_client, _redis_init_attempted
+    if _redis_init_attempted:
+        return _redis_client
+    _redis_init_attempted = True
+    try:
+        import redis as _redis_mod
+
+        client = _redis_mod.from_url(_REDIS_URL, socket_connect_timeout=2)
+        client.ping()
+        _redis_client = client
+    except Exception:
+        logging.getLogger(__name__).warning(
+            "Worker: Redis unavailable at %s — OAuth refresh single-flight lock disabled (DB CAS still active)",
+            _redact_redis_url(_REDIS_URL),
+        )
+        _redis_client = None
+    return _redis_client
+
+
 # Non-image file extensions to skip during category traversal (video, audio)
 _SKIP_EXTENSIONS = {".webm", ".ogv", ".ogg", ".mp3", ".wav", ".flac", ".opus", ".mid", ".oga"}
+
+
+def _validate_encoding(enc_bytes: bytes | None, face_id: int | str = "unknown") -> np.ndarray | None:
+    """Decode and validate a 128D face encoding from a DB BLOB.
+
+    Returns a writable numpy array on success, or None if the bytes are missing,
+    the wrong length, or contain non-finite / out-of-range values. This prevents
+    DB-level tampering (e.g., NaN/Inf injection) from corrupting the centroid
+    and silently mass-misclassifying faces. face_recognition encodings are
+    L2-normalized into roughly [-1, 1]; values outside [-10, 10] are rejected
+    as obviously invalid.
+    """
+    if enc_bytes is None or len(enc_bytes) != 1024:
+        logger.warning(
+            f"Face {face_id}: invalid encoding length ({len(enc_bytes) if enc_bytes else 'None'} bytes), expected 1024"
+        )
+        return None
+    arr = np.frombuffer(enc_bytes, dtype=np.float64).copy()
+    if not np.isfinite(arr).all():
+        logger.warning(f"Face {face_id}: encoding contains NaN/Inf — skipping")
+        return None
+    if np.any(np.abs(arr) > 10.0):
+        logger.warning(f"Face {face_id}: encoding values out of expected range — skipping")
+        return None
+    return arr
 
 
 def _build_skip_extensions_regex(extensions: set[str]) -> str:
@@ -286,9 +353,17 @@ def _download_image(url: str, max_bytes: int = MAX_IMAGE_DOWNLOAD_BYTES) -> byte
 
 
 def _validate_image_dimensions(image_bytes: bytes) -> None:
-    """Check image dimensions via PIL header-only read. Raises ValueError if too large."""
-    img = Image.open(io.BytesIO(image_bytes))
-    w, h = img.size
+    """Check image dimensions via PIL header-only read. Raises ValueError if too large.
+
+    Catches PIL.Image.DecompressionBombError explicitly so callers see a uniform
+    ValueError instead of an unhandled exception (defense-in-depth — the worker
+    subprocess also caps PIL.Image.MAX_IMAGE_PIXELS).
+    """
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+        w, h = img.size
+    except Image.DecompressionBombError as e:
+        raise ValueError(f"Image rejected as decompression bomb: {e}") from e
     if w * h > MAX_IMAGE_PIXELS:
         raise ValueError(f"Image too large for face detection: {w}x{h} ({w * h:,} pixels, limit {MAX_IMAGE_PIXELS:,})")
 
@@ -307,12 +382,11 @@ def _get_csrf_token(access_token: str) -> str:
         raise
 
 
-def _refresh_worker_token(user_id: int) -> str | None:
-    """Refresh an expired OAuth access token for SDC writes.
+def _read_decrypted_user_tokens(user_id: int) -> tuple[str | None, str, Any]:
+    """Read and decrypt the user's access/refresh tokens + expiry from DB.
 
-    Reads refresh_token from DB, calls the OAuth token endpoint,
-    and updates the DB with the new credentials. Returns the new
-    access_token or None if refresh failed.
+    Returns (access_token, refresh_token, expires_at) or (None, "", None) on
+    decrypt/lookup failure (caller should treat as fatal — log already emitted).
     """
     user_row = execute_query(
         "SELECT access_token, refresh_token, token_expires_at FROM users WHERE id = %s",
@@ -320,8 +394,7 @@ def _refresh_worker_token(user_id: int) -> str | None:
         fetch=True,
     )
     if not user_row:
-        return None
-
+        return None, "", None
     user = user_row[0]
     access_token = user["access_token"]
     if isinstance(access_token, bytes):
@@ -332,7 +405,7 @@ def _refresh_worker_token(user_id: int) -> str | None:
         logger.error(
             f"Cannot decrypt access token for user {user_id} — possible key rotation; skipping SDC writes for this user"
         )
-        return None
+        return None, "", None
     refresh_token = user.get("refresh_token", "")
     if isinstance(refresh_token, bytes):
         refresh_token = refresh_token.decode("utf-8")
@@ -342,14 +415,40 @@ def _refresh_worker_token(user_id: int) -> str | None:
         logger.error(
             f"Cannot decrypt refresh token for user {user_id} — possible key rotation; skipping SDC writes for this user"
         )
-        return None
-
+        return None, "", None
     expires_at = user.get("token_expires_at")
     if expires_at:
         if isinstance(expires_at, str):
             expires_at = datetime.fromisoformat(expires_at)
         if expires_at.tzinfo is None:
             expires_at = expires_at.replace(tzinfo=UTC)
+    return access_token, refresh_token, expires_at
+
+
+def _refresh_worker_token(user_id: int) -> str | None:
+    """Refresh an expired OAuth access token for SDC writes.
+
+    Reads refresh_token from DB, calls the OAuth token endpoint, and updates
+    the DB with the new credentials. Returns the new access_token or None if
+    refresh failed.
+
+    Concurrency model (mirrors app.py — see _refresh_access_token for full
+    rationale). Three layers of protection:
+      1. Redis single-flight lock per user_id — only one process per cluster
+         POSTs to the OAuth endpoint with a given refresh_token. Wikimedia
+         rotates refresh tokens on every exchange, so racing two refreshes
+         silently invalidates one of them.
+      2. DB optimistic concurrency (CAS on token_expires_at) — last-line
+         defense if Redis is down or the lock TTL expired mid-refresh.
+      3. Re-read from DB — used by both lost-race paths to recover the
+         winner's freshly-stored access_token.
+    """
+    access_token, refresh_token, expires_at = _read_decrypted_user_tokens(user_id)
+    if access_token is None:
+        return None
+
+    # Token still valid — no refresh needed, no lock needed.
+    if expires_at is not None:
         now = datetime.now(UTC)
         if (expires_at - now).total_seconds() > TOKEN_REFRESH_BUFFER:
             return access_token
@@ -358,88 +457,88 @@ def _refresh_worker_token(user_id: int) -> str | None:
         logger.error(f"No refresh token for user {user_id}, cannot refresh")
         return None
 
-    logger.info(f"Refreshing access token for user {user_id} (worker)")
-    try:
-        resp = _get_session().post(
-            OAUTH_TOKEN_URL,
-            data={
-                "grant_type": "refresh_token",
-                "refresh_token": refresh_token,
-                "client_id": OAUTH_CLIENT_ID,
-                "client_secret": OAUTH_CLIENT_SECRET,
-            },
-            headers={"User-Agent": USER_AGENT},
-            timeout=30,
-        )
+    lock_name = f"oauth-refresh:{user_id}"
+    with single_flight(_get_redis_client(), lock_name, ttl_seconds=15) as got_lock:
+        if not got_lock:
+            # Another process is mid-refresh. Wait briefly, then re-read DB.
+            logger.info(f"Token refresh in flight for user {user_id} (worker) — waiting on peer")
+            time.sleep(1.0)
+            new_access, _, new_expires = _read_decrypted_user_tokens(user_id)
+            if new_access is None:
+                return None
+            if new_expires is not None and (new_expires - datetime.now(UTC)).total_seconds() > TOKEN_REFRESH_BUFFER:
+                return new_access
+            # Peer didn't actually commit — recurse once outside the lock window.
+            logger.warning(f"Peer refresh did not complete for user {user_id}; retrying")
+            return _refresh_worker_token(user_id)
+
+        logger.info(f"Refreshing access token for user {user_id} (worker)")
         try:
-            resp.raise_for_status()
-            new_token = resp.json()
-        finally:
-            resp.close()
-    except Exception:
-        logger.exception(f"Failed to refresh access token for user {user_id}")
-        return None
-
-    new_access = new_token.get("access_token")
-    if not new_access:
-        logger.error(f"Token refresh response missing access_token for user {user_id}")
-        return None
-
-    new_refresh = new_token.get("refresh_token", refresh_token)
-    new_expires_at = datetime.now(UTC) + timedelta(seconds=new_token.get("expires_in", 14400))
-
-    # Optimistic concurrency: only update if no other process refreshed first.
-    # The old expires_at acts as a compare-and-swap guard.
-    old_expires_str = expires_at.strftime("%Y-%m-%d %H:%M:%S") if expires_at else None
-
-    try:
-        if old_expires_str:
-            rowcount = execute_query(
-                "UPDATE users SET access_token = %s, refresh_token = %s, token_expires_at = %s "
-                "WHERE id = %s AND token_expires_at = %s",
-                (
-                    encrypt_token(new_access),
-                    encrypt_token(new_refresh),
-                    new_expires_at.strftime("%Y-%m-%d %H:%M:%S"),
-                    user_id,
-                    old_expires_str,
-                ),
-                fetch=False,
+            resp = _get_session().post(
+                OAUTH_TOKEN_URL,
+                data={
+                    "grant_type": "refresh_token",
+                    "refresh_token": refresh_token,
+                    "client_id": OAUTH_CLIENT_ID,
+                    "client_secret": OAUTH_CLIENT_SECRET,
+                },
+                headers={"User-Agent": USER_AGENT},
+                timeout=10,  # Must complete well within the 15s single-flight lock TTL.
             )
-        else:
-            rowcount = execute_query(
-                "UPDATE users SET access_token = %s, refresh_token = %s, token_expires_at = %s WHERE id = %s",
-                (
-                    encrypt_token(new_access),
-                    encrypt_token(new_refresh),
-                    new_expires_at.strftime("%Y-%m-%d %H:%M:%S"),
-                    user_id,
-                ),
-                fetch=False,
-            )
-
-        if rowcount == 0 and old_expires_str:
-            # Another process already refreshed — re-read from DB
-            logger.info(f"Token already refreshed by another process for user {user_id}")
-            fresh = execute_query(
-                "SELECT access_token FROM users WHERE id = %s",
-                (user_id,),
-                fetch=True,
-            )
-            if fresh:
-                fresh_token = fresh[0]["access_token"]
-                if isinstance(fresh_token, bytes):
-                    fresh_token = fresh_token.decode("utf-8")
-                try:
-                    return decrypt_token(fresh_token)
-                except TokenDecryptionError:
-                    logger.error(f"Cannot decrypt fresh token for user {user_id}")
-                    return None
+            try:
+                resp.raise_for_status()
+                new_token = resp.json()
+            finally:
+                resp.close()
+        except Exception:
+            logger.exception(f"Failed to refresh access token for user {user_id}")
             return None
-    except DatabaseError:
-        logger.exception(f"Failed to persist refreshed token for user {user_id}")
 
-    return new_access
+        new_access = new_token.get("access_token")
+        if not new_access:
+            logger.error(f"Token refresh response missing access_token for user {user_id}")
+            return None
+
+        new_refresh = new_token.get("refresh_token", refresh_token)
+        new_expires_at = datetime.now(UTC) + timedelta(seconds=new_token.get("expires_in", 14400))
+
+        # Optimistic concurrency: only update if no other process refreshed first.
+        old_expires_str = expires_at.strftime("%Y-%m-%d %H:%M:%S") if expires_at else None
+
+        try:
+            if old_expires_str:
+                rowcount = execute_query(
+                    "UPDATE users SET access_token = %s, refresh_token = %s, token_expires_at = %s "
+                    "WHERE id = %s AND token_expires_at = %s",
+                    (
+                        encrypt_token(new_access),
+                        encrypt_token(new_refresh),
+                        new_expires_at.strftime("%Y-%m-%d %H:%M:%S"),
+                        user_id,
+                        old_expires_str,
+                    ),
+                    fetch=False,
+                )
+            else:
+                rowcount = execute_query(
+                    "UPDATE users SET access_token = %s, refresh_token = %s, token_expires_at = %s WHERE id = %s",
+                    (
+                        encrypt_token(new_access),
+                        encrypt_token(new_refresh),
+                        new_expires_at.strftime("%Y-%m-%d %H:%M:%S"),
+                        user_id,
+                    ),
+                    fetch=False,
+                )
+
+            if rowcount == 0 and old_expires_str:
+                logger.info(f"Token already refreshed by another process for user {user_id}")
+                fresh_access, _, _ = _read_decrypted_user_tokens(user_id)
+                return fresh_access
+        except DatabaseError:
+            logger.exception(f"Failed to persist refreshed token for user {user_id}")
+
+        return new_access
 
 
 def traverse_category(project: dict[str, Any]) -> int:
@@ -585,6 +684,67 @@ FACE_DETECT_TIMEOUT = 120  # seconds — kill subprocess if face detection hangs
 # If a subprocess crashes (e.g. dlib segfault), it is automatically respawned.
 
 
+def _harden_face_detect_subprocess() -> None:
+    """Sandbox the face detection subprocess BEFORE importing untrusted-input parsers.
+
+    Defense in depth against a malicious image triggering a CVE in dlib / libjpeg /
+    libpng / Pillow. Two layers:
+
+    1. Scrub sensitive env vars from os.environ so a code-exec exploit in the
+       subprocess cannot exfiltrate OAuth secrets, the Fernet token-encryption key,
+       or DB credentials. The parent process retains these in its own os.environ.
+
+    2. Apply POSIX resource limits (best-effort, Linux only) so a CPU-bomb or
+       memory-bomb image cannot wedge the Toolforge pod:
+         - RLIMIT_AS:   2 GiB virtual address space (face detection on a single
+                        ~50 MB image needs well under 1 GiB even for HOG).
+         - RLIMIT_CPU:  180s CPU time (FACE_DETECT_TIMEOUT is 120s wall clock,
+                        plus headroom for the OS to deliver SIGXCPU).
+         - RLIMIT_FSIZE: 1 MiB — subprocess never legitimately writes files.
+
+    Failures here are logged but non-fatal: on platforms without `resource`
+    (Windows / some sandboxes) the subprocess still runs, just unrestricted.
+    """
+    # Scrub secrets BEFORE any third-party import that could be exploitable.
+    # Keep PATH / LANG / locale / Toolforge runtime hints intact so dlib + libc work.
+    _SENSITIVE_ENV_PREFIXES = (
+        "OAUTH_",
+        "WIKIVISAGE_TOKEN_KEY",
+        "FLASK_SECRET_KEY",
+        "TOOL_TOOLSDB_",
+        "WIKIVISAGE_DB_",
+        "WIKIVISAGE_REDIS_URL",
+    )
+    for key in list(os.environ.keys()):
+        if any(key == p or key.startswith(p) for p in _SENSITIVE_ENV_PREFIXES):
+            del os.environ[key]
+
+    try:
+        import resource  # POSIX-only
+
+        # 2 GiB address space cap. dlib HOG on a 100MP image needs ~600 MB peak.
+        _AS_LIMIT = 2 * 1024 * 1024 * 1024
+        # 180s CPU. Wall-clock kill is FACE_DETECT_TIMEOUT (120s) in the parent.
+        _CPU_LIMIT = 180
+        # 1 MiB write cap — subprocess should never write files at all.
+        _FSIZE_LIMIT = 1 * 1024 * 1024
+
+        for limit_name, soft, hard in (
+            ("RLIMIT_AS", _AS_LIMIT, _AS_LIMIT),
+            ("RLIMIT_CPU", _CPU_LIMIT, _CPU_LIMIT),
+            ("RLIMIT_FSIZE", _FSIZE_LIMIT, _FSIZE_LIMIT),
+        ):
+            try:
+                resource.setrlimit(getattr(resource, limit_name), (soft, hard))
+            except (ValueError, OSError):
+                # Some sandboxes (CI, Docker without --privileged) reject lowering
+                # already-restrictive hard limits. Best-effort: continue.
+                pass
+    except ImportError:
+        # Non-POSIX (Windows). Subprocess runs unrestricted; documented limitation.
+        pass
+
+
 def _face_detect_worker_loop(
     task_conn: multiprocessing.connection.Connection,
     result_conn: multiprocessing.connection.Connection,
@@ -599,9 +759,18 @@ def _face_detect_worker_loop(
     Uses Pipe connections instead of multiprocessing.Queue to avoid POSIX
     semaphores on /dev/shm (unavailable/tiny on Toolforge Kubernetes pods).
     """
+    # Sandbox FIRST — before any import that parses untrusted bytes.
+    _harden_face_detect_subprocess()
+
     # Heavy imports happen once per subprocess lifetime — this is the whole point
     import face_recognition as fr
     import numpy  # noqa: F401 — imported to ensure numpy is initialized
+    from PIL import Image as _PILImage
+
+    # Treat decompression bombs as errors (the default is a warning).
+    # MAX_IMAGE_PIXELS is also enforced in the parent via _validate_image_dimensions,
+    # but a defensive cap here protects against PIL being called inside fr.load_image_file.
+    _PILImage.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
 
     try:
         while True:
@@ -613,7 +782,12 @@ def _face_detect_worker_loop(
                 request_id, image_bytes = task
 
                 try:
-                    image_data = fr.load_image_file(io.BytesIO(image_bytes))
+                    try:
+                        image_data = fr.load_image_file(io.BytesIO(image_bytes))
+                    except _PILImage.DecompressionBombError as bomb_err:
+                        # Image exceeds PIL's pixel cap — refuse rather than allocate.
+                        result_conn.send((request_id, "error", f"decompression bomb rejected: {bomb_err}"))
+                        continue
                     img_height, img_width = image_data.shape[:2]
                     face_locations = fr.face_locations(image_data, model="hog")
                     face_encodings = fr.face_encodings(image_data, face_locations)
@@ -922,6 +1096,18 @@ def _detect_faces_in_subprocess(
     NOTE: This is the FALLBACK path used only when the persistent pool is not
     available (e.g. during single-image retries after pool crash).
     """
+    # Sandbox FIRST — scrub env secrets and apply resource limits before
+    # processing any untrusted image bytes.  face_recognition is already
+    # imported at module level (unavoidable with spawn-based subprocesses),
+    # but hardening still prevents a code-exec exploit from accessing env
+    # secrets and caps runaway resource consumption.
+    _harden_face_detect_subprocess()
+
+    # Cap PIL decompression bombs here as well (mirrors pool worker behaviour).
+    from PIL import Image as _PILImage  # noqa: PLC0415
+
+    _PILImage.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
+
     try:
         image_data = face_recognition.load_image_file(io.BytesIO(image_bytes))
         img_height, img_width = image_data.shape[:2]
@@ -1531,13 +1717,10 @@ def run_autonomous_inference(project: dict[str, Any]) -> int:
     # memory limits. Batching would add complexity with no practical benefit.
     confirmed_encodings = []
     for row in confirmed_rows:
-        enc = row["encoding"]
-        if enc is None or len(enc) != 1024:
-            logger.warning(
-                f"Skipping confirmed face with invalid encoding length ({len(enc) if enc else 'None'} bytes)"
-            )
+        validated = _validate_encoding(row["encoding"], row.get("id", "confirmed"))
+        if validated is None:
             continue
-        confirmed_encodings.append(np.frombuffer(enc, dtype=np.float64).copy())
+        confirmed_encodings.append(validated)
 
     if not confirmed_encodings:
         logger.warning(f"Project {project['id']}: all confirmed encodings invalid, skipping inference")
@@ -1590,13 +1773,9 @@ def run_autonomous_inference(project: dict[str, Any]) -> int:
         if shutdown_requested:
             break
 
-        enc = row["encoding"]
-        if enc is None or len(enc) != 1024:
-            logger.warning(
-                f"Skipping candidate face {row['id']} with invalid encoding ({len(enc) if enc else 'None'} bytes)"
-            )
+        encoding = _validate_encoding(row["encoding"], row["id"])
+        if encoding is None:
             continue
-        encoding = np.frombuffer(enc, dtype=np.float64).copy()
         distance = face_recognition.face_distance([centroid], encoding)[0]
         face_distances.append((row["id"], row["image_id"], float(distance)))
 
@@ -1782,9 +1961,35 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
         if not faces_to_write:
             break
 
+        # Cooperative cancellation inside the per-face loop. The outer-loop check
+        # only fires every SDC_BATCH (50) faces — that's up to 50 unwanted Commons
+        # writes between a user clicking "Stop" and us noticing. Re-check every
+        # `_PER_FACE_CANCEL_CHECK_EVERY` faces (cheap one-row SELECT) so we abort
+        # promptly without spamming the DB.
+        _PER_FACE_CANCEL_CHECK_EVERY = 5
+        faces_since_check = 0
+
         for row in faces_to_write:
             if shutdown_requested:
                 break
+
+            faces_since_check += 1
+            if faces_since_check >= _PER_FACE_CANCEL_CHECK_EVERY:
+                faces_since_check = 0
+                try:
+                    inner_check = execute_query(
+                        "SELECT sdc_write_requested FROM projects WHERE id = %s",
+                        (project_id,),
+                        fetch=True,
+                    )
+                    if not inner_check or inner_check[0]["sdc_write_requested"] == 0:
+                        logger.info(
+                            f"SDC write cancelled mid-batch by user for project {project_id} "
+                            f"({total_written} written so far)"
+                        )
+                        return total_written
+                except DatabaseError:
+                    pass  # Non-fatal: keep writing if the check fails
 
             page_id = row["commons_page_id"]
             face_id = row["face_id"]

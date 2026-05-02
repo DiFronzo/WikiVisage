@@ -167,3 +167,61 @@ class TestLooksLikeFernet:
 
     def test_gAAA_prefix_detected(self, _with_token_key):
         assert _with_token_key._looks_like_fernet("gAAAAABxxxxxxxx") is True
+
+
+# ---------------------------------------------------------------------------
+# Security: production enforcement of WIKIVISAGE_TOKEN_KEY
+# ---------------------------------------------------------------------------
+
+
+class TestProductionEnforcement:
+    """In production environments (Toolforge/Kubernetes), refusing to start
+    without a token key prevents accidental plaintext OAuth-token storage."""
+
+    @pytest.mark.parametrize(
+        "prod_var",
+        ["KUBERNETES_SERVICE_HOST", "TOOLFORGE_TOOL_NAME", "TOOL_DATA_DIR"],
+    )
+    def test_missing_key_raises_in_production(self, prod_var):
+        env = {k: v for k, v in os.environ.items() if k != "WIKIVISAGE_TOKEN_KEY"}
+        env[prod_var] = "set"
+        with patch.dict(os.environ, env, clear=True):
+            import token_crypto
+
+            with pytest.raises(RuntimeError, match="WIKIVISAGE_TOKEN_KEY is required in production"):
+                importlib.reload(token_crypto)
+
+    def test_missing_key_allowed_in_dev(self):
+        """Without any prod marker, missing key is tolerated (dev mode)."""
+        env = {
+            k: v
+            for k, v in os.environ.items()
+            if k
+            not in {
+                "WIKIVISAGE_TOKEN_KEY",
+                "KUBERNETES_SERVICE_HOST",
+                "TOOLFORGE_TOOL_NAME",
+                "TOOL_DATA_DIR",
+            }
+        }
+        with patch.dict(os.environ, env, clear=True):
+            import token_crypto
+
+            importlib.reload(token_crypto)
+            # Module loaded without raising — encryption is disabled
+            assert token_crypto.encrypt_token("hello") == "hello"
+
+    def test_valid_key_in_production_succeeds(self):
+        from cryptography.fernet import Fernet
+
+        key = Fernet.generate_key().decode()
+        env = {k: v for k, v in os.environ.items()}
+        env["WIKIVISAGE_TOKEN_KEY"] = key
+        env["KUBERNETES_SERVICE_HOST"] = "set"
+        with patch.dict(os.environ, env, clear=True):
+            import token_crypto
+
+            importlib.reload(token_crypto)
+            ct = token_crypto.encrypt_token("secret")
+            assert ct.startswith("gAAA")
+            assert token_crypto.decrypt_token(ct) == "secret"
