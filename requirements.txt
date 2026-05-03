@@ -14,7 +14,7 @@ requests>=2.33.1
 
 # Database
 PyMySQL==1.1.2
-cryptography>=43.0.0
+cryptography>=47.0.0
 
 # Face recognition
 # face-recognition depends on "dlib" (source-only, needs CMake/C++ to compile).
