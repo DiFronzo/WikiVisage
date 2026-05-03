@@ -11,4 +11,4 @@ pytest-cov>=6.0
 ruff>=0.9.0
 
 # Type stubs
-types-redis>=4.6.0
+types-redis>=4.6.0.20241004
