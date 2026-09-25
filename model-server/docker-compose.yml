@@ -1,0 +1,42 @@
+# Local development harness for the WikiVisage face detection model server.
+#
+#   docker compose up --build
+#
+# The app and worker then reach it at http://localhost:8080 via
+# WIKIVISAGE_FACE_SERVICE_URL.
+
+services:
+  face-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: wikivisage-face-service:local
+    container_name: wikivisage-face-service
+    ports:
+      - "8080:8080"
+    environment:
+      # Threads running dlib concurrently. Keep at or below the CPU allocation.
+      # dlib is not thread-safe; >1 segfaults the server. See model.py.
+      WIKIVISAGE_FACE_WORKERS: "1"
+      # Reject batches larger than this many instances.
+      WIKIVISAGE_MAX_BATCH_SIZE: "32"
+      WIKIVISAGE_MAX_IMAGE_BYTES: "20971520"
+      # Set to require a bearer token locally too (>= 32 characters). Leave
+      # unset for plain local development; production always sets it.
+      # WIKIVISAGE_FACE_SERVICE_TOKEN: ""
+    # dlib is memory-hungry on large images; this mirrors the ceiling the old
+    # in-process detection subprocess enforced via RLIMIT_AS.
+    mem_limit: 2g
+    cpus: 2.0
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/v1/models/wikivisage"]
+      interval: 30s
+      timeout: 5s
+      start_period: 60s
+      retries: 3

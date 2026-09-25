@@ -4,45 +4,59 @@
 
 Active-learning Flask app for Wikimedia Commons. Users classify faces via yes/no UI, training a centroid-distance model that auto-classifies remaining faces. Approved matches are written as P180 (depicts) SDC claims to Commons via OAuth — triggered manually by the user from the project detail page. Hosted on Wikimedia Toolforge (Kubernetes, no GPU).
 
+Face detection and 128D encoding run in a **separate face service** (`model-server/`), deployed as its own Toolforge tool and reached over HTTPS. The web and worker processes carry no ML dependencies at all.
+
+
 ## Structure
 
 ```
 WikiVisage/
 ├── app.py              # Flask web app: OAuth (PKCE), routes, classification API, CSP (~4279 lines)
-├── worker.py           # Background ML pipeline: crawl, detect (RLIMIT-hardened), infer (~3329 lines)
+├── worker.py           # Background pipeline: crawl, remote detect, infer (~2957 lines)
+├── face_client.py      # HTTP client for the face service. ZERO ML deps — shared by app.py + worker.py
 ├── config.py           # Shared config constants: WAKE_FILE_PATH, HEARTBEAT_FILE_DIR (~13 lines)
 ├── token_crypto.py     # Fernet encrypt/decrypt helpers for OAuth tokens at rest (~125 lines)
 ├── redis_lock.py       # Best-effort Redis single-flight lock; used to serialize OAuth refresh (~100 lines)
 ├── database.py         # MariaDB connection pool with retry logic (~510 lines)
+├── model-server/       # Face detection service — the ONLY place dlib lives
+│   ├── model.py        # KServe V1 predictor: WikiVisageModel(kserve.Model), async predict, direct dlib calls
+│   ├── guard.py        # Stdlib-only ASGI middleware: bearer token + 40 MiB body cap (public-facing)
+│   ├── requirements.txt # kserve 0.15.2, dlib-bin==20.0.1, face_recognition_models, Pillow, numpy — plain pip
+│   ├── Procfile        # Toolforge buildpack entrypoint: `web: python model.py ... --http_port 8000`
+│   ├── project.toml    # Toolforge deb-packages: libopenblas0, liblapack3
+│   ├── .python-version # 3.11 (Heroku Python buildpack)
+│   ├── Dockerfile      # Local dev + CI only. Two-stage, python:3.11-slim-bookworm, uid 10001
+│   ├── blubber.yaml    # Forward-looking only — NOT deployable (see Known Issues)
+│   ├── docker-compose.yml # Local harness with memory/CPU ceilings + read-only rootfs
+│   ├── make_input.py   # Builds KServe request JSON from local image files
+│   └── .dockerignore
 ├── healthcheck.sh      # Toolforge liveness health check script (per-worker heartbeat file age check)
 ├── schema.sql          # DDL for 9 tables: users, sessions, projects, images, faces, user_stats, sdc_claims, project_members, worker_heartbeat
 ├── migrate.py          # Idempotent schema migration with --reset flag (~490 lines)
 ├── pyproject.toml      # Project config: Ruff linter/formatter rules, pytest config, markers, version
-├── requirements.txt    # Python 3.11+, dlib-bin fork (no source compilation)
+├── requirements.txt    # Python 3.11+, NO ML dependencies (see model-server/ for those)
 ├── requirements-dev.txt # Dev/test deps: pytest, pytest-cov, ruff (includes requirements.txt)
 ├── babel.cfg           # pybabel extraction config (explicit file list, excludes venv)
 ├── messages.pot        # Extracted translatable strings template
 ├── CONTRIBUTING.md     # Contributor guide: setup, conventions, i18n, schema changes
+├── TESTING.md          # Face service: build, run, verify, troubleshoot
 ├── translations/       # i18n translation files (Flask-Babel / gettext)
 │   ├── en/LC_MESSAGES/ # English (identity: msgstr = msgid)
 │   ├── nb/LC_MESSAGES/ # Norwegian Bokmål
 │   ├── es/LC_MESSAGES/ # Spanish
 │   └── fr/LC_MESSAGES/ # French
-├── tests/              # Hybrid test suite: 707 unit + 34 integration tests
+├── tests/              # Hybrid test suite: 775 unit + 34 integration + 14 contract tests
 │   ├── __init__.py
 │   ├── conftest.py     # Integration fixture infrastructure (~450 lines)
-│   ├── test_app.py     # 498 unit + 11 integration tests (~10831 lines)
+│   ├── test_app.py     # Unit + integration tests (~10800 lines)
 │   ├── test_database.py # 27 unit + 9 integration tests (~600 lines)
+│   ├── test_face_client.py # 17 unit tests for the face service client
+│   ├── test_face_service_contract.py # 14 contract tests against a live container (5 need a token)
+│   ├── test_face_service_guard.py # 30 unit tests for model-server/guard.py (loaded by path)
 │   ├── test_migrate.py # 15 unit + 8 integration tests (~471 lines)
 │   ├── test_token_crypto.py # 26 unit tests (~227 lines)
-│   ├── test_worker.py  # 110 unit + 6 integration tests (~3101 lines)
-│   └── test_security_round2.py # 31 round-2 security regression tests (CSP, PKCE, single-flight, /health, M3/M4) (~594 lines)
-├── templates/          # Jinja2 templates (10 files, all extend base.html)
-│   ├── base.html       # Layout: nav, flash messages, CSS variables. Blocks: title, extra_head, content
-│   ├── classify.html   # Active learning UI: face image, yes/no/skip/none buttons, keyboard shortcuts, undo
-│   ├── project_detail.html  # Stats, classification breakdown, model results gallery, validation UI, SDC write button
-│   ├── account_settings.html  # User account settings (leaderboard opt-out)
-│   └── ...             # dashboard, index, leaderboard, project_new, project_settings, error
+│   ├── test_worker.py  # Unit + integration tests (~3000 lines)
+│   └── test_security_round2.py # 26 round-2 security regression tests (CSP, PKCE, single-flight, /health, M3/M4)
 ├── static/             # Static assets
 │   ├── wikivisage-logo.svg        # Full logo with text
 │   ├── wikivisage-logo-notext.svg # Logo icon only
@@ -53,7 +67,6 @@ WikiVisage/
 │       ├── ci.yml      # CI: Ruff lint + pytest on Python 3.11/3.13 (integration tests skipped)
 │       └── deploy.yml  # CD: Release-triggered Toolforge deploy via SSH (2 workers + health checks)
 ├── Procfile            # web: gunicorn (4 workers, app factory), worker: python -u worker.py
-├── project.toml        # System deps via heroku/deb-packages: libopenblas0, liblapack3 (dlib runtime)
 ├── jobs.yaml           # Toolforge jobs definition (2 ml-worker instances, health check scripts)
 ├── how-to-run-it.md    # Toolforge deployment guide
 ├── test-local.md       # Local development setup guide
@@ -61,7 +74,123 @@ WikiVisage/
 └── .env                # Local dev env vars (gitignored)
 ```
 
-## Architecture — Two Processes
+> `templates/` (10 Jinja2 files, all extending `base.html`) is unchanged; see the Templates convention section.
+>
+> **The root `project.toml` was deleted.** It existed only to install `libopenblas0` / `liblapack3` via the `heroku/deb-packages` buildpack — both are `dlib-bin` runtime dependencies. The main tool's image needs no system deb packages now; the same file lives on as `model-server/project.toml` for the face tool.
+
+
+## Architecture — Three Processes
+
+```
++---------------------+     +---------------------+
+|   Flask Web App     |     | Background Worker(s)|
+|      (app.py)       |     |     (worker.py)     |
+|  no ML deps         |     |  no ML deps         |
++----------+----------+     +----------+----------+
+           |                           |
+           |  face_client.py (HTTP, base64 image bytes)
+           +-------------+-------------+
+                         v
+              +---------------------+
+              |    Face Service     |
+              | (model-server/)     |
+              |  KServe + dlib      |
+              +---------------------+
+           |                           |
+           +-------------+-------------+
+                         v
+                   +-----------+
+                   |  MariaDB  |
+                   | (ToolsDB) |
+                   +-----------+
+```
+
+Only the face service depends on dlib. Both Toolforge processes import
+`face_client.py`, which has zero ML dependencies — verified by asserting that
+importing `app.py` or `worker.py` loads no `dlib` module. The service itself no
+longer uses the `face_recognition` package either (see Known Issues).
+
+### Face Service (model-server/)
+
+Standalone KServe V1 model server. `WikiVisageModel(kserve.Model)` implements
+`load()` and `async def predict(payload, headers=None, response_headers=None)`.
+
+- **Images arrive base64-encoded, never as URLs.** The service performs no
+  outbound network I/O, which removes SSRF surface and makes it deployable
+  behind a default-deny egress policy.
+- **dlib is blocking C++ and is NOT thread-safe.** `predict` stays on the event
+  loop only for parsing and dispatches each instance to a `ThreadPoolExecutor`
+  via `run_in_executor`, so the loop never blocks. Every dlib call runs under
+  `_dlib_lock`: concurrent calls segfault the process (SIGSEGV, exit 139) or,
+  worse, silently return wrong results — hundreds of garbage boxes, missed
+  faces, or one image's box stored against another image in the same batch.
+  Threads only overlap decoding; scale with replicas.
+- **Per-instance error isolation.** One malformed image yields a
+  `status: "error"` entry for that instance; siblings still return results.
+  `predictions` is always the same length and order as `instances`.
+- Two tasks: `detect` (find all faces) and `encode` (embed known bounding
+  boxes, used by the manual-draw and bbox-edit routes).
+
+Endpoint: `POST /v1/models/wikivisage:predict`. Readiness:
+`GET /v1/models/wikivisage`. See `TESTING.md` for the full wire contract.
+
+**Production hosting: a second Toolforge tool** (`wikivisage-face`, repo
+variable `FACE_TOOL`), built with buildpacks from `model-server/` and run as a
+published continuous job (`face-service`, port 8000, `--mem 3Gi --cpu 2`,
+`--mount=none`, HTTP health check on `/v1/models/wikivisage`). It is a separate
+tool, not a job in `wikivisage`, because Toolforge envvars are tool-wide
+([T405022](https://phabricator.wikimedia.org/T405022)): in the main tool the
+process parsing untrusted images would receive the ToolsDB password, OAuth
+secret and `WIKIVISAGE_TOKEN_KEY`. The hop is `wikivisage job → HTTPS →
+wikivisage-face.toolforge.org → RequestGuard (bearer token, 40 MiB body cap) →
+KServe`. Runbook: `how-to-run-it.md`.
+
+**The guard covers every route.** KServe also serves admin routes such as
+`POST /v2/repository/models/<name>/unload`; with a token set, `guard.py` lets
+only `GET /v1/models/<name>` through unauthenticated (the platform health check
+cannot send headers). gRPC is disabled so there is no second, unguarded port.
+`model.py` refuses to start when `TOOL_TOOLFORGE_API_URL` is set without a token
+or with one shorter than 32 characters.
+
+**Deploy ordering is a safety property.** `deploy.yml` publishes a
+`face-service-<tag>` git tag (commit tree = `model-server/`), rebuilds and
+restarts the face tool, waits for it to report ready, then — on the main tool —
+stops the workers, migrates, restarts web, and only starts the workers again
+once `/health` reports `face_service: reachable`. `is_healthy()` also probes the
+token-protected `GET /v1/models`, so a missing or wrong token fails the
+preflight. An unreachable face service is deliberately
+*not* a hard error in the worker (images stay `pending` so a restart cannot
+mass-error them), so without that preflight a bad deploy would look green while
+silently processing nothing.
+
+**Security posture.** Detection used to run in a subprocess hardened with
+scrubbed env vars plus `RLIMIT_AS` / `RLIMIT_CPU` / `RLIMIT_FSIZE`, because
+dlib/libjpeg/libpng parse untrusted bytes. On Toolforge those limits come from
+the job's `--mem` / `--cpu` and `--mount=none`; locally from the container flags
+(`--memory`, `--cpus`, `--read-only`, uid 10001). Env scrubbing is obsolete —
+the face tool never holds WikiVisage's OAuth, database, or token-encryption
+secrets at all, only its own (unused) ToolsDB and replica credentials.
+
+### Client (face_client.py)
+
+Shared by both Toolforge processes. Encodings travel base64-encoded and are
+handed back as raw `bytes` written straight into the `faces.encoding` BLOB.
+
+| Function | Purpose |
+|---|---|
+| `detect_faces(image_bytes)` | Single image → `DetectionResult` |
+| `detect_faces_batch(items)` | `[(key, bytes)]` → `{key: DetectionResult \| FaceServiceError}` |
+| `encode_known_face(image_bytes, bbox)` | Embed one known box → 1024 bytes or `None` |
+| `is_healthy()` | Readiness probe, never raises |
+| `get_session()` / `reset_session()` | Pooled `requests.Session` with retries |
+
+Exceptions: `FaceServiceError` (base), `FaceServiceUnavailable` (transport —
+retryable), `FaceServiceRejected` (this image is unusable — terminal).
+
+Batches split on whichever of the count / total-bytes budgets is hit first, so
+a few large images cannot produce a huge request body.
+
+## Toolforge Processes
 
 ### Web (app.py)
 
@@ -111,7 +240,7 @@ Flask app served by gunicorn via app factory (`create_app()`). Handles OAuth 2.0
 | `/leaderboard` | GET | Top classifiers |
 | `/sw.js` | GET | Serve service worker from root scope |
 | `/.well-known/appspecific/com.chrome.devtools.json` | GET | Silence Chrome DevTools auto-request |
-| `/health` | GET | Health check (JSON: `status`, `database`, `limiter` (`redis`/`memory`), `degraded` boolean) |
+| `/health` | GET | Health check (JSON: `status`, `database`, `limiter` (`redis`/`memory`), `face_service` (`reachable`/`unreachable`), `degraded` boolean) |
 | `/robots.txt` | GET | Custom robots.txt (overrides Toolforge default Disallow: /) |
 | `/sitemap.xml` | GET | XML sitemap for search engines |
 | `/commons-thumb/<path>` | GET | Redirect to Commons thumbnail URL (standard step sizes enforced) |
@@ -150,12 +279,14 @@ Two query paths:
 |----------|-------------|
 | `traverse_category` | Crawls Commons category API, inserts image rows (batch INSERT IGNORE). Caps at `MAX_IMAGES_PER_PROJECT` (9000). Filters out video/audio (keeps images only). |
 | `_download_image` | Downloads image with streaming 50MB size cap (`MAX_IMAGE_DOWNLOAD_BYTES`) |
-| `_validate_image_dimensions` | Checks image pixel area before face detection (rejects >100 megapixels) |
-| `_detect_faces_in_subprocess` | Runs dlib face detection in isolated subprocess (survives segfaults). Hardened via `_harden_face_detect_subprocess()` preexec hook: env scrubbed, RLIMIT_AS=2 GiB, RLIMIT_CPU=180s, RLIMIT_FSIZE=1 MiB |
-| `_run_face_detection` | Spawns subprocess, handles timeout/crash, returns locations + encodings |
-| `_process_single_image` | Downloads one image, validates dimensions, runs HOG face detection in subprocess, stores encoding (thread-safe) |
-| `process_images` | Spawns `IMAGE_THREADS` parallel threads to process pending images in a batch |
+| `_validate_image_dimensions` | Checks image pixel area before shipping bytes to the face service (rejects >100 megapixels) |
+| `_download_for_detection` | Downloads + dimension-checks one image; marks it `error` and returns `None` on failure |
+| `_persist_detection` | Batch-inserts faces + encodings, marks the image `processed`, auto-classifies single-face bootstrap images |
+| `_handle_detection_failure` | Retry policy: `FaceServiceRejected` → mark `error` (terminal); `FaceServiceUnavailable` → leave `pending` (retry next cycle) |
+| `_process_image_wave` | One memory-bounded wave: parallel download → batched remote detect → serial persist. **The only detection entry point.** |
+| `process_images` | Splits the pending batch into waves of `DETECTION_WAVE_SIZE` and runs each |
 | `bootstrap_from_sparql` | Seeds model from existing P180 depicts claims via SPARQL |
+| `_face_distance` | Pure-numpy L2 distance; replaces `face_recognition.face_distance` |
 | `run_autonomous_inference` | Centroid-distance classification on unclassified faces (needs >= `min_confirmed` target faces) |
 | `write_sdc_claims` | Writes P180 claims to Commons SDC via Wikibase API (idempotent). Triggered by `sdc_write_requested` flag set from web UI. Re-checks `sdc_write_requested` every 5 faces (`_PER_FACE_CANCEL_CHECK_EVERY`) so the user can stop a running batch quickly. Treats `no-such-entity` / `no-such-claim` / `no-such-statement` / `notfound` as already-gone successes (`_ALREADY_GONE_CODES`). |
 | `_api_request` | Wrapper for Commons/Wikidata API calls with maxlag, retry, and User-Agent |
@@ -229,10 +360,31 @@ worker_heartbeat (single-row: id=1, last_seen DATETIME)
 | `POLL_INTERVAL` | 60s | DB polling frequency |
 | `BATCH_SIZE` | 10 | Images per processing batch |
 | `MAX_CONCURRENT_PROJECTS` | 3 | Parallel project processing |
-| `IMAGE_THREADS` | 4 | Parallel image download/detection per project |
+| `IMAGE_THREADS` | 4 | Parallel image download threads per project |
+| `DETECTION_WAVE_SIZE` | `max(IMAGE_THREADS, FACE_SERVICE_BATCH_SIZE)` = 8 | Images held in memory at once — this, not `BATCH_SIZE`, bounds worker peak memory |
 | `MAX_IMAGE_DOWNLOAD_BYTES` | 50 MB | Image download size cap |
-| `MAX_IMAGE_PIXELS` | 100M | Pixel area limit before face detection |
+| `MAX_IMAGE_PIXELS` | 100M | Pixel area limit before shipping to the face service |
 | `MAX_IMAGES_PER_PROJECT` | 9000 | Category traversal cap |
+
+### face_client.py (shared)
+| Constant | Default | Purpose |
+|----------|---------|---------|
+| `FACE_SERVICE_BATCH_SIZE` | 8 | Max images per request |
+| `FACE_SERVICE_MAX_BATCH_BYTES` | 24 MiB | Max raw image bytes per request |
+| `FACE_SERVICE_TIMEOUT` | 30s | Base read timeout |
+| `FACE_SERVICE_TIMEOUT_PER_IMAGE` | 15s | Added per image in the batch |
+| `ENCODING_BYTES` | 1024 | Exact width of a 128D float64 encoding; enforced on receipt |
+
+### model-server/model.py
+| Constant | Default | Purpose |
+|----------|---------|---------|
+| `FACE_WORKERS` | 1 | Threads per instance; dlib itself is serialised under `_dlib_lock` |
+| `MAX_REQUEST_BYTES` | 40 MiB | Body cap enforced by `guard.py` before parsing |
+| `MAX_BATCH_SIZE` | 32 | Reject requests with more instances |
+| `MAX_IMAGE_BYTES` | 20 MB | Per-image decoded size ceiling |
+| `MAX_IMAGE_PIXELS` | 100M | Pixel area ceiling before dlib |
+| `MAX_BOXES_PER_INSTANCE` | 64 | Max boxes per `encode` instance |
+
 
 ## Environment Variables
 
@@ -257,6 +409,25 @@ worker_heartbeat (single-row: id=1, last_seen DATETIME)
 - `WIKIVISAGE_TOKEN_KEY` — Fernet key for encrypting OAuth tokens at rest. If unset, tokens are stored as plaintext (backward compatible). Generate with: `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`
 - `WIKIVISAGE_REDIS_URL` — Redis URL for shared rate limiter storage. Default: `redis://redis.svc.tools.eqiad1.wikimedia.cloud:6379`. Falls back to `memory://` if Redis is unreachable. Key prefix: `wikivisage:`.
 - `OAUTHLIB_INSECURE_TRANSPORT=1` — Required for local dev (OAuth over HTTP)
+
+**Face service client** (read by `face_client.py`, used by both `app.py` and `worker.py`):
+- `WIKIVISAGE_FACE_SERVICE_URL` — Default: `http://localhost:8080`
+- `WIKIVISAGE_FACE_SERVICE_MODEL` — Default: `wikivisage` (the name in the URL path)
+- `WIKIVISAGE_FACE_SERVICE_TOKEN` — Bearer token; must equal the face tool's. Required in production (the service is public).
+- `WIKIVISAGE_FACE_SERVICE_BATCH_SIZE` — Default: `8` (max images per request)
+- `WIKIVISAGE_FACE_SERVICE_MAX_BATCH_BYTES` — Default: `25165824` (24 MiB raw image bytes per request)
+- `WIKIVISAGE_FACE_SERVICE_TIMEOUT` — Default: `30` (base read timeout, seconds)
+- `WIKIVISAGE_FACE_SERVICE_TIMEOUT_PER_IMAGE` — Default: `15` (added per image in the batch)
+
+**Face service server** (read by `model-server/model.py`, set as envvars on the face tool):
+- `WIKIVISAGE_FACE_SERVICE_TOKEN` — Required bearer token (>= 32 chars). Mandatory on Toolforge: the service will not start without it.
+- `WIKIVISAGE_MAX_REQUEST_BYTES` — Default: `41943040` (40 MiB request body cap)
+- `WIKIVISAGE_FACE_WORKERS` — Default: `1` (threads decoding images; dlib always runs one call at a time)
+- `WIKIVISAGE_MAX_BATCH_SIZE` — Default: `32`
+- `WIKIVISAGE_MAX_IMAGE_BYTES` — Default: `20971520` (20 MiB)
+- `WIKIVISAGE_MAX_IMAGE_PIXELS` — Default: `100000000`
+- `WIKIVISAGE_MAX_BOXES` — Default: `64`
+
 
 ## Conventions
 
@@ -343,14 +514,51 @@ Extracted common patterns to reduce duplication across routes, templates, and JS
 ### faces_confirmed counter is unreliable
 The `projects.faces_confirmed` column only increments on target MATCH clicks (Yes button in classify UI) and bootstrap. It does NOT reflect total classifications. The worker's inference gate now uses a direct `COUNT(*)` query instead of this counter. **Do not use `faces_confirmed` for logic — always count `is_target=1` from the faces table.**
 
-### face_recognition fork
-Uses a custom fork of `face-recognition` that depends on `dlib-bin` (pre-compiled wheels) instead of `dlib` (source-only). This avoids OOM during compilation on Toolforge. The fork URL is pinned to a specific commit in `requirements.txt`. **Do not replace with `pip install face-recognition`.**
+### The `face_recognition` package is gone — model.py calls dlib directly
+`requirements.txt` used to pin `face-recognition @ git+https://github.com/DiFronzo/face_recognition@d632e2e...`. **That repository has been deleted from GitHub and now returns 404**, so any build referencing it fails with `could not read Username for 'https://github.com'`. The fork existed only to swap the source-only `dlib` dependency for the pre-built `dlib-bin` wheel.
+
+The stock PyPI package cannot replace it: its metadata requires `dlib` by name, and a buildpack runs a plain `pip install -r` with no way to pass `--no-deps`, so pip tries to compile dlib. `model.py`'s `_Dlib` instead reproduces the ~20 lines of `face_recognition` 1.3.0 we used: `get_frontal_face_detector()` with **one upsample**, box trimming to image bounds, the **5-point** `shape_predictor` (`face_encodings` defaults to `model="small"`, not the 68-point one), `compute_face_descriptor(..., 1)`, PIL `convert("RGB")`, and `ImageFile.LOAD_TRUNCATED_IMAGES = True`, which the package set on import. Verified byte-identical to the old package on 40 Commons images / 67 faces (detect and encode). **Do not add `face_recognition` back to requirements.txt.**
+
+### Commons serves thumbnails from thumb.wikimedia.org
+`Special:FilePath/<file>?width=N` redirects
+`commons.wikimedia.org` → `commons.wikimedia.org/w/index.php` → **`thumb.wikimedia.org`**.
+The original file (no `?width=`) still resolves to `upload.wikimedia.org`. Both
+`worker.py` and `app.py` build thumbnail URLs (`FILE_PATH_URL`, width 500 and
+1024 respectively), so both must allowlist `thumb.wikimedia.org` in
+`_ALLOWED_DOWNLOAD_HOSTS`.
+
+Omitting it fails every download with `Redirect to untrusted host:
+thumb.wikimedia.org` — and because a failed download is recorded as
+`status='error'`, which `images_processed` counts as progress, the UI shows
+partial completion rather than an error. This took out 103 images across 5
+projects when Wikimedia rolled the change out.
+
+The UI's own thumbnails are unaffected: `commons_thumb_url()` builds
+`upload.wikimedia.org` URLs directly and does not follow redirects.
+
+### Auto-completion must never fire while images are pending
+`process_project` step 3b writes `completion_reason` of `no_faces` /
+`insufficient_faces`. The batch loop above it exits as soon as one batch yields
+zero *successes*, which also happens when every download fails. Without the
+`pending_images > 0` guard, a transient outage is recorded as a permanent "no
+faces in this category" verdict — and since `_claim_active_projects` filters
+`WHERE p.status = 'active'`, the project is never picked up again and its
+remaining images are orphaned. `app.py` has always had this guard; `worker.py`
+did not.
+
+### Encodings are not bit-identical across machines
+dlib's ResNet runs in float32, so the same image encoded on different CPU/BLAS combinations differs by ~1e-7 per component (measured: 7.7e-07 L2, versus a 0.6 classification threshold — about one part in a million of the decision margin). The path is bit-deterministic against itself; this is ordinary platform drift and existed before the face service split. What *does* invalidate stored encodings is changing the `dlib-bin` version (pinned `==20.0.1`), the `face_recognition_models` weights, or the dlib calls in `_Dlib` (upsampling, landmark model, `num_jitters`).
+
+Stored encodings can also drift because **Commons re-renders thumbnails**: three March-era faces re-encode 0.06–0.2 L2 away from their stored vectors, and one is no longer detected, with the old and new code alike. The input bytes changed, not the code.
+
+### model-server/blubber.yaml is not deployable
+Wikimedia LiftWing builds production images exclusively with Blubber, so the file exists to keep the service in the right shape. It **cannot be deployed today**: LiftWing is not self-service (it requires membership in the internal `deploy-ml-service` LDAP group, and Toolforge tools are classified as external API consumers), and it hosts no biometric models. Production uses Toolforge buildpacks; local development uses the `Dockerfile`.
 
 ### OAuth scope & token handling
 SDC writes require the `editpage` OAuth grant. The access token is stored per-user in the `users` table. Token refresh is handled in `app.py` `@before_request`. Access tokens from the DB may be `bytes` — normalized to `str` at read time in `before_request`.
 
 ### Worker must be restarted after code changes
-The worker is a long-running `python worker.py` process. Code changes require manual restart. On Toolforge, redeploy the continuous job.
+The worker is a long-running `python worker.py` process. Code changes require manual restart. On Toolforge, redeploy the continuous job. The face service is a separate container with its own lifecycle — changing `model-server/model.py` requires rebuilding and restarting *it*, not the worker.
 
 ### Commons thumbnail proxy
 `/commons-thumb/<path>` redirects to Commons thumbnail URLs server-side. This exists because Commons thumbnails can't be directly embedded due to referrer policies on Toolforge. The route enforces standard thumbnail step sizes to avoid 429 errors from Commons.
@@ -368,7 +576,7 @@ The worker writes `REPLACE INTO worker_heartbeat (id, last_seen) VALUES (1, NOW(
 Separate from the DB heartbeat above, each worker also writes a per-worker file at `$HOME/.wikivisage-worker-alive-{worker_id}` via `_touch_heartbeat_file()`. The `healthcheck.sh` script accepts a worker ID as `$1`, checks the file exists and was modified within 5 minutes (`find -mmin +5`). Toolforge's `--health-check-script` runs this every 10s; 3 consecutive failures trigger automatic pod restart. Per-worker files are critical because `$HOME` is shared NFS on Toolforge — a single file would be kept fresh by any surviving worker, hiding a dead one.
 
 ### Image download limits
-Both `app.py` and `worker.py` enforce a 50MB download size cap (`MAX_IMAGE_DOWNLOAD_BYTES`) via streaming download with early abort. The worker additionally validates image pixel dimensions before face detection (`MAX_IMAGE_PIXELS = 100M pixels`).
+Both `app.py` and `worker.py` enforce a 50MB download size cap (`MAX_IMAGE_DOWNLOAD_BYTES`) via streaming download with early abort. The worker additionally validates image pixel dimensions before shipping bytes to the face service (`MAX_IMAGE_PIXELS = 100M pixels`), so oversized images are rejected before they are base64-inflated and sent over the wire. The service enforces its own independent ceilings.
 
 ### Category traversal limits
 `MAX_IMAGES_PER_PROJECT = 9000` caps how many images the worker will insert per project during category traversal. The worker checks existing image count before starting and calculates remaining capacity. Uses batch `INSERT IGNORE` instead of per-file SELECT+INSERT.
@@ -386,20 +594,22 @@ The project detail page includes approve/reject/edit-bbox controls on each Model
 ### Cookies
 Only 2 cookies: `session` (strictly necessary, managed by Flask's built-in signed session cookie mechanism) and `locale` (functional, language preference). No tracking cookies. A non-blocking consent banner is shown.
 
-### Inference RAM
-Each face encoding is 1024 bytes (128 float64). Even 10K faces ~ 10MB. No RAM concern for inference.
+### Worker memory is bounded by DETECTION_WAVE_SIZE, not BATCH_SIZE
+`process_images` works in waves. A wave's downloaded image bytes are all resident at once while its detection request is in flight, so `DETECTION_WAVE_SIZE` (8) is what caps peak memory — not `BATCH_SIZE` (10). Downloading a whole batch up front would be 50 x 50 MB worst case. Inference itself is cheap: each encoding is 1024 bytes, so even 10K faces is ~10 MB.
 
 ### Wikidata label fetching
 `_fetch_wikidata_label(qid)` in `app.py` calls the Wikidata `wbgetentities` API with `languages=en&languagefallback=1` to retrieve human-readable labels. The `languagefallback=1` parameter makes the API automatically fall back through language variants (e.g., `mul` → `en`, `en-ca` → `en`) when no exact `en` label exists. Used during project creation to auto-fill empty project labels. Without this parameter, entities like Q153694 (Michael Bublé) return empty labels because they only have `mul`/`en-ca`/`en-gb` labels, not `en`.
 
 ## Testing
 
-Hybrid test suite: **707 unit tests** (run in CI) + **34 integration tests** (require local Docker MariaDB).
+Hybrid test suite: **775 unit tests** (run in CI) + **34 integration tests** (require local Docker MariaDB) + **14 contract tests** (require a running face service).
 
 ### Architecture
 
-- **Unit tests**: Pure mocks, no DB. Run everywhere (CI, local). Cover thumb snapping, URL safety, CSRF validation, error classes, migration parsing, route logic, token encryption, CSP hardening, PKCE, single-flight Redis lock, idempotent SDC removal, mid-batch cancel.
+- **Unit tests**: Pure mocks, no DB, no network. Run everywhere (CI, local). Cover thumb snapping, URL safety, CSRF validation, error classes, migration parsing, route logic, token encryption, CSP hardening, PKCE, single-flight Redis lock, idempotent SDC removal, mid-batch cancel, and the face service client (wire parsing, batching, error classification).
 - **Integration tests**: Hit a real MariaDB via Docker. Marked with `@pytest.mark.integration`. Skipped in CI (GitHub Actions) — only run locally when `WIKIVISAGE_TEST_DB=1` is set.
+- **Contract tests**: Run the real `face_client` against a real running face service container. Marked with `@pytest.mark.contract`, skipped unless `WIKIVISAGE_FACE_SERVICE_CONTRACT=1`. This is the only place both sides of the HTTP boundary are exercised together — everything else mocks it — so it is what catches a broken Dockerfile, an unresolvable dependency, or wire-format drift. Five auth tests additionally need `WIKIVISAGE_FACE_SERVICE_TOKEN` set on both the container and the client. CI runs all 14 in the `face-service` job, with a token.
+- **Guard tests**: `test_face_service_guard.py` loads `model-server/guard.py` by file path (it is stdlib-only), so the public-facing auth and body-cap rules are unit-tested without KServe or dlib.
 - **Test DB**: `wikiface_test` — created fresh per pytest session, dropped on teardown. Never touches `wikiface_dev`.
 - **Config**: `pyproject.toml` has `testpaths = ["tests"]`, `pythonpath = ["."]`, and integration marker.
 
@@ -407,13 +617,18 @@ Hybrid test suite: **707 unit tests** (run in CI) + **34 integration tests** (re
 
 | File | Unit | Integration | Total |
 |------|------|-------------|-------|
-| `test_app.py` | 498 | 11 | 509 |
+| `test_app.py` | 518 | 11 | 529 |
 | `test_database.py` | 27 | 9 | 36 |
+| `test_face_client.py` | 17 | 0 | 17 |
+| `test_face_service_contract.py` | 0 | 0 | 14 (contract) |
+| `test_face_service_guard.py` | 30 | 0 | 30 |
 | `test_migrate.py` | 15 | 8 | 23 |
-| `test_security_round2.py` | 31 | 0 | 31 |
+| `test_security_round2.py` | 26 | 0 | 26 |
 | `test_token_crypto.py` | 26 | 0 | 26 |
-| `test_worker.py` | 110 | 6 | 116 |
-| **Total** | **707** | **34** | **741** |
+| `test_worker.py` | 116 | 6 | 122 |
+| **Total** | **775** | **34** | **823** |
+
+`test_security_round2.py` dropped from 31 to 26: the five `TestSubprocessHardening` tests covered `_harden_face_detect_subprocess()`, which no longer exists. Those guarantees are now container-level (see Architecture) and are not unit-testable.
 
 ### Commands
 
@@ -460,10 +675,12 @@ test_db (session) → creates/drops wikiface_test DB
 
 ### CI (`.github/workflows/ci.yml`)
 
-Runs on push/PR to `main`. Two jobs:
+Runs on push/PR to `main`. Four jobs:
 
 1. **Lint**: Ruff check + format check (Python 3.11).
-2. **Test**: `pytest --tb=short -q` on Python 3.11 and 3.13 matrix. Integration tests auto-skipped (no `WIKIVISAGE_TEST_DB` env var in CI). Installs system deps (`libopenblas0`, `liblapack3`) for dlib. Caches pip dependencies.
+2. **Face service**: builds `model-server/` with buildx (gha layer cache), starts the container **with a random token**, waits for readiness, and runs all 14 contract tests through the guard. This job is what would have caught the dead `face-recognition` git fork. It builds the Dockerfile.
+4. **Face service (Toolforge buildpack)**: builds `model-server/` with `pack` and Toolforge's own builder (`tools-harbor.wmcloud.org/toolforge/heroku-builder:24_0.21.8`) — the exact production image — starts it via the `web` Procfile entry on port 8000 with `TOOL_TOOLFORGE_API_URL` set (so the fail-closed token check is live), and runs the same 14 contract tests. Catches `requirements.txt` / `project.toml` / `Procfile` breakage that only affects the buildpack path.
+3. **Test**: `pytest --tb=short -q` on Python 3.11 and 3.13 matrix. Integration tests auto-skipped (no `WIKIVISAGE_TEST_DB` env var in CI). No system deps needed — the ML stack lives in the face service, and the suite mocks `face_client` rather than reaching the network. Caches pip dependencies.
 
 Concurrency: `ci-${{ github.ref }}` with cancel-in-progress.
 
@@ -474,20 +691,15 @@ Triggered on GitHub release publish or manual `workflow_dispatch`. Inputs:
 - `db-reset` (optional): Choice `true`/`false` (default `false`). Runs `migrate.py --reset` to wipe and recreate all tables.
 - `db-reset-confirm` (optional): Must type `WIPE` to confirm when `db-reset` is `true`. Deploy fails without confirmation.
 
-Steps:
-1. Checkout repo + configure SSH to Toolforge bastion.
-2. Generate a deploy script locally, `scp` it to the bastion.
-3. Execute via `become wikivisage bash /tmp/deploy.sh '<tag>' '<db-reset>' '<actor>'`.
-4. Deploy script stages:
-   - `toolforge build start --ref "$TAG"` — rebuild container image from the given git ref.
-   - Poll `toolforge build show --json | jq -r '.build.status // empty'` every 15s (up to 600s timeout). Expects `ok`; fails on `error`/`timeout`/`cancelled`.
-   - Delete both workers: `toolforge jobs delete ml-worker` + `toolforge jobs delete ml-worker-2`.
-   - `toolforge jobs run migrate` — run schema migration (`python migrate.py`, with `--reset` if `db-reset=true`).
-   - Start 2 worker instances with health checks:
-     - `toolforge jobs run ml-worker --command 'python -u worker.py --worker-id ml-worker-1' --continuous --mem 3Gi --cpu 2 --health-check-script './healthcheck.sh ml-worker-1'`
-     - `toolforge jobs run ml-worker-2 --command 'python -u worker.py --worker-id ml-worker-2' --continuous --mem 3Gi --cpu 2 --health-check-script './healthcheck.sh ml-worker-2'`
-   - `toolforge webservice buildservice restart` — restart web.
-   - `dologmsg` — log deployment to Toolforge SAL.
+Configuration: `toolforge` environment secrets `HOST` / `USERNAME` / `KEY`; the SSH user must maintain both tools. Optional repository variable `FACE_TOOL` overrides the face tool name (default `wikivisage-face`). Every release deploys both tools.
+
+Steps (one job, `contents: write` for the tag push):
+1. Validate inputs, checkout the release tag, configure SSH.
+2. **Publish `face-service-<tag>`** — `git commit-tree HEAD:model-server` so the tag's root *is* `model-server/`; buildpacks cannot build from a subdirectory. An existing tag is reused only if its tree matches.
+3. Upload `lib.sh` (shared `build_and_wait`, prints `toolforge build quota` on failure), `deploy-face.sh`, `deploy.sh` to a per-run directory on the bastion.
+4. **Check configuration** — `toolforge envvars show` on both tools (face token; main URL + token) before either is touched.
+5. **`become $FACE_TOOL`** — builds `face-service-<tag>`, recreates the `face-service` job (`--command web --continuous --port 8000 --publish --mount=none --mem 3Gi --cpu 2 --health-check-http /v1/models/wikivisage`), waits up to 10 min for public readiness.
+6. **`become wikivisage`** — builds the release tag, deletes both workers, runs `migrate`, restarts the webservice, then the **preflight**: polls `/health` until `face_service: reachable` (URL + token checked). Only then starts `ml-worker` / `ml-worker-2` (`--mem 1Gi --cpu 2`, `healthcheck.sh`). `dologmsg` to SAL.
 
 Concurrency: `deploy-production` with `cancel-in-progress: false`.
 
@@ -573,7 +785,9 @@ The English `.po` file uses identity translations (`msgstr` = `msgid`). This ens
 ## Commands
 
 ```bash
-# Local development
+# Local development — the face service must be running first
+cd model-server && docker compose up --build   # Face service on :8080
+export WIKIVISAGE_FACE_SERVICE_URL=http://localhost:8080
 python app.py                    # Web app on http://localhost:8000
 python worker.py --worker-id local-1  # Background worker (separate terminal)
 python migrate.py                # Run schema migrations (idempotent)
@@ -594,6 +808,11 @@ source venv/bin/activate
 pybabel extract -F babel.cfg -o messages.pot .    # Extract strings
 pybabel update -i messages.pot -d translations    # Update .po files
 pybabel compile -d translations                   # Compile .mo files
+
+# Face service (see TESTING.md for the full guide)
+cd model-server
+docker build -t wikivisage-face-service:local .
+curl -s http://localhost:8080/v1/models/wikivisage   # readiness
 
 # Toolforge deployment (manual — normally done via .github/workflows/deploy.yml)
 toolforge build start https://github.com/DiFronzo/WikiVisage.git

@@ -1,0 +1,67 @@
+# Blubber build definition for the WikiVisage face detection model server.
+#
+# STATUS: forward-looking artifact, not currently used.
+#
+# Wikimedia LiftWing builds production images exclusively with Blubber (never
+# raw Dockerfiles), so this file exists so the service is already in the right
+# shape if it is ever onboarded. It is NOT deployable today:
+#
+#   * LiftWing is not self-service. Deploying requires membership in the
+#     internal `deploy-ml-service` LDAP group; Toolforge tools are classified
+#     as external API consumers only.
+#     https://wikitech.wikimedia.org/wiki/Machine_Learning/LiftWing/Deploy
+#   * A face-embedding service would need WMF Legal + ML team + community
+#     review. LiftWing hosts no biometric models today.
+#
+# Until then, production runs on Toolforge (buildpacks) and local development
+# uses the Dockerfile alongside this file.
+#
+# When/if this is upstreamed, the layout the inference-services repo expects is:
+#   .pipeline/wikivisage/blubber.yaml
+#   src/models/wikivisage/model_server/{model.py,requirements.txt}
+
+# syntax=docker-registry.wikimedia.org/repos/releng/blubber/buildkit:v0.22.0
+version: v4
+base: docker-registry.wikimedia.org/bookworm:20240414
+
+runs:
+  insecurely: true
+  environment:
+    PYTHONPATH: /srv/wikivisage
+    PYTHONUNBUFFERED: "1"
+
+lives:
+  in: /srv/wikivisage
+
+variants:
+  build:
+    python:
+      version: python3
+      requirements:
+        - requirements.txt
+    apt:
+      packages:
+        - build-essential
+        - python3-pip
+        - python3-dev
+        - python3-setuptools
+
+  production:
+    copies:
+      - from: local
+        source: model.py
+        destination: model.py
+      - from: local
+        source: guard.py
+        destination: guard.py
+      - from: build
+        source: /opt/lib/python/site-packages
+        destination: /opt/lib/python/site-packages
+    apt:
+      packages:
+        - python3
+        - python3-setuptools
+        - libopenblas0
+        - liblapack3
+        - wmf-certificates
+    entrypoint: ["python3", "model.py", "--model_name", "wikivisage", "--http_port", "8080"]

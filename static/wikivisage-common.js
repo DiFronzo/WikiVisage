@@ -11,12 +11,7 @@ function snapThumbWidth(w) {
 function commonsThumbUrl(fileTitle, width) {
     width = snapThumbWidth(width);
     var clean = fileTitle.replace('File:', '').replace(/ /g, '_');
-    // Spark MD5 not available — use the commons-thumb endpoint for non-standard files
-    var ext = '.' + clean.split('.').pop().toLowerCase();
-    if (VIDEO_EXTENSIONS.indexOf(ext) !== -1 || TIF_EXTENSIONS.indexOf(ext) !== -1 || ext === '.svg') {
-        return '/commons-thumb/' + encodeURIComponent(clean) + '?width=' + width;
-    }
-    return 'https://commons.wikimedia.org/wiki/Special:FilePath/' + encodeURIComponent(clean) + '?width=' + width;
+    return '/commons-thumb/' + encodeURIComponent(clean) + '?width=' + width;
 }
 
 /**

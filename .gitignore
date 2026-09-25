@@ -13,3 +13,4 @@ venv/
 .coverage
 .playwright-mcp/
 test-results/
+.omo/

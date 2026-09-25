@@ -1,23 +1,30 @@
 # WikiVisage — Toolforge Jobs
 # Load with: toolforge jobs load jobs.yaml
 # Docs: https://wikitech.wikimedia.org/wiki/Help:Toolforge/Running_jobs
-
+#
+# Memory note: workers used to run dlib in-process and needed 3Gi. Face
+# detection now happens in the separate face service (see model-server/), so
+# these processes only download images, call it over HTTP, and do centroid
+# math. Peak memory is bounded by DETECTION_WAVE_SIZE images held at once.
+#
 #  env:
 #    - name: WIKIVISAGE_WORKER_IMAGE_THREADS
 #      value: "6"
 #    - name: WIKIVISAGE_WORKER_BATCH_SIZE
 #      value: "100"
+#    - name: WIKIVISAGE_FACE_SERVICE_URL
+#      value: "https://wikivisage-face.toolforge.org"
 ---
 - name: ml-worker
   command: python -u worker.py --worker-id ml-worker-1
   image: tool-wikivisage/tool-wikivisage:latest
   continuous: true
-  mem: 3Gi
+  mem: 1Gi
   health-check-script: ./healthcheck.sh ml-worker-1
 
 - name: ml-worker-2
   command: python -u worker.py --worker-id ml-worker-2
   image: tool-wikivisage/tool-wikivisage:latest
   continuous: true
-  mem: 3Gi
+  mem: 1Gi
   health-check-script: ./healthcheck.sh ml-worker-2

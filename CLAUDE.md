@@ -6,24 +6,29 @@ Active-learning Flask app for Wikimedia Commons. Users classify faces via yes/no
 
 ### Non-negotiable principles:
 
-- **Toolforge-compatible.** No GPU, no heavy deps. `dlib-bin` fork (pre-compiled wheels), not `dlib` (source-only). Never replace with `pip install face-recognition`.
+- **Toolforge-compatible.** No GPU. dlib only in `model-server/`, via the pre-built `dlib-bin` wheel, never the source-only `dlib`. Never add `face-recognition` to any requirements file: it requires `dlib` by name and breaks the buildpack build. `model.py` calls dlib directly.
 - **User-triggered SDC writes only.** The "Send Edits to Wikimedia Commons" button is the only way claims are written. Never auto-write.
 - **Parameterized SQL.** All DB queries use `%s` placeholders (PyMySQL). Never interpolate values into SQL. F-strings acceptable for structural SQL only (e.g., building `IN (%s, %s)` placeholder lists).
 - **No type suppression.** No `as any`, `@ts-ignore`, empty `catch` blocks.
 
 ## Architecture
 
-Two long-running processes sharing a MariaDB connection pool (`database.py`):
+Three processes. The web app and worker share a MariaDB connection pool (`database.py`) and
+carry no ML dependencies; face detection lives in a separate HTTP service.
 
 ```
 Flask Web App (app.py)          Background Worker (worker.py)
 ├─ OAuth 2.0 login              ├─ Category traversal (Commons API)
 ├─ Project CRUD                 ├─ Image download (50MB cap, 100MP limit)
-├─ Active learning UI           ├─ HOG face detection (subprocess pool)
-├─ Classification API           ├─ SPARQL bootstrapping
-├─ Model Results validation     ├─ Centroid-distance inference
-├─ SDC write queueing           ├─ SDC claim writing (user-triggered)
-└─ Commons thumbnail proxy      └─ Distributed locking (SELECT FOR UPDATE)
+├─ Active learning UI           ├─ SPARQL bootstrapping
+├─ Classification API           ├─ Centroid-distance inference
+├─ Model Results validation     ├─ SDC claim writing (user-triggered)
+├─ SDC write queueing           └─ Distributed locking (SELECT FOR UPDATE)
+└─ Commons thumbnail proxy
+                  both call, over HTTP via face_client.py
+                               ↓
+                Face Service (model-server/) — KServe + dlib
+                HOG detection + 128D encoding. The only dlib in the stack.
 ```
 
 Worker uses `ThreadPoolExecutor` at two levels: up to 3 projects concurrently, up to 4 image threads per project. Polls DB every 60s.
@@ -31,7 +36,7 @@ Worker uses `ThreadPoolExecutor` at two levels: up to 3 projects concurrently, u
 ## Current Status
 
 - **Version:** `0.9.0` (source of truth: `pyproject.toml`)
-- **Tests:** 741 total (707 unit + 34 integration)
+- **Tests:** 823 total (775 unit + 34 integration + 14 contract)
 - **Python:** 3.11+
 - **Tables:** 9 (`users`, `sessions`, `projects`, `images`, `faces`, `user_stats`, `sdc_claims`, `project_members`, `worker_heartbeat`)
 - **Templates:** 10 files (all extend `base.html`)
@@ -41,11 +46,12 @@ Worker uses `ThreadPoolExecutor` at two levels: up to 3 projects concurrently, u
 
 | File | Unit | Integration | Total |
 |------|------|-------------|-------|
-| `test_app.py` | 498 | 11 | 509 |
-| `test_worker.py` | 110 | 6 | 116 |
+| `test_app.py` | 516 | 11 | 527 |
+| `test_worker.py` | 113 | 6 | 119 |
 | `test_database.py` | 27 | 9 | 36 |
+| `test_face_client.py` | 14 | 0 | 14 |
 | `test_migrate.py` | 15 | 8 | 23 |
-| `test_security_round2.py` | 31 | 0 | 31 |
+| `test_security_round2.py` | 26 | 0 | 26 |
 | `test_token_crypto.py` | 26 | 0 | 26 |
 
 ## Build & Test
@@ -142,7 +148,7 @@ Commons enforces standard step sizes. Non-standard widths return 429.
 - OAuth token encryption at rest via `WIKIVISAGE_TOKEN_KEY` env var (opt-in Fernet)
 - PKCE (RFC 7636, S256) on the OAuth authorization code flow as defense-in-depth
 - OAuth refresh single-flight via Redis lock (`redis_lock.single_flight()`, 15s TTL) — prevents concurrent token refreshes from invalidating each other's rotated refresh tokens
-- Worker face-detection subprocess hardening: env scrubbed via preexec hook; `RLIMIT_AS=2 GiB`, `RLIMIT_CPU=180s`, `RLIMIT_FSIZE=1 MiB`
+- Face service isolation: dlib parses untrusted image bytes in a separate Toolforge tool (`wikivisage-face`), under `--mem`/`--cpu` limits with `--mount=none`, and holds no WikiVisage OAuth, DB, or token-encryption secrets (envvars are tool-wide, T405022). It is public, so `model-server/guard.py` requires a bearer token on every route but the readiness check and caps bodies at 40 MiB
 - SDC writes treat `no-such-entity` / `no-such-claim` / `no-such-statement` / `notfound` as already-gone successes (idempotent removals)
 - SDC write batches re-check `sdc_write_requested` every 5 faces so the user can stop a running batch quickly
 - `/health` reports `degraded: true` (200 OK) when the rate limiter fell back to in-memory storage (Redis unreachable) — so the OAuth refresh single-flight is also a no-op
@@ -186,5 +192,6 @@ Worker-specific: `WIKIVISAGE_WORKER_POLL_INTERVAL` (60s), `WIKIVISAGE_WORKER_MAX
 - **Worker must be restarted after code changes.** It's a long-running process.
 - **Commons thumbnail proxy** (`/commons-thumb/<path>`) exists because Commons thumbnails can't be embedded directly due to referrer policies. Always snap widths to standard steps.
 - **OAuth tokens from DB may be `bytes`** - normalized to `str` in `before_request`.
-- **face_recognition fork** uses `dlib-bin` (pre-compiled). Do not replace with `pip install face-recognition`.
+- **dlib is not thread-safe.** Every dlib call in `model.py` stays under `_dlib_lock`; concurrent calls segfault or return hundreds of garbage boxes. Scale the face service with replicas.
+- **The face service is its own tool.** Deploy builds it from a `face-service-<tag>` tag whose tree is `model-server/` (buildpacks cannot build a subdirectory).
 - **Cookies:** Only `session` (Flask signed) and `locale` (language pref). No tracking cookies.

@@ -25,12 +25,58 @@ permissions:
 concurrency:
   group: deploy-production
   cancel-in-progress: false
+
+# Two Toolforge tools are deployed, in order:
+#
+#   1. The face service, on its own tool (wikivisage-face; override with the
+#      FACE_TOOL repository variable). It parses untrusted image bytes, and
+#      Toolforge envvars are tool-wide, so a separate tool is what keeps the
+#      ToolsDB and OAuth secrets out of that process (see T405022).
+#   2. The main tool: web app, migration, and workers. Workers only start once
+#      the web app reports the face service reachable *with a valid token*.
+#
+# The SSH user must be a maintainer of both tools.
+
 jobs:
   deploy:
+    name: Deploy to Toolforge
     runs-on: ubuntu-latest
     environment: toolforge
+    timeout-minutes: 45
+    permissions:
+      # Pushes the face-service-<tag> source tag.
+      contents: write
+    env:
+      TAG: ${{ github.event.release.tag_name || github.event.inputs.tag }}
+      DB_RESET: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs['db-reset'] || 'false' }}
+      DB_RESET_CONFIRM: ${{ github.event.inputs['db-reset-confirm'] || '' }}
+      FACE_TOOL: ${{ vars.FACE_TOOL || 'wikivisage-face' }}
+      REMOTE_DIR: /tmp/wikivisage-deploy-${{ github.run_id }}
     steps:
+      - name: Validate inputs
+        run: |
+          set -euo pipefail
+          if [ -z "${TAG:-}" ]; then
+            echo "::error::TAG is empty. Provide a valid tag (e.g. v0.2.5)."
+            exit 1
+          fi
+          if ! [[ "$TAG" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "::error::Invalid tag '$TAG'. Allowed characters: A-Z, a-z, 0-9, '.', '_', '-'."
+            exit 1
+          fi
+          if [ "$DB_RESET" = "true" ] && [ "$DB_RESET_CONFIRM" != "WIPE" ]; then
+            echo "::error::DB reset requested but confirmation missing. Type 'WIPE' in the confirmation field."
+            exit 1
+          fi
+          if ! [[ "$FACE_TOOL" =~ ^[a-z0-9-]+$ ]]; then
+            echo "::error::Invalid FACE_TOOL '$FACE_TOOL'."
+            exit 1
+          fi
+
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ env.TAG }}
+
       - name: Setup SSH
         run: |
           if [ -z "$SSH_HOST" ] || [ -z "$SSH_KEY" ] || [ -z "$SSH_USER" ]; then
@@ -41,39 +87,137 @@ jobs:
           ssh-keyscan "$SSH_HOST" >> ~/.ssh/known_hosts
           echo "$SSH_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
+          cat >> ~/.ssh/config <<EOF
+          Host toolforge
+            HostName $SSH_HOST
+            User $SSH_USER
+            IdentityFile ~/.ssh/id_ed25519
+          EOF
         env:
           SSH_HOST: ${{ secrets.HOST }}
           SSH_KEY: ${{ secrets.KEY }}
           SSH_USER: ${{ secrets.USERNAME }}
-      - name: Deploy to Toolforge
-        timeout-minutes: 20
-        env:
-          TAG: ${{ github.event.release.tag_name || github.event.inputs.tag }}
-          DB_RESET: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs['db-reset'] || 'false' }}
-          DB_RESET_CONFIRM: ${{ github.event.inputs['db-reset-confirm'] || '' }}
+
+      # Toolforge builds from the root of a git ref, and the face service lives
+      # in model-server/. This publishes a tag whose commit tree IS model-server/
+      # at this release, so the face tool builds exactly the code being deployed.
+      - name: Publish face service source tag
         run: |
           set -euo pipefail
+          FACE_REF="face-service-${TAG}"
+          TREE=$(git rev-parse "HEAD:model-server")
+          if git ls-remote --exit-code --tags origin "refs/tags/${FACE_REF}" >/dev/null; then
+            git fetch --no-tags origin "refs/tags/${FACE_REF}:refs/tags/${FACE_REF}"
+            if [ "$(git rev-parse "${FACE_REF}^{tree}")" != "$TREE" ]; then
+              echo "::error::Tag ${FACE_REF} exists but does not match model-server/ at ${TAG}."
+              exit 1
+            fi
+            echo "Reusing existing ${FACE_REF}"
+          else
+            COMMIT=$(git commit-tree "$TREE" \
+              -m "Face service for WikiVisage ${TAG}" \
+              -m "Tree of model-server/ at $(git rev-parse HEAD).")
+            git tag "$FACE_REF" "$COMMIT"
+            git push origin "refs/tags/${FACE_REF}"
+            echo "Published ${FACE_REF} -> ${COMMIT}"
+          fi
+          echo "FACE_REF=${FACE_REF}" >> "$GITHUB_ENV"
+        env:
+          GIT_AUTHOR_NAME: github-actions[bot]
+          GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+          GIT_COMMITTER_NAME: github-actions[bot]
+          GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
 
-          if [ -z "${TAG:-}" ]; then
-            echo "::error::TAG is empty. Provide a valid tag (e.g. v0.2.5)."
+      - name: Upload deploy scripts
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/scripts
+
+          cat > /tmp/scripts/lib.sh << 'SCRIPT'
+          build_and_wait() {
+            local ref="$1"
+            echo "==> Building image from ref $ref"
+            toolforge build start --ref "$ref" https://github.com/DiFronzo/WikiVisage.git 2>&1 | tail -5
+            echo "==> Waiting for build to complete..."
+            local elapsed=0 status
+            while [ $elapsed -lt 900 ]; do
+              sleep 15
+              elapsed=$((elapsed + 15))
+              status=$(toolforge build show --json 2>/dev/null | jq -r '.build.status // empty')
+              case "$status" in
+                ok)
+                  echo "Build succeeded after ${elapsed}s"
+                  return 0
+                  ;;
+                error|timeout)
+                  echo "Build failed with status: $status"
+                  toolforge build show
+                  toolforge build logs 2>&1 | tail -30
+                  echo "--- image quota (a full quota also fails builds):"
+                  toolforge build quota 2>&1 || true
+                  return 1
+                  ;;
+                cancelled)
+                  echo "Build was cancelled"
+                  return 1
+                  ;;
+                *)
+                  echo "Waiting... (${elapsed}s) status: ${status:-none yet}"
+                  ;;
+              esac
+            done
+            echo "Build timed out after ${elapsed}s"
+            toolforge build show
+            return 1
+          }
+          SCRIPT
+
+          cat > /tmp/scripts/deploy-face.sh << 'SCRIPT'
+          set -euo pipefail
+          REF="$1"
+          FACE_TOOL="$2"
+          ACTOR="${3:-unknown}"
+          source "$(dirname "$0")/lib.sh"
+
+          # Toolforge requires a token; fail fast before touching the live service.
+          if ! toolforge envvars show WIKIVISAGE_FACE_SERVICE_TOKEN >/dev/null 2>&1; then
+            echo "::error::WIKIVISAGE_FACE_SERVICE_TOKEN is not set on tool ${FACE_TOOL}."
             exit 1
           fi
 
-          if ! [[ "$TAG" =~ ^[A-Za-z0-9._-]+$ ]]; then
-            echo "::error::Invalid tag '$TAG'. Allowed characters: A-Z, a-z, 0-9, '.', '_', '-'."
-            exit 1
-          fi
+          build_and_wait "$REF"
 
-          if [ "$DB_RESET" = "true" ] && [ "$DB_RESET_CONFIRM" != "WIPE" ]; then
-            echo "::error::DB reset requested but confirmation missing. Type 'WIPE' in the confirmation field."
-            exit 1
-          fi
+          echo "==> Restarting face-service job"
+          toolforge jobs delete face-service || true
+          toolforge jobs run face-service \
+            --command web \
+            --image "tool-${FACE_TOOL}/tool-${FACE_TOOL}:latest" \
+            --continuous --port 8000 --publish --mount=none \
+            --mem 3Gi --cpu 2 \
+            --health-check-http /v1/models/wikivisage
 
-          cat > /tmp/deploy.sh << 'SCRIPT'
+          URL="https://${FACE_TOOL}.toolforge.org/v1/models/wikivisage"
+          echo "==> Waiting for ${URL}"
+          for i in $(seq 1 60); do
+            if curl -fsS --max-time 10 "$URL" 2>/dev/null | jq -e '.ready == true' >/dev/null 2>&1; then
+              echo "Face service ready after $((i * 10))s"
+              dologmsg "deployed ${REF} (by ${ACTOR} on GitHub)"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::Face service did not become ready."
+          toolforge jobs show face-service || true
+          toolforge jobs logs face-service 2>&1 | tail -50 || true
+          exit 1
+          SCRIPT
+
+          cat > /tmp/scripts/deploy.sh << 'SCRIPT'
           set -euo pipefail
           TAG="$1"
           DB_RESET="${2:-false}"
           ACTOR="${3:-unknown}"
+          source "$(dirname "$0")/lib.sh"
 
           case "$DB_RESET" in
             true|false) ;;
@@ -83,76 +227,126 @@ jobs:
               ;;
           esac
 
-          echo "==> Building image from ref $TAG"
-          toolforge build start --ref "$TAG" https://github.com/DiFronzo/WikiVisage.git 2>&1 | tail -5
-          echo "==> Waiting for build to complete..."
-          ELAPSED=0
-          while [ $ELAPSED -lt 600 ]; do
-            sleep 15
-            ELAPSED=$((ELAPSED + 15))
-            STATUS=$(toolforge build show --json 2>/dev/null | jq -r '.build.status // empty')
-            if [ -z "$STATUS" ]; then
-              echo "Waiting... (${ELAPSED}s) no status yet"
-              continue
+          for var in WIKIVISAGE_FACE_SERVICE_URL WIKIVISAGE_FACE_SERVICE_TOKEN; do
+            if ! toolforge envvars show "$var" >/dev/null 2>&1; then
+              echo "::error::$var is not set on tool wikivisage. Nothing was changed."
+              exit 1
             fi
-            case "$STATUS" in
-              ok)
-                echo "Build succeeded after ${ELAPSED}s"
-                break
-                ;;
-              error|timeout)
-                echo "Build failed with status: $STATUS"
-                toolforge build show
-                toolforge build logs 2>&1 | tail -20
-                exit 1
-                ;;
-              cancelled)
-                echo "Build was cancelled"
-                exit 1
-                ;;
-              pending|running|unknown)
-                echo "Waiting... (${ELAPSED}s) status: $STATUS"
-                ;;
-              *)
-                echo "Waiting... (${ELAPSED}s) unexpected status: $STATUS"
-                ;;
-            esac
           done
-          if [ $ELAPSED -ge 600 ]; then
-            echo "Build timed out after 600s"
-            toolforge build show
-            exit 1
-          fi
+
+          build_and_wait "$TAG"
+
+          # Stop workers before migration and keep them down until preflight passes.
           echo "==> Deleting ml-worker 1"
           toolforge jobs delete ml-worker || true
           echo "==> Deleting ml-worker 2"
           toolforge jobs delete ml-worker-2 || true
+
           RESET_FLAG=""
           [ "$DB_RESET" = "true" ] && RESET_FLAG=" --reset"
           echo "==> Running migration (db-reset=$DB_RESET)"
           toolforge jobs run migrate --command "python migrate.py${RESET_FLAG}" --image tool-wikivisage/tool-wikivisage:latest --wait
-          echo "==> Running ml-worker 1"
-          toolforge jobs run ml-worker --command 'python -u worker.py --worker-id ml-worker-1' --image tool-wikivisage/tool-wikivisage:latest --continuous --mem 3Gi --cpu 2 --health-check-script './healthcheck.sh ml-worker-1'
-          echo "==> Running ml-worker 2"
-          toolforge jobs run ml-worker-2 --command 'python -u worker.py --worker-id ml-worker-2' --image tool-wikivisage/tool-wikivisage:latest --continuous --mem 3Gi --cpu 2 --health-check-script './healthcheck.sh ml-worker-2'
+
           echo "==> Restarting webservice"
           toolforge webservice buildservice restart
+
+          # Preflight. The web app probes the face service with its own URL and
+          # token and reports the verdict on /health; face_client.is_healthy()
+          # also hits a token-protected path, so a wrong token fails here.
+          #
+          # This gate exists because an unreachable face service is NOT a loud
+          # failure: the worker deliberately leaves images 'pending' so a
+          # restart doesn't permanently error them. Without this check a bad
+          # deploy would look green and silently stop processing.
+          echo "==> Preflight: waiting for face service to be reachable"
+          PREFLIGHT_OK=0
+          for i in $(seq 1 40); do
+            BODY=$(curl -fsS --max-time 10 https://wikivisage.toolforge.org/health 2>/dev/null || true)
+            STATE=$(printf '%s' "$BODY" | jq -r '.face_service // empty' 2>/dev/null || true)
+            case "$STATE" in
+              reachable)
+                echo "Face service reachable after $((i * 5))s"
+                PREFLIGHT_OK=1
+                break
+                ;;
+              unreachable)
+                echo "Waiting... ($((i * 5))s) face_service=unreachable"
+                ;;
+              *)
+                echo "Waiting... ($((i * 5))s) webservice not answering /health yet"
+                ;;
+            esac
+            sleep 5
+          done
+
+          if [ "$PREFLIGHT_OK" -ne 1 ]; then
+            echo "::error::Face service is not reachable. Workers were NOT started."
+            echo "The web app is up, but image processing would stall silently."
+            echo "Check: toolforge envvars show WIKIVISAGE_FACE_SERVICE_URL"
+            echo "       toolforge envvars show WIKIVISAGE_FACE_SERVICE_TOKEN (must match the face tool's)"
+            echo "       curl -s https://wikivisage.toolforge.org/health"
+            exit 1
+          fi
+
+          echo "==> Running ml-worker 1"
+          toolforge jobs run ml-worker --command 'python -u worker.py --worker-id ml-worker-1' --image tool-wikivisage/tool-wikivisage:latest --continuous --mem 1Gi --cpu 2 --health-check-script './healthcheck.sh ml-worker-1'
+          echo "==> Running ml-worker 2"
+          toolforge jobs run ml-worker-2 --command 'python -u worker.py --worker-id ml-worker-2' --image tool-wikivisage/tool-wikivisage:latest --continuous --mem 1Gi --cpu 2 --health-check-script './healthcheck.sh ml-worker-2'
+
           LOG_MSG="deployed $TAG (by $ACTOR on GitHub)"
           [ "$DB_RESET" = "true" ] && LOG_MSG="deployed $TAG with database wipe (by $ACTOR on GitHub)"
           dologmsg "$LOG_MSG"
           echo "==> Deploy complete (logged to SAL)"
           SCRIPT
 
-          scp -i ~/.ssh/id_ed25519 /tmp/deploy.sh "${{ secrets.USERNAME }}@${{ secrets.HOST }}":/tmp/deploy.sh
-          ssh -i ~/.ssh/id_ed25519 "${{ secrets.USERNAME }}@${{ secrets.HOST }}" \
-            "become wikivisage bash /tmp/deploy.sh '${TAG}' '${DB_RESET}' '${{ github.actor }}'"
+          ssh toolforge "mkdir -p '$REMOTE_DIR' && chmod 755 '$REMOTE_DIR'"
+          scp /tmp/scripts/*.sh "toolforge:$REMOTE_DIR/"
+          ssh toolforge "chmod 644 '$REMOTE_DIR'/*.sh"
 
-          echo "## 🚀 Deploy Summary" >> "$GITHUB_STEP_SUMMARY"
-          echo "| | |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **Tag** | \`${TAG}\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **DB Reset** | \`${DB_RESET}\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| **Triggered by** | \`${{ github.actor }}\` |" >> "$GITHUB_STEP_SUMMARY"
-      - name: Cleanup SSH
+      # Checked before either tool is touched, so a missing envvar fails the
+      # release with both tools still running the previous version.
+      - name: Check Toolforge configuration
+        run: |
+          set -euo pipefail
+          check() {
+            local tool="$1"; shift
+            for var in "$@"; do
+              if ssh toolforge "become '$tool' toolforge envvars show '$var'" >/dev/null 2>&1; then
+                echo "ok: $tool has $var"
+              else
+                echo "::error::$var is not set on tool $tool (become $tool; toolforge envvars create $var)"
+                return 1
+              fi
+            done
+          }
+          check "$FACE_TOOL" WIKIVISAGE_FACE_SERVICE_TOKEN
+          check wikivisage WIKIVISAGE_FACE_SERVICE_URL WIKIVISAGE_FACE_SERVICE_TOKEN
+
+      - name: Deploy face service
+        timeout-minutes: 25
+        run: |
+          ssh toolforge "become '$FACE_TOOL' bash '$REMOTE_DIR/deploy-face.sh' '$FACE_REF' '$FACE_TOOL' '${{ github.actor }}'"
+
+      - name: Deploy web app and workers
+        timeout-minutes: 25
+        run: |
+          ssh toolforge "become wikivisage bash '$REMOTE_DIR/deploy.sh' '$TAG' '$DB_RESET' '${{ github.actor }}'"
+
+      - name: Summary
         if: always()
-        run: rm -f ~/.ssh/id_ed25519
+        run: |
+          {
+            echo "## 🚀 Deploy Summary"
+            echo "| | |"
+            echo "|---|---|"
+            echo "| **Tag** | \`${TAG}\` |"
+            echo "| **DB Reset** | \`${DB_RESET}\` |"
+            echo "| **Face service** | \`${FACE_TOOL}\` from \`${FACE_REF:-not published}\` |"
+            echo "| **Triggered by** | \`${{ github.actor }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cleanup
+        if: always()
+        run: |
+          ssh toolforge "rm -rf '$REMOTE_DIR'" 2>/dev/null || true
+          rm -f ~/.ssh/id_ed25519

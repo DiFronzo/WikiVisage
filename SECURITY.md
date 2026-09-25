@@ -66,7 +66,8 @@ The following are **out of scope**:
 - Security headers: `Content-Security-Policy` (with `object-src 'none'`, `base-uri 'none'`, `frame-ancestors 'none'`), `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`, `Permissions-Policy`
 - Input validation on bounding box coordinates
 - Image download size cap (50 MB) and pixel dimension validation (100 megapixel limit)
-- Worker face-detection subprocess hardening: env scrubbed via preexec hook; `RLIMIT_AS=2 GiB`, `RLIMIT_CPU=180s`, `RLIMIT_FSIZE=1 MiB` to contain malformed-image attacks
+- Face detection isolation: dlib/libjpeg/libpng parse untrusted image bytes only inside the face service, which runs as a separate Toolforge tool under memory/CPU limits with no NFS mount. Toolforge envvars are tool-wide, so the separate tool is what keeps WikiVisage's OAuth, database, and token-encryption secrets out of that process; a parser exploit there has nothing of ours to exfiltrate
+- Face service authentication: the service is published on the internet, so `model-server/guard.py` requires a constant-time-compared bearer token (>= 32 chars) on every route except the readiness check — including KServe's model-unload endpoint — rejects bodies over 40 MiB before parsing, and gRPC is disabled. The service refuses to start on Toolforge without a token
 - Distributed worker locking (`SELECT … FOR UPDATE`) with stale-claim expiry
 - Cross-project SDC write deduplication (`sdc_claims` table prevents duplicate P180 claims)
 - Idempotent SDC removals: `no-such-entity` / `no-such-claim` / `no-such-statement` / `notfound` are treated as already-gone successes

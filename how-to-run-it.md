@@ -64,7 +64,18 @@ toolforge envvars create WIKIVISAGE_TOKEN_KEY  "$(python3 -c 'from cryptography.
 # Default: redis://redis.svc.tools.eqiad1.wikimedia.cloud:6379
 # Only needed if you want to customize the Redis URL
 # toolforge envvars create WIKIVISAGE_REDIS_URL "redis://redis.svc.tools.eqiad1.wikimedia.cloud:6379"
+
+# Face service (REQUIRED — image processing does nothing without it).
+# The token must be the same value as on the face tool.
+toolforge envvars create WIKIVISAGE_FACE_SERVICE_URL   "https://wikivisage-face.toolforge.org"
+toolforge envvars create WIKIVISAGE_FACE_SERVICE_TOKEN "<same token as the face tool>"
 ```
+
+> The face service runs as a **second tool** — see
+> [Face Service Deployment](#face-service-deployment-second-tool) below. If
+> `WIKIVISAGE_FACE_SERVICE_URL` or the token is wrong, or the service is down,
+> the workers do not crash: they leave images `pending` and retry forever. The
+> deploy preflight is what turns that silent stall into a failed release.
 
 Verify with:
 
@@ -100,7 +111,7 @@ toolforge build start https://github.com/DiFronzo/WikiVisage.git
 toolforge build show
 ```
 
-The build uses `Procfile`, `requirements.txt`, and `project.toml` to create the container image. The image name is automatically `tool-wikivisage/tool-wikivisage:latest`.
+The build uses `Procfile` and `requirements.txt` to create the container image. The root `project.toml` was removed — it only existed to install dlib's system libraries, which now live with the face service in `model-server/project.toml`. The image name is automatically `tool-wikivisage/tool-wikivisage:latest`.
 
 ---
 
@@ -155,12 +166,12 @@ If `jobs.yaml` loading fails, start workers manually:
 toolforge jobs run ml-worker \
   --command 'python -u worker.py --worker-id ml-worker-1' \
   --image tool-wikivisage/tool-wikivisage:latest \
-  --continuous --mem 3Gi
+  --continuous --mem 1Gi --cpu 2
 
 toolforge jobs run ml-worker-2 \
   --command 'python -u worker.py --worker-id ml-worker-2' \
   --image tool-wikivisage/tool-wikivisage:latest \
-  --continuous --mem 3Gi
+  --continuous --mem 1Gi --cpu 2
 ```
 
 Check worker status:
@@ -184,14 +195,128 @@ toolforge jobs logs ml-worker-2
 
 ## Automated Deployment (CD)
 
-Releases trigger an automated deployment via `.github/workflows/deploy.yml`. The CD workflow:
+Publishing a GitHub release deploys **both tools** via
+`.github/workflows/deploy.yml`, with no manual steps. Order matters: the face
+service is updated and proven healthy *before* the workers are allowed to start.
 
-1. Builds a new container image from the release tag
-2. Runs schema migration
-3. Restarts both workers (`ml-worker` and `ml-worker-2`)
-4. Restarts the web service
+0. **Check configuration** on both tools before touching either: the face tool
+   must have `WIKIVISAGE_FACE_SERVICE_TOKEN`, the main tool
+   `WIKIVISAGE_FACE_SERVICE_URL` and `WIKIVISAGE_FACE_SERVICE_TOKEN`. A missing
+   envvar fails the release with both tools still on the previous version.
+1. **Publish the face service source.** Toolforge builds from the root of a git
+   ref, and the face service lives in `model-server/`. The workflow pushes a tag
+   `face-service-<release>` whose commit tree *is* `model-server/` at that
+   release (reused if it already exists and matches).
+2. **Deploy the face tool** (`become wikivisage-face`): builds
+   `face-service-<release>`, recreates the `face-service` job, and waits for
+   `https://wikivisage-face.toolforge.org/v1/models/wikivisage` to report ready.
+3. **Deploy the main tool** (`become wikivisage`):
+   1. Builds the image from the release tag
+   2. **Stops** both workers
+   3. Runs schema migration
+   4. Restarts the web service
+   5. **Preflight** — polls `/health` until `face_service` is `reachable`. That
+      check uses the web app's own URL and token, and probes a token-protected
+      path, so a wrong or missing token fails here
+   6. Starts both workers, but *only* if the preflight passed
 
-To deploy manually, use the **workflow_dispatch** trigger on the Actions tab with a git tag. The workflow also supports an optional database wipe (requires typing `WIPE` as confirmation).
+If the preflight fails the deploy fails and the workers stay down. That is
+deliberate: workers running against a dead face service look healthy while
+processing nothing, whereas a failed deploy is visible.
+
+To deploy manually, use the **workflow_dispatch** trigger on the Actions tab
+with a git tag. The workflow also supports an optional database wipe (requires
+typing `WIPE` as confirmation). Rolling back either tool is re-running the
+workflow with an older tag.
+
+### Required GitHub configuration
+
+| Kind | Name | Environment | Value |
+|---|---|---|---|
+| Variable | `FACE_TOOL` | — | *optional* — defaults to `wikivisage-face` |
+| Secret | `HOST` / `USERNAME` / `KEY` | `toolforge` | *(existing)* — the SSH user must maintain **both** tools |
+
+---
+
+## Face Service Deployment (second tool)
+
+Face detection runs on Toolforge as its own tool, not inside `wikivisage`.
+Toolforge envvars are injected into every job of a tool, so a face-service job
+in the main tool would receive the ToolsDB password, the OAuth secret and
+`WIKIVISAGE_TOKEN_KEY` — in the one process that parses untrusted image bytes. A
+second tool holds none of them. If
+[T405022](https://phabricator.wikimedia.org/T405022) (per-job envvars) ships,
+it could move back into the main tool as an internal job.
+
+The tool is built with buildpacks from `model-server/`: `requirements.txt`
+(dlib via the pre-built `dlib-bin` wheel), `project.toml` (OpenBLAS/LAPACK via
+`heroku/deb-packages`), `.python-version` and `Procfile`. The `Dockerfile` is
+only for local development and CI.
+
+### One-time setup
+
+**1. Create the tool** `wikivisage-face` in
+[toolsadmin](https://toolsadmin.wikimedia.org/tools/) and add the same
+maintainers as `wikivisage` (the deploy SSH user must be one of them).
+
+**2. Generate the shared token** and set the *same* value on both tools:
+
+```bash
+python3 -c 'import secrets; print(secrets.token_urlsafe(32))'   # >= 32 chars
+
+become wikivisage-face
+toolforge envvars create WIKIVISAGE_FACE_SERVICE_TOKEN          # paste the token
+
+become wikivisage
+toolforge envvars create WIKIVISAGE_FACE_SERVICE_TOKEN          # the same token
+toolforge envvars create WIKIVISAGE_FACE_SERVICE_URL "https://wikivisage-face.toolforge.org"
+```
+
+**3. Publish a release.** The deploy workflow builds and starts the face tool
+automatically. To start it by hand instead:
+
+```bash
+become wikivisage-face
+toolforge build start --ref face-service-<release> https://github.com/DiFronzo/WikiVisage.git
+toolforge jobs run face-service \
+  --command web \
+  --image tool-wikivisage-face/tool-wikivisage-face:latest \
+  --continuous --port 8000 --publish --mount=none \
+  --mem 3Gi --cpu 2 \
+  --health-check-http /v1/models/wikivisage
+curl -s https://wikivisage-face.toolforge.org/v1/models/wikivisage   # {"name":"wikivisage","ready":true}
+```
+
+### How requests are secured
+
+```
+wikivisage job ──HTTPS──> wikivisage-face.toolforge.org ──> model server :8000
+                                                             (RequestGuard: token, 40 MiB body cap)
+```
+
+`model-server/guard.py` rejects any request without `Authorization: Bearer
+<token>` before it reaches KServe, including KServe's own admin routes such as
+`POST /v2/repository/models/<name>/unload`. Only `GET /v1/models/wikivisage`
+(name + boolean) is open, because the Toolforge health check cannot send
+headers. Bodies over 40 MiB get `413` before being buffered, gRPC is disabled
+so there is no second unguarded port, and `model.py` refuses to start on
+Toolforge without a token of at least 32 characters.
+
+### Operations
+
+```bash
+become wikivisage-face
+toolforge jobs logs face-service -f        # logs
+toolforge jobs restart face-service        # restart
+toolforge jobs show face-service           # status, published URL
+
+# Confirm the main tool agrees it is usable (URL and token)
+curl -s https://wikivisage.toolforge.org/health | jq .face_service
+```
+
+Throughput: dlib is not thread-safe, so each replica detects one image at a
+time. To scale, add `--replicas N` to the job rather than raising
+`WIKIVISAGE_FACE_WORKERS`.
 
 ---
 
@@ -224,10 +349,10 @@ toolforge webservice restart
 
 # Restart both workers (delete + run because jobs load doesn't restart unchanged jobs)
 toolforge jobs delete ml-worker || true
-toolforge jobs run ml-worker --command 'python -u worker.py --worker-id ml-worker-1' --image tool-wikivisage/tool-wikivisage:latest --continuous --mem 3Gi
+toolforge jobs run ml-worker --command 'python -u worker.py --worker-id ml-worker-1' --image tool-wikivisage/tool-wikivisage:latest --continuous --mem 1Gi --cpu 2
 
 toolforge jobs delete ml-worker-2 || true
-toolforge jobs run ml-worker-2 --command 'python -u worker.py --worker-id ml-worker-2' --image tool-wikivisage/tool-wikivisage:latest --continuous --mem 3Gi
+toolforge jobs run ml-worker-2 --command 'python -u worker.py --worker-id ml-worker-2' --image tool-wikivisage/tool-wikivisage:latest --continuous --mem 1Gi --cpu 2
 ```
 
 ### Restart web service only
@@ -263,9 +388,9 @@ toolforge envvars create FLASK_SECRET_KEY "<new-value>"
 # Restart services to pick up changes
 toolforge webservice restart
 toolforge jobs delete ml-worker || true
-toolforge jobs run ml-worker --command 'python -u worker.py --worker-id ml-worker-1' --image tool-wikivisage/tool-wikivisage:latest --continuous --mem 3Gi
+toolforge jobs run ml-worker --command 'python -u worker.py --worker-id ml-worker-1' --image tool-wikivisage/tool-wikivisage:latest --continuous --mem 1Gi --cpu 2
 toolforge jobs delete ml-worker-2 || true
-toolforge jobs run ml-worker-2 --command 'python -u worker.py --worker-id ml-worker-2' --image tool-wikivisage/tool-wikivisage:latest --continuous --mem 3Gi
+toolforge jobs run ml-worker-2 --command 'python -u worker.py --worker-id ml-worker-2' --image tool-wikivisage/tool-wikivisage:latest --continuous --mem 1Gi --cpu 2
 ```
 
 ---
@@ -286,10 +411,10 @@ toolforge jobs logs ml-worker-2
 
 # Restart workers
 toolforge jobs delete ml-worker || true
-toolforge jobs run ml-worker --command 'python -u worker.py --worker-id ml-worker-1' --image tool-wikivisage/tool-wikivisage:latest --continuous --mem 3Gi
+toolforge jobs run ml-worker --command 'python -u worker.py --worker-id ml-worker-1' --image tool-wikivisage/tool-wikivisage:latest --continuous --mem 1Gi --cpu 2
 
 toolforge jobs delete ml-worker-2 || true
-toolforge jobs run ml-worker-2 --command 'python -u worker.py --worker-id ml-worker-2' --image tool-wikivisage/tool-wikivisage:latest --continuous --mem 3Gi
+toolforge jobs run ml-worker-2 --command 'python -u worker.py --worker-id ml-worker-2' --image tool-wikivisage/tool-wikivisage:latest --continuous --mem 1Gi --cpu 2
 
 # Or reload from jobs.yaml
 toolforge jobs load jobs.yaml
@@ -309,7 +434,31 @@ toolforge build show
 
 # Common causes:
 # - requirements.txt has a broken dependency
-# - project.toml references a package not in Ubuntu 24.04 repos
+# - a VCS (git+https://) requirement whose repository no longer resolves,
+#   which surfaces as "could not read Username for 'https://github.com'"
+```
+
+### Images stay "pending" and never process
+
+Almost always the face service. The worker treats an unreachable service as
+transient and leaves images `pending` for the next poll cycle rather than
+erroring them, so a misconfigured endpoint stalls silently instead of failing
+loudly.
+
+```bash
+# What the web app thinks
+curl -s https://wikivisage.toolforge.org/health   # expects "face_service": "reachable"
+
+# What the workers are pointed at
+toolforge envvars list | grep FACE_SERVICE
+
+# The worker logs its verdict once at startup
+toolforge jobs logs ml-worker | grep -i "face service"
+
+# "rejected WIKIVISAGE_FACE_SERVICE_TOKEN (HTTP 401)" in the web or worker logs
+# means the two tools hold different tokens. Is the face tool itself up?
+curl -s https://wikivisage-face.toolforge.org/v1/models/wikivisage
+become wikivisage-face && toolforge jobs logs face-service | tail -50
 ```
 
 ### Database connection errors

@@ -3,7 +3,6 @@ import xml.etree.ElementTree as ET
 from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock, PropertyMock, mock_open, patch
 
-import numpy as np
 import pytest
 import requests
 from flask import Response, abort, g, session
@@ -932,6 +931,41 @@ def test_download_image_multi_hop_redirect_succeeds(monkeypatch):
     assert hop2.closed is True
 
 
+def test_download_image_follows_redirect_to_thumb_host(monkeypatch):
+    """Commons serves ?width=N thumbnails from thumb.wikimedia.org.
+
+    /api/manual-face and /api/update-face-bbox both fetch via Special:FilePath,
+    so rejecting that host breaks manual face drawing and bbox editing.
+    """
+    hop1 = _FakeResponse(
+        headers={"Location": "https://commons.wikimedia.org/w/index.php?title=Special:Redirect/file/X.jpg"},
+        chunks=[],
+        is_redirect=True,
+    )
+    hop2 = _FakeResponse(
+        headers={"Location": "https://thumb.wikimedia.org/wikipedia/commons/thumb/6/61/X.jpg/1024px-X.jpg"},
+        chunks=[],
+        is_redirect=True,
+    )
+    content = _FakeResponse(headers={"Content-Length": "4"}, chunks=[b"data"])
+    responses = iter([hop1, hop2, content])
+
+    monkeypatch.setattr(app_module.requests, "get", lambda *_a, **_k: next(responses))
+
+    data = app_module._download_image(
+        "https://commons.wikimedia.org/wiki/Special:FilePath/X.jpg?width=1024", max_bytes=100
+    )
+    assert data == b"data"
+
+
+def test_app_allowlist_still_rejects_non_wikimedia_hosts():
+    """Adding thumb.wikimedia.org must not widen the allowlist to lookalikes."""
+    allowed = app_module._ALLOWED_DOWNLOAD_HOSTS
+    assert "thumb.wikimedia.org" in allowed
+    for host in ("thumb.wikimedia.org.evil.com", "wikimedia.org", "thumb.wikipedia.org"):
+        assert host not in allowed, f"{host} must not be allowed"
+
+
 def test_download_image_too_many_redirects_raises(monkeypatch):
     redirect = _FakeResponse(
         headers={"Location": "https://upload.wikimedia.org/loop"},
@@ -953,11 +987,12 @@ def test_login_required_redirects_unauthenticated(monkeypatch):
         def _protected():
             return "ok"
 
-        resp = _protected()
-        assert isinstance(resp, Response)
-        assert resp.status_code == 302
-        assert "/login?next=" in resp.location
-        assert "next=" in resp.location and "protected" in resp.location
+        response = _protected()
+        assert isinstance(response, Response)
+        assert response.status_code == 302
+        assert response.location is not None
+        assert "/login?next=" in response.location
+        assert "next=" in response.location and "protected" in response.location
 
 
 def test_login_required_allows_authenticated_user():
@@ -5306,16 +5341,6 @@ def _update_bbox_form(**overrides):
     return payload
 
 
-def _build_face_recognition_mock(encodings=None, face_encodings_side_effect=None):
-    mock_fr = MagicMock()
-    mock_fr.load_image_file.return_value = MagicMock()
-    if face_encodings_side_effect is not None:
-        mock_fr.face_encodings.side_effect = face_encodings_side_effect
-    else:
-        mock_fr.face_encodings.return_value = [] if encodings is None else encodings
-    return mock_fr
-
-
 def _default_reclassify_face_row(**overrides):
     row = {
         "id": 1,
@@ -5488,10 +5513,9 @@ def test_api_manual_face_no_encoding_result(monkeypatch):
 
     client, _ = _authed_client(monkeypatch, route_execute_query=_route_query)
     monkeypatch.setattr(app_module, "_download_image", lambda *_a, **_k: b"image-bytes")
-    mock_fr = _build_face_recognition_mock(encodings=[])
+    monkeypatch.setattr(app_module.face_client, "encode_known_face", lambda *_a, **_k: None)
 
-    with patch.dict("sys.modules", {"face_recognition": mock_fr}):
-        resp = client.post("/api/manual-face", data=_manual_face_form())
+    resp = client.post("/api/manual-face", data=_manual_face_form())
 
     assert resp.status_code == 422
     assert "Could not compute face encoding" in resp.get_json()["error"]
@@ -5513,12 +5537,9 @@ def test_api_manual_face_success_normal_insert(monkeypatch):
     client, _ = _authed_client(monkeypatch, route_execute_query=_route_query)
     monkeypatch.setattr(app_module, "_download_image", lambda *_a, **_k: b"image-bytes")
     monkeypatch.setattr(app_module, "execute_transaction", _transaction)
+    monkeypatch.setattr(app_module.face_client, "encode_known_face", lambda *_a, **_k: _make_encoding(2001))
 
-    fake_encoding = np.random.rand(128).astype(np.float64)
-    mock_fr = _build_face_recognition_mock(encodings=[fake_encoding])
-
-    with patch.dict("sys.modules", {"face_recognition": mock_fr}):
-        resp = client.post("/api/manual-face", data=_manual_face_form())
+    resp = client.post("/api/manual-face", data=_manual_face_form())
 
     assert resp.status_code == 200
     assert resp.get_json() == {"status": "ok"}
@@ -5560,16 +5581,14 @@ def test_api_manual_face_dismiss_faces_on_normal_insert(monkeypatch):
     monkeypatch.setattr(app_module, "_download_image", lambda *_a, **_k: b"image-bytes")
     monkeypatch.setattr(app_module, "execute_transaction", _transaction)
 
-    fake_encoding = np.random.rand(128).astype(np.float64)
-    mock_fr = _build_face_recognition_mock(encodings=[fake_encoding])
-
     import json
 
-    with patch.dict("sys.modules", {"face_recognition": mock_fr}):
-        resp = client.post(
-            "/api/manual-face",
-            data=_manual_face_form(dismiss_face_ids=json.dumps([5, 7])),
-        )
+    monkeypatch.setattr(app_module.face_client, "encode_known_face", lambda *_a, **_k: _make_encoding(2002))
+
+    resp = client.post(
+        "/api/manual-face",
+        data=_manual_face_form(dismiss_face_ids=json.dumps([5, 7])),
+    )
 
     assert resp.status_code == 200
     assert resp.get_json() == {"status": "ok"}
@@ -5587,12 +5606,14 @@ def test_api_manual_face_dismiss_faces_on_normal_insert(monkeypatch):
         assert sess["last_classify"]["was_review"] is False
         assert sess["last_classify"]["manual_face_ids"] == [99]
 
-    def _route_query(sql):
+
+def test_api_manual_face_review_mode_tracks_confirmed_ids(monkeypatch):
+    def _review_route_query(sql):
         if "FROM images i " in sql:
             return [{"id": 10, "file_title": "File:Face.jpg", "status": "processed"}]
         return []
 
-    def _transaction(fn):
+    def _review_transaction(fn):
         mock_conn = MagicMock()
         mock_cursor = MagicMock()
         mock_cursor.fetchall.return_value = [{"id": 11}, {"id": 12}]
@@ -5600,15 +5621,12 @@ def test_api_manual_face_dismiss_faces_on_normal_insert(monkeypatch):
         mock_cursor.rowcount = 1
         return fn(mock_conn, mock_cursor)
 
-    client, _ = _authed_client(monkeypatch, route_execute_query=_route_query)
+    client, _ = _authed_client(monkeypatch, route_execute_query=_review_route_query)
     monkeypatch.setattr(app_module, "_download_image", lambda *_a, **_k: b"image-bytes")
-    monkeypatch.setattr(app_module, "execute_transaction", _transaction)
+    monkeypatch.setattr(app_module, "execute_transaction", _review_transaction)
+    monkeypatch.setattr(app_module.face_client, "encode_known_face", lambda *_a, **_k: _make_encoding(2003))
 
-    fake_encoding = np.random.rand(128).astype(np.float64)
-    mock_fr = _build_face_recognition_mock(encodings=[fake_encoding])
-
-    with patch.dict("sys.modules", {"face_recognition": mock_fr}):
-        resp = client.post("/api/manual-face", data=_manual_face_form(reviewing_model="1"))
+    resp = client.post("/api/manual-face", data=_manual_face_form(reviewing_model="1"))
 
     assert resp.status_code == 200
     assert resp.get_json() == {"status": "ok"}
@@ -5657,19 +5675,15 @@ def test_api_manual_face_db_error_on_insert(monkeypatch):
             return [{"id": 10, "file_title": "File:Face.jpg", "status": "processed"}]
         return []
 
+    def _raise_db_error(*_args, **_kwargs):
+        raise app_module.DatabaseError("db")
+
     client, _ = _authed_client(monkeypatch, route_execute_query=_route_query)
     monkeypatch.setattr(app_module, "_download_image", lambda *_a, **_k: b"image-bytes")
-    monkeypatch.setattr(
-        app_module,
-        "execute_transaction",
-        lambda fn: (_ for _ in ()).throw(app_module.DatabaseError("db")),
-    )
+    monkeypatch.setattr(app_module, "execute_transaction", _raise_db_error)
+    monkeypatch.setattr(app_module.face_client, "encode_known_face", lambda *_a, **_k: _make_encoding(2004))
 
-    fake_encoding = np.random.rand(128).astype(np.float64)
-    mock_fr = _build_face_recognition_mock(encodings=[fake_encoding])
-
-    with patch.dict("sys.modules", {"face_recognition": mock_fr}):
-        resp = client.post("/api/manual-face", data=_manual_face_form())
+    resp = client.post("/api/manual-face", data=_manual_face_form())
 
     assert resp.status_code == 500
     assert resp.get_json()["error"] == "Failed to save face"
@@ -5681,15 +5695,35 @@ def test_api_manual_face_unexpected_error(monkeypatch):
             return [{"id": 10, "file_title": "File:Face.jpg", "status": "processed"}]
         return []
 
+    def _raise_runtime_error(*_args, **_kwargs):
+        raise RuntimeError("boom")
+
     client, _ = _authed_client(monkeypatch, route_execute_query=_route_query)
     monkeypatch.setattr(app_module, "_download_image", lambda *_a, **_k: b"image-bytes")
-
-    mock_fr = _build_face_recognition_mock(face_encodings_side_effect=RuntimeError("boom"))
-    with patch.dict("sys.modules", {"face_recognition": mock_fr}):
-        resp = client.post("/api/manual-face", data=_manual_face_form())
+    monkeypatch.setattr(app_module.face_client, "encode_known_face", _raise_runtime_error)
+    resp = client.post("/api/manual-face", data=_manual_face_form())
 
     assert resp.status_code == 500
     assert resp.get_json()["error"] == "Failed to process face region"
+
+
+def test_api_manual_face_face_service_error(monkeypatch):
+    def _route_query(sql):
+        if "FROM images i " in sql:
+            return [{"id": 10, "file_title": "File:Face.jpg", "status": "processed"}]
+        return []
+
+    def _raise_face_service_error(*_args, **_kwargs):
+        raise app_module.FaceServiceError("service down")
+
+    client, _ = _authed_client(monkeypatch, route_execute_query=_route_query)
+    monkeypatch.setattr(app_module, "_download_image", lambda *_a, **_k: b"image-bytes")
+    monkeypatch.setattr(app_module.face_client, "encode_known_face", _raise_face_service_error)
+
+    resp = client.post("/api/manual-face", data=_manual_face_form())
+
+    assert resp.status_code == 503
+    assert resp.get_json()["error"] == "Face detection service is unavailable. Please try again in a moment."
 
 
 def test_api_manual_face_image_not_processed(monkeypatch):
@@ -6284,10 +6318,9 @@ def test_api_update_face_bbox_face_not_found(monkeypatch):
 def test_api_update_face_bbox_no_encoding_result(monkeypatch):
     client, _ = _authed_client(monkeypatch, route_execute_query=_bbox_query_router())
     monkeypatch.setattr(app_module, "_download_image", lambda *_a, **_k: b"image-bytes")
-    mock_fr = _build_face_recognition_mock(encodings=[])
+    monkeypatch.setattr(app_module.face_client, "encode_known_face", lambda *_a, **_k: None)
 
-    with patch.dict("sys.modules", {"face_recognition": mock_fr}):
-        resp = client.post("/api/update-face-bbox", data=_update_bbox_form())
+    resp = client.post("/api/update-face-bbox", data=_update_bbox_form())
 
     assert resp.status_code == 422
     assert "Could not compute face encoding" in resp.get_json()["error"]
@@ -6313,11 +6346,9 @@ def test_api_update_face_bbox_success_new_face_inserted_original_superseded(monk
         return result
 
     monkeypatch.setattr(app_module, "execute_transaction", _transaction)
-    fake_encoding = np.random.rand(128).astype(np.float64)
-    mock_fr = _build_face_recognition_mock(encodings=[fake_encoding])
+    monkeypatch.setattr(app_module.face_client, "encode_known_face", lambda *_a, **_k: _make_encoding(3001))
 
-    with patch.dict("sys.modules", {"face_recognition": mock_fr}):
-        resp = client.post("/api/update-face-bbox", data=_update_bbox_form())
+    resp = client.post("/api/update-face-bbox", data=_update_bbox_form())
 
     assert resp.status_code == 200
     payload = resp.get_json()
@@ -6354,16 +6385,18 @@ def test_api_update_face_bbox_db_error_on_ownership(monkeypatch):
 def test_api_update_face_bbox_db_error_on_insert(monkeypatch):
     client, _ = _authed_client(monkeypatch, route_execute_query=_bbox_query_router())
     monkeypatch.setattr(app_module, "_download_image", lambda *_a, **_k: b"image-bytes")
+
+    def _raise_db_error(*_args, **_kwargs):
+        raise app_module.DatabaseError("db")
+
     monkeypatch.setattr(
         app_module,
         "execute_transaction",
-        lambda fn: (_ for _ in ()).throw(app_module.DatabaseError("db")),
+        _raise_db_error,
     )
-    fake_encoding = np.random.rand(128).astype(np.float64)
-    mock_fr = _build_face_recognition_mock(encodings=[fake_encoding])
+    monkeypatch.setattr(app_module.face_client, "encode_known_face", lambda *_a, **_k: _make_encoding(3002))
 
-    with patch.dict("sys.modules", {"face_recognition": mock_fr}):
-        resp = client.post("/api/update-face-bbox", data=_update_bbox_form())
+    resp = client.post("/api/update-face-bbox", data=_update_bbox_form())
 
     assert resp.status_code == 500
     assert resp.get_json()["error"] == "Failed to save face"
@@ -6372,13 +6405,31 @@ def test_api_update_face_bbox_db_error_on_insert(monkeypatch):
 def test_api_update_face_bbox_unexpected_error(monkeypatch):
     client, _ = _authed_client(monkeypatch, route_execute_query=_bbox_query_router())
     monkeypatch.setattr(app_module, "_download_image", lambda *_a, **_k: b"image-bytes")
-    mock_fr = _build_face_recognition_mock(face_encodings_side_effect=RuntimeError("boom"))
 
-    with patch.dict("sys.modules", {"face_recognition": mock_fr}):
-        resp = client.post("/api/update-face-bbox", data=_update_bbox_form())
+    def _raise_runtime_error(*_args, **_kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(app_module.face_client, "encode_known_face", _raise_runtime_error)
+
+    resp = client.post("/api/update-face-bbox", data=_update_bbox_form())
 
     assert resp.status_code == 500
     assert resp.get_json()["error"] == "Failed to process face region"
+
+
+def test_api_update_face_bbox_face_service_error(monkeypatch):
+    client, _ = _authed_client(monkeypatch, route_execute_query=_bbox_query_router())
+    monkeypatch.setattr(app_module, "_download_image", lambda *_a, **_k: b"image-bytes")
+
+    def _raise_face_service_error(*_args, **_kwargs):
+        raise app_module.FaceServiceError("service down")
+
+    monkeypatch.setattr(app_module.face_client, "encode_known_face", _raise_face_service_error)
+
+    resp = client.post("/api/update-face-bbox", data=_update_bbox_form())
+
+    assert resp.status_code == 503
+    assert resp.get_json()["error"] == "Face detection service is unavailable. Please try again in a moment."
 
 
 def test_api_update_face_bbox_image_not_processed(monkeypatch):
@@ -6453,11 +6504,9 @@ def test_api_update_face_bbox_allows_self_edit(monkeypatch):
         return fn(mock_conn, mock_cursor)
 
     monkeypatch.setattr(app_module, "execute_transaction", _transaction)
-    fake_encoding = np.random.rand(128).astype(np.float64)
-    mock_fr = _build_face_recognition_mock(encodings=[fake_encoding])
+    monkeypatch.setattr(app_module.face_client, "encode_known_face", lambda *_a, **_k: _make_encoding(3003))
 
-    with patch.dict("sys.modules", {"face_recognition": mock_fr}):
-        resp = client.post("/api/update-face-bbox", data=_update_bbox_form())
+    resp = client.post("/api/update-face-bbox", data=_update_bbox_form())
 
     assert resp.status_code == 200
     assert resp.get_json()["new_face_id"] == 999
@@ -6481,11 +6530,9 @@ def test_api_update_face_bbox_allows_edit_of_unclassified_face(monkeypatch):
         return fn(mock_conn, mock_cursor)
 
     monkeypatch.setattr(app_module, "execute_transaction", _transaction)
-    fake_encoding = np.random.rand(128).astype(np.float64)
-    mock_fr = _build_face_recognition_mock(encodings=[fake_encoding])
+    monkeypatch.setattr(app_module.face_client, "encode_known_face", lambda *_a, **_k: _make_encoding(3004))
 
-    with patch.dict("sys.modules", {"face_recognition": mock_fr}):
-        resp = client.post("/api/update-face-bbox", data=_update_bbox_form())
+    resp = client.post("/api/update-face-bbox", data=_update_bbox_form())
 
     assert resp.status_code == 200
     assert resp.get_json()["new_face_id"] == 777
@@ -6517,11 +6564,9 @@ def test_api_update_face_bbox_intx_recheck_blocks_toctou_race(monkeypatch):
             raise app_module.DatabaseError("Transaction execution failed") from exc
 
     monkeypatch.setattr(app_module, "execute_transaction", _transaction)
-    fake_encoding = np.random.rand(128).astype(np.float64)
-    mock_fr = _build_face_recognition_mock(encodings=[fake_encoding])
+    monkeypatch.setattr(app_module.face_client, "encode_known_face", lambda *_a, **_k: _make_encoding(3005))
 
-    with patch.dict("sys.modules", {"face_recognition": mock_fr}):
-        resp = client.post("/api/update-face-bbox", data=_update_bbox_form())
+    resp = client.post("/api/update-face-bbox", data=_update_bbox_form())
 
     assert resp.status_code == 409
     payload = resp.get_json()
@@ -7863,6 +7908,7 @@ def test_leaderboard_filter_bar_active_state(monkeypatch):
 
 def test_health_healthy_db(monkeypatch):
     monkeypatch.setattr(app_module, "execute_query", lambda *a, **k: [{"ok": 1}])
+    monkeypatch.setattr(app_module.face_client, "is_healthy", lambda *a, **k: True)
 
     flask_app.config["TESTING"] = True
     client = flask_app.test_client()
@@ -7875,7 +7921,24 @@ def test_health_healthy_db(monkeypatch):
     assert payload["status"] == "healthy"
     assert payload["database"] == "connected"
     assert payload["limiter"] in ("redis", "memory")
-    assert isinstance(payload["degraded"], bool)
+    assert payload["face_service"] == "reachable"
+    assert payload["degraded"] is (payload["limiter"] == "memory")
+
+
+def test_health_degraded_when_face_service_unhealthy(monkeypatch):
+    monkeypatch.setattr(app_module, "execute_query", lambda *a, **k: [{"ok": 1}])
+    monkeypatch.setattr(app_module.face_client, "is_healthy", lambda *a, **k: False)
+
+    flask_app.config["TESTING"] = True
+    client = flask_app.test_client()
+    response = client.get("/health")
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["status"] == "healthy"
+    assert payload["database"] == "connected"
+    assert payload["face_service"] == "unreachable"
+    assert payload["degraded"] is True
 
 
 def test_health_unhealthy_db_exception(monkeypatch):
@@ -9414,14 +9477,14 @@ def test_invite_code_generate_fails_after_max_retries(monkeypatch, fake_user):
     """All retry attempts raise invite_code collisions; route shows failure flash."""
     project = _project_settings_base_row()
 
-    def route_execute(sql, _params, _fetch):
+    def route_execute_fail(sql, _params, _fetch):
         if "SELECT * FROM projects WHERE id = %s AND user_id = %s" in sql:
             return [project.copy()]
         if "UPDATE projects SET invite_code" in sql:
             raise _make_invite_code_collision_error()
         raise AssertionError(f"Unexpected SQL: {sql}")
 
-    client = _make_authed_client(monkeypatch, fake_user, route_execute)
+    client = _make_authed_client(monkeypatch, fake_user, route_execute_fail)
     _set_csrf_chunk6(client)
 
     response = client.post(
