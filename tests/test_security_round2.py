@@ -17,7 +17,6 @@ from __future__ import annotations
 import base64
 import hashlib
 import os
-import sys
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -58,106 +57,6 @@ def _normalize_server_name():
             flask_app.config["SERVER_NAME"] = prior_value
         else:
             flask_app.config.pop("SERVER_NAME", None)
-
-
-# ---------------------------------------------------------------------------
-# C1 — Worker subprocess hardening
-# ---------------------------------------------------------------------------
-
-
-class TestSubprocessHardening:
-    """`_harden_face_detect_subprocess()` runs FIRST inside the face-detection
-    subprocess, before importing untrusted-input parsers (dlib, libjpeg, libpng).
-    It scrubs sensitive env vars so a subprocess RCE cannot exfiltrate OAuth
-    secrets / DB creds, and applies POSIX rlimits so a CPU/mem-bomb image cannot
-    wedge the Toolforge pod.
-    """
-
-    def test_scrubs_oauth_and_db_secrets(self, monkeypatch):
-        # Populate the subprocess's env with everything we expect to be scrubbed.
-        secrets_to_scrub = {
-            "OAUTH_CLIENT_ID": "leak-id",
-            "OAUTH_CLIENT_SECRET": "leak-secret",
-            "OAUTH_REDIRECT_URI": "leak-uri",
-            "WIKIVISAGE_TOKEN_KEY": "leak-fernet-key",
-            "FLASK_SECRET_KEY": "leak-flask-key",
-            "TOOL_TOOLSDB_USER": "leak-user",
-            "TOOL_TOOLSDB_PASSWORD": "leak-pw",
-            "WIKIVISAGE_DB_NAME": "leak-db",
-            "WIKIVISAGE_REDIS_URL": "redis://leak:6379",
-        }
-        # And things that MUST survive (locale, PATH, Toolforge runtime hints).
-        keep = {
-            "PATH": "/usr/bin:/bin",
-            "LANG": "en_US.UTF-8",
-            "HOME": "/home/user",
-        }
-        env = {**secrets_to_scrub, **keep}
-        with patch.dict(os.environ, env, clear=True):
-            worker_module._harden_face_detect_subprocess()
-            for k in secrets_to_scrub:
-                assert k not in os.environ, f"{k} must be scrubbed"
-            for k, v in keep.items():
-                assert os.environ.get(k) == v, f"{k} must be preserved"
-
-    def test_scrub_handles_prefix_match(self):
-        """Any var starting with one of the configured prefixes must be removed,
-        not just exact matches."""
-        env = {
-            "OAUTH_FOO": "leak",
-            "OAUTH_BAR_BAZ": "leak",
-            "TOOL_TOOLSDB_HOST": "leak",
-            "WIKIVISAGE_DB_POOL_SIZE": "leak",
-            "PATH": "/keep",
-        }
-        with patch.dict(os.environ, env, clear=True):
-            worker_module._harden_face_detect_subprocess()
-            assert "OAUTH_FOO" not in os.environ
-            assert "OAUTH_BAR_BAZ" not in os.environ
-            assert "TOOL_TOOLSDB_HOST" not in os.environ
-            assert "WIKIVISAGE_DB_POOL_SIZE" not in os.environ
-            assert os.environ.get("PATH") == "/keep"
-
-    def test_scrub_does_not_match_unrelated_vars(self):
-        """An env var whose name only *contains* a sensitive substring (but
-        doesn't *start* with any prefix) must not be scrubbed."""
-        env = {
-            "MY_OAUTH_HELPER": "keep",  # contains OAUTH_ but doesn't start with it
-            "PATH": "/keep",
-        }
-        with patch.dict(os.environ, env, clear=True):
-            worker_module._harden_face_detect_subprocess()
-            assert os.environ.get("MY_OAUTH_HELPER") == "keep"
-
-    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX rlimits only")
-    def test_applies_resource_limits_when_available(self):
-        """When `resource` is importable (POSIX), setrlimit is called for
-        AS / CPU / FSIZE. We patch resource.setrlimit to capture the calls."""
-        import resource as _resource
-
-        with patch.object(_resource, "setrlimit") as mock_setrlimit:
-            with patch.dict(os.environ, {"PATH": "/x"}, clear=True):
-                worker_module._harden_face_detect_subprocess()
-        # We expect exactly 3 rlimit applications.
-        rlimit_names = {
-            _resource.RLIMIT_AS,
-            _resource.RLIMIT_CPU,
-            _resource.RLIMIT_FSIZE,
-        }
-        called_with = {call.args[0] for call in mock_setrlimit.call_args_list}
-        # Each of the 3 rlimits we care about should have been targeted.
-        assert rlimit_names.issubset(called_with), f"Missing rlimits: {rlimit_names - called_with}"
-
-    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX rlimits only")
-    def test_rlimit_failures_are_swallowed(self):
-        """A sandbox that rejects setrlimit (raises ValueError or OSError) must
-        not crash the subprocess — best-effort hardening only."""
-        import resource as _resource
-
-        with patch.object(_resource, "setrlimit", side_effect=OSError("denied")):
-            with patch.dict(os.environ, {"PATH": "/x"}, clear=True):
-                # Must not raise
-                worker_module._harden_face_detect_subprocess()
 
 
 # ---------------------------------------------------------------------------
@@ -322,6 +221,7 @@ class TestHealthRedisFallback:
         # Pretend Redis-backed limiter is up
         monkeypatch.setattr(app_module, "_LIMITER_REDIS_OK", True)
         monkeypatch.setattr(app_module, "execute_query", lambda *a, **kw: [{"ok": 1}])
+        monkeypatch.setattr(app_module.face_client, "is_healthy", lambda *a, **kw: True)
         client = app_module.app.test_client()
         resp = client.get("/health")
         assert resp.status_code == 200
@@ -333,6 +233,7 @@ class TestHealthRedisFallback:
     def test_health_reports_degraded_when_redis_down(self, monkeypatch):
         monkeypatch.setattr(app_module, "_LIMITER_REDIS_OK", False)
         monkeypatch.setattr(app_module, "execute_query", lambda *a, **kw: [{"ok": 1}])
+        monkeypatch.setattr(app_module.face_client, "is_healthy", lambda *a, **kw: True)
         client = app_module.app.test_client()
         resp = client.get("/health")
         # Still 200 OK — DB is healthy; ops scrape `degraded` for alerting.

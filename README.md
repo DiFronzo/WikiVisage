@@ -40,6 +40,7 @@ Active learning facial recognition for Wikimedia Commons. Train an ML model to r
 ## 🔗 Quick links
 
 - 📖 Local dev guide: [test-local.md](test-local.md)
+- 🧪 Face service guide: [TESTING.md](TESTING.md)
 - 🚀 Toolforge deploy guide: [how-to-run-it.md](how-to-run-it.md)
 - 🤝 Contributing: [CONTRIBUTING.md](CONTRIBUTING.md)
 - 🔒 Security policy: [SECURITY.md](SECURITY.md)
@@ -48,10 +49,11 @@ Active learning facial recognition for Wikimedia Commons. Train an ML model to r
 ## ✨ Highlights
 
 - 🧠 **Active learning UI**: fast yes/no classification with keyboard shortcuts, undo, skip, and manual face drawing
-- 🧵 **Background worker**: crawls Commons categories, downloads images, detects faces (HOG), and stores 128D encodings
+- 🧵 **Background worker**: crawls Commons categories, downloads images, and stores the 128D encodings the face service returns
 - 🔀 **Multi-instance workers**: distributed locking lets multiple workers process projects concurrently without conflicts
-- 🧪 **Persistent subprocess pool**: face detection runs in long-lived subprocesses, eliminating per-image dlib import overhead
-- 🛡️ **Hardened detection sandbox**: detection subprocesses run with scrubbed env and `RLIMIT_AS` / `RLIMIT_CPU` / `RLIMIT_FSIZE` ceilings to contain malformed-image attacks
+- 🧩 **Separate face service**: dlib lives in its own KServe service, deployed as a second Toolforge tool — the web and worker processes ship with zero ML dependencies
+- 🛡️ **Secret isolation**: the face service parses untrusted image bytes in a tool that holds no OAuth, database, or token-encryption secret, behind a bearer token and a request-size cap
+- 📦 **Batched detection**: images are sent in size-aware batches, and a service outage leaves work `pending` for the next cycle instead of failing it permanently
 - 🧷 **Bootstrap from existing tags**: seeds the model via SPARQL when P180 depicts claims already exist on Commons
 - 🤖 **Autonomous inference**: centroid-distance classification once you have enough confirmed examples
 - ✍️ **User-triggered Commons edits**: click "Send Edits to Wikimedia Commons" to write depicts claims via the Wikibase API (interruptible mid-batch; idempotent on already-removed claims)
@@ -73,26 +75,38 @@ Active learning facial recognition for Wikimedia Commons. Train an ML model to r
 +---------------------------+      +---------------------------+
 |       Flask Web App       |      |  Background Worker(s)     |
 |          (app.py)         |      |       (worker.py)         |
+|      no ML deps           |      |      no ML deps           |
 |---------------------------|      |---------------------------|
 | OAuth 2.0 login           |      | Category traversal        |
 | Project CRUD              |      | Image download            |
-| Active learning UI        |      | HOG face detection (pool) |
-| Classification UI         |      | SPARQL bootstrapping      |
-| Queue SDC writes          |      | Autonomous inference      |
-| Approve/reject/edit bbox  |      | Write SDC claims          |
-|                           |      | Distributed claim locking |
+| Active learning UI        |      | SPARQL bootstrapping      |
+| Classification UI         |      | Autonomous inference      |
+| Queue SDC writes          |      | Write SDC claims          |
+| Approve/reject/edit bbox  |      | Distributed claim locking |
 +------------+--------------+      +------------+--------------+
              |                                  |
-             +----------------------------------+
-                               |
+             |   face_client.py (HTTP, base64 image bytes)
+             +----------------+-----------------+
+                              v
+                 +----------------------------+
+                 |       Face Service         |
+                 |      (model-server/)       |
+                 |----------------------------|
+                 | KServe V1 predictor        |
+                 | dlib HOG detection         |
+                 | 128D face encoding         |
+                 +----------------------------+
+             |                                  |
+             +----------------+-----------------+
+                              v
                         +------------+
                         |   MariaDB  |
                         |  (ToolsDB) |
                         +------------+
 ```
 
-- 🧰 **Stack**: Python 3.11+, Flask, gunicorn, face_recognition (dlib HOG), PyMySQL, requests-oauthlib
-- ☁️ **Hosted on**: [Wikimedia Toolforge](https://wikitech.wikimedia.org/wiki/Help:Toolforge) (Kubernetes Build Service)
+- 🧰 **Stack**: Python 3.11+, Flask, gunicorn, PyMySQL, requests-oauthlib — plus KServe + dlib, isolated in the face service
+- ☁️ **Hosted on**: [Wikimedia Toolforge](https://wikitech.wikimedia.org/wiki/Help:Toolforge) — `wikivisage` (web + workers) and `wikivisage-face` (face service)
 - 🔀 **Workers**: Multiple instances run concurrently — each claims projects via `SELECT … FOR UPDATE` with automatic stale-claim expiry (15 min)
 
 ## 🗂️ Project layout
@@ -100,7 +114,14 @@ Active learning facial recognition for Wikimedia Commons. Train an ML model to r
 ```
 WikiVisage/
 ├── app.py               # Flask app: OAuth, routes, classification API
-├── worker.py            # Background ML pipeline: crawl, detect, infer, write (multi-instance)
+├── worker.py            # Background pipeline: crawl, remote detect, infer, write (multi-instance)
+├── face_client.py       # HTTP client for the face service (zero ML deps)
+├── model-server/        # Face detection service — the only place dlib lives
+│   ├── model.py         # KServe V1 predictor
+│   ├── guard.py         # Bearer-token + body-size middleware
+│   ├── Procfile         # Toolforge buildpack entrypoint (production)
+│   ├── Dockerfile       # Local development and CI
+│   └── requirements.txt # kserve, dlib-bin, face_recognition_models
 ├── token_crypto.py      # Fernet encrypt/decrypt helpers for OAuth tokens at rest
 ├── database.py          # MariaDB connection pool with retry logic
 ├── schema.sql           # Database schema (9 tables + indices)
@@ -109,9 +130,9 @@ WikiVisage/
 ├── templates/           # Jinja2 templates (10 files, all extend base.html)
 ├── static/              # Logos + screenshots
 ├── translations/        # i18n: en, nb, es, fr
-├── requirements.txt     # Runtime dependencies
+├── requirements.txt     # Runtime dependencies (no ML libraries)
 ├── requirements-dev.txt # Dev/test deps (pytest, ruff)
-└── tests/               # 741 tests (707 unit + 34 integration)
+└── tests/               # 823 tests (775 unit + 34 integration + 14 contract)
 ```
 
 ## 🧑‍💻 Setup
@@ -177,9 +198,18 @@ The app will be live at `https://<toolname>.toolforge.org`.
 
 ## 🧪 Local development
 
+Start the face service first — the app and worker call it over HTTP:
+
+```bash
+cd model-server && docker compose up --build   # http://localhost:8080
+```
+
+Then, in another terminal:
+
 ```bash
 pip install -r requirements-dev.txt
 
+export WIKIVISAGE_FACE_SERVICE_URL=http://localhost:8080
 export TOOL_TOOLSDB_USER=root
 export TOOL_TOOLSDB_PASSWORD=yourpassword
 export TOOL_TOOLSDB_HOST=127.0.0.1
@@ -194,6 +224,12 @@ mysql -u root -p -e "CREATE DATABASE wikiface_dev"
 python migrate.py
 python app.py                                   # Web app on http://localhost:8000
 python worker.py --worker-id local-1            # Background worker (separate terminal)
+```
+
+Confirm everything is wired up:
+
+```bash
+curl -s http://localhost:8000/health   # expects "face_service": "reachable"
 ```
 
 For local OAuth you'll need a separate consumer with `http://localhost:8000/auth/callback` as the callback URL. Set `OAUTHLIB_INSECURE_TRANSPORT=1` to allow OAuth over HTTP.
@@ -217,6 +253,16 @@ Each project has a couple of tunables:
 | `WIKIVISAGE_WORKER_BATCH_SIZE` | `50` | Images per processing batch |
 | `WIKIVISAGE_DB_POOL_SIZE` | auto | DB connection pool size (auto = `max_projects × image_threads + 3`) |
 | `COMMONS_DOWNLOAD_THROTTLE_SECONDS` | `0` | Delay between image downloads (seconds) |
+
+### 🧩 Face service variables
+
+Read by both the web app and the worker (see [TESTING.md](TESTING.md) for the full list):
+
+| Variable | Default | Description |
+|---|---:|---|
+| `WIKIVISAGE_FACE_SERVICE_URL` | `http://localhost:8080` | Base URL of the face service |
+| `WIKIVISAGE_FACE_SERVICE_TOKEN` | *(unset)* | Bearer token; must match the face tool's (required in production) |
+| `WIKIVISAGE_FACE_SERVICE_BATCH_SIZE` | `8` | Max images per detection request |
 
 ## ✅ Testing
 

@@ -52,13 +52,142 @@ jobs:
             requirements.txt
             requirements-dev.txt
 
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libopenblas0 liblapack3
-
       - name: Install Python dependencies
         run: pip install -r requirements-dev.txt
 
       - name: Run tests
         run: pytest --tb=short -q
+
+  face-service:
+    name: Face service (build + contract)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Builds model-server/ and runs face_client.py against the real container;
+      # this is the only job that crosses the HTTP boundary for real, so it
+      # catches a broken Dockerfile, an unresolvable dependency, or wire-format
+      # drift between the client and the server.
+      - name: Build face service image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./model-server
+          load: true
+          tags: wikivisage-face-service:ci
+          cache-from: type=gha,scope=face-service
+          cache-to: type=gha,mode=max,scope=face-service
+
+      # Run with a token, as production does, so the request guard is exercised
+      # and the auth contract tests stay enabled.
+      - name: Start face service
+        run: |
+          TOKEN=$(openssl rand -hex 24)
+          echo "::add-mask::$TOKEN"
+          echo "WIKIVISAGE_FACE_SERVICE_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+          docker run -d --name face-service \
+            -p 8080:8080 \
+            -e WIKIVISAGE_FACE_WORKERS=2 \
+            -e WIKIVISAGE_FACE_SERVICE_TOKEN="$TOKEN" \
+            --memory=3g --cpus=2 \
+            wikivisage-face-service:ci
+
+      - name: Wait for readiness
+        run: |
+          for i in $(seq 1 60); do
+            if curl -fsS http://localhost:8080/v1/models/wikivisage 2>/dev/null | grep -q '"ready":true'; then
+              echo "ready after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::face service did not become ready within 60s"
+          docker logs face-service
+          exit 1
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install client dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Run contract tests
+        env:
+          WIKIVISAGE_FACE_SERVICE_CONTRACT: "1"
+          WIKIVISAGE_FACE_SERVICE_URL: http://localhost:8080
+        run: pytest tests/test_face_service_contract.py -v --tb=short
+
+      - name: Face service logs
+        if: failure()
+        run: docker logs face-service
+
+  face-service-buildpack:
+    name: Face service (Toolforge buildpack + contract)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      # Production does not use the Dockerfile: Toolforge builds model-server/
+      # with Cloud Native Buildpacks. This builds it the same way, with
+      # Toolforge's builder, so a requirements.txt / project.toml / Procfile
+      # change that only breaks the buildpack path fails here, not in a release.
+      # heroku/deb-packages is listed explicitly because Toolforge injects it.
+      - name: Build with Toolforge's builder
+        run: |
+          docker run --rm -u root \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$PWD/model-server":/workspace -w /workspace \
+            buildpacksio/pack build wikivisage-face-bp:ci \
+            --builder tools-harbor.wmcloud.org/toolforge/heroku-builder:24_0.21.8 \
+            --buildpack heroku/deb-packages --buildpack heroku/python --buildpack heroku/procfile
+
+      # Same entrypoint, port and fail-closed check as the Toolforge job:
+      # TOOL_TOOLFORGE_API_URL makes model.py refuse to start without a token.
+      - name: Start face service
+        run: |
+          TOKEN=$(openssl rand -hex 24)
+          echo "::add-mask::$TOKEN"
+          echo "WIKIVISAGE_FACE_SERVICE_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+          docker run -d --name face-service -p 8000:8000 --entrypoint web \
+            -e TOOL_TOOLFORGE_API_URL=https://example.invalid \
+            -e WIKIVISAGE_FACE_SERVICE_TOKEN="$TOKEN" \
+            --memory=3g --cpus=2 \
+            wikivisage-face-bp:ci
+
+      - name: Wait for readiness
+        run: |
+          for i in $(seq 1 90); do
+            if curl -fsS http://localhost:8000/v1/models/wikivisage 2>/dev/null | grep -q '"ready":true'; then
+              echo "ready after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::face service did not become ready within 90s"
+          docker logs face-service
+          exit 1
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install client dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Run contract tests
+        env:
+          WIKIVISAGE_FACE_SERVICE_CONTRACT: "1"
+          WIKIVISAGE_FACE_SERVICE_URL: http://localhost:8000
+        run: pytest tests/test_face_service_contract.py -v --tb=short
+
+      - name: Face service logs
+        if: failure()
+        run: docker logs face-service

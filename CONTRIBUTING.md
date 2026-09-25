@@ -7,8 +7,7 @@ Thanks for your interest in contributing to WikiVisage! This guide covers how to
 ### Prerequisites
 
 - Python 3.11+
-- MariaDB (via Docker or Homebrew)
-- cmake (macOS only — `dlib-bin` lacks ARM wheels, falls back to compiling from source)
+- Docker (for MariaDB and the face service)
 
 ### 1. Clone and install dependencies
 
@@ -20,7 +19,8 @@ source venv/bin/activate
 pip install -r requirements-dev.txt   # Includes runtime deps + pytest, ruff
 ```
 
-> **macOS note:** `dlib-bin` doesn't have macOS ARM wheels. It falls back to compiling from source, which requires cmake (`brew install cmake`) and takes a few minutes.
+No compiler or ML libraries are needed: `requirements.txt` has no dlib. Face
+detection runs in the face service container (see step 4).
 
 ### 2. Start a local MariaDB
 
@@ -51,11 +51,24 @@ export OAUTHLIB_INSECURE_TRANSPORT=1
 
 ### 4. Run migrations and start
 
+Start the face service first — the app and worker call it over HTTP and image
+processing fails without it:
+
 ```bash
+cd model-server && docker compose up --build   # http://localhost:8080
+```
+
+Then, in another terminal:
+
+```bash
+export WIKIVISAGE_FACE_SERVICE_URL=http://localhost:8080
 python migrate.py                          # Create/update database tables
 python app.py                              # Web app on http://localhost:8000
 python -u worker.py --worker-id local-1    # Background worker (separate terminal)
 ```
+
+`curl -s localhost:8000/health` should report `"face_service": "reachable"`.
+See [TESTING.md](TESTING.md) for the face service in detail.
 
 The landing page and `/health` endpoint work without OAuth. See [test-local.md](test-local.md) for testing without OAuth credentials and a full smoke test checklist.
 
@@ -64,7 +77,9 @@ The landing page and `/health` endpoint work without OAuth. See [test-local.md](
 | File / Directory | Purpose |
 |---|---|
 | `app.py` | Flask web app: OAuth, routes, classification API |
-| `worker.py` | Background ML pipeline: crawl, detect, infer, write SDC (multi-instance) |
+| `worker.py` | Background pipeline: crawl, download, infer, write SDC (multi-instance) |
+| `face_client.py` | HTTP client for the face service — no ML dependencies |
+| `model-server/` | Face detection service (KServe + dlib). The only place dlib lives |
 | `token_crypto.py` | Fernet encrypt/decrypt helpers for OAuth tokens at rest |
 | `database.py` | MariaDB connection pool with retry logic |
 | `schema.sql` | DDL for 9 tables + indexes |
@@ -79,6 +94,7 @@ The landing page and `/health` endpoint work without OAuth. See [test-local.md](
 | `requirements-dev.txt` | Dev/test deps (pytest, pytest-cov, ruff) |
 | `.github/workflows/` | CI (lint + test) and CD (release-triggered Toolforge deploy) |
 | `SECURITY.md` | Vulnerability reporting policy |
+| `TESTING.md` | Face service: build, run, verify, troubleshoot |
 
 ## Code Conventions
 

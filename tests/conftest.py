@@ -26,22 +26,30 @@ from pymysql.cursors import DictCursor
 
 
 def pytest_configure(config):
-    """Register the 'integration' marker."""
+    """Register the custom markers."""
     config.addinivalue_line(
         "markers",
         "integration: tests requiring a local MariaDB (Docker)",
     )
+    config.addinivalue_line(
+        "markers",
+        "contract: tests requiring a running face service (Docker)",
+    )
 
 
 def pytest_collection_modifyitems(config, items):
-    """Auto-skip integration tests when WIKIVISAGE_TEST_DB env var is not set."""
+    """Auto-skip marked tests when their required backing service is absent."""
     skip_integration = pytest.mark.skip(
         reason="Set WIKIVISAGE_TEST_DB=1 to run integration tests (requires Docker MariaDB)"
     )
+    skip_contract = pytest.mark.skip(
+        reason="Set WIKIVISAGE_FACE_SERVICE_CONTRACT=1 to run contract tests (requires a running face service)"
+    )
     for item in items:
-        if "integration" in item.keywords:
-            if not os.environ.get("WIKIVISAGE_TEST_DB"):
-                item.add_marker(skip_integration)
+        if "integration" in item.keywords and not os.environ.get("WIKIVISAGE_TEST_DB"):
+            item.add_marker(skip_integration)
+        if "contract" in item.keywords and not os.environ.get("WIKIVISAGE_FACE_SERVICE_CONTRACT"):
+            item.add_marker(skip_contract)
 
 
 # ---------------------------------------------------------------------------

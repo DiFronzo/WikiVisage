@@ -14,7 +14,6 @@ with Path(__file__).parent.joinpath("pyproject.toml").open("rb") as _f:
 
 import base64
 import hashlib
-import io
 import json
 import logging
 import math
@@ -53,6 +52,7 @@ from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from requests_oauthlib import OAuth2Session
 
+import face_client
 from config import WAKE_FILE_PATH
 from database import (
     DatabaseError,
@@ -60,6 +60,7 @@ from database import (
     execute_transaction,
     init_db,
 )
+from face_client import FaceServiceError
 from redis_lock import single_flight
 from token_crypto import TokenDecryptionError, decrypt_token, encrypt_token
 
@@ -301,7 +302,17 @@ def _wikimedia_api_get(url: str, params: dict[str, str], timeout: int = 10) -> d
     return resp.json()
 
 
-_ALLOWED_DOWNLOAD_HOSTS = frozenset({"commons.wikimedia.org", "upload.wikimedia.org"})
+# Commons downloads can legitimately resolve to these hosts: `Special:FilePath`
+# with `?width=N` redirects to `thumb.wikimedia.org`, while the original file
+# URL still lands on `upload.wikimedia.org`. Keep `thumb.wikimedia.org` or
+# thumbnail downloads fail with "Redirect to untrusted host".
+_ALLOWED_DOWNLOAD_HOSTS = frozenset(
+    {
+        "commons.wikimedia.org",
+        "upload.wikimedia.org",
+        "thumb.wikimedia.org",
+    }
+)
 
 
 def _download_image(url: str, max_bytes: int = MAX_IMAGE_DOWNLOAD_BYTES) -> bytes:
@@ -2454,14 +2465,13 @@ def api_manual_face():
     try:
         image_bytes = _download_image(url)
 
-        import face_recognition  # lazy: dlib is ~130 MB; avoid loading at startup
+        try:
+            encoding_bytes = face_client.encode_known_face(image_bytes, (bbox_top, bbox_right, bbox_bottom, bbox_left))
+        except FaceServiceError:
+            logger.exception("Face service unavailable while encoding manual face")
+            return jsonify({"error": _("Face detection service is unavailable. Please try again in a moment.")}), 503
 
-        image_data = face_recognition.load_image_file(io.BytesIO(image_bytes))
-
-        face_location = [(bbox_top, bbox_right, bbox_bottom, bbox_left)]
-        encodings = face_recognition.face_encodings(image_data, face_location)
-
-        if not encodings:
+        if not encoding_bytes:
             return jsonify(
                 {
                     "error": _(
@@ -2469,8 +2479,6 @@ def api_manual_face():
                     )
                 }
             ), 422
-
-        encoding_bytes = encodings[0].tobytes()
 
         def _insert_manual_face(conn, cursor):
             _assert_project_access_locked(cursor, project_id, g.user["id"])
@@ -2996,13 +3004,13 @@ def api_update_face_bbox():
     try:
         image_bytes = _download_image(url)
 
-        import face_recognition  # lazy: dlib is ~130 MB; avoid loading at startup
+        try:
+            encoding_bytes = face_client.encode_known_face(image_bytes, (bbox_top, bbox_right, bbox_bottom, bbox_left))
+        except FaceServiceError:
+            logger.exception("Face service unavailable while re-encoding face bbox")
+            return jsonify({"error": _("Face detection service is unavailable. Please try again in a moment.")}), 503
 
-        image_data = face_recognition.load_image_file(io.BytesIO(image_bytes))
-        face_location = [(bbox_top, bbox_right, bbox_bottom, bbox_left)]
-        encodings = face_recognition.face_encodings(image_data, face_location)
-
-        if not encodings:
+        if not encoding_bytes:
             return jsonify(
                 {
                     "error": _(
@@ -3010,8 +3018,6 @@ def api_update_face_bbox():
                     )
                 }
             ), 422
-
-        encoding_bytes = encodings[0].tobytes()
 
         def _update_bbox(conn, cursor):
             _assert_project_access_locked(cursor, face_row["project_id"], g.user["id"])
@@ -4229,20 +4235,21 @@ def chrome_devtools_json():
 def health():
     """Health check endpoint for Toolforge monitoring.
 
-    Reports degraded (200 OK with `degraded: true`) if the rate limiter
-    fell back to per-process memory storage at startup — this means we lost
-    cross-worker rate limit coordination and the OAuth refresh single-flight
-    lock is a no-op. The DB is still healthy, so we don't return 503; ops
-    can scrape `degraded` and alert.
+    Reports degraded (200 OK with `degraded: true`) when the rate limiter fell
+    back to per-process memory storage at startup or when the face service is
+    unreachable. In both cases the database is still healthy, so we don't
+    return 503; ops can scrape `degraded` and alert.
     """
     try:
         rows = execute_query("SELECT 1 AS ok")
         if rows and rows[0].get("ok") == 1:
+            face_service_ok = face_client.is_healthy()
             payload = {
                 "status": "healthy",
                 "database": "connected",
                 "limiter": "redis" if _LIMITER_REDIS_OK else "memory",
-                "degraded": not _LIMITER_REDIS_OK,
+                "face_service": "reachable" if face_service_ok else "unreachable",
+                "degraded": not _LIMITER_REDIS_OK or not face_service_ok,
             }
             return jsonify(payload), 200
     except Exception:

@@ -1,0 +1,12 @@
+# Toolforge Build Service: system libraries for the face service.
+# Installed by the heroku/deb-packages buildpack (Ubuntu 24.04 Noble stack).
+# dlib-bin links against these at runtime; the Dockerfile installs the same two.
+
+[_]
+schema-version = "0.2"
+
+[com.heroku.buildpacks.deb-packages]
+install = [
+    "libopenblas0",
+    "liblapack3",
+]

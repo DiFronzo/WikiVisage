@@ -5,16 +5,27 @@ Step-by-step guide to running WikiVisage locally for development and testing.
 ## 1. Install Dependencies
 
 ```bash
-# macOS — install dlib build deps first
-brew install cmake
-
 # Create a virtualenv
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements-dev.txt   # Includes runtime deps + pytest, ruff
 ```
 
-> **macOS note:** `dlib-bin` doesn't have ARM wheels — it falls back to compiling dlib from source. This needs cmake and takes a few minutes. If it fails, install dlib separately: `pip install dlib` then `pip install face-recognition`.
+No compiler needed — `requirements.txt` contains no ML libraries. dlib lives
+only in the face service container.
+
+## 1b. Start the Face Service
+
+The worker cannot process images without it. Detection failures are treated as
+transient, so a missing face service shows up as images stuck `pending` rather
+than as an error.
+
+```bash
+cd model-server && docker compose up --build   # http://localhost:8080
+```
+
+Leave it running and set `WIKIVISAGE_FACE_SERVICE_URL=http://localhost:8080` in
+the environment below. See [TESTING.md](TESTING.md) for details.
 
 ## 2. Local MariaDB
 

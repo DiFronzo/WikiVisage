@@ -1,10 +1,7 @@
 import io
 import json
 import logging
-import multiprocessing
-import multiprocessing.connection
 import os
-import queue
 import random
 import re
 import signal
@@ -30,15 +27,16 @@ import warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="pkg_resources")
 warnings.filterwarnings("ignore", message=".*pkg_resources.*", category=UserWarning)
 
-import face_recognition
 import numpy as np
 import requests
 from PIL import Image
 from requests.adapters import HTTPAdapter
 from requests.packages.urllib3.util.retry import Retry
 
+import face_client
 from config import HEARTBEAT_FILE_DIR, WAKE_FILE_PATH
 from database import DatabaseError, close_pool, execute_query, execute_transaction, init_db
+from face_client import FaceServiceError, FaceServiceRejected
 from redis_lock import single_flight
 from token_crypto import TokenDecryptionError, decrypt_token, encrypt_token
 
@@ -57,6 +55,12 @@ POLL_INTERVAL = int(os.environ.get("WIKIVISAGE_WORKER_POLL_INTERVAL", 60))
 BATCH_SIZE = int(os.environ.get("WIKIVISAGE_WORKER_BATCH_SIZE", 50))
 MAX_CONCURRENT_PROJECTS = int(os.environ.get("WIKIVISAGE_WORKER_MAX_PROJECTS", 4))
 IMAGE_THREADS = int(os.environ.get("WIKIVISAGE_WORKER_IMAGE_THREADS", 4))
+
+# Images downloaded and held in memory at once. This — not BATCH_SIZE — bounds
+# the worker's peak memory: at the 50 MB download cap, holding a whole batch of
+# 50 would be 2.5 GB worst case. Sized to cover the download fan-out and one
+# full detection batch so neither stage starves the other.
+DETECTION_WAVE_SIZE = max(IMAGE_THREADS, face_client.FACE_SERVICE_BATCH_SIZE)
 
 # Distributed locking: stale claims from crashed workers expire after this many minutes
 CLAIM_EXPIRY_MINUTES = 15
@@ -155,6 +159,18 @@ def _validate_encoding(enc_bytes: bytes | None, face_id: int | str = "unknown") 
         logger.warning(f"Face {face_id}: encoding values out of expected range — skipping")
         return None
     return arr
+
+
+def _face_distance(centroid: np.ndarray, encoding: np.ndarray) -> float:
+    """Euclidean distance between a candidate encoding and the project centroid.
+
+    Reproduces ``face_recognition.face_distance([centroid], encoding)[0]``,
+    which is defined as ``numpy.linalg.norm(face_encodings - face_to_compare,
+    axis=1)``. Inlining it keeps the comparison numerically identical to every
+    ``confidence`` value already stored in the database while removing this
+    module's last import of the dlib-backed package.
+    """
+    return float(np.linalg.norm(centroid - encoding))
 
 
 def _build_skip_extensions_regex(extensions: set[str]) -> str:
@@ -292,7 +308,18 @@ def _api_request(
     raise Exception(f"Failed to execute API request after 3 attempts: {url}")
 
 
-_ALLOWED_DOWNLOAD_HOSTS = frozenset({"commons.wikimedia.org", "upload.wikimedia.org"})
+# Hosts a Commons media download may legitimately resolve to. Wikimedia splits
+# these: Special:FilePath?width=N lands on thumb.wikimedia.org, while the
+# original file (no width) still lands on upload.wikimedia.org. Dropping
+# thumb.wikimedia.org silently fails every thumbnail download — see
+# "Redirect to untrusted host" in Known Issues.
+_ALLOWED_DOWNLOAD_HOSTS = frozenset(
+    {
+        "commons.wikimedia.org",
+        "upload.wikimedia.org",
+        "thumb.wikimedia.org",
+    }
+)
 
 
 def _download_image(url: str, max_bytes: int = MAX_IMAGE_DOWNLOAD_BYTES) -> bytes:
@@ -671,554 +698,73 @@ def traverse_category(project: dict[str, Any]) -> int:
     return added_count
 
 
-FACE_DETECT_TIMEOUT = 120  # seconds — kill subprocess if face detection hangs
-
-
 # ---------------------------------------------------------------------------
-# Persistent Subprocess Pool for Face Detection
+# Image processing (detection happens in the face service — see face_client.py)
 # ---------------------------------------------------------------------------
-# Instead of spawning a new multiprocessing.Process per image (which re-imports
-# dlib/numpy/face_recognition each time — 2-5s overhead on Toolforge), we
-# maintain a pool of long-lived subprocesses. Each subprocess imports the heavy
-# libraries once at startup and processes images received via a Queue.
-# If a subprocess crashes (e.g. dlib segfault), it is automatically respawned.
 
 
-def _harden_face_detect_subprocess() -> None:
-    """Sandbox the face detection subprocess BEFORE importing untrusted-input parsers.
-
-    Defense in depth against a malicious image triggering a CVE in dlib / libjpeg /
-    libpng / Pillow. Two layers:
-
-    1. Scrub sensitive env vars from os.environ so a code-exec exploit in the
-       subprocess cannot exfiltrate OAuth secrets, the Fernet token-encryption key,
-       or DB credentials. The parent process retains these in its own os.environ.
-
-    2. Apply POSIX resource limits (best-effort, Linux only) so a CPU-bomb or
-       memory-bomb image cannot wedge the Toolforge pod:
-         - RLIMIT_AS:   2 GiB virtual address space (face detection on a single
-                        ~50 MB image needs well under 1 GiB even for HOG).
-         - RLIMIT_CPU:  180s CPU time (FACE_DETECT_TIMEOUT is 120s wall clock,
-                        plus headroom for the OS to deliver SIGXCPU).
-         - RLIMIT_FSIZE: 1 MiB — subprocess never legitimately writes files.
-
-    Failures here are logged but non-fatal: on platforms without `resource`
-    (Windows / some sandboxes) the subprocess still runs, just unrestricted.
-    """
-    # Scrub secrets BEFORE any third-party import that could be exploitable.
-    # Keep PATH / LANG / locale / Toolforge runtime hints intact so dlib + libc work.
-    _SENSITIVE_ENV_PREFIXES = (
-        "OAUTH_",
-        "WIKIVISAGE_TOKEN_KEY",
-        "FLASK_SECRET_KEY",
-        "TOOL_TOOLSDB_",
-        "WIKIVISAGE_DB_",
-        "WIKIVISAGE_REDIS_URL",
+def _mark_image_error(img_id: int, message: str) -> None:
+    """Record a terminal processing failure for an image."""
+    execute_query(
+        "UPDATE images SET status = 'error', error_message = %s WHERE id = %s",
+        (message[:1000], img_id),
+        fetch=False,
     )
-    for key in list(os.environ.keys()):
-        if any(key == p or key.startswith(p) for p in _SENSITIVE_ENV_PREFIXES):
-            del os.environ[key]
 
-    try:
-        import resource  # POSIX-only
 
-        # 2 GiB address space cap. dlib HOG on a 100MP image needs ~600 MB peak.
-        _AS_LIMIT = 2 * 1024 * 1024 * 1024
-        # 180s CPU. Wall-clock kill is FACE_DETECT_TIMEOUT (120s) in the parent.
-        _CPU_LIMIT = 180
-        # 1 MiB write cap — subprocess should never write files at all.
-        _FSIZE_LIMIT = 1 * 1024 * 1024
+def _download_for_detection(img_id: int, title: str) -> bytes | None:
+    """Download and dimension-check one image, ready for detection.
 
-        for limit_name, soft, hard in (
-            ("RLIMIT_AS", _AS_LIMIT, _AS_LIMIT),
-            ("RLIMIT_CPU", _CPU_LIMIT, _CPU_LIMIT),
-            ("RLIMIT_FSIZE", _FSIZE_LIMIT, _FSIZE_LIMIT),
-        ):
-            try:
-                resource.setrlimit(getattr(resource, limit_name), (soft, hard))
-            except (ValueError, OSError):
-                # Some sandboxes (CI, Docker without --privileged) reject lowering
-                # already-restrictive hard limits. Best-effort: continue.
-                pass
-    except ImportError:
-        # Non-POSIX (Windows). Subprocess runs unrestricted; documented limitation.
-        pass
-
-
-def _face_detect_worker_loop(
-    task_conn: multiprocessing.connection.Connection,
-    result_conn: multiprocessing.connection.Connection,
-    worker_id: int,
-) -> None:
-    """Long-lived subprocess loop: receive image bytes, detect faces, send results.
-
-    Runs until it receives a None sentinel on task_conn. Each task is
-    (request_id, image_bytes). Results are (request_id, "ok", locations,
-    encodings_bytes, width, height) or (request_id, "error", error_string).
-
-    Uses Pipe connections instead of multiprocessing.Queue to avoid POSIX
-    semaphores on /dev/shm (unavailable/tiny on Toolforge Kubernetes pods).
-    """
-    # Sandbox FIRST — before any import that parses untrusted bytes.
-    _harden_face_detect_subprocess()
-
-    # Heavy imports happen once per subprocess lifetime — this is the whole point
-    import face_recognition as fr
-    import numpy  # noqa: F401 — imported to ensure numpy is initialized
-    from PIL import Image as _PILImage
-
-    # Treat decompression bombs as errors (the default is a warning).
-    # MAX_IMAGE_PIXELS is also enforced in the parent via _validate_image_dimensions,
-    # but a defensive cap here protects against PIL being called inside fr.load_image_file.
-    _PILImage.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
-
-    try:
-        while True:
-            try:
-                task = task_conn.recv()
-                if task is None:
-                    break  # Sentinel: clean shutdown
-
-                request_id, image_bytes = task
-
-                try:
-                    try:
-                        image_data = fr.load_image_file(io.BytesIO(image_bytes))
-                    except _PILImage.DecompressionBombError as bomb_err:
-                        # Image exceeds PIL's pixel cap — refuse rather than allocate.
-                        result_conn.send((request_id, "error", f"decompression bomb rejected: {bomb_err}"))
-                        continue
-                    img_height, img_width = image_data.shape[:2]
-                    face_locations = fr.face_locations(image_data, model="hog")
-                    face_encodings = fr.face_encodings(image_data, face_locations)
-
-                    encodings_as_bytes = [enc.tobytes() for enc in face_encodings]
-                    result_conn.send(
-                        (
-                            request_id,
-                            "ok",
-                            face_locations,
-                            encodings_as_bytes,
-                            img_width,
-                            img_height,
-                        )
-                    )
-                except Exception as e:
-                    result_conn.send((request_id, "error", str(e)))
-
-            except EOFError:
-                # Parent closed the pipe — clean exit
-                break
-            except Exception:
-                # Pipe error or other fatal issue — subprocess exits, will be respawned
-                logging.getLogger(__name__).exception("Fatal error in face detection subprocess, exiting")
-                break
-    finally:
-        task_conn.close()
-        result_conn.close()
-
-
-class PoolUnavailableError(RuntimeError):
-    """Raised when the persistent face detection pool is not functional."""
-
-    pass
-
-
-class FaceDetectPool:
-    """Pool of persistent subprocesses for face detection.
-
-    Eliminates the 2-5 second per-image overhead of spawning a new Process
-    (which re-imports dlib/face_recognition) by keeping N subprocesses alive.
-    Each subprocess imports the heavy libraries once at startup.
-
-    Uses per-worker Pipe pairs for IPC instead of multiprocessing.Queue to
-    avoid POSIX semaphores backed by /dev/shm (unavailable or tiny on
-    Toolforge Kubernetes pods).
-
-    Thread-safe: multiple IMAGE_THREADS can call detect_faces() concurrently.
-    A background dispatch thread routes results from worker result pipes to
-    per-request queues, avoiding stash/requeue races.
-
-    Provides crash isolation: if a subprocess segfaults on a bad image,
-    it is automatically respawned for the next request.
-    """
-
-    def __init__(self, pool_size: int = IMAGE_THREADS):
-        self._pool_size = pool_size
-        # Per-worker: (task_parent_conn, result_parent_conn)
-        self._worker_pipes: list[
-            tuple[multiprocessing.connection.Connection, multiprocessing.connection.Connection]
-        ] = []
-        self._send_locks: list[threading.Lock] = []
-        self._workers: list[multiprocessing.Process] = []
-        self._workers_lock = threading.Lock()
-        self._request_counter = 0
-        self._counter_lock = threading.Lock()
-        self._next_worker = 0
-        self._next_worker_lock = threading.Lock()
-        # Per-request result routing: request_id -> queue.Queue holding the result
-        self._pending: dict[int, queue.Queue] = {}
-        self._pending_lock = threading.Lock()
-        self._dispatcher_thread: threading.Thread | None = None
-        self._shutdown_event = threading.Event()
-        self._started = False
-
-    def start(self) -> None:
-        """Start the subprocess pool and result dispatcher. Idempotent."""
-        if self._started:
-            return
-        logger.info(f"Starting face detection subprocess pool (size={self._pool_size})")
-        self._shutdown_event.clear()
-        with self._workers_lock:
-            for i in range(self._pool_size):
-                self._spawn_worker(i)
-        # Start background thread that routes results to per-request queues
-        self._dispatcher_thread = threading.Thread(
-            target=self._dispatch_results, daemon=True, name="face-pool-dispatch"
-        )
-        self._dispatcher_thread.start()
-        self._started = True
-
-    def _spawn_worker(self, worker_id: int) -> None:
-        """Spawn a single worker subprocess with fresh Pipe pairs. Caller must hold self._workers_lock."""
-        task_parent, task_child = multiprocessing.Pipe()
-        result_parent, result_child = multiprocessing.Pipe()
-
-        proc = multiprocessing.Process(
-            target=_face_detect_worker_loop,
-            args=(task_child, result_child, worker_id),
-        )
-        proc.start()
-
-        # Close child-end connections in parent (only the subprocess needs them)
-        task_child.close()
-        result_child.close()
-
-        if worker_id < len(self._workers):
-            # Synchronize pipe replacement with in-flight sends for this worker.
-            # Lock order must match detect_faces(): workers_lock -> send_lock.
-            with self._send_locks[worker_id]:
-                old_task, old_result = self._worker_pipes[worker_id]
-                for conn in (old_task, old_result):
-                    try:
-                        conn.close()
-                    except Exception:
-                        pass
-                self._workers[worker_id] = proc
-                self._worker_pipes[worker_id] = (task_parent, result_parent)
-        else:
-            self._workers.append(proc)
-            self._worker_pipes.append((task_parent, result_parent))
-            self._send_locks.append(threading.Lock())
-        logger.debug(f"Spawned face detection subprocess {worker_id} (pid={proc.pid})")
-
-    def _ensure_workers_alive(self) -> None:
-        """Check all workers and respawn any that have died."""
-        with self._workers_lock:
-            for i, proc in enumerate(self._workers):
-                if not proc.is_alive():
-                    exitcode = proc.exitcode
-                    logger.warning(f"Face detection subprocess {i} died (exitcode={exitcode}), respawning")
-                    self._spawn_worker(i)
-
-    def _dispatch_results(self) -> None:
-        """Background thread: read results from all worker Pipe connections and route to per-request queues.
-
-        Uses multiprocessing.connection.wait() to efficiently poll multiple
-        pipe endpoints. When a worker dies, recv() raises EOFError and the
-        connection is skipped (the main thread will respawn the worker with
-        a fresh pipe on the next detect_faces() call).
-        """
-        while not self._shutdown_event.is_set():
-            with self._workers_lock:
-                result_conns = [pipes[1] for pipes in self._worker_pipes]
-
-            if not result_conns:
-                time.sleep(0.1)
-                continue
-
-            try:
-                ready = multiprocessing.connection.wait(result_conns, timeout=1.0)
-            except (OSError, ValueError):
-                continue
-
-            for conn in ready:
-                try:
-                    result = conn.recv()
-                except (EOFError, OSError):
-                    continue
-
-                request_id = result[0]
-                with self._pending_lock:
-                    result_q = self._pending.get(request_id)
-
-                if result_q is not None:
-                    result_q.put(result)
-                else:
-                    logger.warning(
-                        f"Face detection result for unknown request_id={request_id} (caller may have timed out)"
-                    )
-
-    def is_healthy(self) -> bool:
-        """Check if the pool is started and the dispatcher thread is alive."""
-        return self._started and self._dispatcher_thread is not None and self._dispatcher_thread.is_alive()
-
-    def detect_faces(self, image_bytes: bytes) -> tuple[list, list[bytes], int, int]:
-        """Submit image for face detection and wait for result.
-
-        Thread-safe: each caller gets a unique request_id and a private result
-        queue. Tasks are round-robin assigned to worker subprocesses via their
-        individual Pipe connections. The dispatch thread routes the subprocess
-        result to the correct caller.
-
-        Returns (locations, encoding_bytes_list, width, height).
-        Raises PoolUnavailableError if the pool is not started or dispatcher is dead.
-        Raises RuntimeError on timeout, subprocess crash, or detection error.
-        """
-        if not self.is_healthy():
-            raise PoolUnavailableError(
-                "Face detection pool is not running"
-                + (" (dispatcher thread died)" if self._started else " (not started)")
-            )
-        self._ensure_workers_alive()
-
-        # Allocate unique request_id under lock
-        with self._counter_lock:
-            self._request_counter += 1
-            request_id = self._request_counter
-
-        # Register a private result queue for this request
-        result_q: queue.Queue = queue.Queue()
-        with self._pending_lock:
-            self._pending[request_id] = result_q
-
-        try:
-            # Round-robin worker selection
-            with self._next_worker_lock:
-                worker_idx = self._next_worker % self._pool_size
-                self._next_worker += 1
-
-            # Send task to selected worker's pipe.
-            # Lock order must match _spawn_worker() replacement path to avoid deadlocks.
-            with self._workers_lock:
-                with self._send_locks[worker_idx]:
-                    task_conn = self._worker_pipes[worker_idx][0]
-                try:
-                    task_conn.send((request_id, image_bytes))
-                except (BrokenPipeError, OSError) as e:
-                    raise RuntimeError(f"Worker {worker_idx} pipe broken: {e}")
-
-            # Wait for our result — the dispatch thread will deliver it
-            try:
-                result = result_q.get(timeout=FACE_DETECT_TIMEOUT)
-            except queue.Empty:
-                logger.warning(
-                    f"Face detection timed out after {FACE_DETECT_TIMEOUT}s (request_id={request_id}). "
-                    "Orphaned task will be discarded when a subprocess picks it up."
-                )
-                raise RuntimeError(f"Face detection timed out after {FACE_DETECT_TIMEOUT}s")
-
-            if result[1] == "error":
-                raise RuntimeError(f"Face detection failed: {result[2]}")
-            if result[1] != "ok":
-                raise RuntimeError(f"Unexpected subprocess result: {result[1]}")
-            return result[2], result[3], result[4], result[5]
-        finally:
-            # Unregister so dispatch thread doesn't hold a stale reference
-            with self._pending_lock:
-                self._pending.pop(request_id, None)
-
-    def shutdown(self) -> None:
-        """Gracefully shut down all worker subprocesses and the dispatch thread.
-
-        Ordering: mark not-started (reject new work) → send sentinels to
-        workers → join workers → stop dispatcher → close pipes. The dispatcher
-        must stay alive while workers drain so in-flight results are still
-        routed to their callers.
-        """
-        if not self._started:
-            return
-        logger.info("Shutting down face detection subprocess pool")
-
-        # 1. Reject new work immediately
-        self._started = False
-
-        # 2. Send sentinel to each worker subprocess so they exit cleanly
-        with self._workers_lock:
-            for i, (task_conn, _) in enumerate(self._worker_pipes):
-                try:
-                    with self._send_locks[i]:
-                        task_conn.send(None)
-                except Exception:
-                    pass
-
-            # 3. Wait for workers to exit (dispatcher still routing results)
-            for i, proc in enumerate(self._workers):
-                proc.join(timeout=5)
-                if proc.is_alive():
-                    logger.warning(f"Force-killing face detection subprocess {i}")
-                    proc.kill()
-                    proc.join(timeout=2)
-
-        # 4. Now stop the dispatcher — all workers are gone, no more results
-        self._shutdown_event.set()
-        if self._dispatcher_thread is not None:
-            self._dispatcher_thread.join(timeout=5)
-
-        # 5. Close all parent-side pipe connections to release OS resources
-        with self._workers_lock:
-            for task_conn, result_conn in self._worker_pipes:
-                for conn in (task_conn, result_conn):
-                    try:
-                        conn.close()
-                    except Exception:
-                        pass
-            self._workers.clear()
-            self._worker_pipes.clear()
-            self._send_locks.clear()
-        logger.info("Face detection subprocess pool shut down")
-
-
-# Module-level pool instance — initialized in main() before processing starts
-_face_pool: FaceDetectPool | None = None
-
-
-def _detect_faces_in_subprocess(
-    image_bytes: bytes,
-    conn: Any,
-) -> None:
-    """Run face detection in an isolated subprocess. Sends results back via pipe.
-
-    This isolates dlib's C++ code so a segfault kills only this subprocess,
-    not the parent worker. Results are sent as (locations, encodings_bytes) or
-    an error string.
-
-    NOTE: This is the FALLBACK path used only when the persistent pool is not
-    available (e.g. during single-image retries after pool crash).
-    """
-    # Sandbox FIRST — scrub env secrets and apply resource limits before
-    # processing any untrusted image bytes.  face_recognition is already
-    # imported at module level (unavoidable with spawn-based subprocesses),
-    # but hardening still prevents a code-exec exploit from accessing env
-    # secrets and caps runaway resource consumption.
-    _harden_face_detect_subprocess()
-
-    # Cap PIL decompression bombs here as well (mirrors pool worker behaviour).
-    from PIL import Image as _PILImage  # noqa: PLC0415
-
-    _PILImage.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
-
-    try:
-        image_data = face_recognition.load_image_file(io.BytesIO(image_bytes))
-        img_height, img_width = image_data.shape[:2]
-        face_locations = face_recognition.face_locations(image_data, model="hog")
-        face_encodings = face_recognition.face_encodings(image_data, face_locations)
-
-        encodings_as_bytes = [enc.tobytes() for enc in face_encodings]
-        conn.send(("ok", face_locations, encodings_as_bytes, img_width, img_height))
-    except Exception as e:
-        conn.send(("error", str(e)))
-    finally:
-        conn.close()
-
-
-def _run_face_detection_fallback(
-    image_bytes: bytes,
-) -> tuple[list, list[bytes], int, int]:
-    """Fallback: run face detection in a one-shot subprocess (old behavior).
-
-    Used only when the persistent pool is unavailable.
-    """
-    parent_conn, child_conn = multiprocessing.Pipe(duplex=False)
-    proc = multiprocessing.Process(
-        target=_detect_faces_in_subprocess,
-        args=(image_bytes, child_conn),
-    )
-    proc.start()
-    child_conn.close()
-
-    elapsed = 0.0
-    poll_slice = 2.0
-    got_result = False
-    while elapsed < FACE_DETECT_TIMEOUT:
-        if shutdown_requested:
-            parent_conn.close()
-            proc.kill()
-            proc.join(timeout=5)
-            raise InterruptedError("Worker shutting down during face detection")
-        wait = min(poll_slice, FACE_DETECT_TIMEOUT - elapsed)
-        if parent_conn.poll(wait):
-            got_result = True
-            break
-        elapsed += wait
-
-    if got_result:
-        result = parent_conn.recv()
-        parent_conn.close()
-        proc.join(timeout=5)
-    else:
-        parent_conn.close()
-        proc.kill()
-        proc.join(timeout=5)
-        raise RuntimeError(f"Face detection timed out after {FACE_DETECT_TIMEOUT}s")
-
-    if result[0] == "error":
-        raise RuntimeError(f"Face detection failed: {result[1]}")
-    if result[0] != "ok":
-        raise RuntimeError(f"Unexpected subprocess result: {result[0]}")
-
-    exitcode = proc.exitcode
-    if exitcode is not None and exitcode < 0:
-        raise RuntimeError(f"Face detection subprocess crashed with signal {-exitcode}")
-
-    return result[1], result[2], result[3], result[4]
-
-
-def _run_face_detection(image_bytes: bytes) -> tuple[list, list[bytes], int, int]:
-    """Run face detection — uses persistent pool if available, falls back to one-shot subprocess.
-
-    Returns (locations, encoding_bytes_list, width, height).
-    Raises RuntimeError if subprocess crashes (segfault) or times out.
-    """
-    if _face_pool is not None:
-        try:
-            return _face_pool.detect_faces(image_bytes)
-        except PoolUnavailableError as e:
-            logger.warning(f"Pool unavailable, falling back to one-shot subprocess: {e}")
-    return _run_face_detection_fallback(image_bytes)
-
-
-def _process_single_image(
-    img_id: int, title: str, *, bootstrapped: bool = False, project_id: int | None = None
-) -> bool:
-    """Download one image, detect faces in subprocess, store encodings.
-
-    If the image is bootstrapped (already has a P180 depicts claim on Commons)
-    and exactly one face is detected, auto-classify it as a target match.
-    Multi-face bootstrapped images are left for manual classification.
-
-    Returns True on success.
+    Returns the image bytes, or None if the image cannot be used now. A
+    transient failure (network error, timeout, HTTP 429/5xx) leaves the row
+    'pending' for a later cycle; anything else marks it 'error'. Keeping
+    transient failures pending matters: 'error' counts as processed, so a CDN
+    outage would otherwise let the project auto-complete as "no faces".
+    Dimension validation stays on this side so oversized images are rejected
+    before they are base64-inflated and pushed over the wire.
     """
     clean_title = title[5:] if title.startswith("File:") else title
     url = FILE_PATH_URL.format(file_title=clean_title)
-
     try:
-        t_start = time.monotonic()
-
         logger.debug(f"Downloading image {title}")
         image_bytes = _download_image(url)
         _validate_image_dimensions(image_bytes)
-        t_download = time.monotonic()
+    except requests.RequestException as e:
+        status = getattr(getattr(e, "response", None), "status_code", None)
+        if status is None or status == 429 or status >= 500:
+            logger.warning(f"Transient error downloading image {title}, leaving pending: {e}")
+            return None
+        logger.error(f"Error downloading image {title}: {e}")
+        _mark_image_error(img_id, str(e))
+        return None
+    except Exception as e:
+        logger.error(f"Error downloading image {title}: {e}")
+        _mark_image_error(img_id, str(e))
+        return None
 
-        if COMMONS_DOWNLOAD_THROTTLE_SECONDS > 0:
-            time.sleep(COMMONS_DOWNLOAD_THROTTLE_SECONDS)
+    if COMMONS_DOWNLOAD_THROTTLE_SECONDS > 0:
+        time.sleep(COMMONS_DOWNLOAD_THROTTLE_SECONDS)
+    return image_bytes
 
-        face_locations, encodings_bytes, det_width, det_height = _run_face_detection(image_bytes)
-        del image_bytes
-        t_detect = time.monotonic()
 
-        face_count = len(face_locations)
+def _persist_detection(
+    img_id: int,
+    result: face_client.DetectionResult,
+    *,
+    bootstrapped: bool = False,
+    project_id: int | None = None,
+) -> bool:
+    """Store detected faces and mark the image processed.
 
+    If the image is bootstrapped (already has a P180 depicts claim on Commons)
+    and exactly one face was detected, auto-classify it as a target match.
+    Multi-face bootstrapped images are left for manual classification.
+    """
+    face_locations = result.locations
+    encodings_bytes = result.encodings
+    face_count = len(face_locations)
+
+    try:
         # Batch-insert detected faces in chunks to stay within max_allowed_packet.
         # All faces start unclassified (is_target=NULL). Classification
         # happens via human confirmation or autonomous inference.
@@ -1244,7 +790,7 @@ def _process_single_image(
         execute_query(
             "UPDATE images SET status = 'processed', face_count = %s, "
             "detection_width = %s, detection_height = %s WHERE id = %s",
-            (face_count, det_width, det_height, img_id),
+            (face_count, result.width, result.height, img_id),
             fetch=False,
         )
 
@@ -1276,26 +822,114 @@ def _process_single_image(
                 )
                 logger.info(f"Auto-classified {auto_classified} face(s) on bootstrapped image {img_id} as target")
 
-        t_db = time.monotonic()
-
-        logger.debug(
-            f"Image {img_id} ({face_count} faces): "
-            f"download={t_download - t_start:.2f}s, "
-            f"detect={t_detect - t_download:.2f}s, "
-            f"db={t_db - t_detect:.2f}s, "
-            f"total={t_db - t_start:.2f}s"
-        )
         return True
-
     except Exception as e:
-        logger.error(f"Error processing image {title}: {e}")
-        error_msg = str(e)[:1000]
-        execute_query(
-            "UPDATE images SET status = 'error', error_message = %s WHERE id = %s",
-            (error_msg, img_id),
-            fetch=False,
-        )
+        logger.error(f"Error storing faces for image {img_id}: {e}")
+        _mark_image_error(img_id, str(e))
         return False
+
+
+def _handle_detection_failure(img_id: int, title: str, error: FaceServiceError) -> None:
+    """Apply the right retry policy to a failed detection.
+
+    The distinction matters: a rejected image will never succeed, so it is
+    marked 'error' and stops consuming batch slots. A service outage is
+    transient, so the row is left 'pending' and picked up on a later poll cycle
+    rather than being permanently written off because the model server happened
+    to be restarting.
+    """
+    if isinstance(error, FaceServiceRejected):
+        logger.error(f"Face service rejected image {title}: {error}")
+        _mark_image_error(img_id, f"face service rejected image: {error}")
+    else:
+        logger.warning(f"Face service unavailable for image {title}, leaving pending: {error}")
+
+
+def _process_image_wave(wave: list[dict[str, Any]], project_id: int) -> tuple[int, tuple[float, float, float]]:
+    """Download, detect, and persist one wave of images.
+
+    Three phases:
+
+    1. Download in parallel — pure network I/O, and the slow half, so it keeps
+       the same thread fan-out the per-image pipeline used.
+    2. Detect in batches — one round trip per batch instead of per image. The
+       client splits further on whichever of its count/byte budgets is hit
+       first.
+    3. Persist serially — the DB pool is small (<= 6 connections per worker
+       against Toolforge's shared 20-connection ceiling) and these are short
+       writes, so fanning them out would only contend for connections.
+
+    Returns ``(processed_count, (download_seconds, detect_seconds, db_seconds))``.
+    """
+    t_start = time.monotonic()
+
+    rows_by_key: dict[str, dict[str, Any]] = {}
+    downloaded: list[tuple[str, bytes]] = []
+    with ThreadPoolExecutor(max_workers=IMAGE_THREADS) as executor:
+        futures = {}
+        for img_row in wave:
+            if shutdown_requested:
+                break
+            key = str(img_row["id"])
+            rows_by_key[key] = img_row
+            futures[executor.submit(_download_for_detection, img_row["id"], img_row["file_title"])] = key
+
+        for future in as_completed(futures):
+            if shutdown_requested:
+                executor.shutdown(wait=False, cancel_futures=True)
+                break
+            key = futures[future]
+            try:
+                image_bytes = future.result()
+            except Exception as e:
+                logger.error(f"Thread error downloading {rows_by_key[key]['file_title']}: {e}")
+                continue
+            if image_bytes is not None:
+                downloaded.append((key, image_bytes))
+
+    t_download = time.monotonic()
+
+    detections: dict[str, face_client.DetectionResult | FaceServiceError] = {}
+    if downloaded and not shutdown_requested:
+        detections = face_client.detect_faces_batch(downloaded)
+    # Release the wave's image bytes before touching the DB — this is the peak
+    # memory point of the whole pipeline.
+    downloaded.clear()
+
+    t_detect = time.monotonic()
+
+    processed_count = 0
+    unavailable = 0
+    for key, outcome in detections.items():
+        if shutdown_requested:
+            break
+        img_row = rows_by_key[key]
+        if isinstance(outcome, FaceServiceError):
+            if not isinstance(outcome, FaceServiceRejected):
+                unavailable += 1
+            _handle_detection_failure(img_row["id"], img_row["file_title"], outcome)
+            continue
+        if _persist_detection(
+            img_row["id"],
+            outcome,
+            bootstrapped=bool(img_row.get("bootstrapped")),
+            project_id=project_id,
+        ):
+            processed_count += 1
+
+    # A whole wave failing as "unavailable" means the service is down, not that
+    # the images were bad. Those rows stay pending by design, so without an
+    # explicit error here the pipeline would stall in total silence.
+    if detections and unavailable == len(detections):
+        logger.error(
+            "Face service unreachable at %s — %d image(s) left pending and NOT processed. "
+            "Check WIKIVISAGE_FACE_SERVICE_URL and that the service is running.",
+            face_client.FACE_SERVICE_URL,
+            unavailable,
+        )
+
+    t_db = time.monotonic()
+    return processed_count, (t_download - t_start, t_detect - t_download, t_db - t_detect)
 
 
 def process_images(project: dict[str, Any]) -> int:
@@ -1404,37 +1038,28 @@ def process_images(project: dict[str, Any]) -> int:
 
     batch_start = time.monotonic()
     processed_count = 0
+    t_download = t_detect = t_db = 0.0
 
-    with ThreadPoolExecutor(max_workers=IMAGE_THREADS) as executor:
-        futures = {}
-        for img_row in pending_images:
-            if shutdown_requested:
-                break
-            future = executor.submit(
-                _process_single_image,
-                img_row["id"],
-                img_row["file_title"],
-                bootstrapped=bool(img_row.get("bootstrapped")),
-                project_id=project_id,
-            )
-            futures[future] = img_row["file_title"]
-
-        for future in as_completed(futures):
-            if shutdown_requested:
-                executor.shutdown(wait=False, cancel_futures=True)
-                break
-            try:
-                if future.result():
-                    processed_count += 1
-            except Exception as e:
-                logger.error(f"Thread error processing {futures[future]}: {e}")
+    # Waves, not one big download pass — see DETECTION_WAVE_SIZE.
+    for wave_start in range(0, len(pending_images), DETECTION_WAVE_SIZE):
+        if shutdown_requested:
+            break
+        wave = pending_images[wave_start : wave_start + DETECTION_WAVE_SIZE]
+        processed, timings = _process_image_wave(wave, project_id)
+        processed_count += processed
+        t_download += timings[0]
+        t_detect += timings[1]
+        t_db += timings[2]
 
     batch_elapsed = time.monotonic() - batch_start
     batch_size = len(pending_images) if pending_images else 0
     per_image = batch_elapsed / batch_size if batch_size > 0 else 0
     logger.info(
         f"Batch complete: {processed_count}/{batch_size} images in {batch_elapsed:.1f}s "
-        f"({per_image:.2f}s/image avg, {IMAGE_THREADS} threads)"
+        f"({per_image:.2f}s/image avg) | "
+        f"download={t_download:.1f}s ({IMAGE_THREADS} threads), "
+        f"detect={t_detect:.1f}s (waves of {DETECTION_WAVE_SIZE}), "
+        f"db={t_db:.1f}s"
     )
 
     # Update project stats
@@ -1557,7 +1182,7 @@ def bootstrap_from_sparql(project: dict[str, Any]) -> int:
                             )
 
                         # Auto-classify single unclassified faces as target
-                        # matches (same logic as _process_single_image).
+                        # matches (same logic as _persist_detection).
                         # Perform this in a single conditional UPDATE to avoid a per-image COUNT query.
                         auto = execute_query(
                             "UPDATE faces "
@@ -1776,7 +1401,7 @@ def run_autonomous_inference(project: dict[str, Any]) -> int:
         encoding = _validate_encoding(row["encoding"], row["id"])
         if encoding is None:
             continue
-        distance = face_recognition.face_distance([centroid], encoding)[0]
+        distance = _face_distance(centroid, encoding)
         face_distances.append((row["id"], row["image_id"], float(distance)))
 
     # Phase 2: per-image dedup — only the closest face below threshold is a match;
@@ -2953,6 +2578,20 @@ def process_project(project: dict[str, Any], *, skip_discovery: bool = False) ->
 
         # 3b. Auto-complete if no faces or insufficient faces detected
         if not shutdown_requested and _is_still_active():
+            # Never auto-complete while images are still unprocessed. The loop
+            # above exits as soon as a batch yields zero successes, which also
+            # happens when every download fails (e.g. Commons moves its CDN to a
+            # host the allowlist rejects). Without this guard a transient outage
+            # is recorded as a permanent "no faces in this category" verdict,
+            # and _claim_active_projects only picks up status='active', so the
+            # remaining images are never retried. Mirrors app.py's guard.
+            pending_row = execute_query(
+                "SELECT COUNT(*) AS cnt FROM images WHERE project_id = %s AND status = 'pending'",
+                (project_id,),
+                fetch=True,
+            )
+            pending_images = pending_row[0]["cnt"] if pending_row else 0
+
             face_count_row = execute_query(
                 "SELECT COUNT(*) AS cnt FROM faces f "
                 "JOIN images i ON f.image_id = i.id "
@@ -2973,7 +2612,14 @@ def process_project(project: dict[str, Any], *, skip_discovery: bool = False) ->
             else:
                 # Fall back to the original project dict or default to preserve existing behavior.
                 min_confirmed = project.get("min_confirmed", 5)
-            if total_faces == 0:
+
+            if pending_images > 0:
+                logger.warning(
+                    f"Project {project_id}: image processing stopped early with {pending_images} image(s) "
+                    f"still pending ({total_faces} faces so far). NOT auto-completing — the project stays "
+                    f"active and will retry next cycle. Check images.error_message for the cause."
+                )
+            elif total_faces == 0:
                 execute_query(
                     "UPDATE projects SET status = 'completed', completion_reason = 'no_faces' "
                     "WHERE id = %s AND status = 'active'",
@@ -3085,11 +2731,19 @@ def main():
         logger.error(f"Database initialization failed: {e}")
         sys.exit(1)
 
-    # Start persistent face detection subprocess pool — each subprocess imports
-    # dlib/face_recognition once, eliminating 2-5s per-image spawn overhead.
-    global _face_pool
-    _face_pool = FaceDetectPool(pool_size=IMAGE_THREADS)
-    _face_pool.start()
+    # Probe the face service once at startup so a misconfigured endpoint shows
+    # up in the logs immediately rather than as a wave of per-image failures.
+    # Non-fatal: the service may still be starting, and detection retries on
+    # every poll cycle anyway.
+    if face_client.is_healthy():
+        logger.info("Face service ready at %s (model=%s)", face_client.FACE_SERVICE_URL, face_client.FACE_SERVICE_MODEL)
+    else:
+        logger.warning(
+            "Face service not ready at %s (model=%s) — image processing will retry each poll cycle. "
+            "Set WIKIVISAGE_FACE_SERVICE_URL if this is wrong.",
+            face_client.FACE_SERVICE_URL,
+            face_client.FACE_SERVICE_MODEL,
+        )
 
     try:
         diag = execute_query(
@@ -3340,15 +2994,9 @@ def main():
     finally:
         logger.info("Worker %s shutting down, releasing claims and closing resources.", _worker_id)
         _release_all_claims()
-        if _face_pool is not None:
-            _face_pool.shutdown()
+        face_client.reset_session()
         close_pool()
 
 
 if __name__ == "__main__":
-    # spawn avoids fork-safety issues with threads + dlib's C++ code
-    try:
-        multiprocessing.set_start_method("spawn")
-    except RuntimeError:
-        pass
     main()

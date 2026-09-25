@@ -8,17 +8,20 @@ os.environ.setdefault("TOOL_TOOLSDB_HOST", "localhost")
 from unittest.mock import MagicMock, patch
 
 import numpy as np
+import pytest
+import requests
+
+import face_client
 
 with patch("database.init_db"):
     import worker as _worker_module
     from worker import (
-        FaceDetectPool,
         _claim_active_projects,
         _claim_inference_projects,
         _claim_sdc_projects,
         _infer_and_release,
         _process_and_release,
-        _process_single_image,
+        _process_image_wave,
         _refresh_claims,
         _release_all_claims,
         _release_project,
@@ -29,6 +32,8 @@ with patch("database.init_db"):
         run_autonomous_inference,
         write_sdc_claims,
     )
+
+_handle_detection_failure = _worker_module._handle_detection_failure
 
 
 def _make_encoding(seed: int) -> bytes:
@@ -87,6 +92,7 @@ def test_inference_single_face_per_image():
         if "SELECT f.id, f.image_id, f.encoding FROM faces f" in sql:
             return unclassified_rows
         if "UPDATE faces SET" in sql:
+            assert params is not None
             update_params.append(params)
             return len(unclassified_rows)
         raise AssertionError(f"Unexpected query executed: {sql}")
@@ -94,10 +100,7 @@ def test_inference_single_face_per_image():
     distances = [0.3, 0.8, 0.4]
     with (
         patch("worker.execute_query", side_effect=mock_execute_query),
-        patch(
-            "worker.face_recognition.face_distance",
-            side_effect=[np.array([d], dtype=np.float64) for d in distances],
-        ),
+        patch("worker._face_distance", side_effect=distances),
         patch("worker.shutdown_requested", False),
     ):
         classified = run_autonomous_inference(project)
@@ -134,20 +137,14 @@ def test_inference_multi_face_dedup():
         if "SELECT f.id, f.image_id, f.encoding FROM faces f" in sql:
             return unclassified_rows
         if "UPDATE faces SET" in sql:
+            assert params is not None
             update_params.append(params)
             return len(unclassified_rows)
         raise AssertionError(f"Unexpected query executed: {sql}")
 
     with (
         patch("worker.execute_query", side_effect=mock_execute_query),
-        patch(
-            "worker.face_recognition.face_distance",
-            side_effect=[
-                np.array([0.5], dtype=np.float64),
-                np.array([0.3], dtype=np.float64),
-                np.array([0.4], dtype=np.float64),
-            ],
-        ),
+        patch("worker._face_distance", side_effect=[0.5, 0.3, 0.4]),
         patch("worker.shutdown_requested", False),
     ):
         classified = run_autonomous_inference(project)
@@ -180,19 +177,14 @@ def test_inference_multi_face_all_above_threshold():
         if "SELECT f.id, f.image_id, f.encoding FROM faces f" in sql:
             return unclassified_rows
         if "UPDATE faces SET" in sql:
+            assert params is not None
             update_params.append(params)
             return len(unclassified_rows)
         raise AssertionError(f"Unexpected query executed: {sql}")
 
     with (
         patch("worker.execute_query", side_effect=mock_execute_query),
-        patch(
-            "worker.face_recognition.face_distance",
-            side_effect=[
-                np.array([0.7], dtype=np.float64),
-                np.array([0.8], dtype=np.float64),
-            ],
-        ),
+        patch("worker._face_distance", side_effect=[0.7, 0.8]),
         patch("worker.shutdown_requested", False),
     ):
         classified = run_autonomous_inference(project)
@@ -228,15 +220,7 @@ def test_inference_returns_classified_count():
 
     with (
         patch("worker.execute_query", side_effect=mock_execute_query),
-        patch(
-            "worker.face_recognition.face_distance",
-            side_effect=[
-                np.array([0.3], dtype=np.float64),
-                np.array([0.5], dtype=np.float64),
-                np.array([0.2], dtype=np.float64),
-                np.array([0.9], dtype=np.float64),
-            ],
-        ),
+        patch("worker._face_distance", side_effect=[0.3, 0.5, 0.2, 0.9]),
         patch("worker.shutdown_requested", False),
     ):
         classified = run_autonomous_inference(project)
@@ -244,10 +228,15 @@ def test_inference_returns_classified_count():
     assert classified == 4
 
 
-def test_process_single_image_bootstrapped_single_face_auto_classifies():
+def test_process_image_wave_bootstrapped_single_face_auto_classifies():
     """Single-face bootstrapped image should auto-classify as target, set sdc_written=1, and increment faces_confirmed."""
     fake_location = (10, 110, 110, 10)
     fake_encoding = _make_encoding(1)
+    detection_result = face_client.DetectionResult(
+        width=800,
+        height=600,
+        faces=[face_client.DetectedFace(*fake_location, encoding=fake_encoding)],
+    )
 
     query_calls: list[tuple] = []
 
@@ -259,13 +248,12 @@ def test_process_single_image_bootstrapped_single_face_auto_classifies():
 
     with (
         patch("worker.execute_query", side_effect=mock_execute_query),
-        patch("worker._download_image", return_value=b"fake"),
-        patch("worker._validate_image_dimensions"),
-        patch("worker._run_face_detection", return_value=([fake_location], [fake_encoding], 800, 600)),
+        patch("worker._download_for_detection", return_value=b"fake"),
+        patch("worker.face_client.detect_faces_batch", return_value={"42": detection_result}),
     ):
-        result = _process_single_image(42, "File:Test.jpg", bootstrapped=True, project_id=5)
+        processed, _timings = _process_image_wave([{"id": 42, "file_title": "File:Test.jpg", "bootstrapped": 1}], 5)
 
-    assert result is True
+    assert processed == 1
 
     auto_classify_calls = [c for c in query_calls if "UPDATE faces SET is_target" in c[0]]
     assert len(auto_classify_calls) == 1
@@ -281,10 +269,18 @@ def test_process_single_image_bootstrapped_single_face_auto_classifies():
     assert sdc_written_calls[0][1] == (42,)
 
 
-def test_process_single_image_bootstrapped_multi_face_no_auto_classify():
+def test_process_image_wave_bootstrapped_multi_face_no_auto_classify():
     """Multi-face bootstrapped image should NOT trigger auto-classify or faces_confirmed update."""
     fake_locations = [(10, 110, 110, 10), (200, 310, 310, 200)]
     fake_encodings = [_make_encoding(2), _make_encoding(3)]
+    detection_result = face_client.DetectionResult(
+        width=800,
+        height=600,
+        faces=[
+            face_client.DetectedFace(*fake_locations[0], encoding=fake_encodings[0]),
+            face_client.DetectedFace(*fake_locations[1], encoding=fake_encodings[1]),
+        ],
+    )
 
     query_calls: list[tuple] = []
 
@@ -294,21 +290,25 @@ def test_process_single_image_bootstrapped_multi_face_no_auto_classify():
 
     with (
         patch("worker.execute_query", side_effect=mock_execute_query),
-        patch("worker._download_image", return_value=b"fake"),
-        patch("worker._validate_image_dimensions"),
-        patch("worker._run_face_detection", return_value=(fake_locations, fake_encodings, 800, 600)),
+        patch("worker._download_for_detection", return_value=b"fake"),
+        patch("worker.face_client.detect_faces_batch", return_value={"43": detection_result}),
     ):
-        result = _process_single_image(43, "File:Multi.jpg", bootstrapped=True, project_id=5)
+        processed, _timings = _process_image_wave([{"id": 43, "file_title": "File:Multi.jpg", "bootstrapped": 1}], 5)
 
-    assert result is True
+    assert processed == 1
     assert not any("UPDATE faces SET is_target" in c[0] for c in query_calls)
     assert not any("UPDATE projects SET faces_confirmed" in c[0] for c in query_calls)
 
 
-def test_process_single_image_non_bootstrapped_no_auto_classify():
+def test_process_image_wave_non_bootstrapped_no_auto_classify():
     """Non-bootstrapped single-face image should NOT trigger auto-classify or faces_confirmed update."""
     fake_location = (10, 110, 110, 10)
     fake_encoding = _make_encoding(4)
+    detection_result = face_client.DetectionResult(
+        width=800,
+        height=600,
+        faces=[face_client.DetectedFace(*fake_location, encoding=fake_encoding)],
+    )
 
     query_calls: list[tuple] = []
 
@@ -318,13 +318,12 @@ def test_process_single_image_non_bootstrapped_no_auto_classify():
 
     with (
         patch("worker.execute_query", side_effect=mock_execute_query),
-        patch("worker._download_image", return_value=b"fake"),
-        patch("worker._validate_image_dimensions"),
-        patch("worker._run_face_detection", return_value=([fake_location], [fake_encoding], 800, 600)),
+        patch("worker._download_for_detection", return_value=b"fake"),
+        patch("worker.face_client.detect_faces_batch", return_value={"44": detection_result}),
     ):
-        result = _process_single_image(44, "File:NonBoot.jpg", bootstrapped=False, project_id=5)
+        processed, _timings = _process_image_wave([{"id": 44, "file_title": "File:NonBoot.jpg", "bootstrapped": 0}], 5)
 
-    assert result is True
+    assert processed == 1
     assert not any("UPDATE faces SET is_target" in c[0] for c in query_calls)
     assert not any("UPDATE projects SET faces_confirmed" in c[0] for c in query_calls)
 
@@ -353,23 +352,34 @@ def test_process_images_prioritises_non_bootstrap():
             return 1
         return ()
 
-    submitted_ids = []
+    persisted = []
 
-    def fake_process_single(img_id, title, bootstrapped=False, project_id=None):
-        submitted_ids.append((img_id, bootstrapped))
+    def fake_persist(img_id, result, *, bootstrapped=False, project_id=None):
+        persisted.append((img_id, bootstrapped, len(result.faces), project_id))
         return True
+
+    detect_result = face_client.DetectionResult(
+        width=100,
+        height=80,
+        faces=[face_client.DetectedFace(1, 2, 3, 4, encoding=_make_encoding(10))],
+    )
 
     with (
         patch("worker.execute_query", side_effect=mock_execute_query),
-        patch("worker._process_single_image", side_effect=fake_process_single),
+        patch("worker._download_for_detection", return_value=b"fake-bytes"),
+        patch(
+            "worker.face_client.detect_faces_batch",
+            return_value={"3": detect_result, "1": detect_result, "2": detect_result},
+        ),
+        patch("worker._persist_detection", side_effect=fake_persist),
         patch("worker.shutdown_requested", False),
     ):
         count = process_images(project)
 
     assert count == 3
-    assert (1, False) in submitted_ids
-    assert (2, False) in submitted_ids
-    assert (3, True) in submitted_ids
+    assert (1, False, 1, 99) in persisted
+    assert (2, False, 1, 99) in persisted
+    assert (3, True, 1, 99) in persisted
 
 
 def test_process_images_caps_bootstrap_when_already_processed():
@@ -396,7 +406,8 @@ def test_process_images_caps_bootstrap_when_already_processed():
 
     with (
         patch("worker.execute_query", side_effect=mock_execute_query),
-        patch("worker._process_single_image"),
+        patch("worker._download_for_detection"),
+        patch("worker.face_client.detect_faces_batch"),
         patch("worker.shutdown_requested", False),
     ):
         count = process_images(project)
@@ -404,59 +415,6 @@ def test_process_images_caps_bootstrap_when_already_processed():
     assert count == 0
     assert not bootstrap_pending_queried, "Bootstrap pending query should not be executed when cap is already met"
 
-
-def test_face_detect_pool_start_detect_shutdown_uses_pipe_lifecycle():
-    task_parent = MagicMock()
-    task_child = MagicMock()
-    result_parent = MagicMock()
-    result_child = MagicMock()
-    proc = MagicMock()
-    proc.pid = 1234
-    proc.is_alive.side_effect = [True, False]
-    dispatcher = MagicMock()
-    dispatcher.is_alive.return_value = True
-    fake_result_q = MagicMock()
-    fake_result_q.get.return_value = (1, "ok", [(1, 2, 3, 4)], [b"enc"], 100, 80)
-
-    with (
-        patch("worker.multiprocessing.Pipe", side_effect=[(task_parent, task_child), (result_parent, result_child)]),
-        patch("worker.multiprocessing.Process", return_value=proc),
-        patch("worker.threading.Thread", return_value=dispatcher),
-        patch("worker.queue.Queue", return_value=fake_result_q),
-    ):
-        pool = FaceDetectPool(pool_size=1)
-        pool.start()
-        result = pool.detect_faces(b"image-bytes")
-        pool.shutdown()
-
-    assert result == ([(1, 2, 3, 4)], [b"enc"], 100, 80)
-    task_parent.send.assert_any_call((1, b"image-bytes"))
-    task_parent.send.assert_any_call(None)
-    task_child.close.assert_called_once()
-    result_child.close.assert_called_once()
-
-
-def test_face_detect_pool_dispatch_routes_result_to_pending_request_queue():
-    pool = FaceDetectPool(pool_size=1)
-    result_conn = MagicMock()
-    result_payload = (7, "ok", [], [], 10, 10)
-    result_conn.recv.return_value = result_payload
-    pending_q = MagicMock()
-
-    pool._worker_pipes = [(MagicMock(), result_conn)]
-    pool._pending = {7: pending_q}
-
-    def _wait_once(_conns, timeout):
-        pool._shutdown_event.set()
-        return [result_conn]
-
-    with patch("worker.multiprocessing.connection.wait", side_effect=_wait_once):
-        pool._dispatch_results()
-
-    pending_q.put.assert_called_once_with(result_payload)
-
-
-import pytest
 
 try:
     from conftest import _make_encoding
@@ -1443,6 +1401,7 @@ def test_bootstrap_flags_existing_images_at_cap():
 
         # SELECT existing image by page_id
         if "SELECT id, status FROM images WHERE project_id" in sql_s:
+            assert params is not None
             page_id = params[1]
             if page_id == 5001:
                 return [{"id": 101, "status": "processed"}]
@@ -1621,6 +1580,95 @@ def test_process_project_auto_completes_insufficient_faces():
     assert len(update_calls) == 1
     assert "insufficient_faces" in update_calls[0][0]
     mock_inference.assert_not_called()
+
+
+def test_process_project_never_autocompletes_while_images_are_pending():
+    """A transient download outage must not be recorded as a permanent verdict.
+
+    Regression for the thumb.wikimedia.org incident: every download failed, so
+    process_images returned 0 and the batch loop exited after one pass. Step 3b
+    then saw 0 faces and wrote completion_reason='no_faces' — even though 173
+    images were still pending. Because _claim_active_projects only picks up
+    status='active', those images were never retried.
+    """
+    project = {
+        "id": 20,
+        "user_id": 1,
+        "wikidata_qid": "Q232101",
+        "commons_category": "Rachael Leigh Cook by year",
+        "status": "active",
+        "distance_threshold": 0.6,
+        "min_confirmed": 10,
+    }
+    completion_updates = []
+
+    def mock_eq(sql, params=None, fetch=True):
+        sql_s = sql if isinstance(sql, str) else str(sql)
+        if "SELECT status, worker_claimed_by FROM projects" in sql_s:
+            return [{"status": "active", "worker_claimed_by": "test-worker"}]
+        if "UPDATE projects SET worker_claimed_at" in sql_s:
+            return 1
+        # 173 images never got processed because every download failed.
+        if "FROM images WHERE project_id" in sql_s and "status = 'pending'" in sql_s:
+            return [{"cnt": 173}]
+        # Zero faces — but only because detection never ran.
+        if "COUNT(*) AS cnt FROM faces" in sql_s:
+            return [{"cnt": 0}]
+        if "SELECT min_confirmed FROM projects" in sql_s:
+            return [{"min_confirmed": 10}]
+        if "UPDATE projects SET status = 'completed'" in sql_s:
+            completion_updates.append((sql_s, params))
+            return 1
+        return ()
+
+    with (
+        patch("worker.execute_query", side_effect=mock_eq),
+        patch("worker.traverse_category", return_value=0),
+        patch("worker.bootstrap_from_sparql", return_value=0),
+        patch("worker.process_images", return_value=0),
+        patch("worker.run_autonomous_inference", return_value=0),
+        patch("worker.shutdown_requested", False),
+        patch("worker._worker_id", "test-worker"),
+    ):
+        process_project(project)
+
+    assert completion_updates == [], f"Project was auto-completed despite 173 pending images: {completion_updates}"
+
+
+def test_worker_download_image_follows_redirect_to_thumb_host():
+    """Commons serves ?width=N thumbnails from thumb.wikimedia.org.
+
+    Real chain: Special:FilePath -> commons/index.php -> thumb.wikimedia.org.
+    Rejecting that host fails every thumbnail download.
+    """
+    hop1 = MagicMock()
+    hop1.is_redirect = True
+    hop1.headers = {"Location": "https://commons.wikimedia.org/w/index.php?title=Special:Redirect/file/X.jpg"}
+    hop1.close = MagicMock()
+
+    hop2 = MagicMock()
+    hop2.is_redirect = True
+    hop2.headers = {"Location": "https://thumb.wikimedia.org/wikipedia/commons/thumb/6/61/X.jpg/500px-X.jpg"}
+    hop2.close = MagicMock()
+
+    content_resp = MagicMock()
+    content_resp.is_redirect = False
+    content_resp.headers = {"Content-Length": "4"}
+    content_resp.raise_for_status = MagicMock()
+    content_resp.iter_content.return_value = iter([b"data"])
+    content_resp.close = MagicMock()
+
+    mock_session = MagicMock()
+    mock_session.get.side_effect = [hop1, hop2, content_resp]
+    with patch.object(_worker_module, "_get_session", return_value=mock_session):
+        result = _worker_module._download_image("https://commons.wikimedia.org/wiki/Special:FilePath/X.jpg?width=500")
+    assert result == b"data"
+
+
+def test_worker_allowlist_still_rejects_non_wikimedia_hosts():
+    """Adding thumb.wikimedia.org must not widen the allowlist to lookalikes."""
+    expected = frozenset({"commons.wikimedia.org", "upload.wikimedia.org", "thumb.wikimedia.org"})
+    assert expected == _worker_module._ALLOWED_DOWNLOAD_HOSTS
 
 
 def test_process_project_no_auto_complete_when_enough_faces():
@@ -2325,6 +2373,7 @@ def test_traverse_category_handles_subcategories():
     def mock_api_request(url, params=None, **kwargs):
         resp = MagicMock()
         call_count[0] += 1
+        assert params is not None
         cmtitle = params.get("cmtitle", "")
         if "ParentCat" in cmtitle:
             resp.json.return_value = {
@@ -2390,6 +2439,7 @@ def test_traverse_category_respects_image_limit():
         if "INSERT IGNORE INTO images" in sql:
             # Pretend all inserted
             flat = params
+            assert flat is not None
             return len([x for x in range(0, len(flat), 3)])
         if "UPDATE projects SET images_total" in sql:
             return 1
@@ -2590,12 +2640,16 @@ def test_bootstrap_api_exception_returns_zero():
 
 
 # ---------------------------------------------------------------------------
-# Tests for _process_single_image error path
+# Tests for _process_image_wave error paths
 # ---------------------------------------------------------------------------
 
 
-def test_process_single_image_download_error_marks_image_as_error():
-    """When download fails, image status is set to 'error'."""
+def test_process_image_wave_download_failure_is_not_detected_or_persisted():
+    """A failed download drops out of the wave: never sent for detection, never persisted.
+
+    _download_for_detection marks the row 'error' itself, so the wave must not
+    issue any further DB writes for it.
+    """
     db_calls = []
 
     def mock_execute_query(sql, params=None, fetch=True):
@@ -2604,17 +2658,17 @@ def test_process_single_image_download_error_marks_image_as_error():
 
     with (
         patch("worker.execute_query", side_effect=mock_execute_query),
-        patch("worker._download_image", side_effect=RuntimeError("download failed")),
+        patch("worker._download_for_detection", return_value=None),
+        patch("worker.face_client.detect_faces_batch") as mock_batch,
     ):
-        result = _process_single_image(55, "File:Broken.jpg")
+        processed, _timings = _process_image_wave([{"id": 55, "file_title": "File:Broken.jpg", "bootstrapped": 0}], 7)
 
-    assert result is False
-    error_updates = [(s, p) for s, p in db_calls if "UPDATE images SET status = 'error'" in s]
-    assert len(error_updates) == 1
-    assert error_updates[0][1][1] == 55
+    assert processed == 0
+    assert db_calls == []
+    mock_batch.assert_not_called()
 
 
-def test_process_single_image_no_faces_no_auto_classify():
+def test_process_image_wave_no_faces_no_auto_classify():
     """When no faces are detected, no is_target update is made."""
     db_calls = []
 
@@ -2622,17 +2676,118 @@ def test_process_single_image_no_faces_no_auto_classify():
         db_calls.append((sql.strip(), params))
         return None
 
+    detection_result = face_client.DetectionResult(width=800, height=600, faces=[])
+
     with (
         patch("worker.execute_query", side_effect=mock_execute_query),
-        patch("worker._download_image", return_value=b"fake"),
-        patch("worker._validate_image_dimensions"),
-        patch("worker._run_face_detection", return_value=([], [], 800, 600)),
+        patch("worker._download_for_detection", return_value=b"fake"),
+        patch("worker.face_client.detect_faces_batch", return_value={"56": detection_result}),
     ):
-        result = _process_single_image(56, "File:Empty.jpg", bootstrapped=True, project_id=10)
+        processed, _timings = _process_image_wave([{"id": 56, "file_title": "File:Empty.jpg", "bootstrapped": 1}], 10)
 
-    assert result is True
+    assert processed == 1
     auto_class = [s for s, _ in db_calls if "UPDATE faces SET is_target" in s]
     assert len(auto_class) == 0
+
+
+def test_process_image_wave_mixed_success_and_failure():
+    """One unusable image in a wave must not stop its siblings being persisted."""
+    good = face_client.DetectionResult(
+        width=800,
+        height=600,
+        faces=[face_client.DetectedFace(10, 110, 110, 10, encoding=_make_encoding(9))],
+    )
+    batch = {
+        "1": good,
+        "2": face_client.FaceServiceRejected("corrupt image"),
+        "3": good,
+    }
+
+    error_updates: list[tuple] = []
+
+    def mock_execute_query(sql, params=None, fetch=True):
+        if "status = 'error'" in sql:
+            assert params is not None
+            error_updates.append(params)
+        return None
+
+    with (
+        patch("worker.execute_query", side_effect=mock_execute_query),
+        patch("worker._download_for_detection", side_effect=lambda i, t: b"bytes"),
+        patch("worker.face_client.detect_faces_batch", return_value=batch),
+    ):
+        processed, _timings = _process_image_wave(
+            [
+                {"id": 1, "file_title": "File:A.jpg", "bootstrapped": 0},
+                {"id": 2, "file_title": "File:B.jpg", "bootstrapped": 0},
+                {"id": 3, "file_title": "File:C.jpg", "bootstrapped": 0},
+            ],
+            5,
+        )
+
+    assert processed == 2
+    # The rejected image is terminal, so exactly one row is marked 'error'.
+    assert len(error_updates) == 1
+    assert error_updates[0][1] == 2
+
+
+def test_process_image_wave_unavailable_leaves_row_pending():
+    """A service outage must NOT write the image off as a permanent error."""
+    batch = {"1": face_client.FaceServiceUnavailable("connection refused")}
+
+    db_calls: list[str] = []
+
+    def mock_execute_query(sql, params=None, fetch=True):
+        db_calls.append(sql)
+        return None
+
+    with (
+        patch("worker.execute_query", side_effect=mock_execute_query),
+        patch("worker._download_for_detection", return_value=b"bytes"),
+        patch("worker.face_client.detect_faces_batch", return_value=batch),
+    ):
+        processed, _timings = _process_image_wave([{"id": 1, "file_title": "File:A.jpg", "bootstrapped": 0}], 5)
+
+    assert processed == 0
+    assert not any("status = 'error'" in sql for sql in db_calls)
+
+
+def test_process_images_splits_batch_into_memory_bounded_waves():
+    """process_images must not hold a whole BATCH_SIZE of image bytes at once.
+
+    DETECTION_WAVE_SIZE is what bounds worker peak memory, so a pending set
+    larger than one wave has to be processed across several waves.
+    """
+    wave_size = _worker_module.DETECTION_WAVE_SIZE
+    pending = [{"id": i, "file_title": f"File:{i}.jpg", "bootstrapped": 0} for i in range(wave_size * 2 + 1)]
+
+    def mock_execute_query(sql, params=None, fetch=True):
+        if "SUM(CASE WHEN bootstrapped" in sql:
+            return [{"bs_done": 0, "total": len(pending)}]
+        if "COUNT(*) AS cnt FROM images" in sql:
+            return [{"cnt": 0}]
+        if "status = 'pending' AND bootstrapped = 1" in sql:
+            return []
+        if "status = 'pending' AND bootstrapped = 0" in sql:
+            return pending
+        return None
+
+    wave_sizes: list[int] = []
+
+    def fake_wave(wave, project_id):
+        wave_sizes.append(len(wave))
+        return len(wave), (0.0, 0.0, 0.0)
+
+    with (
+        patch("worker.execute_query", side_effect=mock_execute_query),
+        patch("worker._process_image_wave", side_effect=fake_wave),
+    ):
+        processed = process_images({"id": 99})
+
+    assert processed == len(pending)
+    assert len(wave_sizes) == 3
+    assert wave_sizes == [wave_size, wave_size, 1]
+    assert max(wave_sizes) <= wave_size
 
 
 # ---------------------------------------------------------------------------
@@ -2666,7 +2821,8 @@ def test_process_images_no_pending_bootstrap_at_cap_skips_leftover():
 
     with (
         patch("worker.execute_query", side_effect=mock_execute_query),
-        patch("worker._process_single_image"),
+        patch("worker._download_for_detection"),
+        patch("worker.face_client.detect_faces_batch"),
         patch("worker.shutdown_requested", False),
     ):
         count = process_images(project)
@@ -2917,16 +3073,37 @@ def test_inference_skips_invalid_candidate_encodings():
 
     with (
         patch("worker.execute_query", side_effect=mock_execute_query),
-        patch(
-            "worker.face_recognition.face_distance",
-            return_value=np.array([0.3], dtype=np.float64),
-        ),
+        patch("worker._face_distance", return_value=0.3),
         patch("worker.shutdown_requested", False),
     ):
         result = run_autonomous_inference(project)
 
     # Only the valid candidate (id=501) should be classified
     assert result == 1
+
+
+def test_handle_detection_failure_rejected_marks_image_error():
+    db_calls = []
+
+    def mock_execute_query(sql, params=None, fetch=True):
+        db_calls.append((sql, params, fetch))
+        return 1
+
+    with patch("worker.execute_query", side_effect=mock_execute_query):
+        _handle_detection_failure(77, "File:Rejected.jpg", face_client.FaceServiceRejected("bad image"))
+
+    assert len(db_calls) == 1
+    sql, params, fetch = db_calls[0]
+    assert "UPDATE images SET status = 'error'" in sql
+    assert params == ("face service rejected image: bad image", 77)
+    assert fetch is False
+
+
+def test_handle_detection_failure_unavailable_leaves_pending():
+    with patch("worker.execute_query") as mock_execute_query:
+        _handle_detection_failure(78, "File:Retry.jpg", face_client.FaceServiceUnavailable("timeout"))
+
+    mock_execute_query.assert_not_called()
 
 
 # --- Security: _worker_id sanitization ---
@@ -3099,3 +3276,32 @@ def test_validate_encoding_accepts_edge_values():
     """Boundary values just inside the [-10, 10] bound are accepted."""
     arr = np.full(128, 9.99, dtype=np.float64)
     assert _worker_module._validate_encoding(arr.tobytes(), face_id=10) is not None
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        requests.ConnectionError("reset"),
+        requests.Timeout("slow"),
+        requests.HTTPError(response=MagicMock(status_code=503)),
+        requests.HTTPError(response=MagicMock(status_code=429)),
+    ],
+)
+def test_download_for_detection_leaves_transient_failures_pending(exc):
+    """'error' counts as processed, so marking transient failures would allow false auto-completion."""
+    with (
+        patch.object(_worker_module, "_download_image", side_effect=exc),
+        patch.object(_worker_module, "_mark_image_error") as mark,
+    ):
+        assert _worker_module._download_for_detection(1, "File:X.jpg") is None
+    mark.assert_not_called()
+
+
+def test_download_for_detection_marks_permanent_http_errors():
+    exc = requests.HTTPError(response=MagicMock(status_code=404))
+    with (
+        patch.object(_worker_module, "_download_image", side_effect=exc),
+        patch.object(_worker_module, "_mark_image_error") as mark,
+    ):
+        assert _worker_module._download_for_detection(1, "File:X.jpg") is None
+    mark.assert_called_once()

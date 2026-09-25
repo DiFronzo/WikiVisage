@@ -1,6 +1,6 @@
 [project]
 name = "wikivisage"
-version = "0.9.0"
+version = "0.10.0"
 requires-python = ">=3.11"
 
 [tool.ruff]
@@ -46,4 +46,7 @@ ignore = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
-markers = ["integration: tests requiring a local MariaDB (Docker)"]
+markers = [
+    "integration: tests requiring a local MariaDB (Docker)",
+    "contract: tests requiring a running face service (Docker)",
+]
