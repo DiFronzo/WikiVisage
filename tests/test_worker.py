@@ -1666,15 +1666,8 @@ def test_worker_download_image_follows_redirect_to_thumb_host():
 
 def test_worker_allowlist_still_rejects_non_wikimedia_hosts():
     """Adding thumb.wikimedia.org must not widen the allowlist to lookalikes."""
-    allowed = _worker_module._ALLOWED_DOWNLOAD_HOSTS
-    assert "thumb.wikimedia.org" in allowed
-    for host in (
-        "thumb.wikimedia.org.evil.com",
-        "thumbx.wikimedia.org",
-        "wikimedia.org",
-        "thumb.wikipedia.org",
-    ):
-        assert host not in allowed, f"{host} must not be allowed"
+    expected = frozenset({"commons.wikimedia.org", "upload.wikimedia.org", "thumb.wikimedia.org"})
+    assert expected == _worker_module._ALLOWED_DOWNLOAD_HOSTS
 
 
 def test_process_project_no_auto_complete_when_enough_faces():

@@ -1,0 +1,137 @@
+Based on the symbol map I pulled from app.py (3177 lines, 21 routes, ~60 helper functions), here's what the blueprint split would require:
+Proposed Blueprint Structure
+Blueprint	Routes
+auth	/login, /auth/callback, POST /logout
+projects	/project/new, /project/<id>, /project/<id>/classify, /project/<id>/settings, /project/<id>/delete, /project/<id>/classify/clear-skips, /project/<id>/rerun-inference
+api	/api/classify, /api/undo-classify, /api/reclassify, /api/manual-face, /api/update-face-bbox, /api/write-sdc/<id>, /api/sdc-status/<id>, /api/gallery/<id>, /api/progress/<id>
+pages	/, /dashboard, /leaderboard, /account/settings, /health, /commons-thumb/<path>, /set-language/<lang>
+app.py (core)	Error handlers, middleware, shared helpers, app factory
+Shared State That Complicates It
+These live at module level in app.py and are used across all route groups:
+- limiter — Flask-Limiter instance, decorates routes in api and projects
+- _load_whitelist / _whitelist_cache — used in before_request
+- _make_oauth_session / _refresh_access_token / _get_valid_token — used by auth routes AND api routes (SDC writes need tokens)
+- _csrf_token / _validate_csrf — used by every POST route across all blueprints
+- login_required decorator — used by routes in every blueprint
+- get_project_for_user / verify_image_ownership / has_sibling_match — DB helpers used by projects and api blueprints
+- _download_image — used by api_manual_face and api_update_face_bbox
+- commons_thumb_url / _snap_thumb_width / _THUMB_STEPS — used by projects, api, and pages
+- _is_human_entity / _commons_category_exists / _fetch_p18_thumb_url / _fetch_wikidata_label — Wikidata/Commons API helpers used by project creation
+- _remove_sdc_claim — used by api_reclassify
+- Constants: MAX_BBOX_PX, MIN_BBOX_AREA, PROJECTS_PER_PAGE, MAX_IMAGE_DOWNLOAD_BYTES, OAuth URLs, etc.
+All of this would need to move to a shared helpers.py or stay in app.py and get imported by each blueprint module.
+Template url_for() Changes
+Every url_for('function_name') in all 9 templates would need blueprint prefixes:
+url_for('index')           → url_for('pages.index')
+url_for('login')           → url_for('auth.login')
+url_for('logout')          → url_for('auth.logout')
+url_for('dashboard')       → url_for('pages.dashboard')
+url_for('project_detail')  → url_for('projects.project_detail')
+url_for('api_classify')    → url_for('api.api_classify')
+...
+That's ~50-80 url_for() calls across templates, plus any in Python code (redirects in route handlers).
+Test Breakage
+This is the biggest issue. The tests mock module-level attributes like:
+monkeypatch.setattr(app_module, "_is_human_entity", ...)
+monkeypatch.setattr(app_module, "get_project_for_user", ...)
+monkeypatch.setattr(app_module, "_load_whitelist", ...)
+monkeypatch.setattr(app_module, "_download_image", ...)
+monkeypatch.setattr(app_module, "execute_query", ...)
+If _is_human_entity moves to helpers.py and gets imported into blueprints/projects.py, the mock target changes. And due to Python's import system, you have to mock where the name is looked up, not where it's defined. So every mock path would need updating — potentially 200+ monkeypatch.setattr calls across 420 tests.
+Some tests also import app_module directly:
+import app as app_module
+And then inspect its source code, check attributes, etc. Those would all need reworking.
+File Layout (What I Would Have Created)
+WikiVisage/
+├── app.py                    # App factory, middleware, error handlers, shared init
+├── helpers.py                # Shared helpers: OAuth, CSRF, download, Wikidata API, thumb utils
+├── blueprints/
+│   ├── __init__.py
+│   ├── auth.py               # login, callback, logout
+│   ├── projects.py           # project CRUD, classify, settings, detail, delete
+│   ├── api.py                # All /api/* JSON endpoints
+│   └── pages.py              # index, dashboard, leaderboard, account, health, commons-thumb
+├── config.py                 # Already exists (WAKE_FILE_PATH)
+├── ...
+
+
+That makes sense — clean slate after all these schema and logic changes. Before the migrate, wipe the data:
+# 1. Rebuild
+toolforge build start https://github.com/DiFronzo/WikiVisage.git
+# 2. Wipe all data (drops and recreates tables)
+
+mariadb --defaults-file=$HOME/replica.my.cnf -h tools.db.svc.wikimedia.cloud s57423__wikiface \
+  -e "ALTER TABLE faces DROP FOREIGN KEY fk_faces_classified_by_user;" 2>/dev/null; \
+mariadb --defaults-file=$HOME/replica.my.cnf -h tools.db.svc.wikimedia.cloud s57423__wikiface \
+  -e "ALTER TABLE faces DROP FOREIGN KEY fk_faces_superseded_by;" 2>/dev/null; \
+echo "done"
+
+toolforge jobs run migrate --command "python migrate.py" --image tool-wikivisage/tool-wikivisage:latest --wait
+# 4. Restart web service
+toolforge webservice buildservice restart
+# 5. Restart worker
+toolforge jobs restart ml-worker
+
+curl -fsSL https://raw.githubusercontent.com/DiFronzo/WikiVisage/refs/heads/main/jobs.yaml -o /tmp/jobs.yaml
+              toolforge jobs load /tmp/jobs.yaml
+
+toolforge jobs run migrate --command "python migrate.py --reset" --image tool-wikivisage/tool-wikivisage:latest --wait
+
+
+toolforge jobs run ml-worker --command "python -u worker.py" --image tool-wikivisage/tool-wikivisage:latest --continuous --mem 2G
+
+toolforge jobs delete ml-worker
+
+toolforge jobs run ml-worker --command 'python -u worker.py' --image tool-wikivisage/tool-wikivisage:latest --continuous --mem 3Gi
+
+when i delete 
+
+https://WikiVisage.toolforge.org
+
+
+
+Yes, you have plenty of room to scale up. The binding constraint is memory (4.5Gi free).
+Current setup (from Procfile + jobs.yaml): web (gunicorn, 4 workers) + ml-worker (1 continuous job).
+Options:
+1. Bump worker concurrency (free, no extra pods) — increase MAX_CONCURRENT_PROJECTS and IMAGE_THREADS via env vars. You're at 3 projects × 4 threads = 12 concurrent image operations. Could go to 4×6 = 24 if CPU/memory allows. Just set WIKIVISAGE_WORKER_MAX_PROJECTS and WIKIVISAGE_WORKER_IMAGE_THREADS.
+2. Run multiple worker instances — spin up a second ml-worker pod. Would need coordination to avoid double-processing the same project (current code doesn't have distributed locking, so this would cause duplicate work).
+3. Increase gunicorn workers — currently 4 workers. Could bump to 6-8 if you're seeing web request queuing.
+My recommendation: Option 1 is the easiest win — no code changes, just bump the env vars. You have the CPU headroom. Something like:
+WIKIVISAGE_WORKER_MAX_PROJECTS: "5"
+WIKIVISAGE_WORKER_IMAGE_THREADS: "6"
+
+
+tools.wikivisage@tools-bastion-15:~$ toolforge jobs run ml-worker-3 \
+>   --command 'python -u worker.py --worker-id ml-worker-3' \
+>   --image tool-wikivisage/tool-wikivisage:latest \
+>   --continuous \
+>   --mem 3Gi \
+>   --cpu 3
+tools.wikivisage@tools-bastion-15:~$                                       
+tools.wikivisage@tools-bastion-15:~$
+tools.wikivisage@tools-bastion-15:~$
+tools.wikivisage@tools-bastion-15:~$ toolforge jobs list
++-------------+------------+-------------+
+|  Job name:  | Job type:  |   Status:   |
++-------------+------------+-------------+
+| ml-worker-3 | continuous | Not running |
++-------------+------------+-------------+
+tools.wikivisage@tools-bastion-15:~$ toolforge jobs logs ml-worker-3      
+ERROR: Job 'ml-worker-3' does not have any logs available
+
+1. Session Security: Flask-Session is in requirements.txt but Session(app) is never called. App uses Flask's built-in cookie-based sessions (signed but not encrypted). Session data (user_id, csrf_token) is readable client-side. Recommendation: Either initialize Flask-Session with server-side backend or remove it from requirements.txt.
+
+what about classifying the same person, could a trained model be shared between users? make a plan for this, where the user can select a shared trained model
+
+aiagent
+<9r6U0E
+
+
+Here are all your *.upthere.fyi services on k3s:
+#	Service	URL	Namespace	Image	Status
+1	Penpot	https://penpot.upthere.fyi	penpot	penpotapp/frontend:2.14.1 + backend + exporter + PostgreSQL + Valkey	✅ Running
+2	VERT	https://vert.upthere.fyi	vert	ghcr.io/vert-sh/vert:latest	✅ Running
+3	Cactoide	https://cactoide.upthere.fyi	cactoide	ghcr.io/polaroi8d/cactoide/cactoide:latest + PostgreSQL	✅ Running
+4	Canine	https://canine.upthere.fyi	canine	ghcr.io/caninehq/canine:latest (web + worker) + PostgreSQL	✅ Running
+5	Uptime Kuma	https://kuma.upthere.fyi	uptime-kuma	louislam/uptime-kuma:2	✅ Running
+https://grafana.upthere.fyi/d/k8s-server-overview/k3s-server-overview-nuc01
