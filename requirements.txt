@@ -1,0 +1,30 @@
+# WikiVisage face detection model server — Python 3.11 (see .python-version)
+#
+# This is the ONLY place in the WikiVisage stack that depends on dlib. The same
+# file is installed by the Dockerfile (local dev, CI) and by the Toolforge
+# buildpack (production), so it must stay installable with a plain
+# `pip install -r requirements.txt` — no --no-deps, no VCS URLs.
+
+# --- KServe runtime -------------------------------------------------------
+# 0.15.x matches the range Wikimedia's inference-services repo pins and runs on
+# FastAPI/uvicorn. Do not downgrade to 0.8.x: it pins numpy~=1.19 / ray 1.9 /
+# protobuf 3.19, none of which build on Python 3.11.
+kserve==0.15.2
+
+# --- Face detection -------------------------------------------------------
+# `dlib-bin` is a pre-built wheel of dlib; the `dlib` sdist needs CMake plus a
+# C++ toolchain and OOMs on constrained builders. The `face_recognition` wrapper
+# is deliberately NOT a dependency: it requires `dlib` by name, which pip would
+# try to compile. model.py makes the same dlib calls directly instead.
+#
+# Encoding compatibility: stored 128D vectors depend on these two exact
+# versions. Changing either invalidates every encoding in the database.
+dlib-bin==20.0.1
+face_recognition_models==0.3.0
+
+# face_recognition_models still imports pkg_resources, removed in setuptools 82+
+setuptools<81
+
+# --- Image handling -------------------------------------------------------
+Pillow>=12.2.0
+numpy>=1.26.0

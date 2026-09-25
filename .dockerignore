@@ -1,0 +1,5 @@
+# Keep the build context to just what the image needs.
+*
+!model.py
+!guard.py
+!requirements.txt
