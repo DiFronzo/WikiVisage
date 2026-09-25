@@ -218,7 +218,12 @@ def test_health_endpoint(integration_client):
     response = client.get("/health")
 
     assert response.status_code == 200
-    assert response.get_json() == {"status": "healthy", "database": "connected"}
+    payload = response.get_json()
+    assert payload["status"] == "healthy"
+    assert payload["database"] == "connected"
+    assert payload["face_service"] in ("reachable", "unreachable")
+    assert payload["limiter"] in ("redis", "memory")
+    assert isinstance(payload["degraded"], bool)
 
 
 @pytest.mark.integration

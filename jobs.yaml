@@ -3,9 +3,11 @@
 # Docs: https://wikitech.wikimedia.org/wiki/Help:Toolforge/Running_jobs
 #
 # Memory note: workers used to run dlib in-process and needed 3Gi. Face
-# detection now happens in the separate face service (see model-server/), so
-# these processes only download images, call it over HTTP, and do centroid
-# math. Peak memory is bounded by DETECTION_WAVE_SIZE images held at once.
+# detection now happens in the separate face service (see model-server/).
+# Peak memory is DETECTION_WAVE_SIZE (8) images per project x
+# WIKIVISAGE_WORKER_MAX_PROJECTS (4) concurrent projects. Thumbnails are
+# usually well under 1 MiB, but the download cap is 50 MB per image, so 2Gi
+# leaves headroom for a wave of unusually large files.
 #
 #  env:
 #    - name: WIKIVISAGE_WORKER_IMAGE_THREADS
@@ -19,12 +21,12 @@
   command: python -u worker.py --worker-id ml-worker-1
   image: tool-wikivisage/tool-wikivisage:latest
   continuous: true
-  mem: 1Gi
+  mem: 2Gi
   health-check-script: ./healthcheck.sh ml-worker-1
 
 - name: ml-worker-2
   command: python -u worker.py --worker-id ml-worker-2
   image: tool-wikivisage/tool-wikivisage:latest
   continuous: true
-  mem: 1Gi
+  mem: 2Gi
   health-check-script: ./healthcheck.sh ml-worker-2

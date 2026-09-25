@@ -232,3 +232,28 @@ def test_get_session_caches_and_reset_session_rebuilds():
     assert third is not first
     assert built_sessions[0].mount.call_count == 2
     built_sessions[0].close.assert_called_once()
+
+
+def test_non_object_prediction_is_unavailable_not_a_crash():
+    with patch("face_client._post", return_value=[None]):
+        results = face_client.detect_faces_batch([("a", b"img")])
+
+    assert isinstance(results["a"], face_client.FaceServiceUnavailable)
+
+
+def test_oversized_image_is_rejected_without_a_request(monkeypatch):
+    """Above the server's cap the body would hit HTTP 413, which is retryable."""
+    monkeypatch.setattr(face_client, "FACE_SERVICE_MAX_IMAGE_BYTES", 10)
+    with patch("face_client._post", return_value=[_ok_prediction(key="ok")]) as post:
+        results = face_client.detect_faces_batch([("big", b"x" * 11), ("ok", b"x" * 10)])
+
+    assert isinstance(results["big"], face_client.FaceServiceRejected)
+    assert isinstance(results["ok"], face_client.DetectionResult)
+    assert [i["id"] for i in post.call_args.args[0]] == ["ok"]
+
+
+def test_encode_known_face_returns_none_for_oversized_image(monkeypatch):
+    monkeypatch.setattr(face_client, "FACE_SERVICE_MAX_IMAGE_BYTES", 10)
+    with patch("face_client._post") as post:
+        assert face_client.encode_known_face(b"x" * 11, (1, 2, 3, 4)) is None
+    post.assert_not_called()

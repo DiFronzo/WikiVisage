@@ -715,10 +715,13 @@ def _mark_image_error(img_id: int, message: str) -> None:
 def _download_for_detection(img_id: int, title: str) -> bytes | None:
     """Download and dimension-check one image, ready for detection.
 
-    Returns the image bytes, or None if the image is unusable — in which case
-    the row has already been marked 'error'. Dimension validation stays on this
-    side so oversized images are rejected before they are base64-inflated and
-    pushed over the wire.
+    Returns the image bytes, or None if the image cannot be used now. A
+    transient failure (network error, timeout, HTTP 429/5xx) leaves the row
+    'pending' for a later cycle; anything else marks it 'error'. Keeping
+    transient failures pending matters: 'error' counts as processed, so a CDN
+    outage would otherwise let the project auto-complete as "no faces".
+    Dimension validation stays on this side so oversized images are rejected
+    before they are base64-inflated and pushed over the wire.
     """
     clean_title = title[5:] if title.startswith("File:") else title
     url = FILE_PATH_URL.format(file_title=clean_title)
@@ -726,6 +729,14 @@ def _download_for_detection(img_id: int, title: str) -> bytes | None:
         logger.debug(f"Downloading image {title}")
         image_bytes = _download_image(url)
         _validate_image_dimensions(image_bytes)
+    except requests.RequestException as e:
+        status = getattr(getattr(e, "response", None), "status_code", None)
+        if status is None or status == 429 or status >= 500:
+            logger.warning(f"Transient error downloading image {title}, leaving pending: {e}")
+            return None
+        logger.error(f"Error downloading image {title}: {e}")
+        _mark_image_error(img_id, str(e))
+        return None
     except Exception as e:
         logger.error(f"Error downloading image {title}: {e}")
         _mark_image_error(img_id, str(e))

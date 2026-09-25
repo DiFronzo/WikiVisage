@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
+import requests
 
 import face_client
 
@@ -3275,3 +3276,32 @@ def test_validate_encoding_accepts_edge_values():
     """Boundary values just inside the [-10, 10] bound are accepted."""
     arr = np.full(128, 9.99, dtype=np.float64)
     assert _worker_module._validate_encoding(arr.tobytes(), face_id=10) is not None
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        requests.ConnectionError("reset"),
+        requests.Timeout("slow"),
+        requests.HTTPError(response=MagicMock(status_code=503)),
+        requests.HTTPError(response=MagicMock(status_code=429)),
+    ],
+)
+def test_download_for_detection_leaves_transient_failures_pending(exc):
+    """'error' counts as processed, so marking transient failures would allow false auto-completion."""
+    with (
+        patch.object(_worker_module, "_download_image", side_effect=exc),
+        patch.object(_worker_module, "_mark_image_error") as mark,
+    ):
+        assert _worker_module._download_for_detection(1, "File:X.jpg") is None
+    mark.assert_not_called()
+
+
+def test_download_for_detection_marks_permanent_http_errors():
+    exc = requests.HTTPError(response=MagicMock(status_code=404))
+    with (
+        patch.object(_worker_module, "_download_image", side_effect=exc),
+        patch.object(_worker_module, "_mark_image_error") as mark,
+    ):
+        assert _worker_module._download_for_detection(1, "File:X.jpg") is None
+    mark.assert_called_once()

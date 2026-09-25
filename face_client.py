@@ -31,6 +31,11 @@ FACE_SERVICE_TOKEN = os.environ.get("WIKIVISAGE_FACE_SERVICE_TOKEN", "")
 
 FACE_SERVICE_BATCH_SIZE = int(os.environ.get("WIKIVISAGE_FACE_SERVICE_BATCH_SIZE", 8))
 FACE_SERVICE_MAX_BATCH_BYTES = int(os.environ.get("WIKIVISAGE_FACE_SERVICE_MAX_BATCH_BYTES", 24 * 1024 * 1024))
+# Mirrors the server's WIKIVISAGE_MAX_IMAGE_BYTES. Larger images are rejected
+# here: the server would refuse them anyway, and above ~30 MiB the base64 body
+# exceeds its 40 MiB request cap, which surfaces as a retryable HTTP 413 and
+# would leave the image pending forever.
+FACE_SERVICE_MAX_IMAGE_BYTES = int(os.environ.get("WIKIVISAGE_FACE_SERVICE_MAX_IMAGE_BYTES", 20 * 1024 * 1024))
 
 FACE_SERVICE_TIMEOUT = float(os.environ.get("WIKIVISAGE_FACE_SERVICE_TIMEOUT", 30))
 FACE_SERVICE_TIMEOUT_PER_IMAGE = float(os.environ.get("WIKIVISAGE_FACE_SERVICE_TIMEOUT_PER_IMAGE", 15))
@@ -243,6 +248,8 @@ def _parse_prediction(prediction: dict[str, Any]) -> DetectionResult:
     Raises FaceServiceRejected if the server reported a per-image error, or
     FaceServiceUnavailable if the payload is structurally wrong.
     """
+    if not isinstance(prediction, dict):
+        raise FaceServiceUnavailable("each prediction must be an object")
     status = prediction.get("status")
     if status == "error":
         raise FaceServiceRejected(str(prediction.get("error", "unknown face service error")))
@@ -301,6 +308,11 @@ def _chunk(items: Sequence[tuple[str, bytes]]) -> Iterable[list[tuple[str, bytes
         yield batch
 
 
+def _check_image_size(image_bytes: bytes) -> None:
+    if len(image_bytes) > FACE_SERVICE_MAX_IMAGE_BYTES:
+        raise FaceServiceRejected(f"image is {len(image_bytes)} bytes, limit is {FACE_SERVICE_MAX_IMAGE_BYTES}")
+
+
 def detect_faces_batch(items: Sequence[tuple[str, bytes]]) -> dict[str, DetectionResult | FaceServiceError]:
     """Detect faces in several images, splitting them across batched requests.
 
@@ -311,10 +323,16 @@ def detect_faces_batch(items: Sequence[tuple[str, bytes]]) -> dict[str, Detectio
     intact, so one flaky request does not discard a whole run's work.
     """
     results: dict[str, DetectionResult | FaceServiceError] = {}
-    if not items:
-        return results
+    sendable = []
+    for key, image_bytes in items:
+        try:
+            _check_image_size(image_bytes)
+        except FaceServiceRejected as exc:
+            results[key] = exc
+        else:
+            sendable.append((key, image_bytes))
 
-    for batch in _chunk(items):
+    for batch in _chunk(sendable):
         instances = [
             {"id": key, "task": "detect", "image": base64.b64encode(image_bytes).decode("ascii")}
             for key, image_bytes in batch
@@ -344,6 +362,7 @@ def detect_faces(image_bytes: bytes) -> DetectionResult:
     Raises :class:`FaceServiceRejected` if the image itself is unusable, or
     :class:`FaceServiceUnavailable` if the service could not be reached.
     """
+    _check_image_size(image_bytes)
     predictions = _post([{"id": "0", "task": "detect", "image": base64.b64encode(image_bytes).decode("ascii")}])
     return _parse_prediction(predictions[0])
 
@@ -356,6 +375,11 @@ def encode_known_face(image_bytes: bytes, bbox: tuple[int, int, int, int]) -> by
     (typically because the box is too small or contains no usable face) — which
     callers surface to the user as "try drawing a slightly larger box".
     """
+    try:
+        _check_image_size(image_bytes)
+    except FaceServiceRejected as exc:
+        logger.info("Not encoding manual bbox %s: %s", bbox, exc)
+        return None
     top, right, bottom, left = bbox
     predictions = _post(
         [

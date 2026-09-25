@@ -699,7 +699,7 @@ Steps (one job, `contents: write` for the tag push):
 3. Upload `lib.sh` (shared `build_and_wait`, prints `toolforge build quota` on failure), `deploy-face.sh`, `deploy.sh` to a per-run directory on the bastion.
 4. **Check configuration** — `toolforge envvars show` on both tools (face token; main URL + token) before either is touched.
 5. **`become $FACE_TOOL`** — builds `face-service-<tag>`, recreates the `face-service` job (`--command web --continuous --port 8000 --publish --mount=none --mem 3Gi --cpu 2 --health-check-http /v1/models/wikivisage`), waits up to 10 min for public readiness.
-6. **`become wikivisage`** — builds the release tag, deletes both workers, runs `migrate`, restarts the webservice, then the **preflight**: polls `/health` until `face_service: reachable` (URL + token checked). Only then starts `ml-worker` / `ml-worker-2` (`--mem 1Gi --cpu 2`, `healthcheck.sh`). `dologmsg` to SAL.
+6. **`become wikivisage`** — builds the release tag, deletes both workers, runs `migrate`, restarts the webservice, then the **preflight**: polls `/health` until `face_service: reachable` (URL + token checked). Only then starts `ml-worker` / `ml-worker-2` (`--mem 2Gi --cpu 2`, `healthcheck.sh`). `dologmsg` to SAL.
 
 Concurrency: `deploy-production` with `cancel-in-progress: false`.
 

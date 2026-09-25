@@ -166,12 +166,12 @@ If `jobs.yaml` loading fails, start workers manually:
 toolforge jobs run ml-worker \
   --command 'python -u worker.py --worker-id ml-worker-1' \
   --image tool-wikivisage/tool-wikivisage:latest \
-  --continuous --mem 1Gi --cpu 2
+  --continuous --mem 2Gi --cpu 2
 
 toolforge jobs run ml-worker-2 \
   --command 'python -u worker.py --worker-id ml-worker-2' \
   --image tool-wikivisage/tool-wikivisage:latest \
-  --continuous --mem 1Gi --cpu 2
+  --continuous --mem 2Gi --cpu 2
 ```
 
 Check worker status:
@@ -349,10 +349,10 @@ toolforge webservice restart
 
 # Restart both workers (delete + run because jobs load doesn't restart unchanged jobs)
 toolforge jobs delete ml-worker || true
-toolforge jobs run ml-worker --command 'python -u worker.py --worker-id ml-worker-1' --image tool-wikivisage/tool-wikivisage:latest --continuous --mem 1Gi --cpu 2
+toolforge jobs run ml-worker --command 'python -u worker.py --worker-id ml-worker-1' --image tool-wikivisage/tool-wikivisage:latest --continuous --mem 2Gi --cpu 2
 
 toolforge jobs delete ml-worker-2 || true
-toolforge jobs run ml-worker-2 --command 'python -u worker.py --worker-id ml-worker-2' --image tool-wikivisage/tool-wikivisage:latest --continuous --mem 1Gi --cpu 2
+toolforge jobs run ml-worker-2 --command 'python -u worker.py --worker-id ml-worker-2' --image tool-wikivisage/tool-wikivisage:latest --continuous --mem 2Gi --cpu 2
 ```
 
 ### Restart web service only
@@ -388,9 +388,9 @@ toolforge envvars create FLASK_SECRET_KEY "<new-value>"
 # Restart services to pick up changes
 toolforge webservice restart
 toolforge jobs delete ml-worker || true
-toolforge jobs run ml-worker --command 'python -u worker.py --worker-id ml-worker-1' --image tool-wikivisage/tool-wikivisage:latest --continuous --mem 1Gi --cpu 2
+toolforge jobs run ml-worker --command 'python -u worker.py --worker-id ml-worker-1' --image tool-wikivisage/tool-wikivisage:latest --continuous --mem 2Gi --cpu 2
 toolforge jobs delete ml-worker-2 || true
-toolforge jobs run ml-worker-2 --command 'python -u worker.py --worker-id ml-worker-2' --image tool-wikivisage/tool-wikivisage:latest --continuous --mem 1Gi --cpu 2
+toolforge jobs run ml-worker-2 --command 'python -u worker.py --worker-id ml-worker-2' --image tool-wikivisage/tool-wikivisage:latest --continuous --mem 2Gi --cpu 2
 ```
 
 ---
@@ -411,10 +411,10 @@ toolforge jobs logs ml-worker-2
 
 # Restart workers
 toolforge jobs delete ml-worker || true
-toolforge jobs run ml-worker --command 'python -u worker.py --worker-id ml-worker-1' --image tool-wikivisage/tool-wikivisage:latest --continuous --mem 1Gi --cpu 2
+toolforge jobs run ml-worker --command 'python -u worker.py --worker-id ml-worker-1' --image tool-wikivisage/tool-wikivisage:latest --continuous --mem 2Gi --cpu 2
 
 toolforge jobs delete ml-worker-2 || true
-toolforge jobs run ml-worker-2 --command 'python -u worker.py --worker-id ml-worker-2' --image tool-wikivisage/tool-wikivisage:latest --continuous --mem 1Gi --cpu 2
+toolforge jobs run ml-worker-2 --command 'python -u worker.py --worker-id ml-worker-2' --image tool-wikivisage/tool-wikivisage:latest --continuous --mem 2Gi --cpu 2
 
 # Or reload from jobs.yaml
 toolforge jobs load jobs.yaml
