@@ -1,5 +1,11 @@
 # Keep the build context to just what the image needs.
 *
 !model.py
+!backend.py
 !guard.py
 !requirements.txt
+!weights/
+!weights/det_500m.onnx
+!weights/w600k_mbf.onnx
+!weights/SHA256SUMS
+!weights/LICENSE-NOTICE

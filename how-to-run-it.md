@@ -69,6 +69,12 @@ toolforge envvars create WIKIVISAGE_TOKEN_KEY  "$(python3 -c 'from cryptography.
 # The token must be the same value as on the face tool.
 toolforge envvars create WIKIVISAGE_FACE_SERVICE_URL   "https://wikivisage-face.toolforge.org"
 toolforge envvars create WIKIVISAGE_FACE_SERVICE_TOKEN "<same token as the face tool>"
+
+# LiftWing metadata pre-filter (optional, experimental, worker-only).
+# Anonymous access works (rate limited per IP); a Wikimedia personal API token
+# from api.wikimedia.org moves calls to the authenticated quota. Only public
+# Commons metadata is sent — never image bytes.
+# toolforge envvars create WIKIVISAGE_LIFTWING_API_TOKEN "<personal-api-token>"
 ```
 
 > The face service runs as a **second tool** — see
@@ -111,7 +117,7 @@ toolforge build start https://github.com/DiFronzo/WikiVisage.git
 toolforge build show
 ```
 
-The build uses `Procfile` and `requirements.txt` to create the container image. The root `project.toml` was removed — it only existed to install dlib's system libraries, which now live with the face service in `model-server/project.toml`. The image name is automatically `tool-wikivisage/tool-wikivisage:latest`.
+The build uses `Procfile` and `requirements.txt` to create the container image. There is no `project.toml`: nothing in the stack needs system packages any more (the face service's ONNX Runtime and OpenCV wheels are self-contained). The image name is automatically `tool-wikivisage/tool-wikivisage:latest`.
 
 ---
 
@@ -249,9 +255,19 @@ second tool holds none of them. If
 it could move back into the main tool as an internal job.
 
 The tool is built with buildpacks from `model-server/`: `requirements.txt`
-(dlib via the pre-built `dlib-bin` wheel), `project.toml` (OpenBLAS/LAPACK via
-`heroku/deb-packages`), `.python-version` and `Procfile`. The `Dockerfile` is
-only for local development and CI.
+(KServe, ONNX Runtime, OpenCV headless), `.python-version`, `Procfile` and the
+committed model weights in `weights/`. No system packages are installed. The
+`Dockerfile` is only for local development and CI.
+
+The weights (`det_500m.onnx`, `w600k_mbf.onnx`, about 16 MB) are **ordinary git
+blobs**, not Git LFS or submodules, because the build service does a plain
+clone. They are InsightFace models licensed for **non-commercial research use
+only** — see `model-server/weights/LICENSE-NOTICE`. The service verifies their
+SHA-256 at startup and exits on a mismatch, so a broken build never becomes ready
+and the deploy's readiness wait fails before any worker is restarted. If Toolforge
+administrators object to hosting them, the `FaceBackend` interface in
+`model-server/backend.py` is where a permissively licensed pair (YuNet + SFace)
+would go.
 
 ### One-time setup
 
@@ -314,9 +330,42 @@ toolforge jobs show face-service           # status, published URL
 curl -s https://wikivisage.toolforge.org/health | jq .face_service
 ```
 
-Throughput: dlib is not thread-safe, so each replica detects one image at a
-time. To scale, add `--replicas N` to the job rather than raising
-`WIKIVISAGE_FACE_WORKERS`.
+Throughput: one ONNX session per model is shared by `WIKIVISAGE_FACE_WORKERS`
+threads (default 2, matching the job's `--cpu 2`). To scale beyond that, add
+`--replicas N` to the job. After a deploy, `toolforge jobs logs face-service`
+shows a `Weights verified: ...` line with both SHA-256 values and a
+`Model 'wikivisage' loaded (model_id=scrfd500m+arcface_mbf, dim=512, ...)` line.
+
+### Upgrading the embedding model (one-time wipe) and rollback
+
+The switch from dlib (128D) to ArcFace (512D) embeddings is **destructive**:
+the `migrate` job's `apply_embedding_model_upgrade()` deletes every image, face
+and SDC claim row exactly once (it is gated on the absence of
+`faces.embedding_model`), resets every project's progress counters and
+distance threshold, and reactivates `completed` projects. Users, projects,
+project members, sessions and the leaderboard stats are kept, and the worker
+re-crawls each project. Safe for Commons: `write_sdc_claims` checks Commons for
+an existing P180 claim before writing, and bootstrap re-seeds from claims that
+already exist.
+
+Before the first deploy of this version:
+
+1. **Take a database dump and store it outside the repository** (it holds user
+   classifications and OAuth tokens):
+   `mysqldump --defaults-file=$HOME/replica.my.cnf -h tools.db.svc.wikimedia.cloud --single-transaction <db> > ~/wikivisage-pre-wipe.sql`
+2. Export the labelled data if you want to calibrate the thresholds afterwards.
+
+Deploy order is already safe: the face tool is rebuilt and ready before the
+workers are stopped, and a worker that reaches an old face service (or a new one
+with an old worker) refuses vectors of the wrong model/width, leaving images
+`pending`.
+
+Rollback after the wipe: the old rows exist only in the dump. Restore it into
+the database, redeploy the previous release tag (`deploy.yml` with the old
+`tag`, which rebuilds the previous `face-service-<tag>` too) and re-run
+`migrate` — the restored `faces` table has no `embedding_model`, so with the
+*old* code nothing wipes it; with the *new* code it would be wiped again, so do
+not run the new `migrate` against a restored dump.
 
 ---
 

@@ -11,7 +11,7 @@ source venv/bin/activate
 pip install -r requirements-dev.txt   # Includes runtime deps + pytest, ruff
 ```
 
-No compiler needed — `requirements.txt` contains no ML libraries. dlib lives
+No compiler needed — `requirements.txt` contains no ML libraries. ONNX Runtime lives
 only in the face service container.
 
 ## 1b. Start the Face Service

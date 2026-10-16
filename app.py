@@ -39,6 +39,7 @@ from flask import (
     abort,
     flash,
     g,
+    has_request_context,
     jsonify,
     redirect,
     render_template,
@@ -53,14 +54,14 @@ from flask_limiter.util import get_remote_address
 from requests_oauthlib import OAuth2Session
 
 import face_client
-from config import WAKE_FILE_PATH
+from config import COMMONS_THUMB_STEPS, DETECTION_WIDTH, LIFTWING_PROBE_INTERVAL, WAKE_FILE_PATH
 from database import (
     DatabaseError,
     execute_query,
     execute_transaction,
     init_db,
 )
-from face_client import FaceServiceError
+from face_client import FaceServiceError, FaceServiceRejected
 from redis_lock import single_flight
 from token_crypto import TokenDecryptionError, decrypt_token, encrypt_token
 
@@ -214,8 +215,14 @@ def inject_i18n_helpers() -> dict[str, Any]:
 # Token expiry buffer (refresh 5 minutes before actual expiry)
 TOKEN_REFRESH_BUFFER = 300  # seconds
 
-# Wikimedia Commons file URL pattern (used for manual face detection)
-FILE_PATH_URL = "https://commons.wikimedia.org/wiki/Special:FilePath/{file_title}?width=1024"
+# Wikimedia Commons file URL pattern (used for manual face detection). Same width
+# as the worker's detection (WIKIVISAGE_DETECTION_WIDTH), so a drawn box and the
+# stored detection space differ by a scale factor of about 1.
+FILE_PATH_URL = f"https://commons.wikimedia.org/wiki/Special:FilePath/{{file_title}}?width={DETECTION_WIDTH}"
+
+# Default cosine-distance threshold for new projects. Provisional until Phase 0
+# calibration (docs/plans/face-model-upgrade.md); keep in step with schema.sql.
+DEFAULT_DISTANCE_THRESHOLD = 0.5
 USER_AGENT = "WikiVisage/1.0 (https://github.com/DiFronzo/WikiVisage)"
 COMMONS_API_URL = "https://commons.wikimedia.org/w/api.php"
 WIKIDATA_API_URL = "https://www.wikidata.org/w/api.php"
@@ -682,6 +689,62 @@ def inject_worker_status() -> dict[str, Any]:
     return {"worker_down": worker_down}
 
 
+# A LiftWing status older than three probe intervals reads as unknown, so a
+# stopped worker hides the banner instead of showing a stale one. With the
+# probe disabled (interval 0) every status is stale, which is correct.
+_LIFTWING_STALE_SECONDS = LIFTWING_PROBE_INTERVAL * 3
+
+
+def _liftwing_status_snapshot() -> dict[str, Any]:
+    """Last-known LiftWing state from ``service_status``; never makes a live call.
+
+    Never raises: the banner and /health must not depend on the optional
+    experiment being reachable, or on the table having been migrated yet.
+    """
+    unknown: dict[str, Any] = {"status": "unknown", "last_checked": None, "last_ok": None}
+    try:
+        rows = execute_query(
+            "SELECT status, last_checked, last_ok, "
+            "(last_checked IS NULL OR last_checked < NOW() - INTERVAL %s SECOND) AS is_stale "
+            "FROM service_status WHERE name = 'liftwing'",
+            (_LIFTWING_STALE_SECONDS,),
+        )
+        if not rows:
+            return unknown
+        row = rows[0]
+        is_stale = bool(row.get("is_stale"))
+        status = "unknown" if is_stale else str(row.get("status") or "unknown")
+        if status not in ("up", "down"):
+            status = "unknown"
+        return {"status": status, "last_checked": row.get("last_checked"), "last_ok": row.get("last_ok")}
+    except Exception:
+        logger.debug("LiftWing status lookup failed", exc_info=True)
+        return unknown
+
+
+# Endpoints that can show the LiftWing banner or status line. Every other page
+# skips the service_status lookup entirely.
+_LIFTWING_STATUS_ENDPOINTS = ("project_detail", "project_settings")
+
+
+@app.context_processor
+def inject_liftwing_status() -> dict[str, Any]:
+    """Expose the experimental LiftWing pre-filter status to templates.
+
+    The banner and the settings status line only exist on project detail and
+    settings pages, so other endpoints return defaults without a DB query.
+    (Outside a request context — unit tests — the lookup still runs.)
+    """
+    if has_request_context() and request.endpoint not in _LIFTWING_STATUS_ENDPOINTS:
+        return {"liftwing_down": False, "liftwing_status": "unknown", "liftwing_last_checked": None}
+    snapshot = _liftwing_status_snapshot()
+    return {
+        "liftwing_down": snapshot["status"] == "down",
+        "liftwing_status": snapshot["status"],
+        "liftwing_last_checked": snapshot["last_checked"],
+    }
+
+
 @app.after_request
 def set_security_headers(response):
     """Add security headers to all responses."""
@@ -924,7 +987,7 @@ def _fetch_wikidata_label(qid: str) -> str | None:
 # Wikimedia Commons enforces standard thumbnail step sizes ($wgThumbnailSteps).
 # Requests for non-standard widths return 429. Snap to the nearest allowed step.
 # https://www.mediawiki.org/wiki/Common_thumbnail_sizes
-_THUMB_STEPS = (20, 40, 60, 120, 250, 330, 500, 960, 1280, 1920, 3840)
+_THUMB_STEPS = COMMONS_THUMB_STEPS
 
 # Extensions that need special thumbnail URL patterns on Commons
 _VIDEO_EXTENSIONS = {".webm", ".ogv", ".ogg"}
@@ -1206,10 +1269,11 @@ def get_project_for_actor(project_id: int, user_id: int, *, require_owner: bool 
 def verify_image_access(image_id: int, project_id: int, user_id: int) -> dict | None:
     """Confirm *image_id* belongs to a project accessible to *user_id* (owner or member).
 
-    Returns the image row (``id``, ``file_title``, ``status``) or ``None``.
+    Returns the image row (``id``, ``file_title``, ``status``, ``detection_width``,
+    ``detection_height``) or ``None``.
     """
     rows = execute_query(
-        "SELECT i.id, i.file_title, i.status FROM images i "
+        "SELECT i.id, i.file_title, i.status, i.detection_width, i.detection_height FROM images i "
         "JOIN projects p ON i.project_id = p.id "
         "LEFT JOIN project_members pm ON pm.project_id = p.id AND pm.user_id = %s AND pm.status = 'active' "
         "WHERE i.id = %s AND p.id = %s AND p.status != 'deleted' "
@@ -1566,7 +1630,7 @@ def project_new():
     wikidata_qid = request.form.get("wikidata_qid", "").strip().upper()
     commons_category = request.form.get("commons_category", "").strip()
     label = request.form.get("label", "").strip()
-    distance_threshold = request.form.get("distance_threshold", "0.6")
+    distance_threshold = request.form.get("distance_threshold", str(DEFAULT_DISTANCE_THRESHOLD))
     min_confirmed = request.form.get("min_confirmed", "5")
 
     # Validation
@@ -1582,7 +1646,7 @@ def project_new():
             errors.append(_("Distance threshold must be between 0.1 and 1.0."))
     except ValueError:
         errors.append(_("Distance threshold must be a number."))
-        distance_threshold = 0.6
+        distance_threshold = DEFAULT_DISTANCE_THRESHOLD
 
     try:
         min_confirmed = int(min_confirmed)
@@ -2389,6 +2453,19 @@ def api_undo_classify():
     return jsonify({"status": "ok", "project_id": project_id, "image_id": image_id})
 
 
+def _detection_space(width: Any, height: Any) -> tuple[int, int] | None:
+    """The stored ``images.detection_width/height`` as a ``box_space``, or None if unknown.
+
+    Drawn boxes are in this pixel space (the UI scales them into it); passing it
+    lets the face service map them onto whatever size we download.
+    """
+    try:
+        w, h = int(width), int(height)
+    except (TypeError, ValueError):
+        return None
+    return (w, h) if w > 0 and h > 0 else None
+
+
 @app.route("/api/manual-face", methods=["POST"])
 @login_required
 @limiter.limit("10 per minute")
@@ -2466,12 +2543,19 @@ def api_manual_face():
         image_bytes = _download_image(url)
 
         try:
-            encoding_bytes = face_client.encode_known_face(image_bytes, (bbox_top, bbox_right, bbox_bottom, bbox_left))
+            encoded = face_client.encode_known_face(
+                image_bytes,
+                (bbox_top, bbox_right, bbox_bottom, bbox_left),
+                box_space=_detection_space(img.get("detection_width"), img.get("detection_height")),
+            )
+        except FaceServiceRejected:
+            logger.warning("Face service rejected the image while encoding manual face (image %s)", image_id)
+            return jsonify({"error": _("This image could not be read by the face detection service.")}), 422
         except FaceServiceError:
             logger.exception("Face service unavailable while encoding manual face")
             return jsonify({"error": _("Face detection service is unavailable. Please try again in a moment.")}), 503
 
-        if not encoding_bytes:
+        if not encoded:
             return jsonify(
                 {
                     "error": _(
@@ -2479,6 +2563,11 @@ def api_manual_face():
                     )
                 }
             ), 422
+
+        encoding_bytes, embedding_model, aligned = encoded
+        if not aligned:
+            logger.info("Manual face on image %s embedded without landmark alignment", image_id)
+        aligned_flag = 1 if aligned else 0
 
         def _insert_manual_face(conn, cursor):
             _assert_project_access_locked(cursor, project_id, g.user["id"])
@@ -2495,12 +2584,14 @@ def api_manual_face():
 
                 cursor.execute(
                     "INSERT INTO faces "
-                    "(image_id, encoding, bbox_top, bbox_right, bbox_bottom, bbox_left, "
+                    "(image_id, encoding, embedding_model, aligned, bbox_top, bbox_right, bbox_bottom, bbox_left, "
                     "is_target, classified_by, classified_by_user_id, classified_at) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, 1, 'human', %s, NOW())",
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 1, 'human', %s, NOW())",
                     (
                         image_id,
                         encoding_bytes,
+                        embedding_model,
+                        aligned_flag,
                         bbox_top,
                         bbox_right,
                         bbox_bottom,
@@ -2524,12 +2615,14 @@ def api_manual_face():
             else:
                 cursor.execute(
                     "INSERT INTO faces "
-                    "(image_id, encoding, bbox_top, bbox_right, bbox_bottom, bbox_left, "
+                    "(image_id, encoding, embedding_model, aligned, bbox_top, bbox_right, bbox_bottom, bbox_left, "
                     "is_target, classified_by, classified_by_user_id, classified_at) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, 1, 'human', %s, NOW())",
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 1, 'human', %s, NOW())",
                     (
                         image_id,
                         encoding_bytes,
+                        embedding_model,
+                        aligned_flag,
                         bbox_top,
                         bbox_right,
                         bbox_bottom,
@@ -2956,7 +3049,7 @@ def api_update_face_bbox():
         rows = execute_query(
             "SELECT f.id, f.image_id, f.is_target, f.classified_by, f.confidence, "
             "  f.classified_by_user_id, f.sdc_written, i.file_title, i.commons_page_id, "
-            "  i.status AS image_status, "
+            "  i.status AS image_status, i.detection_width, i.detection_height, "
             "  p.id AS project_id, p.wikidata_qid, "
             "  u.wiki_username AS prev_classifier_username "
             "FROM faces f "
@@ -2977,8 +3070,8 @@ def api_update_face_bbox():
     if face_row.get("image_status") != "processed":
         return jsonify({"error": _("Image has not finished processing yet")}), 409
 
-    # Pre-check cross-user guard BEFORE downloading the image and running dlib
-    # encoding. Mirrors the in-transaction guard in reclassify: members can
+    # Pre-check cross-user guard BEFORE downloading the image and running the
+    # face-service encoding. Mirrors the in-transaction guard in reclassify: members can
     # only edit faces they classified themselves (or NULL/model/bootstrap).
     # An in-transaction re-check below closes the TOCTOU window.
     orig_classified_by_user_id = face_row.get("classified_by_user_id")
@@ -3005,12 +3098,19 @@ def api_update_face_bbox():
         image_bytes = _download_image(url)
 
         try:
-            encoding_bytes = face_client.encode_known_face(image_bytes, (bbox_top, bbox_right, bbox_bottom, bbox_left))
+            encoded = face_client.encode_known_face(
+                image_bytes,
+                (bbox_top, bbox_right, bbox_bottom, bbox_left),
+                box_space=_detection_space(face_row.get("detection_width"), face_row.get("detection_height")),
+            )
+        except FaceServiceRejected:
+            logger.warning("Face service rejected the image while re-encoding face bbox (face %s)", face_id)
+            return jsonify({"error": _("This image could not be read by the face detection service.")}), 422
         except FaceServiceError:
             logger.exception("Face service unavailable while re-encoding face bbox")
             return jsonify({"error": _("Face detection service is unavailable. Please try again in a moment.")}), 503
 
-        if not encoding_bytes:
+        if not encoded:
             return jsonify(
                 {
                     "error": _(
@@ -3018,6 +3118,11 @@ def api_update_face_bbox():
                     )
                 }
             ), 422
+
+        encoding_bytes, embedding_model, aligned = encoded
+        if not aligned:
+            logger.info("Edited face %s embedded without landmark alignment", face_id)
+        aligned_flag = 1 if aligned else 0
 
         def _update_bbox(conn, cursor):
             _assert_project_access_locked(cursor, face_row["project_id"], g.user["id"])
@@ -3042,12 +3147,14 @@ def api_update_face_bbox():
 
             cursor.execute(
                 "INSERT INTO faces "
-                "(image_id, encoding, bbox_top, bbox_right, bbox_bottom, bbox_left, "
+                "(image_id, encoding, embedding_model, aligned, bbox_top, bbox_right, bbox_bottom, bbox_left, "
                 " is_target, classified_by, confidence, classified_by_user_id, sdc_written, classified_at) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, 'human', %s, %s, %s, NOW())",
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'human', %s, %s, %s, NOW())",
                 (
                     image_id,
                     encoding_bytes,
+                    embedding_model,
+                    aligned_flag,
                     bbox_top,
                     bbox_right,
                     bbox_bottom,
@@ -3576,6 +3683,7 @@ def project_settings(project_id: int):
     min_confirmed = request.form.get("min_confirmed", str(project["min_confirmed"]))
     status = request.form.get("status", project["status"])
     label = request.form.get("label", project["label"])
+    prefilter_mode = request.form.get("prefilter_mode", project.get("prefilter_mode", "off"))
 
     errors = []
     try:
@@ -3598,6 +3706,12 @@ def project_settings(project_id: int):
         errors.append(_("Invalid status."))
         status = project["status"]
 
+    # 'enforce' exists in the column for forward compatibility but is not built
+    # yet, so only the two implemented modes can be selected.
+    if prefilter_mode not in ("off", "shadow"):
+        errors.append(_("Invalid metadata pre-filter mode."))
+        prefilter_mode = project.get("prefilter_mode", "off")
+
     if errors:
         for err in errors:
             flash(err, "error")
@@ -3605,18 +3719,21 @@ def project_settings(project_id: int):
         project["min_confirmed"] = min_confirmed
         project["status"] = status
         project["label"] = label
+        project["prefilter_mode"] = prefilter_mode
         return render_template("project_settings.html", project=project, members=[], is_owner=True)
 
     try:
         completion_reason_clause = ", completion_reason = NULL" if status != "completed" else ""
         execute_query(
             "UPDATE projects SET distance_threshold = %s, min_confirmed = %s, "
-            f"status = %s, label = %s{completion_reason_clause} WHERE id = %s AND user_id = %s",
+            f"status = %s, label = %s, prefilter_mode = %s{completion_reason_clause} "
+            "WHERE id = %s AND user_id = %s",
             (
                 distance_threshold,
                 min_confirmed,
                 status,
                 label,
+                prefilter_mode,
                 project_id,
                 g.user["id"],
             ),
@@ -4230,6 +4347,30 @@ def chrome_devtools_json():
     return jsonify({}), 200
 
 
+def _liftwing_health_value() -> str:
+    """``reachable`` / ``unreachable`` / ``disabled`` for /health.
+
+    Reads the worker's last probe from ``service_status`` (never a live call)
+    and reports ``disabled`` when no project uses the pre-filter or the status
+    is unknown. Deliberately does not affect ``degraded``: LiftWing is an
+    optional, fail-open experiment, and only the face service degrades health.
+    """
+    try:
+        in_use = execute_query(
+            "SELECT COUNT(*) AS cnt FROM projects WHERE status != 'deleted' AND prefilter_mode != 'off'"
+        )
+        if not in_use or not in_use[0]["cnt"]:
+            return "disabled"
+    except Exception:
+        return "disabled"
+    status = _liftwing_status_snapshot()["status"]
+    if status == "up":
+        return "reachable"
+    if status == "down":
+        return "unreachable"
+    return "disabled"
+
+
 @app.route("/health")
 @limiter.exempt
 def health():
@@ -4238,7 +4379,8 @@ def health():
     Reports degraded (200 OK with `degraded: true`) when the rate limiter fell
     back to per-process memory storage at startup or when the face service is
     unreachable. In both cases the database is still healthy, so we don't
-    return 503; ops can scrape `degraded` and alert.
+    return 503; ops can scrape `degraded` and alert. The ``liftwing`` field
+    reports the optional metadata pre-filter and never sets ``degraded``.
     """
     try:
         rows = execute_query("SELECT 1 AS ok")
@@ -4249,6 +4391,7 @@ def health():
                 "database": "connected",
                 "limiter": "redis" if _LIMITER_REDIS_OK else "memory",
                 "face_service": "reachable" if face_service_ok else "unreachable",
+                "liftwing": _liftwing_health_value(),
                 "degraded": not _LIMITER_REDIS_OK or not face_service_ok,
             }
             return jsonify(payload), 200

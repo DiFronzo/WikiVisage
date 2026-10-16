@@ -38,10 +38,29 @@
             </select>
         </div>
 
+        <div class="form-group">
+            <label for="prefilter_mode">{{ _('Metadata Pre-Filter (experimental)') }}</label>
+            <select id="prefilter_mode" name="prefilter_mode">
+                <option value="off" {% if project.get('prefilter_mode', 'off') == 'off' %}selected{% endif %}>{{ _('Off') }}</option>
+                <option value="shadow" {% if project.get('prefilter_mode', 'off') == 'shadow' %}selected{% endif %}>{{ _('Shadow mode - record model verdicts only') }}</option>
+            </select>
+            <div class="help-text">{{ _('Asks the experimental LiftWing Qwen model to judge from Commons metadata whether a file could show a person. Shadow mode only records those verdicts for evaluation; nothing is filtered out and processing is unchanged.') }}</div>
+            <div class="help-text">
+                {{ _('LiftWing service status:') }}
+                {% if liftwing_status == 'up' %}<strong style="color: var(--primary);">{{ _('reachable') }}</strong>
+                {% elif liftwing_status == 'down' %}<strong style="color: var(--danger);">{{ _('unreachable') }}</strong>
+                {% else %}{{ _('unknown') }}{% endif %}
+                {% if liftwing_last_checked %}
+                &middot; {{ _('last checked') }} {{ liftwing_last_checked.strftime('%Y-%m-%d %H:%M') }} UTC
+                {% endif %}
+            </div>
+        </div>
+
         <div class="grid-2">
             <div class="form-group">
                 <label for="distance_threshold">{{ _('Distance Threshold') }}</label>
                 <input type="number" id="distance_threshold" name="distance_threshold" value="{{ project.distance_threshold }}" step="0.05" min="0.1" max="1.0" required>
+                <div class="help-text">{{ _('Cosine distance to the target: lower = stricter matching (default 0.5)') }}</div>
             </div>
 
             <div class="form-group">
@@ -49,6 +68,7 @@
                 <input type="number" id="min_confirmed" name="min_confirmed" value="{{ project.min_confirmed }}" min="1" required>
             </div>
         </div>
+        <hr style="border: none; border-top: 1px solid var(--text-muted); opacity: 0.35; margin: 1.5rem 0 0.75rem;">
         <div class="help-text">{{ _('Changes to these values only affect future classifications. Use Re-run Inference below to reclassify existing model results.') }}</div>
 
         <div style="margin-top: 2rem;">

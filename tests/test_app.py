@@ -1,6 +1,8 @@
 import os
+import re
 import xml.etree.ElementTree as ET
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from unittest.mock import MagicMock, PropertyMock, mock_open, patch
 
 import pytest
@@ -23,6 +25,11 @@ with patch("database.init_db"):
     import app as app_module
 
     flask_app = app_module.app
+    # The limiter is initialised with its config, so tests must disable the
+    # instance (not the config). A full run otherwise exhausts the global
+    # 200/hour quota part-way through and turns unrelated assertions into 429s.
+    # Tests that need limiting turn it back on themselves.
+    app_module.limiter.enabled = False
     _snap_thumb_width = app_module._snap_thumb_width
     _is_safe_url = app_module._is_safe_url
     commons_thumb_url = app_module.commons_thumb_url
@@ -31,9 +38,34 @@ with patch("database.init_db"):
 
 
 try:
-    from conftest import _make_encoding
+    from conftest import _make_embedding, require_sample_env
 except ModuleNotFoundError:
-    from tests.conftest import _make_encoding
+    from tests.conftest import _make_embedding, require_sample_env
+
+
+def _known_encoding(seed: int, *, aligned: bool = True):
+    """What ``face_client.encode_known_face`` returns for a located face."""
+    return app_module.face_client.KnownFaceEncoding(_make_embedding(seed), "scrfd500m+arcface_mbf", aligned)
+
+
+def test_require_sample_env_accepts_only_explicit_affirmatives(monkeypatch):
+    """L2: WIKIVISAGE_REQUIRE_SAMPLE=0 must mean "not required", not truthy."""
+    for value, expected in [
+        (None, False),
+        ("", False),
+        ("0", False),
+        ("false", False),
+        ("off", False),
+        ("1", True),
+        ("true", True),
+        ("YES", True),
+        (" on ", True),
+    ]:
+        if value is None:
+            monkeypatch.delenv("WIKIVISAGE_REQUIRE_SAMPLE", raising=False)
+        else:
+            monkeypatch.setenv("WIKIVISAGE_REQUIRE_SAMPLE", value)
+        assert require_sample_env() is expected, value
 
 
 def test_snap_exact_match():
@@ -252,9 +284,9 @@ def test_api_classify_target(integration_client, seed_project, seed_images, db_c
 
     with db_conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO faces (image_id, encoding, bbox_top, bbox_right, bbox_bottom, bbox_left) "
-            "VALUES (%s, %s, 50, 200, 200, 50)",
-            (seed_images[0]["id"], _make_encoding(999)),
+            "INSERT INTO faces (image_id, encoding, embedding_model, bbox_top, bbox_right, bbox_bottom, bbox_left) "
+            "VALUES (%s, %s, 'scrfd500m+arcface_mbf', 50, 200, 200, 50)",
+            (seed_images[0]["id"], _make_embedding(999)),
         )
         face_id = cur.lastrowid
 
@@ -292,9 +324,9 @@ def test_api_classify_none(integration_client, seed_project, seed_images, db_con
 
     with db_conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO faces (image_id, encoding, bbox_top, bbox_right, bbox_bottom, bbox_left) "
-            "VALUES (%s, %s, 50, 200, 200, 50)",
-            (seed_images[0]["id"], _make_encoding(1000)),
+            "INSERT INTO faces (image_id, encoding, embedding_model, bbox_top, bbox_right, bbox_bottom, bbox_left) "
+            "VALUES (%s, %s, 'scrfd500m+arcface_mbf', 50, 200, 200, 50)",
+            (seed_images[0]["id"], _make_embedding(1000)),
         )
         face_id = cur.lastrowid
 
@@ -332,9 +364,9 @@ def test_api_undo_classify(integration_client, seed_project, seed_images, db_con
 
     with db_conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO faces (image_id, encoding, bbox_top, bbox_right, bbox_bottom, bbox_left) "
-            "VALUES (%s, %s, 50, 200, 200, 50)",
-            (seed_images[0]["id"], _make_encoding(1001)),
+            "INSERT INTO faces (image_id, encoding, embedding_model, bbox_top, bbox_right, bbox_bottom, bbox_left) "
+            "VALUES (%s, %s, 'scrfd500m+arcface_mbf', 50, 200, 200, 50)",
+            (seed_images[0]["id"], _make_embedding(1001)),
         )
         face_id = cur.lastrowid
 
@@ -378,10 +410,10 @@ def test_api_reclassify_approve(integration_client, seed_images, db_conn):
 
     with db_conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO faces (image_id, encoding, bbox_top, bbox_right, bbox_bottom, bbox_left, "
+            "INSERT INTO faces (image_id, encoding, embedding_model, bbox_top, bbox_right, bbox_bottom, bbox_left, "
             "is_target, classified_by, classified_by_user_id) "
-            "VALUES (%s, %s, 50, 200, 200, 50, 0, 'model', NULL)",
-            (seed_images[0]["id"], _make_encoding(1002)),
+            "VALUES (%s, %s, 'scrfd500m+arcface_mbf', 50, 200, 200, 50, 0, 'model', NULL)",
+            (seed_images[0]["id"], _make_embedding(1002)),
         )
         face_id = cur.lastrowid
 
@@ -416,10 +448,10 @@ def test_api_reclassify_reject(integration_client, seed_images, db_conn):
 
     with db_conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO faces (image_id, encoding, bbox_top, bbox_right, bbox_bottom, bbox_left, "
+            "INSERT INTO faces (image_id, encoding, embedding_model, bbox_top, bbox_right, bbox_bottom, bbox_left, "
             "is_target, classified_by, classified_by_user_id, sdc_written) "
-            "VALUES (%s, %s, 50, 200, 200, 50, 1, 'model', NULL, 0)",
-            (seed_images[0]["id"], _make_encoding(1003)),
+            "VALUES (%s, %s, 'scrfd500m+arcface_mbf', 50, 200, 200, 50, 1, 'model', NULL, 0)",
+            (seed_images[0]["id"], _make_embedding(1003)),
         )
         face_id = cur.lastrowid
 
@@ -630,7 +662,9 @@ def test_wake_file_path_consistent():
 
     # app.py must import WAKE_FILE_PATH from config (not define its own)
     app_source = inspect.getsource(app_module)
-    assert "from config import WAKE_FILE_PATH" in app_source, "app.py must import WAKE_FILE_PATH from config"
+    assert re.search(r"^from config import .*\bWAKE_FILE_PATH\b", app_source, re.M), (
+        "app.py must import WAKE_FILE_PATH from config"
+    )
 
 
 def test_before_request_without_session_user_id_sets_no_user():
@@ -754,22 +788,32 @@ def test_set_security_headers_sets_all_required_headers():
 
 
 def test_hsts_header_not_set_in_debug_mode():
-    flask_app.debug = True
+    # set_security_headers reads the module-level app, and an integration-mode
+    # test may have reloaded the module, so both must be addressed through
+    # app_module rather than the module-level flask_app reference.
+    application = app_module.app
+    original_debug = application.debug
+    application.debug = True
     try:
-        with flask_app.test_request_context():
-            response = flask_app.make_response(("ok", 200))
+        with application.test_request_context():
+            response = application.make_response(("ok", 200))
             result = app_module.set_security_headers(response)
             assert "Strict-Transport-Security" not in result.headers
     finally:
-        flask_app.debug = False
+        application.debug = original_debug
 
 
 def test_hsts_header_set_when_not_debug():
-    flask_app.debug = False
-    with flask_app.test_request_context():
-        response = flask_app.make_response(("ok", 200))
-        result = app_module.set_security_headers(response)
-        assert result.headers["Strict-Transport-Security"] == "max-age=31536000; includeSubDomains"
+    application = app_module.app
+    original_debug = application.debug
+    application.debug = False
+    try:
+        with application.test_request_context():
+            response = application.make_response(("ok", 200))
+            result = app_module.set_security_headers(response)
+            assert result.headers["Strict-Transport-Security"] == "max-age=31536000; includeSubDomains"
+    finally:
+        application.debug = original_debug
 
 
 def test_csp_header_contains_required_directives():
@@ -4187,7 +4231,7 @@ def test_api_classify_ownership_check_fail(monkeypatch):
                     "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
                 }
             ]
-        if "SELECT i.id, i.file_title, i.status FROM images i" in sql:
+        if "SELECT i.id, i.file_title, i.status, i.detection_width, i.detection_height FROM images i" in sql:
             return ()
         return ()
 
@@ -4214,7 +4258,7 @@ def test_api_classify_ownership_check_db_error(monkeypatch):
                     "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
                 }
             ]
-        if "SELECT i.id, i.file_title, i.status FROM images i" in sql:
+        if "SELECT i.id, i.file_title, i.status, i.detection_width, i.detection_height FROM images i" in sql:
             raise app_module.DatabaseError("db")
         return ()
 
@@ -4243,7 +4287,7 @@ def test_api_classify_invalid_selected_face_id(monkeypatch):
                     "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
                 }
             ]
-        if "SELECT i.id, i.file_title, i.status FROM images i" in sql:
+        if "SELECT i.id, i.file_title, i.status, i.detection_width, i.detection_height FROM images i" in sql:
             return [{"id": 2, "file_title": "File:Test.jpg", "status": "processed"}]
         return ()
 
@@ -4255,7 +4299,10 @@ def test_api_classify_invalid_selected_face_id(monkeypatch):
     )
     assert response.status_code == 400
     assert response.get_json()["error"] == "Invalid face ID"
-    assert any("SELECT i.id, i.file_title, i.status FROM images i" in q[0] for q in queries)
+    assert any(
+        "SELECT i.id, i.file_title, i.status, i.detection_width, i.detection_height FROM images i" in q[0]
+        for q in queries
+    )
 
 
 def test_api_classify_none_normal_mode_sets_last_classify(monkeypatch):
@@ -4273,7 +4320,7 @@ def test_api_classify_none_normal_mode_sets_last_classify(monkeypatch):
                     "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
                 }
             ]
-        if "SELECT i.id, i.file_title, i.status FROM images i" in sql:
+        if "SELECT i.id, i.file_title, i.status, i.detection_width, i.detection_height FROM images i" in sql:
             return [{"id": 22, "file_title": "File:Test.jpg", "status": "processed"}]
         return ()
 
@@ -4320,7 +4367,7 @@ def test_api_classify_none_review_mode_updates_human_flags(monkeypatch):
                     "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
                 }
             ]
-        if "SELECT i.id, i.file_title, i.status FROM images i" in sql:
+        if "SELECT i.id, i.file_title, i.status, i.detection_width, i.detection_height FROM images i" in sql:
             return [{"id": 22, "file_title": "File:Test.jpg", "status": "processed"}]
         return ()
 
@@ -4363,7 +4410,7 @@ def test_api_classify_none_bootstrapped_without_sibling_queues_removal(monkeypat
                     "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
                 }
             ]
-        if "SELECT i.id, i.file_title, i.status FROM images i" in sql:
+        if "SELECT i.id, i.file_title, i.status, i.detection_width, i.detection_height FROM images i" in sql:
             return [{"id": 22, "file_title": "File:Test.jpg", "status": "processed"}]
         return ()
 
@@ -4400,7 +4447,7 @@ def test_api_classify_none_bootstrapped_with_sibling_does_not_queue_removal(monk
                     "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
                 }
             ]
-        if "SELECT i.id, i.file_title, i.status FROM images i" in sql:
+        if "SELECT i.id, i.file_title, i.status, i.detection_width, i.detection_height FROM images i" in sql:
             return [{"id": 22, "file_title": "File:Test.jpg", "status": "processed"}]
         return ()
 
@@ -4437,7 +4484,7 @@ def test_api_classify_target_normal_mode_updates_and_counter(monkeypatch):
                     "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
                 }
             ]
-        if "SELECT i.id, i.file_title, i.status FROM images i" in sql:
+        if "SELECT i.id, i.file_title, i.status, i.detection_width, i.detection_height FROM images i" in sql:
             return [{"id": 22, "file_title": "File:Test.jpg", "status": "processed"}]
         return ()
 
@@ -4485,7 +4532,7 @@ def test_api_classify_target_review_mode_updates_other_faces_human(monkeypatch):
                     "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
                 }
             ]
-        if "SELECT i.id, i.file_title, i.status FROM images i" in sql:
+        if "SELECT i.id, i.file_title, i.status, i.detection_width, i.detection_height FROM images i" in sql:
             return [{"id": 22, "file_title": "File:Test.jpg", "status": "processed"}]
         return ()
 
@@ -4540,7 +4587,7 @@ def test_api_classify_target_review_mode_does_not_use_is_target_null(monkeypatch
                     "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
                 }
             ]
-        if "SELECT i.id, i.file_title, i.status FROM images i" in sql:
+        if "SELECT i.id, i.file_title, i.status, i.detection_width, i.detection_height FROM images i" in sql:
             return [{"id": 22, "file_title": "File:Test.jpg", "status": "processed"}]
         return ()
 
@@ -4593,7 +4640,7 @@ def test_api_classify_db_error_during_transaction(monkeypatch):
                     "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
                 }
             ]
-        if "SELECT i.id, i.file_title, i.status FROM images i" in sql:
+        if "SELECT i.id, i.file_title, i.status, i.detection_width, i.detection_height FROM images i" in sql:
             return [{"id": 22, "file_title": "File:Test.jpg", "status": "processed"}]
         return ()
 
@@ -4652,7 +4699,7 @@ def test_api_undo_classify_ownership_check_fail(monkeypatch):
                     "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
                 }
             ]
-        if "SELECT i.id, i.file_title, i.status FROM images i" in sql:
+        if "SELECT i.id, i.file_title, i.status, i.detection_width, i.detection_height FROM images i" in sql:
             return ()
         return ()
 
@@ -4678,7 +4725,7 @@ def test_api_undo_classify_ownership_check_db_error(monkeypatch):
                     "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
                 }
             ]
-        if "SELECT i.id, i.file_title, i.status FROM images i" in sql:
+        if "SELECT i.id, i.file_title, i.status, i.detection_width, i.detection_height FROM images i" in sql:
             raise app_module.DatabaseError("db")
         return ()
 
@@ -4706,7 +4753,7 @@ def test_api_undo_classify_target_normal_decrements_counter(monkeypatch):
                     "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
                 }
             ]
-        if "SELECT i.id, i.file_title, i.status FROM images i" in sql:
+        if "SELECT i.id, i.file_title, i.status, i.detection_width, i.detection_height FROM images i" in sql:
             return [{"id": 2, "file_title": "File:Test.jpg", "status": "processed"}]
         return ()
 
@@ -4750,7 +4797,7 @@ def test_api_undo_classify_none_review_restores_model(monkeypatch):
                     "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
                 }
             ]
-        if "SELECT i.id, i.file_title, i.status FROM images i" in sql:
+        if "SELECT i.id, i.file_title, i.status, i.detection_width, i.detection_height FROM images i" in sql:
             return [{"id": 2, "file_title": "File:Test.jpg", "status": "processed"}]
         return ()
 
@@ -4792,7 +4839,7 @@ def test_api_undo_classify_manual_face_deletion_and_exclusion(monkeypatch):
                     "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
                 }
             ]
-        if "SELECT i.id, i.file_title, i.status FROM images i" in sql:
+        if "SELECT i.id, i.file_title, i.status, i.detection_width, i.detection_height FROM images i" in sql:
             return [{"id": 2, "file_title": "File:Test.jpg", "status": "processed"}]
         return ()
 
@@ -4836,7 +4883,7 @@ def test_api_undo_classify_manual_face_review_action_decrements(monkeypatch):
                     "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
                 }
             ]
-        if "SELECT i.id, i.file_title, i.status FROM images i" in sql:
+        if "SELECT i.id, i.file_title, i.status, i.detection_width, i.detection_height FROM images i" in sql:
             return [{"id": 2, "file_title": "File:Test.jpg", "status": "processed"}]
         return ()
 
@@ -4875,7 +4922,7 @@ def test_api_undo_classify_db_error_during_transaction(monkeypatch):
                     "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
                 }
             ]
-        if "SELECT i.id, i.file_title, i.status FROM images i" in sql:
+        if "SELECT i.id, i.file_title, i.status, i.detection_width, i.detection_height FROM images i" in sql:
             return [{"id": 2, "file_title": "File:Test.jpg", "status": "processed"}]
         return ()
 
@@ -4914,7 +4961,7 @@ def test_api_undo_classify_success_response_contains_ids(monkeypatch):
                     "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
                 }
             ]
-        if "SELECT i.id, i.file_title, i.status FROM images i" in sql:
+        if "SELECT i.id, i.file_title, i.status, i.detection_width, i.detection_height FROM images i" in sql:
             return [{"id": 2, "file_title": "File:Test.jpg", "status": "processed"}]
         return ()
 
@@ -5540,7 +5587,7 @@ def test_api_manual_face_success_normal_insert(monkeypatch):
     client, _ = _authed_client(monkeypatch, route_execute_query=_route_query)
     monkeypatch.setattr(app_module, "_download_image", lambda *_a, **_k: b"image-bytes")
     monkeypatch.setattr(app_module, "execute_transaction", _transaction)
-    monkeypatch.setattr(app_module.face_client, "encode_known_face", lambda *_a, **_k: _make_encoding(2001))
+    monkeypatch.setattr(app_module.face_client, "encode_known_face", lambda *_a, **_k: _known_encoding(2001))
 
     resp = client.post("/api/manual-face", data=_manual_face_form())
 
@@ -5553,6 +5600,69 @@ def test_api_manual_face_success_normal_insert(monkeypatch):
         assert sess["last_classify"]["was_review"] is False
         assert sess["last_classify"]["face_ids"] == []
         assert sess["last_classify"]["manual_face_ids"] == [99]
+
+
+def test_api_manual_face_unaligned_encoding_is_stored_with_flag(monkeypatch):
+    """L3: a drawn box the detector cannot confirm is embedded unaligned; the
+    faces row records that so the effect is measurable later."""
+    executed_sqls = []
+
+    def _route_query(sql):
+        if "FROM images i " in sql:
+            return [{"id": 10, "file_title": "File:Face.jpg", "status": "processed"}]
+        return []
+
+    def _transaction(fn):
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_cursor.lastrowid = 99
+        mock_cursor.rowcount = 1
+
+        original_execute = mock_cursor.execute
+
+        def tracking_execute(sql, params=None):
+            executed_sqls.append((sql, params))
+            return original_execute(sql, params)
+
+        mock_cursor.execute = tracking_execute
+        return fn(mock_conn, mock_cursor)
+
+    client, _ = _authed_client(monkeypatch, route_execute_query=_route_query)
+    monkeypatch.setattr(app_module, "_download_image", lambda *_a, **_k: b"image-bytes")
+    monkeypatch.setattr(app_module, "execute_transaction", _transaction)
+    monkeypatch.setattr(
+        app_module.face_client, "encode_known_face", lambda *_a, **_k: _known_encoding(2100, aligned=False)
+    )
+
+    resp = client.post("/api/manual-face", data=_manual_face_form())
+
+    assert resp.status_code == 200
+    inserts = [(sql, params) for sql, params in executed_sqls if "INSERT INTO faces" in sql]
+    assert len(inserts) == 1
+    sql, params = inserts[0]
+    assert "aligned" in sql
+    assert params[3] == 0  # aligned flag sits right after the embedding columns
+
+
+def test_api_manual_face_face_service_rejected_returns_422(monkeypatch):
+    """A malformed image is terminal for this request: 422, not a retryable 503."""
+
+    def _route_query(sql):
+        if "FROM images i " in sql:
+            return [{"id": 10, "file_title": "File:Face.jpg", "status": "processed"}]
+        return []
+
+    def _raise_rejected(*_args, **_kwargs):
+        raise app_module.FaceServiceRejected("image could not be decoded")
+
+    client, _ = _authed_client(monkeypatch, route_execute_query=_route_query)
+    monkeypatch.setattr(app_module, "_download_image", lambda *_a, **_k: b"image-bytes")
+    monkeypatch.setattr(app_module.face_client, "encode_known_face", _raise_rejected)
+
+    resp = client.post("/api/manual-face", data=_manual_face_form())
+
+    assert resp.status_code == 422
+    assert resp.get_json()["error"] == "This image could not be read by the face detection service."
 
 
 def test_api_manual_face_dismiss_faces_on_normal_insert(monkeypatch):
@@ -5586,7 +5696,7 @@ def test_api_manual_face_dismiss_faces_on_normal_insert(monkeypatch):
 
     import json
 
-    monkeypatch.setattr(app_module.face_client, "encode_known_face", lambda *_a, **_k: _make_encoding(2002))
+    monkeypatch.setattr(app_module.face_client, "encode_known_face", lambda *_a, **_k: _known_encoding(2002))
 
     resp = client.post(
         "/api/manual-face",
@@ -5627,7 +5737,7 @@ def test_api_manual_face_review_mode_tracks_confirmed_ids(monkeypatch):
     client, _ = _authed_client(monkeypatch, route_execute_query=_review_route_query)
     monkeypatch.setattr(app_module, "_download_image", lambda *_a, **_k: b"image-bytes")
     monkeypatch.setattr(app_module, "execute_transaction", _review_transaction)
-    monkeypatch.setattr(app_module.face_client, "encode_known_face", lambda *_a, **_k: _make_encoding(2003))
+    monkeypatch.setattr(app_module.face_client, "encode_known_face", lambda *_a, **_k: _known_encoding(2003))
 
     resp = client.post("/api/manual-face", data=_manual_face_form(reviewing_model="1"))
 
@@ -5684,7 +5794,7 @@ def test_api_manual_face_db_error_on_insert(monkeypatch):
     client, _ = _authed_client(monkeypatch, route_execute_query=_route_query)
     monkeypatch.setattr(app_module, "_download_image", lambda *_a, **_k: b"image-bytes")
     monkeypatch.setattr(app_module, "execute_transaction", _raise_db_error)
-    monkeypatch.setattr(app_module.face_client, "encode_known_face", lambda *_a, **_k: _make_encoding(2004))
+    monkeypatch.setattr(app_module.face_client, "encode_known_face", lambda *_a, **_k: _known_encoding(2004))
 
     resp = client.post("/api/manual-face", data=_manual_face_form())
 
@@ -6349,7 +6459,7 @@ def test_api_update_face_bbox_success_new_face_inserted_original_superseded(monk
         return result
 
     monkeypatch.setattr(app_module, "execute_transaction", _transaction)
-    monkeypatch.setattr(app_module.face_client, "encode_known_face", lambda *_a, **_k: _make_encoding(3001))
+    monkeypatch.setattr(app_module.face_client, "encode_known_face", lambda *_a, **_k: _known_encoding(3001))
 
     resp = client.post("/api/update-face-bbox", data=_update_bbox_form())
 
@@ -6397,7 +6507,7 @@ def test_api_update_face_bbox_db_error_on_insert(monkeypatch):
         "execute_transaction",
         _raise_db_error,
     )
-    monkeypatch.setattr(app_module.face_client, "encode_known_face", lambda *_a, **_k: _make_encoding(3002))
+    monkeypatch.setattr(app_module.face_client, "encode_known_face", lambda *_a, **_k: _known_encoding(3002))
 
     resp = client.post("/api/update-face-bbox", data=_update_bbox_form())
 
@@ -6433,6 +6543,50 @@ def test_api_update_face_bbox_face_service_error(monkeypatch):
 
     assert resp.status_code == 503
     assert resp.get_json()["error"] == "Face detection service is unavailable. Please try again in a moment."
+
+
+def test_api_update_face_bbox_face_service_rejected_returns_422(monkeypatch):
+    client, _ = _authed_client(monkeypatch, route_execute_query=_bbox_query_router())
+    monkeypatch.setattr(app_module, "_download_image", lambda *_a, **_k: b"image-bytes")
+
+    def _raise_rejected(*_args, **_kwargs):
+        raise app_module.FaceServiceRejected("image could not be decoded")
+
+    monkeypatch.setattr(app_module.face_client, "encode_known_face", _raise_rejected)
+
+    resp = client.post("/api/update-face-bbox", data=_update_bbox_form())
+
+    assert resp.status_code == 422
+    assert resp.get_json()["error"] == "This image could not be read by the face detection service."
+
+
+def test_api_update_face_bbox_unaligned_encoding_records_flag(monkeypatch):
+    client, _ = _authed_client(monkeypatch, route_execute_query=_bbox_query_router())
+    monkeypatch.setattr(app_module, "_download_image", lambda *_a, **_k: b"image-bytes")
+    captured = {}
+
+    def _transaction(fn):
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_cursor.lastrowid = 322
+        mock_cursor.fetchone.return_value = {"classified_by_user_id": None, "wiki_username": None}
+        result = fn(mock_conn, mock_cursor)
+        captured["calls"] = mock_cursor.execute.call_args_list
+        return result
+
+    monkeypatch.setattr(app_module, "execute_transaction", _transaction)
+    monkeypatch.setattr(
+        app_module.face_client, "encode_known_face", lambda *_a, **_k: _known_encoding(3003, aligned=False)
+    )
+
+    resp = client.post("/api/update-face-bbox", data=_update_bbox_form())
+
+    assert resp.status_code == 200
+    inserts = [call for call in captured["calls"] if call.args[0].startswith("INSERT INTO faces")]
+    assert len(inserts) == 1
+    sql, params = inserts[0].args[0], inserts[0].args[1]
+    assert "aligned" in sql
+    assert params[3] == 0
 
 
 def test_api_update_face_bbox_image_not_processed(monkeypatch):
@@ -6507,7 +6661,7 @@ def test_api_update_face_bbox_allows_self_edit(monkeypatch):
         return fn(mock_conn, mock_cursor)
 
     monkeypatch.setattr(app_module, "execute_transaction", _transaction)
-    monkeypatch.setattr(app_module.face_client, "encode_known_face", lambda *_a, **_k: _make_encoding(3003))
+    monkeypatch.setattr(app_module.face_client, "encode_known_face", lambda *_a, **_k: _known_encoding(3003))
 
     resp = client.post("/api/update-face-bbox", data=_update_bbox_form())
 
@@ -6533,7 +6687,7 @@ def test_api_update_face_bbox_allows_edit_of_unclassified_face(monkeypatch):
         return fn(mock_conn, mock_cursor)
 
     monkeypatch.setattr(app_module, "execute_transaction", _transaction)
-    monkeypatch.setattr(app_module.face_client, "encode_known_face", lambda *_a, **_k: _make_encoding(3004))
+    monkeypatch.setattr(app_module.face_client, "encode_known_face", lambda *_a, **_k: _known_encoding(3004))
 
     resp = client.post("/api/update-face-bbox", data=_update_bbox_form())
 
@@ -6567,7 +6721,7 @@ def test_api_update_face_bbox_intx_recheck_blocks_toctou_race(monkeypatch):
             raise app_module.DatabaseError("Transaction execution failed") from exc
 
     monkeypatch.setattr(app_module, "execute_transaction", _transaction)
-    monkeypatch.setattr(app_module.face_client, "encode_known_face", lambda *_a, **_k: _make_encoding(3005))
+    monkeypatch.setattr(app_module.face_client, "encode_known_face", lambda *_a, **_k: _known_encoding(3005))
 
     resp = client.post("/api/update-face-bbox", data=_update_bbox_form())
 
@@ -8053,7 +8207,9 @@ def test_commons_thumb_route_custom_width(monkeypatch, fake_user):
 
 
 def test_create_app_returns_app():
-    assert app_module.create_app() is flask_app
+    # Compare within the module: an integration-mode test may have reloaded
+    # app and rebound app_module.app after flask_app was captured at import.
+    assert app_module.create_app() is app_module.app
 
 
 def test_account_settings_get(monkeypatch, fake_user):
@@ -9937,7 +10093,7 @@ def test_api_classify_target_marks_sdc_written_when_p180_exists(monkeypatch):
                     "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
                 }
             ]
-        if "SELECT i.id, i.file_title, i.status FROM images i" in sql:
+        if "SELECT i.id, i.file_title, i.status, i.detection_width, i.detection_height FROM images i" in sql:
             return [{"id": 22, "file_title": "File:Test.jpg", "status": "processed"}]
         if "SELECT i.commons_page_id, p.wikidata_qid" in sql:
             return [{"commons_page_id": 555, "wikidata_qid": "Q42"}]
@@ -9985,7 +10141,7 @@ def test_api_classify_target_no_sdc_written_when_p180_missing(monkeypatch):
                     "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
                 }
             ]
-        if "SELECT i.id, i.file_title, i.status FROM images i" in sql:
+        if "SELECT i.id, i.file_title, i.status, i.detection_width, i.detection_height FROM images i" in sql:
             return [{"id": 22, "file_title": "File:Test.jpg", "status": "processed"}]
         if "SELECT i.commons_page_id, p.wikidata_qid" in sql:
             return [{"commons_page_id": 555, "wikidata_qid": "Q42"}]
@@ -10029,7 +10185,7 @@ def test_api_classify_target_p180_check_db_error_non_fatal(monkeypatch):
                     "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
                 }
             ]
-        if "SELECT i.id, i.file_title, i.status FROM images i" in sql:
+        if "SELECT i.id, i.file_title, i.status, i.detection_width, i.detection_height FROM images i" in sql:
             return [{"id": 22, "file_title": "File:Test.jpg", "status": "processed"}]
         if "SELECT i.commons_page_id, p.wikidata_qid" in sql:
             raise app_module.DatabaseError("meta lookup failed")
@@ -11158,3 +11314,430 @@ class TestFindInCauseChain:
     def test_handles_none_input(self):
         # Defensive: walking None should just return None
         assert app_module._find_in_cause_chain(None, ValueError) is None  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# Embedding model switch: box_space, embedding_model, detection width, threshold
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def server_name_default():
+    """Some earlier tests pop SERVER_NAME from the shared app; restore the default."""
+    flask_app.config.setdefault("SERVER_NAME", None)
+
+
+def test_detection_space_uses_stored_dimensions():
+    assert app_module._detection_space(960, 640) == (960, 640)
+    assert app_module._detection_space("960", "640") == (960, 640)
+
+
+@pytest.mark.parametrize("width,height", [(None, 640), (960, None), (0, 640), (960, -1), ("x", 640)])
+def test_detection_space_is_none_when_dimensions_unknown(width, height):
+    assert app_module._detection_space(width, height) is None
+
+
+def test_file_path_url_uses_the_shared_detection_width():
+    import config
+    import worker
+
+    assert config.DETECTION_WIDTH == 960
+    assert app_module.FILE_PATH_URL == worker.FILE_PATH_URL
+    assert app_module.FILE_PATH_URL.endswith("?width=960")
+    assert "{file_title}" in app_module.FILE_PATH_URL
+    assert config.DETECTION_WIDTH in app_module._THUMB_STEPS
+
+
+def test_api_manual_face_passes_stored_detection_space_and_stores_embedding_model(monkeypatch, server_name_default):
+    seen = {}
+    executed = []
+
+    def _route_query(sql):
+        if "FROM images i " in sql:
+            return [
+                {
+                    "id": 10,
+                    "file_title": "File:Face.jpg",
+                    "status": "processed",
+                    "detection_width": 960,
+                    "detection_height": 720,
+                }
+            ]
+        return []
+
+    def _transaction(fn):
+        cursor = MagicMock()
+        cursor.lastrowid = 99
+        cursor.rowcount = 1
+        cursor.execute.side_effect = lambda sql, params=None: executed.append((sql, params))
+        return fn(MagicMock(), cursor)
+
+    def _encode(image_bytes, bbox, box_space=None):
+        seen["bbox"], seen["box_space"] = bbox, box_space
+        return _known_encoding(2101)
+
+    client, _ = _authed_client(monkeypatch, route_execute_query=_route_query)
+    monkeypatch.setattr(app_module, "_download_image", lambda *_a, **_k: b"image-bytes")
+    monkeypatch.setattr(app_module, "execute_transaction", _transaction)
+    monkeypatch.setattr(app_module.face_client, "encode_known_face", _encode)
+
+    resp = client.post("/api/manual-face", data=_manual_face_form())
+
+    assert resp.status_code == 200
+    # The drawn box is passed through untouched; the service rescales it from
+    # the stored detection space onto whatever size was downloaded.
+    assert seen["bbox"] == (10, 30, 40, 10)
+    assert seen["box_space"] == (960, 720)
+
+    inserts = [(sql, params) for sql, params in executed if sql.startswith("INSERT INTO faces")]
+    assert len(inserts) == 1
+    sql, params = inserts[0]
+    assert "embedding_model" in sql
+    assert params[1] == _make_embedding(2101)
+    assert params[2] == "scrfd500m+arcface_mbf"
+
+
+def test_api_manual_face_omits_box_space_when_detection_size_unknown(monkeypatch, server_name_default):
+    seen = {}
+
+    def _route_query(sql):
+        if "FROM images i " in sql:
+            return [{"id": 10, "file_title": "File:Face.jpg", "status": "processed"}]
+        return []
+
+    def _encode(image_bytes, bbox, box_space=None):
+        seen["box_space"] = box_space
+        return None
+
+    client, _ = _authed_client(monkeypatch, route_execute_query=_route_query)
+    monkeypatch.setattr(app_module, "_download_image", lambda *_a, **_k: b"image-bytes")
+    monkeypatch.setattr(app_module.face_client, "encode_known_face", _encode)
+
+    resp = client.post("/api/manual-face", data=_manual_face_form())
+
+    assert resp.status_code == 422
+    assert seen["box_space"] is None
+
+
+def test_api_update_face_bbox_passes_detection_space_and_stores_embedding_model(monkeypatch, server_name_default):
+    seen = {}
+    executed = []
+    row = _default_bbox_face_row()
+    row["detection_width"] = 960
+    row["detection_height"] = 640
+
+    def _encode(image_bytes, bbox, box_space=None):
+        seen["box_space"] = box_space
+        return _known_encoding(3101)
+
+    def _transaction(fn):
+        cursor = MagicMock()
+        cursor.lastrowid = 321
+        cursor.fetchone.return_value = {"classified_by_user_id": None, "wiki_username": None}
+        cursor.execute.side_effect = lambda sql, params=None: executed.append((sql, params))
+        return fn(MagicMock(), cursor)
+
+    client, _ = _authed_client(monkeypatch, route_execute_query=_bbox_query_router(face_row=row))
+    monkeypatch.setattr(app_module, "_download_image", lambda *_a, **_k: b"image-bytes")
+    monkeypatch.setattr(app_module, "execute_transaction", _transaction)
+    monkeypatch.setattr(app_module.face_client, "encode_known_face", _encode)
+
+    resp = client.post("/api/update-face-bbox", data=_update_bbox_form())
+
+    assert resp.status_code == 200
+    assert seen["box_space"] == (960, 640)
+    inserts = [(sql, params) for sql, params in executed if sql.startswith("INSERT INTO faces")]
+    assert len(inserts) == 1
+    sql, params = inserts[0]
+    assert "embedding_model" in sql
+    assert params[2] == "scrfd500m+arcface_mbf"
+
+
+def _threshold_form_client(monkeypatch):
+    return _authed_client(monkeypatch, route_execute_query=lambda sql: [])
+
+
+@pytest.mark.parametrize("value,ok", [("0.5", True), ("0.1", True), ("1.0", True), ("0.09", False), ("1.01", False)])
+def test_project_new_distance_threshold_range_is_unchanged(monkeypatch, value, ok, server_name_default):
+    client, _ = _threshold_form_client(monkeypatch)
+    monkeypatch.setattr(app_module, "_is_human_entity", lambda *_a, **_k: False)
+
+    resp = client.post(
+        "/project/new",
+        data={
+            "csrf_token": "testtoken",
+            "wikidata_qid": "Q42",
+            "commons_category": "Douglas Adams",
+            "distance_threshold": value,
+            "min_confirmed": "5",
+        },
+    )
+
+    body = resp.get_data(as_text=True)
+    assert ("Distance threshold must be between 0.1 and 1.0." in body) is (not ok)
+
+
+def test_project_new_form_defaults_to_the_cosine_threshold(server_name_default):
+    assert app_module.DEFAULT_DISTANCE_THRESHOLD == 0.5
+    with flask_app.test_request_context("/"):
+        html = app_module.render_template("project_new.html")
+    assert 'value="0.5"' in html
+    assert "(default 0.5)" in html
+    assert "0.6" not in html.split('id="distance_threshold"', 1)[1].split("</div>", 1)[0]
+
+
+def test_schema_default_threshold_matches_app_and_migration_default():
+    import migrate
+
+    schema = (Path(__file__).resolve().parent.parent / "schema.sql").read_text(encoding="utf-8")
+    assert f"DEFAULT {app_module.DEFAULT_DISTANCE_THRESHOLD} COMMENT 'Cosine distance threshold" in schema
+    assert migrate.DEFAULT_DISTANCE_THRESHOLD == app_module.DEFAULT_DISTANCE_THRESHOLD
+
+
+# ---------------------------------------------------------------------------
+# Experimental LiftWing pre-filter status (Phase 2)
+# ---------------------------------------------------------------------------
+
+
+def _liftwing_status_row(status="down", is_stale=0):
+    return {
+        "status": status,
+        "is_stale": is_stale,
+        "last_checked": datetime.now(UTC),
+        "last_ok": None,
+    }
+
+
+def test_inject_liftwing_status_up(monkeypatch):
+    monkeypatch.setattr(app_module, "execute_query", lambda *a, **kw: [_liftwing_status_row("up")])
+
+    data = app_module.inject_liftwing_status()
+
+    assert data["liftwing_down"] is False
+    assert data["liftwing_status"] == "up"
+
+
+def test_inject_liftwing_status_down(monkeypatch):
+    monkeypatch.setattr(app_module, "execute_query", lambda *a, **kw: [_liftwing_status_row("down")])
+
+    data = app_module.inject_liftwing_status()
+
+    assert data["liftwing_down"] is True
+    assert data["liftwing_status"] == "down"
+    assert data["liftwing_last_checked"] is not None
+
+
+def test_inject_liftwing_status_stale_down_reads_unknown(monkeypatch):
+    monkeypatch.setattr(app_module, "execute_query", lambda *a, **kw: [_liftwing_status_row("down", is_stale=1)])
+
+    data = app_module.inject_liftwing_status()
+
+    assert data["liftwing_down"] is False
+    assert data["liftwing_status"] == "unknown"
+
+
+def test_inject_liftwing_status_missing_row_is_unknown(monkeypatch):
+    monkeypatch.setattr(app_module, "execute_query", lambda *a, **kw: [])
+
+    data = app_module.inject_liftwing_status()
+
+    assert data["liftwing_down"] is False
+    assert data["liftwing_status"] == "unknown"
+    assert data["liftwing_last_checked"] is None
+
+
+def test_inject_liftwing_status_skips_lookup_on_non_project_pages(monkeypatch):
+    """L4: only project detail/settings show the banner; other pages skip the query."""
+
+    def _boom(*_args, **_kwargs):
+        raise AssertionError("the context processor must not query on this page")
+
+    monkeypatch.setattr(app_module, "execute_query", _boom)
+
+    with app_module.app.test_request_context("/dashboard"):
+        data = app_module.inject_liftwing_status()
+
+    assert data == {"liftwing_down": False, "liftwing_status": "unknown", "liftwing_last_checked": None}
+
+
+def test_inject_liftwing_status_still_queries_on_project_pages(monkeypatch):
+    monkeypatch.setattr(app_module, "execute_query", lambda *a, **kw: [_liftwing_status_row("down")])
+
+    with app_module.app.test_request_context("/project/1"):
+        data = app_module.inject_liftwing_status()
+
+    assert data["liftwing_down"] is True
+
+
+def test_inject_liftwing_status_db_error_is_unknown(monkeypatch):
+    def boom(*args, **kwargs):
+        raise RuntimeError("database down")
+
+    monkeypatch.setattr(app_module, "execute_query", boom)
+
+    data = app_module.inject_liftwing_status()
+
+    assert data["liftwing_down"] is False
+    assert data["liftwing_status"] == "unknown"
+
+
+def _health_execute_query(liftwing_usage, liftwing_row):
+    def route(sql, params=None, fetch=True):
+        if "SELECT 1 AS ok" in sql:
+            return [{"ok": 1}]
+        if "COUNT(*) AS cnt FROM projects" in sql:
+            return [{"cnt": liftwing_usage}]
+        if "SELECT status, last_checked, last_ok" in sql:
+            return [liftwing_row] if liftwing_row else []
+        raise AssertionError(f"Unexpected SQL: {sql}")
+
+    return route
+
+
+def test_health_liftwing_disabled_when_unused(monkeypatch):
+    monkeypatch.setattr(app_module, "_LIMITER_REDIS_OK", True)
+    monkeypatch.setattr(app_module.face_client, "is_healthy", lambda *a, **kw: True)
+    monkeypatch.setattr(app_module, "execute_query", _health_execute_query(0, None))
+
+    response = flask_app.test_client().get("/health")
+    data = response.get_json()
+
+    assert response.status_code == 200
+    assert data["liftwing"] == "disabled"
+    assert data["degraded"] is False
+
+
+def test_health_liftwing_reachable(monkeypatch):
+    monkeypatch.setattr(app_module, "_LIMITER_REDIS_OK", True)
+    monkeypatch.setattr(app_module.face_client, "is_healthy", lambda *a, **kw: True)
+    monkeypatch.setattr(app_module, "execute_query", _health_execute_query(1, _liftwing_status_row("up")))
+
+    data = flask_app.test_client().get("/health").get_json()
+
+    assert data["liftwing"] == "reachable"
+    assert data["degraded"] is False
+
+
+def test_health_liftwing_unreachable_does_not_degrade(monkeypatch):
+    monkeypatch.setattr(app_module, "_LIMITER_REDIS_OK", True)
+    monkeypatch.setattr(app_module.face_client, "is_healthy", lambda *a, **kw: True)
+    monkeypatch.setattr(app_module, "execute_query", _health_execute_query(1, _liftwing_status_row("down")))
+
+    data = flask_app.test_client().get("/health").get_json()
+
+    assert data["liftwing"] == "unreachable"
+    assert data["degraded"] is False
+
+
+def test_health_liftwing_disabled_when_status_stale(monkeypatch):
+    monkeypatch.setattr(app_module, "_LIMITER_REDIS_OK", True)
+    monkeypatch.setattr(app_module.face_client, "is_healthy", lambda *a, **kw: True)
+    row = _liftwing_status_row("down", is_stale=1)
+    monkeypatch.setattr(app_module, "execute_query", _health_execute_query(1, row))
+
+    data = flask_app.test_client().get("/health").get_json()
+
+    assert data["liftwing"] == "disabled"
+
+
+def test_project_settings_invalid_prefilter_mode(monkeypatch, fake_user):
+    project = _project_settings_base_row()
+
+    def route_execute(sql, _params, _fetch):
+        if "SELECT * FROM projects" in sql:
+            return [project.copy()]
+        raise AssertionError(f"Unexpected SQL: {sql}")
+
+    client = _make_authed_client(monkeypatch, fake_user, route_execute)
+    _set_csrf_chunk6(client)
+
+    response = client.post(
+        "/project/1/settings",
+        data={
+            "csrf_token": "testtoken",
+            "distance_threshold": "0.6",
+            "min_confirmed": "5",
+            "status": "active",
+            "label": "X",
+            "prefilter_mode": "enforce",
+        },
+    )
+
+    assert response.status_code == 200
+    assert b"Invalid metadata pre-filter mode." in response.data
+
+
+def test_project_settings_success_persists_prefilter_mode(monkeypatch, fake_user):
+    project = _project_settings_base_row()
+    project["prefilter_mode"] = "off"
+    updates = []
+
+    def route_execute(sql, params, fetch):
+        if "SELECT * FROM projects" in sql:
+            return [project.copy()]
+        if "UPDATE projects SET distance_threshold" in sql:
+            updates.append((params, fetch))
+            return 1
+        if "AS human_confirmed" in sql:
+            return [{"human_confirmed": 10, "by_bootstrap": 0}]
+        raise AssertionError(f"Unexpected SQL: {sql}")
+
+    client = _make_authed_client(monkeypatch, fake_user, route_execute)
+    _set_csrf_chunk6(client)
+
+    response = client.post(
+        "/project/1/settings",
+        data={
+            "csrf_token": "testtoken",
+            "distance_threshold": "0.55",
+            "min_confirmed": "6",
+            "status": "paused",
+            "label": "New Label",
+            "prefilter_mode": "shadow",
+        },
+    )
+
+    assert response.status_code == 302
+    assert len(updates) == 1
+    assert updates[0][0][4] == "shadow"
+
+
+def test_project_settings_shows_liftwing_banner_and_status(monkeypatch, fake_user):
+    project = _project_settings_base_row()
+    project["prefilter_mode"] = "shadow"
+
+    def route_execute(sql, _params=None, _fetch=True):
+        if "SELECT * FROM projects" in sql:
+            return [project.copy()]
+        if "project_members" in sql:
+            return []
+        if "SELECT status, last_checked, last_ok" in sql:
+            return [_liftwing_status_row("down")]
+        raise AssertionError(f"Unexpected SQL: {sql}")
+
+    client = _make_authed_client(monkeypatch, fake_user, route_execute)
+    response = client.get("/project/1/settings")
+
+    assert response.status_code == 200
+    assert b"The LiftWing AI service used for the metadata filter" in response.data
+    assert b"unreachable" in response.data
+
+
+def test_project_settings_hides_liftwing_banner_when_mode_off(monkeypatch, fake_user):
+    project = _project_settings_base_row()
+    project["prefilter_mode"] = "off"
+
+    def route_execute(sql, _params=None, _fetch=True):
+        if "SELECT * FROM projects" in sql:
+            return [project.copy()]
+        if "project_members" in sql:
+            return []
+        if "SELECT status, last_checked, last_ok" in sql:
+            return [_liftwing_status_row("down")]
+        raise AssertionError(f"Unexpected SQL: {sql}")
+
+    client = _make_authed_client(monkeypatch, fake_user, route_execute)
+    response = client.get("/project/1/settings")
+
+    assert response.status_code == 200
+    assert b"The LiftWing AI service used for the metadata filter" not in response.data

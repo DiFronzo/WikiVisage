@@ -49,9 +49,9 @@ Active learning facial recognition for Wikimedia Commons. Train an ML model to r
 ## ✨ Highlights
 
 - 🧠 **Active learning UI**: fast yes/no classification with keyboard shortcuts, undo, skip, and manual face drawing
-- 🧵 **Background worker**: crawls Commons categories, downloads images, and stores the 128D encodings the face service returns
+- 🧵 **Background worker**: crawls Commons categories, downloads images, and stores the 512D face embeddings the face service returns
 - 🔀 **Multi-instance workers**: distributed locking lets multiple workers process projects concurrently without conflicts
-- 🧩 **Separate face service**: dlib lives in its own KServe service, deployed as a second Toolforge tool — the web and worker processes ship with zero ML dependencies
+- 🧩 **Separate face service**: SCRFD face detection and ArcFace embeddings run on ONNX Runtime in their own KServe service, deployed as a second Toolforge tool — the web and worker processes ship with zero ML dependencies
 - 🛡️ **Secret isolation**: the face service parses untrusted image bytes in a tool that holds no OAuth, database, or token-encryption secret, behind a bearer token and a request-size cap
 - 📦 **Batched detection**: images are sent in size-aware batches, and a service outage leaves work `pending` for the next cycle instead of failing it permanently
 - 🧷 **Bootstrap from existing tags**: seeds the model via SPARQL when P180 depicts claims already exist on Commons
@@ -93,8 +93,9 @@ Active learning facial recognition for Wikimedia Commons. Train an ML model to r
                  |      (model-server/)       |
                  |----------------------------|
                  | KServe V1 predictor        |
-                 | dlib HOG detection         |
-                 | 128D face encoding         |
+                 | SCRFD-500M face detection  |
+                 | ArcFace MBF 512D embedding |
+                 | (ONNX Runtime, CPU)        |
                  +----------------------------+
              |                                  |
              +----------------+-----------------+
@@ -105,7 +106,7 @@ Active learning facial recognition for Wikimedia Commons. Train an ML model to r
                         +------------+
 ```
 
-- 🧰 **Stack**: Python 3.11+, Flask, gunicorn, PyMySQL, requests-oauthlib — plus KServe + dlib, isolated in the face service
+- 🧰 **Stack**: Python 3.11+, Flask, gunicorn, PyMySQL, requests-oauthlib — plus KServe + ONNX Runtime + OpenCV, isolated in the face service
 - ☁️ **Hosted on**: [Wikimedia Toolforge](https://wikitech.wikimedia.org/wiki/Help:Toolforge) — `wikivisage` (web + workers) and `wikivisage-face` (face service)
 - 🔀 **Workers**: Multiple instances run concurrently — each claims projects via `SELECT … FOR UPDATE` with automatic stale-claim expiry (15 min)
 
@@ -116,12 +117,14 @@ WikiVisage/
 ├── app.py               # Flask app: OAuth, routes, classification API
 ├── worker.py            # Background pipeline: crawl, remote detect, infer, write (multi-instance)
 ├── face_client.py       # HTTP client for the face service (zero ML deps)
-├── model-server/        # Face detection service — the only place dlib lives
+├── model-server/        # Face detection service — the only place ML runs
 │   ├── model.py         # KServe V1 predictor
+│   ├── backend.py       # SCRFD + ArcFace on ONNX Runtime, weight verification
+│   ├── weights/         # ONNX models (non-commercial licence, see LICENSES.md)
 │   ├── guard.py         # Bearer-token + body-size middleware
 │   ├── Procfile         # Toolforge buildpack entrypoint (production)
 │   ├── Dockerfile       # Local development and CI
-│   └── requirements.txt # kserve, dlib-bin, face_recognition_models
+│   └── requirements.txt # kserve, onnxruntime, opencv-python-headless
 ├── token_crypto.py      # Fernet encrypt/decrypt helpers for OAuth tokens at rest
 ├── database.py          # MariaDB connection pool with retry logic
 ├── schema.sql           # Database schema (9 tables + indices)
@@ -248,7 +251,7 @@ Each project has a couple of tunables:
 | Variable | Default | Description |
 |---|---:|---|
 | `WIKIVISAGE_WORKER_POLL_INTERVAL` | `60` | Seconds between poll cycles |
-| `WIKIVISAGE_WORKER_MAX_PROJECTS` | `3` | Max projects processed concurrently per worker |
+| `WIKIVISAGE_WORKER_MAX_PROJECTS` | `4` | Max projects processed concurrently per worker |
 | `WIKIVISAGE_WORKER_IMAGE_THREADS` | `4` | Parallel image download/detection threads per project |
 | `WIKIVISAGE_WORKER_BATCH_SIZE` | `50` | Images per processing batch |
 | `WIKIVISAGE_DB_POOL_SIZE` | auto | DB connection pool size (auto = `max_projects × image_threads + 3`) |
@@ -263,6 +266,7 @@ Read by both the web app and the worker (see [TESTING.md](TESTING.md) for the fu
 | `WIKIVISAGE_FACE_SERVICE_URL` | `http://localhost:8080` | Base URL of the face service |
 | `WIKIVISAGE_FACE_SERVICE_TOKEN` | *(unset)* | Bearer token; must match the face tool's (required in production) |
 | `WIKIVISAGE_FACE_SERVICE_BATCH_SIZE` | `8` | Max images per detection request |
+| `WIKIVISAGE_DETECTION_WIDTH` | `960` | Commons thumbnail width used for detection and manual drawing (a standard Commons step) |
 
 ## ✅ Testing
 
@@ -279,4 +283,8 @@ WIKIVISAGE_TEST_DB=1 pytest tests/ --cov=. --cov-report=term-missing
 
 ## 📝 License
 
-[MIT](LICENSE)
+[MIT](LICENSE) for the WikiVisage code.
+
+⚠️ The face models in `model-server/weights/` are third-party InsightFace weights
+released for **non-commercial research use only**; they are not covered by the MIT
+licence. See [LICENSES.md](LICENSES.md) and `model-server/weights/LICENSE-NOTICE`.

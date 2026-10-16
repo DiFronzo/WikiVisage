@@ -344,6 +344,8 @@ def test_faces_table_columns(test_db: str, db_conn) -> None:
         "id",
         "image_id",
         "encoding",
+        "embedding_model",
+        "det_score",
         "bbox_top",
         "bbox_right",
         "bbox_bottom",
@@ -469,3 +471,397 @@ def test_load_schema_real_file(test_db: str) -> None:
     assert statements
     assert "CREATE TABLE IF NOT EXISTS users" in statements[0]
     assert len(statements) >= 6
+
+
+# ---------------------------------------------------------------------------
+# Embedding-model upgrade: one-time wipe + schema changes
+# ---------------------------------------------------------------------------
+
+
+class _FakeDb:
+    """Records SQL and simulates just enough of MariaDB for the upgrade gate.
+
+    ``column_present`` is what ``information_schema.COLUMNS`` reports for
+    ``faces.embedding_model``; executing the marker ``ADD COLUMN`` flips it, like
+    the real thing. ``fail_on`` makes a statement containing the substring raise.
+    """
+
+    def __init__(self, column_present: bool, fail_on: str | None = None, fail_with: Exception | None = None):
+        self.column_present = column_present
+        self.fail_on = fail_on
+        self.fail_with = fail_with or RuntimeError("boom")
+        self.statements: list[tuple[str, tuple | None]] = []
+        self.events: list[str] = []
+        self.rowcount = 0
+        self._last = ""
+
+    def execute(self, sql: str, params: tuple | None = None) -> None:
+        self.statements.append((sql, params))
+        self._last = sql
+        self.events.append(sql)
+        if self.fail_on and self.fail_on in sql:
+            raise self.fail_with
+        if "ADD COLUMN embedding_model" in sql:
+            self.column_present = True
+        self.rowcount = 3
+
+    def fetchone(self):
+        assert "information_schema.COLUMNS" in self._last
+        return {"cnt": 1 if self.column_present else 0}
+
+    def commit(self) -> None:
+        self.events.append("COMMIT")
+
+    def rollback(self) -> None:
+        self.events.append("ROLLBACK")
+
+    def cursor(self):
+        cm = MagicMock()
+        cm.__enter__.return_value = self
+        cm.__exit__.return_value = False
+        return cm
+
+    def connection(self):
+        cm = MagicMock()
+        cm.__enter__.return_value = self
+        cm.__exit__.return_value = False
+        return cm
+
+    @property
+    def sql(self) -> list[str]:
+        return [s for s, _ in self.statements]
+
+
+def _run_upgrade(db: _FakeDb) -> bool:
+    import migrate
+
+    with patch("migrate.get_connection", return_value=db.connection()):
+        return migrate.apply_embedding_model_upgrade()
+
+
+def test_upgrade_wipes_and_adds_columns_when_marker_column_is_absent() -> None:
+    db = _FakeDb(column_present=False)
+
+    assert _run_upgrade(db) is True
+
+    sql = db.sql
+    assert "DELETE FROM images" in sql
+    assert "DELETE FROM sdc_claims" in sql
+    assert any(s.startswith("UPDATE projects SET images_total = 0") for s in sql)
+    assert any("ADD COLUMN embedding_model VARCHAR(32) NOT NULL" in s for s in sql)
+    assert any("ADD COLUMN det_score FLOAT NULL" in s for s in sql)
+    assert db.column_present is True
+
+
+def test_upgrade_does_nothing_when_marker_column_exists() -> None:
+    """Every later migrate run, and every fresh database, must skip the wipe."""
+    db = _FakeDb(column_present=True)
+
+    assert _run_upgrade(db) is False
+
+    assert len(db.statements) == 1
+    assert "information_schema.COLUMNS" in db.sql[0]
+    assert db.statements[0][1] == ("faces", "embedding_model")
+
+
+def test_upgrade_wipes_only_once_across_two_runs() -> None:
+    db = _FakeDb(column_present=False)
+
+    assert _run_upgrade(db) is True
+    first_run = len(db.statements)
+    assert _run_upgrade(db) is False
+
+    second_run = db.statements[first_run:]
+    assert len(second_run) == 1  # just the information_schema probe
+    assert "DELETE" not in second_run[0][0]
+
+
+def test_upgrade_never_uses_truncate_and_only_touches_derived_tables() -> None:
+    db = _FakeDb(column_present=False)
+    _run_upgrade(db)
+
+    joined = "\n".join(db.sql).upper()
+    assert "TRUNCATE" not in joined
+    assert "DROP TABLE" not in joined
+    assert "FOREIGN_KEY_CHECKS" not in joined
+    for kept in ("USERS", "SESSIONS", "PROJECT_MEMBERS", "USER_STATS", "WORKER_HEARTBEAT"):
+        assert f"DELETE FROM {kept}" not in joined
+        assert f"UPDATE {kept} " not in joined
+    deletes = [s for s in db.sql if s.startswith("DELETE")]
+    assert deletes == ["DELETE FROM images", "DELETE FROM sdc_claims"]
+
+
+def test_upgrade_resets_every_project_counter_and_the_threshold() -> None:
+    import migrate
+
+    db = _FakeDb(column_present=False)
+    _run_upgrade(db)
+
+    sql, params = next((s, p) for s, p in db.statements if s.startswith("UPDATE projects SET images_total"))
+    for column in (
+        "images_total = 0",
+        "images_processed = 0",
+        "faces_confirmed = 0",
+        "last_inference_threshold = NULL",
+        "last_inference_min_confirmed = NULL",
+        "completion_reason = NULL",
+        "sdc_write_requested = 0",
+        "sdc_write_user_id = NULL",
+        "sdc_write_error = NULL",
+        "worker_claimed_by = NULL",
+        "worker_claimed_at = NULL",
+        "distance_threshold = %s",
+    ):
+        assert column in sql
+    assert " WHERE " not in sql  # every project, including paused and deleted
+    assert params == (migrate.DEFAULT_DISTANCE_THRESHOLD,)
+
+
+def test_upgrade_reactivates_completed_projects_only() -> None:
+    db = _FakeDb(column_present=False)
+    _run_upgrade(db)
+
+    sql = next(s for s in db.sql if "SET status = 'active'" in s)
+    assert sql == "UPDATE projects SET status = 'active' WHERE status = 'completed'"
+
+
+def test_upgrade_adds_the_marker_column_last_and_only_after_the_wipe_committed() -> None:
+    db = _FakeDb(column_present=False)
+    _run_upgrade(db)
+
+    events = db.events
+    marker = next(i for i, e in enumerate(events) if "ADD COLUMN embedding_model" in e)
+    delete = next(i for i, e in enumerate(events) if e == "DELETE FROM images")
+    other_ddl = [i for i, e in enumerate(events) if e.startswith("ALTER TABLE") and "embedding_model" not in e]
+
+    assert marker == max(i for i, e in enumerate(events) if e.startswith("ALTER TABLE"))
+    assert all(i < marker for i in other_ddl)
+    assert "COMMIT" in events[delete:marker]  # wipe committed before any DDL
+
+
+def test_failed_wipe_rolls_back_and_leaves_the_marker_absent() -> None:
+    db = _FakeDb(column_present=False, fail_on="DELETE FROM sdc_claims")
+
+    with pytest.raises(RuntimeError, match="boom"):
+        _run_upgrade(db)
+
+    assert "ROLLBACK" in db.events
+    assert db.column_present is False
+    assert not any(s.startswith("ALTER TABLE") for s in db.sql)
+
+    # Next run starts from scratch: it sees no marker and wipes again.
+    db.fail_on = None
+    assert _run_upgrade(db) is True
+    assert db.column_present is True
+
+
+def test_interrupted_schema_step_leaves_marker_absent_so_the_next_run_repeats_the_wipe() -> None:
+    db = _FakeDb(column_present=False, fail_on="ADD COLUMN det_score", fail_with=RuntimeError("lost connection"))
+
+    with pytest.raises(DatabaseError, match="det_score"):
+        _run_upgrade(db)
+
+    assert db.column_present is False
+
+    db.fail_on = None
+    assert _run_upgrade(db) is True
+    assert sum(1 for s in db.sql if s == "DELETE FROM images") == 2
+
+
+def test_already_applied_ddl_errors_are_tolerated_during_the_upgrade() -> None:
+    """e.g. det_score already exists from a half-applied earlier attempt."""
+    db = _FakeDb(
+        column_present=False,
+        fail_on="ADD COLUMN det_score",
+        fail_with=pymysql.err.OperationalError(1060, "Duplicate column name 'det_score'"),
+    )
+
+    assert _run_upgrade(db) is True
+    assert db.column_present is True
+
+
+def test_upgrade_logs_a_warning_when_it_wipes(caplog: pytest.LogCaptureFixture) -> None:
+    db = _FakeDb(column_present=False)
+
+    with caplog.at_level(logging.WARNING):
+        _run_upgrade(db)
+
+    assert any("wiping" in r.getMessage() for r in caplog.records)
+
+
+def test_run_migration_applies_the_upgrade_after_the_alter_migrations() -> None:
+    import migrate
+
+    order: list[str] = []
+    conn_cm = MagicMock()
+    conn_cm.__enter__.return_value.cursor.return_value.__enter__.return_value = MagicMock()
+    conn_cm.__exit__.return_value = False
+
+    with (
+        patch("migrate.init_db"),
+        patch("migrate.close_pool"),
+        patch("migrate.get_connection", return_value=conn_cm),
+        patch("migrate.load_schema", return_value=["CREATE TABLE IF NOT EXISTS t (id INT)"]),
+        patch("migrate._apply_alter_migrations", side_effect=lambda: order.append("alter")),
+        patch("migrate.apply_embedding_model_upgrade", side_effect=lambda: order.append("upgrade") or False),
+    ):
+        migrate.run_migration()
+
+    assert order == ["alter", "upgrade"]
+
+
+def test_schema_sql_has_the_embedding_columns_so_fresh_databases_skip_the_wipe() -> None:
+    schema = (Path(__file__).resolve().parent.parent / "schema.sql").read_text(encoding="utf-8")
+    faces = schema[schema.index("CREATE TABLE IF NOT EXISTS faces") :]
+    faces = faces[: faces.index(") ENGINE")]
+
+    assert "embedding_model VARCHAR(32)     NOT NULL" in faces
+    assert "det_score       FLOAT           NULL" in faces
+    assert "float32 embedding, 2048 bytes for 512D" in faces
+    assert "Cosine distance" in faces
+    assert "128D" not in schema
+
+
+def test_upgrade_ddl_matches_schema_sql_column_definitions() -> None:
+    import migrate
+
+    ddl = "\n".join(sql for _, sql in migrate._EMBEDDING_MODEL_SCHEMA) + migrate._EMBEDDING_MODEL_MARKER_COLUMN[1]
+    assert "VARCHAR(32) NOT NULL" in ddl
+    assert "float32 embedding, 2048 bytes for 512D" in ddl
+    assert f"DEFAULT {migrate.DEFAULT_DISTANCE_THRESHOLD}" in ddl
+
+
+@pytest.mark.integration
+def test_embedding_model_upgrade_wipes_once_on_a_legacy_database(
+    test_db: str, db_conn, db_pool, seed_user, seed_project, seed_images, seed_faces
+) -> None:
+    import migrate
+
+    with db_conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO sdc_claims (commons_page_id, wikidata_qid, project_id, face_id) VALUES (%s, %s, %s, %s)",
+            (seed_images[0]["commons_page_id"], "Q42", seed_project["id"], seed_faces["target"][0]),
+        )
+        cur.execute(
+            "UPDATE projects SET status = 'completed', completion_reason = 'no_faces', images_total = 10, "
+            "images_processed = 10, faces_confirmed = 5, sdc_write_requested = 1, worker_claimed_by = 'w1', "
+            "distance_threshold = 0.6 WHERE id = %s",
+            (seed_project["id"],),
+        )
+        # Make the schema look like the pre-upgrade one.
+        cur.execute("ALTER TABLE faces DROP COLUMN embedding_model, DROP COLUMN det_score")
+
+    try:
+        assert migrate.apply_embedding_model_upgrade() is True
+
+        with db_conn.cursor() as cur:
+            for table in ("images", "faces", "sdc_claims"):
+                cur.execute(f"SELECT COUNT(*) AS n FROM {table}")
+                assert cur.fetchone()["n"] == 0, table
+            cur.execute("SELECT COUNT(*) AS n FROM users")
+            assert cur.fetchone()["n"] == 1
+            cur.execute("SELECT * FROM projects WHERE id = %s", (seed_project["id"],))
+            project = cur.fetchone()
+            cur.execute("DESCRIBE faces")
+            columns = {row["Field"]: row for row in cur.fetchall()}
+
+        assert project["status"] == "active"
+        assert project["images_total"] == project["images_processed"] == project["faces_confirmed"] == 0
+        assert project["completion_reason"] is None
+        assert project["sdc_write_requested"] == 0
+        assert project["worker_claimed_by"] is None
+        assert project["distance_threshold"] == pytest.approx(migrate.DEFAULT_DISTANCE_THRESHOLD)
+        assert "embedding_model" in columns and "det_score" in columns
+
+        # Re-run: data created after the upgrade must survive.
+        with db_conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO images (project_id, commons_page_id, file_title, status) VALUES (%s, %s, %s, 'processed')",
+                (seed_project["id"], 777, "File:New.jpg"),
+            )
+            image_id = cur.lastrowid
+            cur.execute(
+                "INSERT INTO faces (image_id, encoding, embedding_model, bbox_top, bbox_right, bbox_bottom, bbox_left) "
+                "VALUES (%s, %s, 'scrfd500m+arcface_mbf', 1, 2, 3, 4)",
+                (image_id, b"\x00" * 2048),
+            )
+
+        assert migrate.apply_embedding_model_upgrade() is False
+
+        with db_conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) AS n FROM faces")
+            assert cur.fetchone()["n"] == 1
+    finally:
+        with db_conn.cursor() as cur:
+            cur.execute("DESCRIBE faces")
+            present = {row["Field"] for row in cur.fetchall()}
+            if "embedding_model" not in present:
+                migrate.apply_embedding_model_upgrade()
+
+
+@pytest.mark.integration
+def test_embedding_model_upgrade_is_a_noop_on_a_fresh_database(test_db: str, db_pool, seed_user, seed_project) -> None:
+    import migrate
+
+    assert migrate.apply_embedding_model_upgrade() is False
+    from database import execute_query
+
+    assert len(execute_query("SELECT id FROM projects WHERE id = %s", (seed_project["id"],))) == 1
+
+
+def test_alter_migrations_include_liftwing_prefilter():
+    descriptions = " ".join(desc for desc, _sql in _ALTER_MIGRATIONS)
+
+    assert "prefilter_mode" in descriptions
+    assert "prefilter_keep" in descriptions
+    assert "prefilter_reason" in descriptions
+    assert "prefilter_checked_at" in descriptions
+    assert "service_status" in descriptions
+
+
+def test_alter_migrations_include_faces_aligned():
+    matching = [sql for _desc, sql in _ALTER_MIGRATIONS if sql.startswith("ALTER TABLE faces") and "aligned" in sql]
+
+    assert len(matching) == 1
+    assert "DEFAULT 1" in matching[0]
+    assert "AFTER det_score" in matching[0]
+
+
+def test_schema_sql_defines_faces_aligned_column():
+    statements = load_schema(str(Path(__file__).resolve().parent.parent / "schema.sql"))
+    faces = next(stmt for stmt in statements if "CREATE TABLE IF NOT EXISTS faces" in stmt)
+
+    assert "aligned" in faces
+    assert "DEFAULT 1" in faces
+
+
+def test_all_tables_include_service_status():
+    assert "service_status" in _ALL_TABLES
+
+
+def test_schema_sql_defines_liftwing_prefilter_objects():
+    statements = load_schema(str(Path(__file__).resolve().parent.parent / "schema.sql"))
+    joined = "\n".join(statements)
+
+    assert "CREATE TABLE IF NOT EXISTS service_status" in joined
+    assert "INSERT IGNORE INTO service_status" in joined
+    assert "prefilter_keep" in joined
+    assert "prefilter_mode" in joined
+
+
+def test_schema_semicolons_are_only_statement_terminators():
+    """Guards load_schema's naive ';' split.
+
+    A semicolon anywhere but as a lone statement terminator (inside a '--'
+    comment or a quoted COMMENT string) chops the surrounding statement in
+    half. That mistake is invisible to the unit tests, which run against fake
+    cursors and never parse the real file, and only fails on a real database.
+    """
+    schema_path = Path(__file__).resolve().parent.parent / "schema.sql"
+    offenders = [
+        (number, line)
+        for number, line in enumerate(schema_path.read_text(encoding="utf-8").splitlines(), 1)
+        if ";" in line and not (line.rstrip().endswith(";") and line.rstrip().count(";") == 1 and "--" not in line)
+    ]
+
+    assert offenders == []

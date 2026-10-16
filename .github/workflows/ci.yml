@@ -33,6 +33,12 @@ jobs:
       - name: Ruff format check
         run: ruff format --check .
 
+      # The Toolforge build service does a plain clone. The ONNX weights must be
+      # ordinary git blobs: a Git LFS pointer file or a submodule would build
+      # "successfully" and then fail at runtime. See scripts/check_no_lfs.sh.
+      - name: Weights are plain git blobs (no LFS, no submodules, no pointer files)
+        run: scripts/check_no_lfs.sh
+
   test:
     name: Test (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
@@ -58,12 +64,47 @@ jobs:
       - name: Run tests
         run: pytest --tb=short -q
 
+  face-service-unit:
+    name: Face service (backend + model unit tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Verify model weights (SHA256SUMS)
+        working-directory: model-server/weights
+        run: sha256sum -c SHA256SUMS
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            model-server/requirements.txt
+            requirements-dev.txt
+
+      # The only job that installs the ONNX/OpenCV/KServe stack outside a
+      # container; the plain test job skips these files (importorskip).
+      - name: Install face service and test dependencies
+        run: pip install -r model-server/requirements.txt -r requirements-dev.txt
+
+      - name: Run backend and model unit tests
+        env:
+          WIKIVISAGE_REQUIRE_SAMPLE: "1"
+        run: pytest tests/test_face_service_backend.py tests/test_face_service_model.py -v --tb=short
+
   face-service:
     name: Face service (build + contract)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
+
+      # A Git LFS pointer file or a truncated weight file fails here, before
+      # any image is built. model.py repeats the check at startup.
+      - name: Verify model weights (SHA256SUMS)
+        working-directory: model-server/weights
+        run: sha256sum -c SHA256SUMS
 
       - uses: docker/setup-buildx-action@v3
 
@@ -120,7 +161,20 @@ jobs:
         env:
           WIKIVISAGE_FACE_SERVICE_CONTRACT: "1"
           WIKIVISAGE_FACE_SERVICE_URL: http://localhost:8080
+          WIKIVISAGE_REQUIRE_SAMPLE: "1"
         run: pytest tests/test_face_service_contract.py -v --tb=short
+
+      # The detector's declared output shapes come from a 640x640 trace, so ORT
+      # logs VerifyOutputSizes on every other input size unless the session's
+      # log level is raised (backend._make_session). The contract tests have
+      # just sent many differently sized images.
+      - name: No ONNX Runtime VerifyOutputSizes warnings in the service log
+        run: |
+          if docker logs face-service 2>&1 | grep -q VerifyOutputSizes; then
+            echo "::error::service log contains VerifyOutputSizes warnings"
+            docker logs face-service 2>&1 | grep VerifyOutputSizes | head -5
+            exit 1
+          fi
 
       - name: Face service logs
         if: failure()
@@ -133,11 +187,16 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Verify model weights (SHA256SUMS)
+        working-directory: model-server/weights
+        run: sha256sum -c SHA256SUMS
+
       # Production does not use the Dockerfile: Toolforge builds model-server/
       # with Cloud Native Buildpacks. This builds it the same way, with
-      # Toolforge's builder, so a requirements.txt / project.toml / Procfile
-      # change that only breaks the buildpack path fails here, not in a release.
-      # heroku/deb-packages is listed explicitly because Toolforge injects it.
+      # Toolforge's builder, so a requirements.txt / Procfile change that only
+      # breaks the buildpack path fails here, not in a release. The face service
+      # needs no system packages (no project.toml), so heroku/deb-packages is
+      # not requested; only the Python and Procfile buildpacks run.
       - name: Build with Toolforge's builder
         run: |
           docker run --rm -u root \
@@ -145,7 +204,7 @@ jobs:
             -v "$PWD/model-server":/workspace -w /workspace \
             buildpacksio/pack build wikivisage-face-bp:ci \
             --builder tools-harbor.wmcloud.org/toolforge/heroku-builder:24_0.21.8 \
-            --buildpack heroku/deb-packages --buildpack heroku/python --buildpack heroku/procfile
+            --buildpack heroku/python --buildpack heroku/procfile
 
       # Same entrypoint, port and fail-closed check as the Toolforge job:
       # TOOL_TOOLFORGE_API_URL makes model.py refuse to start without a token.
@@ -186,7 +245,16 @@ jobs:
         env:
           WIKIVISAGE_FACE_SERVICE_CONTRACT: "1"
           WIKIVISAGE_FACE_SERVICE_URL: http://localhost:8000
+          WIKIVISAGE_REQUIRE_SAMPLE: "1"
         run: pytest tests/test_face_service_contract.py -v --tb=short
+
+      - name: No ONNX Runtime VerifyOutputSizes warnings in the service log
+        run: |
+          if docker logs face-service 2>&1 | grep -q VerifyOutputSizes; then
+            echo "::error::service log contains VerifyOutputSizes warnings"
+            docker logs face-service 2>&1 | grep VerifyOutputSizes | head -5
+            exit 1
+          fi
 
       - name: Face service logs
         if: failure()
