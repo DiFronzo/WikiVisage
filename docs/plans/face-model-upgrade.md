@@ -206,9 +206,10 @@ class FaceBackend(Protocol):
 - **Align:** least-squares similarity (Umeyama, numpy) from the 5 landmarks to the 112x112 template, then `cv2.warpAffine`:
 
 ```python
-ARCFACE_SRC = np.array([
-    [38.2946, 51.6963], [73.5318, 51.5014], [56.0252, 71.7366],
-    [41.5493, 92.3655], [70.7299, 92.2041]], dtype=np.float32)
+ARCFACE_SRC = np.array(
+    [[38.2946, 51.6963], [73.5318, 51.5014], [56.0252, 71.7366], [41.5493, 92.3655], [70.7299, 92.2041]],
+    dtype=np.float32,
+)
 ```
 
 - **Embed:** `w600k_mbf.onnx` takes 112x112 RGB with `(x - 127.5) / 127.5`, and returns 512D. Batch all of an image's aligned faces into one call. **L2-normalise explicitly** and return float32.

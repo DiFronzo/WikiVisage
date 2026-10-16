@@ -36,5 +36,7 @@ redis>=7.4.0
 # Internationalization
 Flask-Babel==4.0.0
 
-# Environment variables from .env files
-python-dotenv==1.2.2
+# Environment variables from .env files.
+# Kept a range, not a pin: model-server/requirements.txt pins python-dotenv
+# transitively and CI resolves both files in one install.
+python-dotenv>=1.2.2
