@@ -56,8 +56,8 @@ toolforge envvars create OAUTH_REDIRECT_URI    "https://wikivisage.toolforge.org
 # Flask secret key (generate a strong random one)
 toolforge envvars create FLASK_SECRET_KEY      "$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
 
-# Token encryption (optional — encrypts OAuth tokens at rest in the DB)
-# If unset, tokens are stored as plaintext (backward compatible)
+# Token encryption (REQUIRED in production — the app refuses to start on
+# Toolforge without it). Encrypts OAuth tokens at rest in the DB.
 toolforge envvars create WIKIVISAGE_TOKEN_KEY  "$(python3 -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())')"
 
 # Redis for shared rate limiting (optional — falls back to in-memory if unavailable)
@@ -73,7 +73,8 @@ toolforge envvars create WIKIVISAGE_FACE_SERVICE_TOKEN "<same token as the face 
 # LiftWing metadata pre-filter (optional, experimental, worker-only).
 # Anonymous access works (rate limited per IP); a Wikimedia personal API token
 # from api.wikimedia.org moves calls to the authenticated quota. Only public
-# Commons metadata is sent — never image bytes.
+# Commons metadata is sent — never image bytes. Calls are serialised and spaced
+# by a jittered minimum interval (default 2 s; WIKIVISAGE_LIFTWING_MIN_INTERVAL).
 # toolforge envvars create WIKIVISAGE_LIFTWING_API_TOKEN "<personal-api-token>"
 ```
 
@@ -132,7 +133,7 @@ toolforge jobs run migrate \
   --mem 512Mi
 ```
 
-This creates all 9 tables (`users`, `sessions`, `projects`, `images`, `faces`, `user_stats`, `sdc_claims`, `project_members`, `worker_heartbeat`) and their indexes. Safe to re-run — migrations are idempotent.
+This creates all 10 tables (`users`, `sessions`, `projects`, `images`, `faces`, `user_stats`, `sdc_claims`, `project_members`, `worker_heartbeat`, `service_status`) and their indexes. Safe to re-run — migrations are idempotent.
 
 Check the migration completed:
 
@@ -192,7 +193,7 @@ toolforge jobs logs ml-worker-2
 
 ## 8. Verify Everything
 
-1. **Health check**: Visit `https://wikivisage.toolforge.org/health` — should return `{"status": "healthy", "database": "connected"}`
+1. **Health check**: Visit `https://wikivisage.toolforge.org/health` — should return `"status": "healthy"`, `"database": "connected"` and `"face_service": "reachable"`
 2. **Login**: Click "Log in with Wikimedia" — should redirect to Meta for OAuth, then back to the dashboard
 3. **Create a project**: Enter a Wikidata Q-ID (e.g., `Q42` for Douglas Adams) and a Commons category
 4. **Worker activity**: Check `toolforge jobs logs ml-worker` — should show category traversal starting within 60 seconds
@@ -514,4 +515,4 @@ become wikivisage-face && toolforge jobs logs face-service | tail -50
 
 - Verify credentials: `toolforge envvars list`
 - Verify the database exists: `mariadb --defaults-file=$HOME/replica.my.cnf -h tools.db.svc.wikimedia.cloud -e "SHOW DATABASES LIKE '%wikiface%'"`
-- Check that migration has run: look for 9 tables in the database
+- Check that migration has run: look for 10 tables in the database

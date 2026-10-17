@@ -343,8 +343,9 @@ other input sizes do not flood the log).
 
 ## Verified behaviour
 
-Checked locally against a freshly started service process (real KServe 0.15.2,
-real weights, Python 3.11, Apple-silicon laptop; **not** inside Docker or the
+Checked locally against a freshly started service process (real KServe — 0.15.2 when
+this check was made, 0.21.0 in the current lock — real weights, Python 3.11,
+Apple-silicon laptop; **not** inside Docker or the
 Toolforge buildpack image):
 
 | Check | Result |
@@ -386,8 +387,9 @@ python3.11 -m venv .venv
 .venv/bin/python model.py --model_name wikivisage --http_port 8080
 ```
 
-Python 3.11 is required: `kserve==0.15.2` runs on FastAPI/uvicorn and needs a
-modern interpreter. Do not downgrade to the `kserve` 0.8.x line — it pins
+Python 3.11 is required: the `kserve` 0.21.x SDK runs on FastAPI/uvicorn
+(requires Python >=3.10,<3.14) and needs a modern interpreter. Do not
+downgrade to the `kserve` 0.8.x line — it pins
 `numpy~=1.19`, `ray==1.9.0`, and `protobuf==3.19.1`, none of which have wheels
 for or build on Python 3.11+.
 
@@ -405,8 +407,11 @@ uv pip compile --python-version 3.11 --python-platform x86_64-manylinux_2_28 \
 ```
 
 The target is the buildpack's Python and platform (Python 3.11, x86_64
-manylinux). Never edit `requirements.txt` by hand and never reduce it to
-top-level-only pins — that is how transitive versions drifted under a file
+manylinux). Without `--upgrade`, uv keeps the pins already in
+`requirements.txt` and only changes what `requirements.in` demands; add
+`--upgrade` to also refresh every transitive pin to the newest version the
+constraints allow. Never edit `requirements.txt` by hand and never reduce it
+to top-level-only pins — that is how transitive versions drifted under a file
 labelled "pinned". Both the Docker image and the Toolforge buildpack install
 the generated lock with a plain `pip install -r requirements.txt`.
 

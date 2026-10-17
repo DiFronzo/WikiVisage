@@ -38,6 +38,7 @@ def _client(session: MagicMock, **kwargs) -> LiftWingClient:
     kwargs.setdefault("url", "https://example.invalid/openai/v1/chat/completions")
     kwargs.setdefault("model", "test-model")
     kwargs.setdefault("api_token", "")  # tests opt in to auth explicitly
+    kwargs.setdefault("min_call_interval", 0)  # request spacing is tested explicitly
     return LiftWingClient(session=session, **kwargs)
 
 
@@ -561,3 +562,100 @@ def test_get_client_is_a_singleton_and_reset_closes_it(monkeypatch):
 
     liftwing_client.reset_client()
     assert liftwing_client._CLIENT is None
+
+
+# ---------------------------------------------------------------------------
+# Politeness gap (request spacing)
+# ---------------------------------------------------------------------------
+
+
+class _FakeClock:
+    """Deterministic monotonic clock whose ``sleep`` advances time."""
+
+    def __init__(self, start: float = 1000.0) -> None:
+        self.now = start
+        self.sleeps: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+@pytest.fixture()
+def fake_clock(monkeypatch):
+    clock = _FakeClock()
+    monkeypatch.setattr(liftwing_client.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(liftwing_client.time, "sleep", clock.sleep)
+    return clock
+
+
+def test_spacing_waits_between_calls(fake_clock):
+    session = MagicMock()
+    session.post.return_value = _response(payload=_completion('[{"page_id": 1, "keep": true, "reason": "ok"}]'))
+    client = _client(session, min_call_interval=5.0)
+    item = MetadataItem(page_id=1, title="File:A.jpg")
+
+    assert client.filter_metadata([item]) is not None
+    assert fake_clock.sleeps == []  # the first call of a burst never waits
+
+    assert client.filter_metadata([item]) is not None
+    assert len(fake_clock.sleeps) == 1
+    assert 5.0 <= fake_clock.sleeps[0] <= 7.5  # interval + up to half as jitter
+
+
+def test_spacing_disabled_by_zero_interval(fake_clock):
+    session = MagicMock()
+    session.post.return_value = _response(payload=_completion('[{"page_id": 1, "keep": true, "reason": "ok"}]'))
+    client = _client(session, min_call_interval=0)
+    item = MetadataItem(page_id=1, title="File:A.jpg")
+
+    client.filter_metadata([item])
+    client.filter_metadata([item])
+
+    assert fake_clock.sleeps == []
+
+
+def test_spacing_also_applies_to_the_probe(fake_clock):
+    session = MagicMock()
+    session.post.return_value = _response(payload=_completion("pong"))
+    client = _client(session, min_call_interval=5.0)
+
+    assert client.probe() == (True, None)
+    assert fake_clock.sleeps == []
+
+    assert client.probe() == (True, None)
+    assert len(fake_clock.sleeps) == 1
+    assert 5.0 <= fake_clock.sleeps[0] <= 7.5
+
+
+def test_spacing_applies_after_a_failed_call(fake_clock):
+    """A failed batch still arms the gap: retries must not hammer."""
+    session = MagicMock()
+    session.post.side_effect = [
+        requests.exceptions.Timeout("too slow"),
+        _response(payload=_completion('[{"page_id": 1, "keep": true, "reason": "ok"}]')),
+    ]
+    client = _client(session, min_call_interval=5.0)
+    item = MetadataItem(page_id=1, title="File:A.jpg")
+
+    assert client.filter_metadata([item]) is None
+    assert client.filter_metadata([item]) is not None
+
+    assert len(fake_clock.sleeps) == 1
+    assert 5.0 <= fake_clock.sleeps[0] <= 7.5
+
+
+def test_spacing_skipped_when_the_breaker_is_open(fake_clock):
+    session = MagicMock()
+    session.post.return_value = _response(status_code=429, payload={}, headers={"Retry-After": "600"})
+    client = _client(session, min_call_interval=5.0, circuit_failure_threshold=5)
+    item = MetadataItem(page_id=1, title="File:A.jpg")
+
+    assert client.filter_metadata([item]) is None  # the 429 opens the breaker
+    fake_clock.sleeps.clear()
+
+    assert client.filter_metadata([item]) is None  # no request, so no wait
+    assert fake_clock.sleeps == []

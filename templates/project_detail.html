@@ -694,27 +694,32 @@
 </div>
 {% endif %}
 
-{% set inference_running = inference_eligible > 0 and human_confirmed >= project.min_confirmed %}
+{% set inference_capable = human_confirmed >= (project.min_confirmed or 5) %}
+{% set processing_incomplete = project.status == 'active' and (pending_images > 0 or (project.images_processed or 0) != (project.images_total or 0) or project.images_total == 0) %}
+{% set inference_watch = inference_triggered or (inference_capable and (eligible > 0 or processing_incomplete)) %}
+{% set inference_running = eligible > 0 and inference_capable %}
 {% set inference_done = inference_triggered and not inference_running %}
-{% if inference_running %}
-<div class="card inference-banner" id="inferenceBanner" role="status" aria-live="polite">
+{% if inference_watch %}
+<div class="card inference-banner{% if inference_done %} inference-banner-done{% endif %}" id="inferenceBanner" role="status" aria-live="polite"{% if not inference_running and not inference_done %} style="display:none"{% endif %}>
     <div class="inference-banner-row">
+        {% if inference_done %}
+        <span class="inference-done-icon" aria-hidden="true">✓</span>
+        {% else %}
         <div class="inference-spinner" id="inferenceSpinner" aria-hidden="true"></div>
+        {% endif %}
         <p class="inference-banner-text" id="inferenceText">
+            {% if inference_done %}
+            {{ _('Model inference complete.') }}
+            {% else %}
             {{ ngettext('Model inference in progress — %(num)d face remaining…', 'Model inference in progress — %(num)d faces remaining…', inference_eligible, num=inference_eligible) }}
+            {% endif %}
         </p>
     </div>
     <button class="inference-banner-close" aria-label="{{ _('Close') }}" onclick="this.parentElement.remove();try{localStorage.setItem('inference_dismissed_{{ project.id }}','1')}catch(e){}">&times;</button>
 </div>
-{% elif inference_done %}
-<div class="card inference-banner inference-banner-done" id="inferenceBanner" role="status" aria-live="polite">
-    <div class="inference-banner-row">
-        <span class="inference-done-icon" aria-hidden="true">✓</span>
-        <p class="inference-banner-text">{{ _('Model inference complete.') }}</p>
-    </div>
-    <button class="inference-banner-close" aria-label="{{ _('Close') }}" onclick="this.parentElement.remove();try{localStorage.setItem('inference_dismissed_{{ project.id }}','1')}catch(e){}">&times;</button>
-</div>
+{% if inference_done %}
 <script nonce="{{ csp_nonce }}">try{if(localStorage.getItem('inference_dismissed_{{ project.id }}')==='1'){var ib=document.getElementById('inferenceBanner');if(ib)ib.remove()}}catch(e){}</script>
+{% endif %}
 {% endif %}
 
 <div class="action-buttons">
@@ -2113,12 +2118,13 @@
     {% endif %}
 
     // --- Inference progress live polling ---
-    {% if inference_running %}
+    {% if inference_watch %}
     (function() {
         var apiProgressUrl = {{ url_for('api_progress', project_id=project.id)|tojson }};
         var inferenceTimer = null;
         var inferencePollInFlight = false;
         var lastEligible = {{ inference_eligible }};
+        var minConfirmed = {{ project.min_confirmed or 5 }};
         var i18nInference = {
             inProgressOne: {{ _('Model inference in progress — {num} face remaining…')|tojson }},
             inProgressMany: {{ _('Model inference in progress — {num} faces remaining…')|tojson }},
@@ -2147,7 +2153,7 @@
                     'statNonMatches': fs.confirmed_non_matches,
                     'statUnclassified': fs.unclassified,
                     'statSdcWritten': fs.sdc_written,
-                    'statSdcPending': fs.sdc_pending,
+                    'statSdcPending': (fs.sdc_pending || 0) + (fs.sdc_removal_pending_faces || 0),
                     'statByHuman': fs.by_human,
                     'statByModel': fs.by_model,
                     'statByBootstrap': fs.by_bootstrap
@@ -2159,33 +2165,46 @@
                 syncSdcButtonState();
                 updateSdcStatusText();
 
-                if (eligible > 0) {
+                var canInfer = (fs.human_confirmed || 0) >= minConfirmed;
+                var running = eligible > 0 && canInfer;
+                if (running) {
                     // Still running
                     var msg = eligible === 1 ? i18nInference.inProgressOne : i18nInference.inProgressMany;
                     if (textEl) textEl.textContent = msg.replace('{num}', eligible);
+                    banner.style.display = '';
                     lastEligible = eligible;
-                } else {
-                    // Inference complete
+                } else if (lastEligible > 0) {
+                    if (canInfer && data.complete && (data.pending_images || 0) === 0) {
+                        // Everything is finished — show the completion note and stop polling
+                        clearInterval(inferenceTimer);
+                        inferenceTimer = null;
+                        var newMatches = Math.max(0, (fs.by_model || 0) - initialByModel);
+                        banner.classList.add('inference-banner-done');
+                        var spinner = document.getElementById('inferenceSpinner');
+                        if (spinner) spinner.outerHTML = '<span class="inference-done-icon" aria-hidden="true">✓</span>';
+                        if (textEl) textEl.textContent = i18nInference.done.replace('{matches}', newMatches);
+
+                        // Clear dismissal so the completed banner shows fresh
+                        try { localStorage.removeItem('inference_dismissed_{{ project.id }}'); } catch(e) {}
+
+                        // Ensure banner is visible (user may have dismissed in-progress state)
+                        banner.style.display = '';
+
+                        // Also hide the info banner if visible (no longer relevant)
+                        var infoBanner = document.getElementById('infoBanner');
+                        if (infoBanner) infoBanner.style.display = 'none';
+
+                        // Refresh gallery to show new model results
+                        if (typeof loadGalleryPage === 'function') loadGalleryPage(1);
+                    } else {
+                        // More image work remains — inference runs again next cycle
+                        banner.style.display = 'none';
+                        lastEligible = 0;
+                    }
+                } else if (data.complete && (data.pending_images || 0) === 0) {
+                    // Nothing left to watch
                     clearInterval(inferenceTimer);
                     inferenceTimer = null;
-                    var newMatches = Math.max(0, (fs.by_model || 0) - initialByModel);
-                    banner.classList.add('inference-banner-done');
-                    var spinner = document.getElementById('inferenceSpinner');
-                    if (spinner) spinner.outerHTML = '<span class="inference-done-icon" aria-hidden="true">✓</span>';
-                    if (textEl) textEl.textContent = i18nInference.done.replace('{matches}', newMatches);
-
-                    // Clear dismissal so the completed banner shows fresh
-                    try { localStorage.removeItem('inference_dismissed_{{ project.id }}'); } catch(e) {}
-
-                    // Ensure banner is visible (user may have dismissed in-progress state)
-                    banner.style.display = '';
-
-                    // Also hide the info banner if visible (no longer relevant)
-                    var infoBanner = document.getElementById('infoBanner');
-                    if (infoBanner) infoBanner.style.display = 'none';
-
-                    // Refresh gallery to show new model results
-                    if (typeof loadGalleryPage === 'function') loadGalleryPage(1);
                 }
             }).catch(function(e) {
                 console.error('Inference poll error:', e);

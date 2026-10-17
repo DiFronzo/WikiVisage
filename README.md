@@ -55,7 +55,8 @@ Active learning facial recognition for Wikimedia Commons. Train an ML model to r
 - 🛡️ **Secret isolation**: the face service parses untrusted image bytes in a tool that holds no OAuth, database, or token-encryption secret, behind a bearer token and a request-size cap
 - 📦 **Batched detection**: images are sent in size-aware batches, and a service outage leaves work `pending` for the next cycle instead of failing it permanently
 - 🧷 **Bootstrap from existing tags**: seeds the model via SPARQL when P180 depicts claims already exist on Commons
-- 🤖 **Autonomous inference**: centroid-distance classification once you have enough confirmed examples
+- 🤖 **Autonomous inference**: centroid-distance classification once you have enough confirmed examples, with a live status card on the project page
+- 🧪 **Experimental metadata pre-filter**: optional LiftWing verdicts on whether a file could show a person, with recall/skip statistics on the project settings page — shadow mode only, never enforced
 - ✍️ **User-triggered Commons edits**: click "Send Edits to Wikimedia Commons" to write depicts claims via the Wikibase API (interruptible mid-batch; idempotent on already-removed claims)
 - 🔐 **Hardened OAuth flow**: PKCE (S256) plus Redis-backed single-flight token refresh to survive concurrent gunicorn workers
 - 🌍 **i18n-ready**: translations included (en, nb, es, fr)
@@ -127,7 +128,7 @@ WikiVisage/
 │   └── requirements.txt # kserve, onnxruntime, opencv-python-headless
 ├── token_crypto.py      # Fernet encrypt/decrypt helpers for OAuth tokens at rest
 ├── database.py          # MariaDB connection pool with retry logic
-├── schema.sql           # Database schema (9 tables + indices)
+├── schema.sql           # Database schema (10 tables + indices)
 ├── migrate.py           # Idempotent migration script with --reset flag
 ├── jobs.yaml            # Toolforge jobs definition (2 worker instances)
 ├── templates/           # Jinja2 templates (10 files, all extend base.html)
@@ -135,7 +136,7 @@ WikiVisage/
 ├── translations/        # i18n: en, nb, es, fr
 ├── requirements.txt     # Runtime dependencies (no ML libraries)
 ├── requirements-dev.txt # Dev/test deps (pytest, ruff)
-└── tests/               # 823 tests (775 unit + 34 integration + 14 contract)
+└── tests/               # Hybrid suite: 1059 tests (993 unit, 38 integration, 28 face-service/contract)
 ```
 
 ## 🧑‍💻 Setup
@@ -164,7 +165,11 @@ toolforge envvars create OAUTH_REDIRECT_URI     "https://<toolname>.toolforge.or
 # Flask
 toolforge envvars create FLASK_SECRET_KEY "$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
 
-# Token encryption (optional — tokens stored as plaintext if unset)
+# Face service (required — it runs as a second tool, see how-to-run-it.md)
+toolforge envvars create WIKIVISAGE_FACE_SERVICE_URL   "https://wikivisage-face.toolforge.org"
+toolforge envvars create WIKIVISAGE_FACE_SERVICE_TOKEN "<shared token, same value on both tools>"
+
+# Token encryption (required in production — the app refuses to start on Toolforge without it)
 toolforge envvars create WIKIVISAGE_TOKEN_KEY "$(python3 -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())')"
 ```
 
@@ -198,6 +203,11 @@ toolforge jobs load jobs.yaml
 ```
 
 The app will be live at `https://<toolname>.toolforge.org`.
+
+The face service is a second tool (`wikivisage-face`) and must be running before
+the workers start — otherwise every image stays `pending`. Setup order, the
+shared token and rollback are covered in
+[how-to-run-it.md](how-to-run-it.md#face-service-deployment-second-tool).
 
 ## 🧪 Local development
 
@@ -243,7 +253,7 @@ Each project has a couple of tunables:
 
 | Parameter | Default | Description |
 |---|---:|---|
-| `distance_threshold` | `0.6` | Face-distance cutoff for autonomous classification (lower = stricter). |
+| `distance_threshold` | `0.5` | Face-distance cutoff for autonomous classification (lower = stricter). |
 | `min_confirmed` | `5` | Minimum confirmed matches before autonomous inference starts. |
 
 ### 🔧 Worker environment variables (optional)
@@ -254,7 +264,7 @@ Each project has a couple of tunables:
 | `WIKIVISAGE_WORKER_MAX_PROJECTS` | `4` | Max projects processed concurrently per worker |
 | `WIKIVISAGE_WORKER_IMAGE_THREADS` | `4` | Parallel image download/detection threads per project |
 | `WIKIVISAGE_WORKER_BATCH_SIZE` | `50` | Images per processing batch |
-| `WIKIVISAGE_DB_POOL_SIZE` | auto | DB connection pool size (auto = `max_projects × image_threads + 3`) |
+| `WIKIVISAGE_DB_POOL_SIZE` | auto | DB connection pool size (auto = `min(max_projects × image_threads + 3, 6)`) |
 | `COMMONS_DOWNLOAD_THROTTLE_SECONDS` | `0` | Delay between image downloads (seconds) |
 
 ### 🧩 Face service variables
@@ -267,6 +277,20 @@ Read by both the web app and the worker (see [TESTING.md](TESTING.md) for the fu
 | `WIKIVISAGE_FACE_SERVICE_TOKEN` | *(unset)* | Bearer token; must match the face tool's (required in production) |
 | `WIKIVISAGE_FACE_SERVICE_BATCH_SIZE` | `8` | Max images per detection request |
 | `WIKIVISAGE_DETECTION_WIDTH` | `960` | Commons thumbnail width used for detection and manual drawing (a standard Commons step) |
+
+### 🧪 Metadata Pre-Filter (experimental, optional)
+
+Projects can switch on **Metadata Pre-Filter (experimental)** in project settings.
+In shadow mode the worker asks Wikimedia LiftWing's `llm-qwen36-27b` whether a file
+could show a person, using only public Commons metadata — never image bytes. The
+verdicts are stored for evaluation, **never block processing**, and the settings
+page shows the shadow results (files checked, would-skip rate, and any
+human-confirmed matches it would have dropped). Calls are serialised and spaced
+by a jittered minimum interval (default 2 s) so the worker never bursts at the
+shared service; anonymous access works (rate-limited per IP) and
+`WIKIVISAGE_LIFTWING_API_TOKEN` (a Wikimedia personal API token) moves calls to
+the authenticated quota. See
+[how-to-run-it.md](how-to-run-it.md) for the remaining variables.
 
 ## ✅ Testing
 

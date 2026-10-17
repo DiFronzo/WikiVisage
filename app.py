@@ -444,6 +444,57 @@ def _get_face_stats(project_id: int) -> dict[str, Any]:
     return {}
 
 
+def _get_prefilter_stats(project_id: int) -> dict[str, Any]:
+    """Return shadow-mode Metadata Pre-Filter results for a project.
+
+    Columns: checked, kept, dropped, dropped_with_faces, kept_without_faces,
+    human_targets_dropped, human_targets_total, plus ``skip_pct`` and the
+    timestamp of the last stored verdict (``last_checked``). Counts are
+    coerced to ``int`` (NULL → 0). Face-dependent counters only cover
+    ``status='processed'`` images, mirroring ``scripts/eval_prefilter.py``.
+    Returns an empty dict on database error.
+    """
+    try:
+        rows = execute_query(
+            "SELECT "
+            "  COUNT(*) AS checked, "
+            "  COALESCE(SUM(i.prefilter_keep = 1), 0) AS kept, "
+            "  COALESCE(SUM(i.prefilter_keep = 0), 0) AS dropped, "
+            "  COALESCE(SUM(i.prefilter_keep = 0 AND i.status = 'processed' "
+            "    AND COALESCE(f.face_count, 0) > 0), 0) AS dropped_with_faces, "
+            "  COALESCE(SUM(i.prefilter_keep = 1 AND i.status = 'processed' "
+            "    AND COALESCE(f.face_count, 0) = 0), 0) AS kept_without_faces, "
+            "  COALESCE(SUM(i.prefilter_keep = 0 AND COALESCE(f.human_targets, 0) > 0), 0) AS human_targets_dropped, "
+            "  COALESCE(SUM(COALESCE(f.human_targets, 0) > 0), 0) AS human_targets_total, "
+            "  MAX(i.prefilter_checked_at) AS last_checked "
+            "FROM images i "
+            "LEFT JOIN ("
+            "  SELECT image_id, COUNT(*) AS face_count, "
+            "    SUM(CASE WHEN is_target = 1 AND classified_by_user_id IS NOT NULL THEN 1 ELSE 0 END) AS human_targets "
+            "  FROM faces WHERE superseded_by IS NULL GROUP BY image_id"
+            ") f ON f.image_id = i.id "
+            "WHERE i.project_id = %s AND i.prefilter_checked_at IS NOT NULL",
+            (project_id,),
+        )
+        if rows:
+            row = dict(rows[0])
+            last_checked = row.pop("last_checked", None)
+            stats = {k: int(v or 0) for k, v in row.items()}
+            stats["last_checked"] = last_checked
+            stats["skip_pct"] = round(100.0 * stats["dropped"] / stats["checked"], 1) if stats["checked"] else 0.0
+            return stats
+    except DatabaseError:
+        logger.exception("Failed to load pre-filter stats for project %s", project_id)
+    return {}
+
+
+def _prefilter_stats_for(project: dict[str, Any]) -> dict[str, Any]:
+    """Load pre-filter stats for the settings page; empty when the mode is off."""
+    if project.get("prefilter_mode", "off") == "off":
+        return {}
+    return _get_prefilter_stats(int(project["id"]))
+
+
 # ---------------------------------------------------------------------------
 # Auth helpers
 # ---------------------------------------------------------------------------
@@ -3676,7 +3727,10 @@ def project_settings(project_id: int):
             )
         except DatabaseError:
             logger.exception("Failed to load project members")
-        return render_template("project_settings.html", project=project, members=members, is_owner=True)
+        prefilter_stats = _prefilter_stats_for(project)
+        return render_template(
+            "project_settings.html", project=project, members=members, is_owner=True, prefilter_stats=prefilter_stats
+        )
 
     if not _validate_csrf():
         abort(400, _("Invalid CSRF token"))
@@ -3722,7 +3776,13 @@ def project_settings(project_id: int):
         project["status"] = status
         project["label"] = label
         project["prefilter_mode"] = prefilter_mode
-        return render_template("project_settings.html", project=project, members=[], is_owner=True)
+        return render_template(
+            "project_settings.html",
+            project=project,
+            members=[],
+            is_owner=True,
+            prefilter_stats=_prefilter_stats_for(project),
+        )
 
     try:
         completion_reason_clause = ", completion_reason = NULL" if status != "completed" else ""

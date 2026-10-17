@@ -5,17 +5,18 @@ of [`face-model-upgrade.md`](face-model-upgrade.md) in a running local stack. Re
 that plan's two "Implementation notes" sections first; this file lists what still
 needs fixing, finishing or checking, in priority order.
 
-> **Status 2026-10-17: all findings fixed and re-verified.** See
-> [Resolution status](#resolution-status-2026-10-17) at the end for what changed,
-> the suite numbers and the small set of things that still need a push or a
-> production run.
+> **Status 2026-10-17: all findings fixed and re-verified, and the work is now
+> released** — v0.11.0 (PR #116) and v0.11.1 (PR #117, HEAD `c32451b`); v0.11.0 was
+> deployed to Toolforge and the one-time embedding wipe ran on production. See
+> [Resolution status](#resolution-status-2026-10-17) at the end for what changed
+> and the suite numbers.
 
 ## Ground rules
 
-- **Nothing is committed.** Everything (Phase 1 + Phase 2 + test fixes) is in the
-  working tree on `release/0.11.0` (HEAD `a0bc575`). Do not commit unless the owner
-  asks. Do not lose the pre-existing staged `AGENTS.md`, `CLAUDE.md`, `README.md`,
-  `SECURITY.md`.
+- **Nothing was committed while the work was in progress** — everything (Phase 1 +
+  Phase 2 + test fixes) sat in the working tree on `release/0.11.0` (HEAD
+  `a0bc575`) until the owner asked for the push; it has since shipped as v0.11.0
+  and v0.11.1. (Kept as a record of how the phase was done.)
 - **Never run `migrate.py` against a real (Toolforge) database. No deploys.**
 - Keep Phase 2 **shadow-only and fail-open**. Do not build `enforce`.
 - After every change: `ruff check . && ruff format --check .`, the unit suite
@@ -383,14 +384,15 @@ Per finding:
   presidential portrait (3x4 close cropped)" (Adam Schultz / White House, public
   domain), 960x1268, 244 KB, downloaded via `Special:FilePath/...?width=960`.
   Exactly one face (514x756 px, score 0.80), so the half-scale pass is exercised.
-  Provenance table in `tests/data/README.md`. (Not a git commit — the owner decides
-  when to commit.)
+  Provenance table in `tests/data/README.md`. (Since committed and released in
+  v0.11.0.)
 - **B2 — verified locally as far as possible.** `pack` built the production image
   from `model-server/` with the Toolforge builder (`tools-harbor.wmcloud.org/toolforge/heroku-builder:24_0.21.8`,
   `heroku/python` + `heroku/procfile`) using the fully pinned lock; the image was
   started through its `web` Procfile entry with `TOOL_TOOLFORGE_API_URL` set and a
   token, reported ready in 4 s, and passed the contract suite through the guard
-  (25 passed) with no ORT warnings. CI and `deploy.yml` still have to run on push.
+  (25 passed) with no ORT warnings. *(Since run green on the v0.11.0 push; `deploy.yml`
+  deployed both tools.)*
 - **H1 — done.** `prefilter_images` moved after the image loop; selection is now
   `bootstrapped = 0 AND prefilter_checked_at IS NULL` regardless of `status`.
   Ordering is pinned by `test_process_project_runs_prefilter_after_image_processing`;
@@ -545,3 +547,38 @@ New tests: `test_filter_metadata_settles_non_visual_media_without_a_model_call`,
 `test_system_prompt_names_the_biography_noise_and_drop_reasons` (client) and
 `test_plain_text_strips_wikitext_and_truncates` (worker). `AGENTS.md`'s
 pre-filter section and constants table carry the same information.
+
+### Follow-up fix: inference status card was a page-load snapshot (same day)
+
+Owner report: a project page showed no indication that the model was still
+running over its images, and the stat boxes could drift from the
+server-rendered numbers on the first poll.
+
+Root cause (all in `templates/project_detail.html`): the banner and its poller
+were gated on `inference_eligible > 0` at *page load*. A page opened while
+nothing was eligible — a gap between model cycles, or a project whose images
+were fully processed with the inference queue already drained — showed no live
+status at all, and the "complete" card could fire while downloads were still
+pending. The poller's live stat update also wrote `fs.sdc_pending` alone,
+overwriting the server-rendered `SDC Pending` figure, which is `sdc_pending +
+sdc_removal_pending_faces`.
+
+Fix (template-only; no new i18n strings, no Python changes):
+
+- New watch state: the card renders whenever the viewer crossed
+  `min_confirmed` and (eligible faces > 0 or the project is still processing
+  images), plus always on `?inference_triggered=1`. With nothing eligible at
+  render time it starts hidden.
+- The `/api/progress` poller (now gated on the watch state, with its own
+  `minConfirmed`) reveals the card when a model cycle starts, hides it again
+  between cycles, and shows the completion state only once `complete` **and**
+  `pending_images == 0`; polling stops when nothing is left to watch.
+- The live stat update adds `sdc_removal_pending_faces`, matching the
+  server-rendered combined figure.
+
+New real-template tests: `test_project_detail_inference_banner_hidden_while_processing`,
+`test_project_detail_inference_banner_absent_when_idle`,
+`test_project_detail_inference_banner_visible_while_running` and
+`test_project_detail_inference_banner_renders_for_rerun_done_state`. Gates:
+ruff clean; 993 unit / 1031 integration tests green. `AGENTS.md`'s Known
+Issues section carries the same invariant.

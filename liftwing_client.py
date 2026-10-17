@@ -12,8 +12,10 @@ human face (audio, video, PDF, SVG, DjVu) are settled deterministically as
 ``keep=false`` without a model call; anything else, including a missing MIME
 type, still goes to the model. A small circuit breaker (per process)
 backs the pre-filter off after repeated failures, mirroring the worker's
-database-level probe hysteresis. A ``429`` opens the breaker immediately and
-honours ``Retry-After`` when the gateway sends it.
+database-level probe hysteresis. Calls are serialised and spaced by a jittered
+minimum interval so the tool never bursts at the shared service. A ``429``
+opens the breaker immediately and honours ``Retry-After`` when the gateway
+sends it.
 
 Configured via ``WIKIVISAGE_LIFTWING_*`` environment variables; the module
 constants below carry the defaults. Set ``WIKIVISAGE_LIFTWING_API_TOKEN`` to
@@ -27,6 +29,7 @@ import email.utils
 import json
 import logging
 import os
+import random
 import re
 import threading
 import time
@@ -69,6 +72,13 @@ MAX_TOKENS = int(os.environ.get("WIKIVISAGE_LIFTWING_MAX_TOKENS", 2000))
 # Retry-After says) and let the worker probe take over.
 CIRCUIT_FAILURE_THRESHOLD = int(os.environ.get("WIKIVISAGE_LIFTWING_CIRCUIT_FAILURES", 3))
 CIRCUIT_COOLDOWN = float(os.environ.get("WIKIVISAGE_LIFTWING_CIRCUIT_COOLDOWN", 600))
+
+# Politeness: keep a quiet gap between outbound requests so the tool cannot
+# burst at the shared service. The gap runs between the end of one request and
+# the start of the next; a jitter of up to half the interval keeps two worker
+# processes from falling into lockstep. ``0`` disables it (tests).
+MIN_CALL_INTERVAL = float(os.environ.get("WIKIVISAGE_LIFTWING_MIN_INTERVAL", 2.0))
+_CALL_INTERVAL_JITTER_FRACTION = 0.5
 
 MAX_REASON_CHARS = 160
 MAX_DESCRIPTION_CHARS = 250
@@ -231,11 +241,12 @@ def parse_verdicts(content: str) -> dict[int, Verdict]:
 
 
 class LiftWingClient:
-    """One shared instance per worker process. Requests are serialised.
+    """One shared instance per worker process. Requests are serialised and spaced.
 
     The pre-filter is deliberately low-throughput: one request at a time per
-    worker (``concurrency 1``), a single attempt per call, and a circuit
-    breaker that stops calls for a while after repeated failures.
+    worker (``concurrency 1``), a jittered minimum gap between requests, a
+    single attempt per call, and a circuit breaker that stops calls for a while
+    after repeated failures.
     """
 
     def __init__(
@@ -249,6 +260,7 @@ class LiftWingClient:
         max_tokens: int | None = None,
         circuit_failure_threshold: int | None = None,
         circuit_cooldown: float | None = None,
+        min_call_interval: float | None = None,
         user_agent: str | None = None,
         api_token: str | None = None,
     ) -> None:
@@ -261,6 +273,7 @@ class LiftWingClient:
             CIRCUIT_FAILURE_THRESHOLD if circuit_failure_threshold is None else circuit_failure_threshold
         )
         self.circuit_cooldown = CIRCUIT_COOLDOWN if circuit_cooldown is None else circuit_cooldown
+        self.min_call_interval = MIN_CALL_INTERVAL if min_call_interval is None else float(min_call_interval)
         self.user_agent = user_agent or USER_AGENT
         # Optional OAuth 2.0 / personal API token; never logged.
         self.api_token = api_token if api_token is not None else os.environ.get("WIKIVISAGE_LIFTWING_API_TOKEN", "")
@@ -274,6 +287,8 @@ class LiftWingClient:
         self._lock = threading.Lock()
         self._consecutive_failures = 0
         self._disabled_until = 0.0
+        # When the next outbound request may start (the politeness gap).
+        self._next_call_at = 0.0
         # A server-imposed deadline from a 429 Retry-After. Kept apart from the
         # breaker because recovery probes skip the breaker's own cooldown but
         # must still respect the server's "come back later".
@@ -330,6 +345,31 @@ class LiftWingClient:
         if self.api_token:
             headers["Authorization"] = f"Bearer {self.api_token}"
         return headers
+
+    def _chat_spaced(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        max_tokens: int | None = None,
+        timeout: float | None = None,
+    ) -> str:
+        """``_chat`` with the politeness gap: wait first, then leave a quiet tail.
+
+        The caller must hold ``self._lock``. The wait happens before the request
+        when the previous request finished less than the interval ago, and the
+        next deadline is armed after this one returns, so the service always
+        gets its gap even when answers come back quickly.
+        """
+        wait = self._next_call_at - time.monotonic()
+        if wait > 0:
+            logger.debug("LiftWing politeness: waiting %.1f s before the next request", wait)
+            time.sleep(wait)
+        try:
+            return self._chat(messages, max_tokens=max_tokens, timeout=timeout)
+        finally:
+            if self.min_call_interval > 0:
+                jitter = random.uniform(0.0, self.min_call_interval * _CALL_INTERVAL_JITTER_FRACTION)
+                self._next_call_at = time.monotonic() + self.min_call_interval + jitter
 
     def _chat(
         self,
@@ -433,7 +473,7 @@ class LiftWingClient:
                 return None
 
             try:
-                content = self._chat(self._build_messages(visual))
+                content = self._chat_spaced(self._build_messages(visual))
             except LiftWingUnavailable as exc:
                 self._record_failure(status_code=exc.status_code, retry_after=exc.retry_after)
                 logger.warning("LiftWing pre-filter request failed (%s); keeping %d file(s)", exc, len(visual))
@@ -471,7 +511,7 @@ class LiftWingClient:
                 logger.info("LiftWing probe skipped: rate limited for another %.0f s", remaining)
                 return False, f"rate limited (HTTP 429 Retry-After), {remaining:.0f} s left"
             try:
-                self._chat(
+                self._chat_spaced(
                     [{"role": "user", "content": "Reply with the single word: pong"}],
                     max_tokens=PROBE_MAX_TOKENS,
                     timeout=self.probe_timeout,
