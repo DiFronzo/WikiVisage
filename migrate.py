@@ -431,8 +431,14 @@ _ALTER_MIGRATIONS = [
     ),
     (
         "Add aligned to faces (record unaligned manual embeddings)",
+        # AFTER confidence, not AFTER det_score: det_score is created by
+        # apply_embedding_model_upgrade(), which runs after this list, so on a
+        # pre-upgrade database "AFTER det_score" fails with error 1054 before
+        # the upgrade can add it. confidence exists in every legacy schema, and
+        # the final column order still matches schema.sql
+        # (confidence, det_score, aligned).
         "ALTER TABLE faces ADD COLUMN aligned TINYINT(1) NOT NULL DEFAULT 1 "
-        "COMMENT '0=embedded without landmark alignment (drawn box, detector missed it)' AFTER det_score",
+        "COMMENT '0=embedded without landmark alignment (drawn box, detector missed it)' AFTER confidence",
     ),
     (
         "Create service_status table for optional-service reachability",

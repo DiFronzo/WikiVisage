@@ -809,6 +809,50 @@ def test_embedding_model_upgrade_is_a_noop_on_a_fresh_database(test_db: str, db_
     assert len(execute_query("SELECT id FROM projects WHERE id = %s", (seed_project["id"],))) == 1
 
 
+@pytest.mark.integration
+def test_run_migration_upgrades_a_legacy_faces_schema_end_to_end(test_db: str, db_conn, db_pool) -> None:
+    """The full entry point must complete against a pre-upgrade faces table.
+
+    ``aligned`` used to be positioned ``AFTER det_score``, but ``det_score`` is
+    created later, by ``apply_embedding_model_upgrade()``. On a real legacy
+    database that failed with "Unknown column 'det_score'" (error 1054) before
+    the upgrade could run. The upgrade's own tests cannot catch this: they start
+    from a schema that already has ``aligned``.
+    """
+    import migrate
+
+    with db_conn.cursor() as cur:
+        # Simulate a 0.10.x faces table: none of the columns this release adds
+        # exist yet. (aligned and det_score shipped together, so a legacy table
+        # has neither.)
+        cur.execute("ALTER TABLE faces DROP COLUMN aligned, DROP COLUMN det_score, DROP COLUMN embedding_model")
+
+    try:
+        migrate.run_migration()
+
+        with db_conn.cursor() as cur:
+            cur.execute("SHOW COLUMNS FROM faces")
+            columns = [row["Field"] for row in cur.fetchall()]
+
+        assert {"aligned", "det_score", "embedding_model"} <= set(columns)
+        # Same order as schema.sql: the ALTER list adds aligned after the legacy
+        # confidence column, then the upgrade inserts det_score after confidence.
+        assert columns.index("confidence") < columns.index("det_score") < columns.index("aligned")
+        assert columns.index("encoding") < columns.index("embedding_model")
+    finally:
+        # Whatever happened, leave a complete faces table for the remaining tests.
+        with db_conn.cursor() as cur:
+            cur.execute("SHOW COLUMNS FROM faces LIKE 'aligned'")
+            aligned_missing = cur.fetchone() is None
+        if aligned_missing:
+            database.init_db(pool_size=1)
+            try:
+                migrate.apply_embedding_model_upgrade()
+                migrate._apply_alter_migrations()
+            finally:
+                database.close_pool()
+
+
 def test_alter_migrations_include_liftwing_prefilter():
     descriptions = " ".join(desc for desc, _sql in _ALTER_MIGRATIONS)
 
@@ -824,7 +868,18 @@ def test_alter_migrations_include_faces_aligned():
 
     assert len(matching) == 1
     assert "DEFAULT 1" in matching[0]
-    assert "AFTER det_score" in matching[0]
+    # AFTER confidence, not det_score: det_score is only added later, by
+    # apply_embedding_model_upgrade(), so anchoring on it fails on a legacy DB.
+    assert "AFTER confidence" in matching[0]
+
+
+def test_alter_migrations_never_anchor_on_columns_the_upgrade_creates():
+    """The ALTER list runs before apply_embedding_model_upgrade(), so an AFTER
+    on a column only the upgrade creates (det_score, embedding_model) breaks the
+    full migration on a pre-upgrade database with error 1054."""
+    for description, sql in _ALTER_MIGRATIONS:
+        assert "AFTER det_score" not in sql, description
+        assert "AFTER embedding_model" not in sql, description
 
 
 def test_schema_sql_defines_faces_aligned_column():

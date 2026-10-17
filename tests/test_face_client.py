@@ -70,12 +70,14 @@ def test_detect_faces_parses_successful_response():
 def test_detect_faces_rejected_prediction_raises_faceservicerejected():
     session = MagicMock()
     session.post.return_value = _response(
-        json_body={"predictions": [{"id": "0", "status": "error", "error": "bad image"}]}
+        json_body={"predictions": [{"id": "0", "status": "error", "error": "bad image", "error_code": "invalid_image"}]}
     )
 
     with patch("face_client.get_session", return_value=session):
-        with pytest.raises(face_client.FaceServiceRejected, match="bad image"):
+        with pytest.raises(face_client.FaceServiceRejected, match="bad image") as excinfo:
             face_client.detect_faces(b"image-bytes")
+
+    assert excinfo.value.code == face_client.ERROR_CODE_INVALID_IMAGE
 
 
 def test_detect_faces_http_500_raises_unavailable():
@@ -180,7 +182,34 @@ def test_encode_known_face_returns_none_on_empty_faces():
     assert result is None
 
 
-def test_encode_known_face_returns_none_on_rejected():
+def test_encode_known_face_returns_none_on_a_region_rejection():
+    """A box-level rejection means "try a different region", so it stays None."""
+    with patch(
+        "face_client._post",
+        return_value=[{"id": "0", "status": "error", "error": "box outside image", "error_code": "invalid_box"}],
+    ):
+        result = face_client.encode_known_face(b"image", (1, 2, 3, 4))
+
+    assert result is None
+
+
+def test_encode_known_face_reraises_an_image_rejection():
+    """A corrupt image is terminal for both bbox routes: the client must not
+    turn it into the "try a larger box" answer (None)."""
+    with patch(
+        "face_client._post",
+        return_value=[
+            {"id": "0", "status": "error", "error": "could not decode image: broken", "error_code": "invalid_image"}
+        ],
+    ):
+        with pytest.raises(face_client.FaceServiceRejected, match="could not decode") as excinfo:
+            face_client.encode_known_face(b"image", (1, 2, 3, 4))
+
+    assert excinfo.value.code == face_client.ERROR_CODE_INVALID_IMAGE
+
+
+def test_encode_known_face_treats_a_codeless_rejection_as_the_region():
+    """Older services omit error_code; that must keep the previous behaviour."""
     with patch(
         "face_client._post",
         return_value=[{"id": "0", "status": "error", "error": "box unusable"}],
@@ -264,15 +293,18 @@ def test_oversized_image_is_rejected_without_a_request(monkeypatch):
         results = face_client.detect_faces_batch([("big", b"x" * 11), ("ok", b"x" * 10)])
 
     assert isinstance(results["big"], face_client.FaceServiceRejected)
+    assert results["big"].code == face_client.ERROR_CODE_INVALID_IMAGE
     assert isinstance(results["ok"], face_client.DetectionResult)
     assert [i["id"] for i in post.call_args.args[0]] == ["ok"]
 
 
-def test_encode_known_face_returns_none_for_oversized_image(monkeypatch):
+def test_encode_known_face_raises_for_oversized_image(monkeypatch):
     monkeypatch.setattr(face_client, "FACE_SERVICE_MAX_IMAGE_BYTES", 10)
     with patch("face_client._post") as post:
-        assert face_client.encode_known_face(b"x" * 11, (1, 2, 3, 4)) is None
+        with pytest.raises(face_client.FaceServiceRejected) as excinfo:
+            face_client.encode_known_face(b"x" * 11, (1, 2, 3, 4))
     post.assert_not_called()
+    assert excinfo.value.code == face_client.ERROR_CODE_INVALID_IMAGE
 
 
 def _detect_with(prediction):

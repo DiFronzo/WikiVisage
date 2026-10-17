@@ -5645,24 +5645,58 @@ def test_api_manual_face_unaligned_encoding_is_stored_with_flag(monkeypatch):
 
 
 def test_api_manual_face_face_service_rejected_returns_422(monkeypatch):
-    """A malformed image is terminal for this request: 422, not a retryable 503."""
+    """A malformed image is terminal for this request: 422, not a retryable 503.
+
+    Only the HTTP transport is stubbed: the rejection travels through
+    face_client's real parsing path, so the client's error classification is
+    part of what is being tested.
+    """
 
     def _route_query(sql):
         if "FROM images i " in sql:
             return [{"id": 10, "file_title": "File:Face.jpg", "status": "processed"}]
         return []
 
-    def _raise_rejected(*_args, **_kwargs):
-        raise app_module.FaceServiceRejected("image could not be decoded")
+    def _rejected(_instances):
+        return [
+            {
+                "id": "0",
+                "status": "error",
+                "error": "could not decode image: broken data",
+                "error_code": "invalid_image",
+            }
+        ]
 
     client, _ = _authed_client(monkeypatch, route_execute_query=_route_query)
     monkeypatch.setattr(app_module, "_download_image", lambda *_a, **_k: b"image-bytes")
-    monkeypatch.setattr(app_module.face_client, "encode_known_face", _raise_rejected)
+    monkeypatch.setattr(app_module.face_client, "_post", _rejected)
 
     resp = client.post("/api/manual-face", data=_manual_face_form())
 
     assert resp.status_code == 422
     assert resp.get_json()["error"] == "This image could not be read by the face detection service."
+
+
+def test_api_manual_face_unusable_region_still_asks_for_a_new_box(monkeypatch):
+    """A box-level rejection is not an image problem: the user should draw a
+    different box, not be told the image is unreadable."""
+
+    def _route_query(sql):
+        if "FROM images i " in sql:
+            return [{"id": 10, "file_title": "File:Face.jpg", "status": "processed"}]
+        return []
+
+    def _rejected(_instances):
+        return [{"id": "0", "status": "error", "error": "box lies outside", "error_code": "invalid_box"}]
+
+    client, _ = _authed_client(monkeypatch, route_execute_query=_route_query)
+    monkeypatch.setattr(app_module, "_download_image", lambda *_a, **_k: b"image-bytes")
+    monkeypatch.setattr(app_module.face_client, "_post", _rejected)
+
+    resp = client.post("/api/manual-face", data=_manual_face_form())
+
+    assert resp.status_code == 422
+    assert "Could not compute face encoding" in resp.get_json()["error"]
 
 
 def test_api_manual_face_dismiss_faces_on_normal_insert(monkeypatch):
@@ -6546,18 +6580,42 @@ def test_api_update_face_bbox_face_service_error(monkeypatch):
 
 
 def test_api_update_face_bbox_face_service_rejected_returns_422(monkeypatch):
+    """Only the HTTP transport is stubbed; the rejection travels through
+    face_client's real parsing path (see the manual-face counterpart)."""
     client, _ = _authed_client(monkeypatch, route_execute_query=_bbox_query_router())
     monkeypatch.setattr(app_module, "_download_image", lambda *_a, **_k: b"image-bytes")
 
-    def _raise_rejected(*_args, **_kwargs):
-        raise app_module.FaceServiceRejected("image could not be decoded")
+    def _rejected(_instances):
+        return [
+            {
+                "id": "0",
+                "status": "error",
+                "error": "could not decode image: broken data",
+                "error_code": "invalid_image",
+            }
+        ]
 
-    monkeypatch.setattr(app_module.face_client, "encode_known_face", _raise_rejected)
+    monkeypatch.setattr(app_module.face_client, "_post", _rejected)
 
     resp = client.post("/api/update-face-bbox", data=_update_bbox_form())
 
     assert resp.status_code == 422
     assert resp.get_json()["error"] == "This image could not be read by the face detection service."
+
+
+def test_api_update_face_bbox_unusable_region_still_asks_for_a_new_box(monkeypatch):
+    client, _ = _authed_client(monkeypatch, route_execute_query=_bbox_query_router())
+    monkeypatch.setattr(app_module, "_download_image", lambda *_a, **_k: b"image-bytes")
+
+    def _rejected(_instances):
+        return [{"id": "0", "status": "error", "error": "box lies outside", "error_code": "invalid_box"}]
+
+    monkeypatch.setattr(app_module.face_client, "_post", _rejected)
+
+    resp = client.post("/api/update-face-bbox", data=_update_bbox_form())
+
+    assert resp.status_code == 422
+    assert "Could not compute face encoding" in resp.get_json()["error"]
 
 
 def test_api_update_face_bbox_unaligned_encoding_records_flag(monkeypatch):

@@ -169,8 +169,9 @@ Standalone KServe V1 model server. `WikiVisageModel(kserve.Model)` implements
   `dim`) is a `Protocol`; YuNet + SFace (permissive licences) is the intended drop-in if the
   non-commercial weights ever have to go.
 - **Per-instance error isolation.** One malformed image yields a
-  `status: "error"` entry for that instance; siblings still return results.
-  `predictions` is always the same length and order as `instances`.
+  `status: "error"` entry (with a machine-readable `error_code`: `invalid_image`,
+  `invalid_box`, `invalid_request` or `service_error`) for that instance; siblings
+  still return results. `predictions` is always the same length and order as `instances`.
 - Two tasks: `detect` (find all faces) and `encode` (embed known bounding
   boxes, used by the manual-draw and bbox-edit routes).
 
@@ -227,15 +228,16 @@ float64 payload is rejected.
 |---|---|
 | `detect_faces(image_bytes)` | Single image → `DetectionResult` |
 | `detect_faces_batch(items)` | `[(key, bytes)]` → `{key: DetectionResult \| FaceServiceError}` |
-| `encode_known_face(image_bytes, bbox, box_space=None)` | Embed one known box → `KnownFaceEncoding(encoding, model_id, aligned)` or `None`; `box_space=(w, h)` is the stored `detection_width/height` the box was measured in |
+| `encode_known_face(image_bytes, bbox, box_space=None)` | Embed one known box → `KnownFaceEncoding(encoding, model_id, aligned)` or `None` (unusable region — `invalid_box` rejection or no face; image-level `invalid_image` rejections are re-raised). `box_space=(w, h)` is the stored `detection_width/height` the box was measured in |
 | `check_service_model()` | One tiny real request; returns `(model_id, dim)`; used by the worker at startup |
 | `is_healthy()` | Readiness probe, never raises |
 | `get_session()` / `reset_session()` | Pooled `requests.Session` with retries |
 
 Exceptions: `FaceServiceError` (base), `FaceServiceUnavailable` (transport —
 retryable), `FaceServiceModelMismatch` (subclass of Unavailable: wrong model/dim; the
-worker exits at startup on it), `FaceServiceRejected` (this image is unusable — terminal).
-`DetectedFace` carries `score` and `aligned`; `DetectionResult` carries `model_id` and `dim`.
+worker exits at startup on it), `FaceServiceRejected` (this input is unusable — terminal;
+`code` carries the service's `error_code` when present). `DetectedFace` carries `score`
+and `aligned`; `DetectionResult` carries `model_id` and `dim`.
 
 Batches split on whichever of the count / total-bytes budgets is hit first, so
 a few large images cannot produce a huge request body.
@@ -298,7 +300,11 @@ rejects it and the worker treats any non-`off` value as shadow).
   `Authorization: Bearer <token>` and moves calls to the authenticated quota.
   A 429 opens the client circuit breaker immediately and honours `Retry-After`
   (delta-seconds or HTTP-date) as the cooldown instead of hammering the gateway
-  two more times. The User-Agent is `WikiVisage/<version>`
+  two more times. The 429 deadline is tracked separately from the breaker, so it
+  also pauses the recovery probe, and a later success cannot clear it early. The
+  breaker check, the request and the recorded outcome run under one lock, so
+  calls queued behind a failing one see the open breaker instead of each firing
+  their own request. The User-Agent is `WikiVisage/<version>`
   (`config.PROJECT_VERSION`).
 - **Web side:** context processor `inject_liftwing_status` reads the row (no
   network call; failures read as "no message") and `base.html` shows a
@@ -735,7 +741,7 @@ The face service used to run dlib HOG + `face_recognition` (128D float64). It no
 **The weights are third-party and non-commercial research only** (InsightFace `buffalo_sc`). They are committed as ordinary git blobs in `model-server/weights/` with `LICENSE-NOTICE` stating the terms; the project owner accepted this for the experiment. Wikimedia admins could object, so keep the `FaceBackend` protocol pluggable (YuNet + SFace is the fallback). **Never use Git LFS or submodules for them**: the Toolforge build service does a plain clone, and a pointer file would build "successfully" and then fail. Three guards enforce it: `scripts/check_no_lfs.sh` in the CI lint job, `sha256sum -c SHA256SUMS` in every face-service CI job, and `backend.verify_weights` at startup (fail-closed). `scripts/fetch_weights.sh` re-creates and verifies the files from the official release URL.
 
 ### The embedding-model wipe (one-time, in `migrate.py`)
-Old 128D dlib encodings and new 512D embeddings are not comparable, so `migrate.apply_embedding_model_upgrade()` wipes derived data exactly once. It is gated on `information_schema.COLUMNS`: if `faces.embedding_model` is absent it runs `DELETE FROM images` (cascades to faces and sdc_claims; never `TRUNCATE`, InnoDB refuses it on FK-referenced tables) and `DELETE FROM sdc_claims`, resets every project (counters, inference settings, completion reason, SDC flags, worker claim, `distance_threshold` = the new default), reactivates `completed` projects, then applies the schema changes (`det_score`, comments, default) and adds `embedding_model` **last**, so an interrupted run repeats the wipe instead of skipping it. Later runs and fresh databases (whose `schema.sql` already has the column) skip it. It keeps users, sessions, projects, project_members, user_stats and worker_heartbeat. Wiping `sdc_claims` cannot create duplicate P180 claims because `write_sdc_claims` checks Commons first, and `bootstrap_from_sparql` re-seeds from existing claims. Take a DB dump before the first run on real data. `migrate.py --reset` is a different, harsher tool (it also drops users and tokens).
+Old 128D dlib encodings and new 512D embeddings are not comparable, so `migrate.apply_embedding_model_upgrade()` wipes derived data exactly once. It is gated on `information_schema.COLUMNS`: if `faces.embedding_model` is absent it runs `DELETE FROM images` (cascades to faces and sdc_claims; never `TRUNCATE`, InnoDB refuses it on FK-referenced tables) and `DELETE FROM sdc_claims`, resets every project (counters, inference settings, completion reason, SDC flags, worker claim, `distance_threshold` = the new default), reactivates `completed` projects, then applies the schema changes (`det_score`, comments, default) and adds `embedding_model` **last**, so an interrupted run repeats the wipe instead of skipping it. The ALTER list that runs *before* this step must never anchor a column on `det_score` or `embedding_model` — they do not exist yet on a legacy database (error 1054): `faces.aligned` is positioned after the old `confidence` column instead, and `test_run_migration_upgrades_a_legacy_faces_schema_end_to_end` exercises the full entry point against a simulated 0.10.x table. Later runs and fresh databases (whose `schema.sql` already has the column) skip it. It keeps users, sessions, projects, project_members, user_stats and worker_heartbeat. Wiping `sdc_claims` cannot create duplicate P180 claims because `write_sdc_claims` checks Commons first, and `bootstrap_from_sparql` re-seeds from existing claims. Take a DB dump before the first run on real data. `migrate.py --reset` is a different, harsher tool (it also drops users and tokens).
 
 ### The LiftWing pre-filter is shadow-only and fails open
 `projects.prefilter_mode` accepts `off` and `shadow`; `enforce` is in the ENUM so adding it later needs no schema change, but settings reject it and the worker treats any non-`off` value as shadow. Whatever the model says, every image is still downloaded and face-detected — the verdicts only land on `images.prefilter_keep/_reason/_checked_at` for `scripts/eval_prefilter.py`. Do not wire the verdicts into `process_images` before that readout shows a keep recall of at least 99.5% on human-confirmed target images (the readout also reports dropped images that had detected faces, and keeps with none).
@@ -817,7 +823,7 @@ The project detail page includes approve/reject/edit-bbox controls on each Model
 - **Approve** (checkmark): Sets `is_target=1, classified_by='human'` via `/api/reclassify`. Updates card badge in-place.
 - **Reject** (X): Sets `is_target=0, classified_by='human'`. If the face had `sdc_written=1`, also removes the P180 depicts claim from Commons via `_remove_sdc_claim()` (uses `wbgetclaims` -> `wbremoveclaims`).
 - **Edit bbox** (pencil): Opens a modal with a 1280px image. User draws a new bounding box. Old face is kept; a new face row is inserted via `/api/update-face-bbox` (face encoding recomputed server-side; `faces.aligned` records whether the detector confirmed the box or the embedding fell back to an unaligned resize).
-- **Unreadable image**: if the face service rejects the image itself (`FaceServiceRejected`), both `/api/manual-face` and `/api/update-face-bbox` return **422** with "This image could not be read by the face detection service." (retryable service failures stay 503).
+- **Unreadable image**: if the face service rejects the image itself (`FaceServiceRejected` with `error_code: invalid_image`, which `encode_known_face` re-raises), both `/api/manual-face` and `/api/update-face-bbox` return **422** with "This image could not be read by the face detection service." (retryable service failures stay 503; box-level rejections still answer "draw a slightly larger box").
 - **Filter interaction**: After reclassification, `data-source` is NOT changed — the card remains visible under its original source filter (Model/Bootstrap). Only the visible method label updates to "human".
 
 ### Cookies
@@ -852,6 +858,8 @@ Hybrid test suite: unit tests (run in CI), integration tests (require local Dock
 Phase 2 added: the LiftWing client suite (`test_liftwing_client.py`); `prefilter_images` mode/fail-open/cap tests, probe claim/hysteresis tests and `_fetch_metadata` tests in `test_worker.py`; status-snapshot, banner, `/health` and settings-POST tests in `test_app.py`; migration/schema assertions in `test_migrate.py`, including `test_schema_semicolons_are_only_statement_terminators` — `load_schema` splits `schema.sql` naively on `;`, so a semicolon inside a comment or a quoted `COMMENT` would silently chop a statement in half and only fail on a real database.
 
 The follow-up round added: `test_eval_prefilter.py` (the readout math under mock rows), auth-header/429-`Retry-After`/minimal-completion-probe tests in `test_liftwing_client.py`, prefilter success/failure `service_status` wiring and the "prefilter runs after the image loop" ordering test in `test_worker.py`, 422 `FaceServiceRejected` tests for both bbox routes plus the `aligned` flag assertions in `test_app.py`, `faces.aligned` migration/schema assertions in `test_migrate.py`, and a `require_sample_env` truthiness test pinning that `WIKIVISAGE_REQUIRE_SAMPLE=0` means "not required".
+
+The Copilot-review round added: `test_run_migration_upgrades_a_legacy_faces_schema_end_to_end` (full migration entry point against a simulated 0.10.x `faces` table), the `encode` rejection-classification tests (`invalid_image` re-raised vs an unusable region staying `None`) in `test_face_client.py`, both bbox routes (through the real client parsing path — only `_post` stubbed) and the live contract suite, `error_code` assertions on per-instance error entries in `test_face_service_model.py` (plus a parity check against `face_client`'s constant), and the LiftWing breaker-serialization (`test_queued_calls_see_the_breaker_the_running_call_opens`) and 429-deadline probe tests.
 
 ### Commands
 

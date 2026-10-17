@@ -142,8 +142,10 @@ def test_corrupt_image_is_rejected_not_retried(image_bytes):
     The worker branches on exactly this distinction: FaceServiceRejected marks
     the image 'error', FaceServiceUnavailable leaves it pending forever.
     """
-    with pytest.raises(FaceServiceRejected):
+    with pytest.raises(FaceServiceRejected) as excinfo:
         face_client.detect_faces(b"this is definitely not an image")
+
+    assert excinfo.value.code == face_client.ERROR_CODE_INVALID_IMAGE
 
 
 def test_batch_isolates_a_bad_image_from_its_siblings(image_bytes):
@@ -155,6 +157,7 @@ def test_batch_isolates_a_bad_image_from_its_siblings(image_bytes):
     assert isinstance(results["good-1"], DetectionResult)
     assert isinstance(results["good-2"], DetectionResult)
     assert isinstance(results["bad"], FaceServiceRejected)
+    assert results["bad"].code == face_client.ERROR_CODE_INVALID_IMAGE
 
 
 def test_batch_larger_than_one_request_still_returns_every_key(image_bytes):
@@ -171,6 +174,15 @@ def test_batch_larger_than_one_request_still_returns_every_key(image_bytes):
 def test_encode_known_box_returns_none_for_an_unusable_region(image_bytes):
     """Drives the HTTP 422 path in /api/manual-face and /api/update-face-bbox."""
     assert face_client.encode_known_face(image_bytes, (10, 15, 15, 10)) is None
+
+
+def test_encode_known_face_reraises_an_unreadable_image():
+    """The 422 "could not be read" branch in both bbox routes depends on this:
+    a corrupt image must raise, not come back as an unusable region (None)."""
+    with pytest.raises(FaceServiceRejected) as excinfo:
+        face_client.encode_known_face(b"this is definitely not an image", (20, 120, 120, 20))
+
+    assert excinfo.value.code == face_client.ERROR_CODE_INVALID_IMAGE
 
 
 def test_encode_without_a_face_falls_back_to_an_unaligned_unit_vector():
@@ -230,12 +242,14 @@ def test_encode_rejects_a_malformed_box_space(image_bytes):
         ]
     )
     assert prediction["status"] == "error"
+    assert prediction["error_code"] == "invalid_box"
 
 
 def test_encode_rejects_a_box_outside_the_image(image_bytes):
     box = {"top": 2000, "right": 3000, "bottom": 2100, "left": 2900}
     [prediction] = _post_instances([{"id": "0", "task": "encode", "image": _b64(image_bytes), "boxes": [box]}])
     assert prediction["status"] == "error"
+    assert prediction["error_code"] == "invalid_box"
 
 
 def test_detect_finds_exactly_one_face_in_the_portrait(portrait):

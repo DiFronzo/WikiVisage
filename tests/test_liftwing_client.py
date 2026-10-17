@@ -6,6 +6,7 @@ of raising, and a circuit breaker stops calls after repeated failures.
 """
 
 import json
+import threading
 import time
 from unittest.mock import MagicMock
 
@@ -298,6 +299,43 @@ def test_circuit_resets_after_success():
     assert session.post.call_count == 3
 
 
+def test_queued_calls_see_the_breaker_the_running_call_opens():
+    """Regression: the breaker used to be checked outside the request lock, so
+    threads already inside filter_metadata each sent their own request after the
+    429 that should have stopped them — exactly the hammering the breaker is
+    there to prevent."""
+    session = MagicMock()
+    in_request = threading.Event()
+    release = threading.Event()
+    calls: list[int] = []
+
+    def _post(*_args, **_kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            in_request.set()
+            assert release.wait(timeout=5)
+        return _response(status_code=429, payload={}, headers={"Retry-After": "600"})
+
+    session.post.side_effect = _post
+    client = _client(session, circuit_failure_threshold=5)
+    item = MetadataItem(page_id=1, title="File:A.jpg")
+    results: list[dict | None] = []
+
+    threads = [threading.Thread(target=lambda: results.append(client.filter_metadata([item])))]
+    threads[0].start()
+    assert in_request.wait(timeout=5)  # the first call is inside its HTTP request
+    threads += [threading.Thread(target=lambda: results.append(client.filter_metadata([item]))) for _ in range(7)]
+    for thread in threads[1:]:
+        thread.start()
+    time.sleep(0.2)  # let the queued threads reach the breaker check
+    release.set()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert len(calls) == 1  # only the first call ever reached the wire
+    assert results == [None] * 8
+
+
 # ---------------------------------------------------------------------------
 # Auth and Retry-After (H4)
 # ---------------------------------------------------------------------------
@@ -337,6 +375,7 @@ def test_429_opens_circuit_immediately_and_honours_retry_after():
     assert session.post.call_count == 1
     assert client._consecutive_failures == 1
     assert client._disabled_until - time.monotonic() > 1100  # Retry-After beats the default cooldown
+    assert client._rate_limited() is True
 
 
 def test_parse_retry_after_accepts_seconds_and_http_date():
@@ -411,6 +450,37 @@ def test_probe_429_reports_failure_and_opens_the_breaker():
     assert "429" in error
     assert client._consecutive_failures == 1
     assert client._circuit_open() is True
+    assert client._rate_limited() is True
+
+
+def test_probe_honours_the_429_deadline_and_a_success_does_not_clear_it():
+    """Regression: a probe used to fire regardless of Retry-After, and a later
+    success cleared the deadline, spending quota the server had denied."""
+    session = MagicMock()
+    session.post.side_effect = [
+        _response(status_code=429, payload={}, headers={"Retry-After": "1200"}),
+        _response(payload=_completion("pong")),
+    ]
+    client = _client(session, circuit_failure_threshold=5, circuit_cooldown=600)
+
+    assert client.probe() == (False, "HTTP 429")  # learns the deadline
+    assert client._rate_limited() is True
+    assert client._rate_limited_until - time.monotonic() > 1100
+
+    calls = session.post.call_count
+    up, error = client.probe()
+    assert up is False
+    assert "rate limited" in error
+    assert session.post.call_count == calls  # no request spent against the quota
+
+    # A success elsewhere must not clear the server's deadline early.
+    client._record_success()
+    assert client._rate_limited() is True
+
+    # Once the deadline expires, probes try the wire again.
+    client._rate_limited_until = time.monotonic() - 1
+    client._disabled_until = time.monotonic() - 1
+    assert client.probe() == (True, None)
 
 
 def test_probe_reports_transport_error():

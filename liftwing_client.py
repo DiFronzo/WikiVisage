@@ -266,11 +266,18 @@ class LiftWingClient:
         self.api_token = api_token if api_token is not None else os.environ.get("WIKIVISAGE_LIFTWING_API_TOKEN", "")
 
         self._session = session if session is not None else requests.Session()
-        # Serialises HTTP calls so a worker never runs two pre-filter requests
-        # at once, whatever its project-level thread pool is doing.
+        # Serialises pre-filter calls so a worker never runs two at once,
+        # whatever its project-level thread pool is doing — and so the breaker
+        # check, the request and the recorded outcome are one critical section:
+        # a failure observed by one call must be visible to the next call's
+        # check, not only to the one after that.
         self._lock = threading.Lock()
         self._consecutive_failures = 0
         self._disabled_until = 0.0
+        # A server-imposed deadline from a 429 Retry-After. Kept apart from the
+        # breaker because recovery probes skip the breaker's own cooldown but
+        # must still respect the server's "come back later".
+        self._rate_limited_until = 0.0
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -283,22 +290,32 @@ class LiftWingClient:
 
     # -- circuit breaker ---------------------------------------------------
 
+    def _rate_limited(self) -> bool:
+        return time.monotonic() < self._rate_limited_until
+
     def _circuit_open(self) -> bool:
-        return time.monotonic() < self._disabled_until
+        now = time.monotonic()
+        return now < self._disabled_until or now < self._rate_limited_until
 
     def _record_success(self) -> None:
         self._consecutive_failures = 0
         self._disabled_until = 0.0
+        # _rate_limited_until is deliberately not cleared: a server's 429
+        # Retry-After stands until it expires, whatever else succeeds.
 
     def _record_failure(self, *, status_code: int | None = None, retry_after: float | None = None) -> None:
         self._consecutive_failures += 1
         cooldown = self.circuit_cooldown
         if retry_after is not None:
             cooldown = max(cooldown, retry_after)
-        # A 429 is an explicit "come back later": open immediately and honour
-        # Retry-After instead of hammering the gateway two more times.
+        now = time.monotonic()
+        # A 429 is an explicit "come back later": open immediately, remember the
+        # deadline for recovery probes too, and honour Retry-After instead of
+        # hammering the gateway two more times.
+        if status_code == 429:
+            self._rate_limited_until = now + (retry_after if retry_after is not None else cooldown)
         if status_code == 429 or self._consecutive_failures >= self.circuit_failure_threshold:
-            self._disabled_until = time.monotonic() + cooldown
+            self._disabled_until = now + cooldown
             logger.warning(
                 "LiftWing circuit breaker opened after %d consecutive failure(s)%s; paused for %.0f s",
                 self._consecutive_failures,
@@ -321,7 +338,12 @@ class LiftWingClient:
         max_tokens: int | None = None,
         timeout: float | None = None,
     ) -> str:
-        """One chat completion; returns the assistant's content or raises."""
+        """One chat completion; returns the assistant's content or raises.
+
+        The caller must hold ``self._lock``: calls are serialised as one
+        critical section (check breaker, request, record outcome), not just
+        around the HTTP call.
+        """
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
@@ -330,13 +352,12 @@ class LiftWingClient:
             "max_tokens": self.max_tokens if max_tokens is None else max_tokens,
         }
         try:
-            with self._lock:
-                response = self._session.post(
-                    self.url,
-                    json=payload,
-                    headers=self._headers(),
-                    timeout=self.timeout if timeout is None else timeout,
-                )
+            response = self._session.post(
+                self.url,
+                json=payload,
+                headers=self._headers(),
+                timeout=self.timeout if timeout is None else timeout,
+            )
         except requests.exceptions.RequestException as exc:
             raise LiftWingUnavailable(f"request failed: {exc}") from exc
 
@@ -402,25 +423,30 @@ class LiftWingClient:
         if not visual:
             logger.info("LiftWing pre-filter settled %d non-visual file(s) without a call", len(settled))
             return settled
-        if self._circuit_open():
-            logger.info("LiftWing circuit breaker is open; keeping %d file(s) unfiltered", len(visual))
-            return None
 
-        try:
-            content = self._chat(self._build_messages(visual))
-        except LiftWingUnavailable as exc:
-            self._record_failure(status_code=exc.status_code, retry_after=exc.retry_after)
-            logger.warning("LiftWing pre-filter request failed (%s); keeping %d file(s)", exc, len(visual))
-            return None
+        # Check, request and outcome are one critical section: calls queue here,
+        # so a failure recorded by the running call is already visible to the
+        # next call's breaker check instead of letting it fire its own request.
+        with self._lock:
+            if self._circuit_open():
+                logger.info("LiftWing circuit breaker is open; keeping %d file(s) unfiltered", len(visual))
+                return None
 
-        try:
-            verdicts = parse_verdicts(content)
-        except LiftWingUnavailable as exc:
-            self._record_failure()
-            logger.warning("LiftWing answer unusable (%s); keeping %d file(s)", exc, len(visual))
-            return None
+            try:
+                content = self._chat(self._build_messages(visual))
+            except LiftWingUnavailable as exc:
+                self._record_failure(status_code=exc.status_code, retry_after=exc.retry_after)
+                logger.warning("LiftWing pre-filter request failed (%s); keeping %d file(s)", exc, len(visual))
+                return None
 
-        self._record_success()
+            try:
+                verdicts = parse_verdicts(content)
+            except LiftWingUnavailable as exc:
+                self._record_failure()
+                logger.warning("LiftWing answer unusable (%s); keeping %d file(s)", exc, len(visual))
+                return None
+
+            self._record_success()
         verdicts.update(settled)
         return verdicts
 
@@ -433,21 +459,31 @@ class LiftWingClient:
         a broken pre-filter from the status banner and wrongly close the
         circuit breaker. A 429 counts as a failure and its ``Retry-After``
         feeds the breaker cooldown.
+
+        The probe ignores the breaker's own cooldown (detecting recovery is its
+        job) but honours a server-imposed 429 deadline: while that is running it
+        reports not-up without a request, and a later success elsewhere does not
+        clear the deadline early.
         """
-        try:
-            self._chat(
-                [{"role": "user", "content": "Reply with the single word: pong"}],
-                max_tokens=PROBE_MAX_TOKENS,
-                timeout=self.probe_timeout,
-            )
-        except LiftWingUnavailable as exc:
-            self._record_failure(status_code=exc.status_code, retry_after=exc.retry_after)
-            return False, str(exc)
-        except Exception as exc:  # defensive: a probe must never take the worker down
-            logger.warning("LiftWing probe crashed: %s", exc)
-            return False, str(exc)
-        self._record_success()
-        return True, None
+        with self._lock:
+            if self._rate_limited():
+                remaining = self._rate_limited_until - time.monotonic()
+                logger.info("LiftWing probe skipped: rate limited for another %.0f s", remaining)
+                return False, f"rate limited (HTTP 429 Retry-After), {remaining:.0f} s left"
+            try:
+                self._chat(
+                    [{"role": "user", "content": "Reply with the single word: pong"}],
+                    max_tokens=PROBE_MAX_TOKENS,
+                    timeout=self.probe_timeout,
+                )
+            except LiftWingUnavailable as exc:
+                self._record_failure(status_code=exc.status_code, retry_after=exc.retry_after)
+                return False, str(exc)
+            except Exception as exc:  # defensive: a probe must never take the worker down
+                logger.warning("LiftWing probe crashed: %s", exc)
+                return False, str(exc)
+            self._record_success()
+            return True, None
 
 
 _CLIENT: LiftWingClient | None = None

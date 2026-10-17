@@ -337,6 +337,41 @@ def test_bad_instances_become_error_entries(model, instance, message):
     assert result["status"] == "error" and message in result["error"]
 
 
+@pytest.mark.parametrize(
+    "instance,error_code",
+    [
+        ({"id": "x", "task": "detect", "image": "!!!"}, "invalid_image"),
+        ({"id": "x", "task": "detect", "image": _b64(b"not an image")}, "invalid_image"),
+        ({"id": "x", "task": "encode", "image": _b64(b"x"), "boxes": []}, "invalid_request"),
+        ({"id": "x", "task": "frobnicate", "image": _b64(b"x")}, "invalid_request"),
+    ],
+)
+def test_error_entries_carry_a_machine_readable_code(model, instance, error_code):
+    """face_client branches on `invalid_image`; the codes are a wire contract."""
+    result = _run(model, instance)
+    assert result["status"] == "error"
+    assert result["error_code"] == error_code
+
+
+def test_box_rejections_carry_the_invalid_box_code(model):
+    tiny = {"top": 10, "right": 15, "bottom": 15, "left": 10}  # under MIN_BBOX_AREA
+    outside = {"top": 2000, "right": 3000, "bottom": 2100, "left": 2900}
+
+    assert _run(model, _encode_instance([tiny]))["error_code"] == "invalid_box"
+    assert _run(model, _encode_instance([outside]))["error_code"] == "invalid_box"
+    assert _run(model, _encode_instance([BOX], box_space={"width": 0, "height": 10}))["error_code"] == "invalid_box"
+
+
+def test_error_codes_match_face_clients_constants():
+    """model.py produces the codes, face_client interprets the one it needs."""
+    import face_client as fc
+
+    assert ms.ERROR_CODE_INVALID_IMAGE == fc.ERROR_CODE_INVALID_IMAGE == "invalid_image"
+    assert ms.ERROR_CODE_INVALID_BOX == "invalid_box"
+    assert ms.ERROR_CODE_INVALID_REQUEST == "invalid_request"
+    assert ms.ERROR_CODE_SERVICE_ERROR == "service_error"
+
+
 def test_backend_failure_is_reported_for_that_instance_only(model):
     def boom(*_a, **_k):
         raise be.FaceBackendError("embedder produced a non-finite or zero vector")
@@ -346,16 +381,21 @@ def test_backend_failure_is_reported_for_that_instance_only(model):
     result = _run(model, _detect_instance())
 
     assert result["status"] == "error" and "face backend failed" in result["error"]
+    assert result["error_code"] == "service_error"
 
 
 def test_oversized_image_bytes_are_rejected(model, monkeypatch):
     monkeypatch.setattr(ms, "MAX_IMAGE_BYTES", 10)
-    assert "limit is 10" in _run(model, _detect_instance())["error"]
+    result = _run(model, _detect_instance())
+    assert "limit is 10" in result["error"]
+    assert result["error_code"] == "invalid_image"
 
 
 def test_pixel_limit_is_enforced(model, monkeypatch):
     monkeypatch.setattr(ms, "MAX_IMAGE_PIXELS", 1000)
-    assert _run(model, _detect_instance())["status"] == "error"
+    result = _run(model, _detect_instance())
+    assert result["status"] == "error"
+    assert result["error_code"] == "invalid_image"
 
 
 def test_exif_orientation_is_not_applied(model):

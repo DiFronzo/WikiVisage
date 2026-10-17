@@ -52,6 +52,13 @@ EXPECTED_MODEL_ID = os.environ.get("WIKIVISAGE_FACE_MODEL_ID", "scrfd500m+arcfac
 EMBEDDING_DIM = int(os.environ.get("WIKIVISAGE_FACE_EMBEDDING_DIM", 512))
 BYTES_PER_COMPONENT = 4  # little-endian float32
 
+# The only per-instance ``error_code`` this client interprets: the service's
+# image bytes cannot be decoded or are over the size limit. Only the ``encode``
+# path special-cases it (see :func:`encode_known_face`); the full code set is
+# documented in TESTING.md and produced by model-server/model.py (a test pins
+# the values together).
+ERROR_CODE_INVALID_IMAGE = "invalid_image"
+
 
 class FaceServiceError(Exception):
     """Base class for all face service failures."""
@@ -78,7 +85,16 @@ class FaceServiceRejected(FaceServiceError):
 
     Not retryable: the image is malformed, oversized, or the bounding box is
     unusable. The caller should record a terminal error for this item.
+
+    ``code`` is the service's machine-readable ``error_code`` when present.
+    :data:`ERROR_CODE_INVALID_IMAGE` means the image itself can never be
+    embedded; callers that accept user-drawn boxes re-raise that and treat every
+    other rejection as an unusable region (retry with a different box).
     """
+
+    def __init__(self, message: str, code: str | None = None):
+        super().__init__(message)
+        self.code = code
 
 
 @dataclass(frozen=True)
@@ -297,7 +313,11 @@ def _parse_prediction(prediction: dict[str, Any]) -> DetectionResult:
         raise FaceServiceUnavailable("each prediction must be an object")
     status = prediction.get("status")
     if status == "error":
-        raise FaceServiceRejected(str(prediction.get("error", "unknown face service error")))
+        code = prediction.get("error_code")
+        raise FaceServiceRejected(
+            str(prediction.get("error", "unknown face service error")),
+            code=code if isinstance(code, str) else None,
+        )
     if status != "ok":
         raise FaceServiceUnavailable(f"unexpected prediction status {status!r}")
 
@@ -365,7 +385,10 @@ def _chunk(items: Sequence[tuple[str, bytes]]) -> Iterable[list[tuple[str, bytes
 
 def _check_image_size(image_bytes: bytes) -> None:
     if len(image_bytes) > FACE_SERVICE_MAX_IMAGE_BYTES:
-        raise FaceServiceRejected(f"image is {len(image_bytes)} bytes, limit is {FACE_SERVICE_MAX_IMAGE_BYTES}")
+        raise FaceServiceRejected(
+            f"image is {len(image_bytes)} bytes, limit is {FACE_SERVICE_MAX_IMAGE_BYTES}",
+            code=ERROR_CODE_INVALID_IMAGE,
+        )
 
 
 def detect_faces_batch(items: Sequence[tuple[str, bytes]]) -> dict[str, DetectionResult | FaceServiceError]:
@@ -446,14 +469,12 @@ def encode_known_face(
     Returns ``(encoding, model_id, aligned)``, or ``None`` if the service could
     not produce one for that region (typically because the box is too small or
     lies outside the image) — which callers surface to the user as "try drawing
-    a slightly larger box". ``aligned`` is False when no face could be located
-    inside the box and it was embedded by plain resize.
+    a slightly larger box". Raises :class:`FaceServiceRejected` when the image
+    itself is unusable (over the size limit, or the service cannot decode it):
+    no box the user draws can help there. ``aligned`` is False when no face
+    could be located inside the box and it was embedded by plain resize.
     """
-    try:
-        _check_image_size(image_bytes)
-    except FaceServiceRejected as exc:
-        logger.info("Not encoding manual bbox %s: %s", bbox, exc)
-        return None
+    _check_image_size(image_bytes)
     top, right, bottom, left = bbox
     instance: dict[str, Any] = {
         "id": "0",
@@ -467,6 +488,8 @@ def encode_known_face(
     try:
         result = _parse_prediction(predictions[0])
     except FaceServiceRejected as exc:
+        if exc.code == ERROR_CODE_INVALID_IMAGE:
+            raise
         logger.info("Face service rejected manual bbox %s: %s", bbox, exc)
         return None
     if not result.faces:

@@ -189,8 +189,12 @@ curl -s -X POST http://localhost:8080/v1/models/wikivisage:predict \
 ```
 
 `predictions` is always the same length and order as `instances`. One bad image
-yields `{"status": "error", "error": "..."}` for that entry only — its siblings
-still return results.
+yields `{"status": "error", "error": "...", "error_code": "..."}` for that entry
+only — its siblings still return results. `error_code` is one of `invalid_image`
+(the image bytes cannot be decoded or are over the size limit), `invalid_box`,
+`invalid_request` or `service_error`. `face_client.encode_known_face` re-raises
+`invalid_image` (no other box can help) and turns every other rejection into
+"unusable region"; `detect_faces` raises `FaceServiceRejected` either way.
 
 ### Encoding a known bounding box
 
@@ -234,7 +238,10 @@ curl -s -i -X POST http://localhost:8080/v1/models/wikivisage:predict \
 The distinction matters to the worker: a per-instance error is treated as
 terminal and marks the image `status='error'`, while a transport or envelope
 failure is treated as transient and leaves the image `pending` for the next
-poll cycle.
+poll cycle. For the `encode` path the `error_code` adds a second distinction:
+`invalid_image` is what makes `face_client.encode_known_face` raise (both bbox
+routes then answer HTTP 422 "could not be read"), while `invalid_box` comes back
+as `None` ("try drawing a slightly larger box").
 
 ---
 
@@ -350,7 +357,7 @@ Toolforge buildpack image):
 | Sloppy hand-drawn box around a face | Landmarks recovered (`aligned: true`), embedding 0.957 cosine to the detected face |
 | Same box, unaligned fallback | 0.69 cosine to the aligned embedding — why `aligned` is reported |
 | `box_space` | A box given in a 2x larger space embeds identically to the same region given directly |
-| Per-instance error isolation | A corrupt image in a batch returns an error for that entry only |
+| Per-instance error isolation | A corrupt image in a batch returns an error (with a machine-readable `error_code`) for that entry only |
 | Unreachable service | Raises `FaceServiceUnavailable`, not a crash |
 | Service log | No `VerifyOutputSizes` warnings after the contract suite |
 

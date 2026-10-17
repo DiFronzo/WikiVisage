@@ -25,11 +25,12 @@ Runtime) live in ``backend.py``; this module is the KServe envelope around them.
       {"id": "43", "status": "ok", "width": 1024, "height": 768,
        "model_id": "scrfd500m+arcface_mbf", "dim": 512,
        "faces": [{"box": {...}, "score": 0.88, "aligned": true, "encoding": "..."}]},
-      {"id": "44", "status": "error", "error": "..."}
+      {"id": "44", "status": "error", "error": "...", "error_code": "invalid_image"}
     ]}
 
 ``predictions`` always matches ``instances`` in length and order; one bad image
-yields a ``status: "error"`` entry without affecting its siblings.
+yields a ``status: "error"`` entry (with a machine-readable ``error_code``)
+without affecting its siblings.
 
 ``box_space`` (``encode`` only, optional) is the pixel size of the image the
 caller measured its boxes in. The server scales the boxes to the image it
@@ -113,23 +114,44 @@ _TASK_DETECT = "detect"
 _TASK_ENCODE = "encode"
 _VALID_TASKS = frozenset({_TASK_DETECT, _TASK_ENCODE})
 
+# Machine-readable codes for per-instance error entries ("error_code").
+# face_client only special-cases ERROR_CODE_INVALID_IMAGE: an unusable image can
+# never be embedded, while every other rejection means the request (usually the
+# box) should change. Keep in step with face_client's constants (a test pins
+# the values together).
+ERROR_CODE_INVALID_IMAGE = "invalid_image"
+ERROR_CODE_INVALID_BOX = "invalid_box"
+ERROR_CODE_INVALID_REQUEST = "invalid_request"
+ERROR_CODE_SERVICE_ERROR = "service_error"
+
 
 class ImageRejected(ValueError):
-    """Raised for per-instance input problems that should not fail the batch."""
+    """Raised for per-instance input problems that should not fail the batch.
+
+    ``code`` classifies the problem for the caller (sent as ``error_code`` on
+    the wire); it defaults to ``invalid_request`` so a raise site that forgets a
+    code is never mistaken for an unusable image.
+    """
+
+    def __init__(self, message: str, code: str = ERROR_CODE_INVALID_REQUEST):
+        super().__init__(message)
+        self.code = code
 
 
 def _decode_image_field(raw: Any) -> bytes:
     """Base64-decode an instance's ``image`` field with strict validation."""
     if not isinstance(raw, str) or not raw:
-        raise ImageRejected("'image' must be a non-empty base64 string")
+        raise ImageRejected("'image' must be a non-empty base64 string", code=ERROR_CODE_INVALID_IMAGE)
     try:
         image_bytes = base64.b64decode(raw, validate=True)
     except (binascii.Error, ValueError) as exc:
-        raise ImageRejected(f"'image' is not valid base64: {exc}") from exc
+        raise ImageRejected(f"'image' is not valid base64: {exc}", code=ERROR_CODE_INVALID_IMAGE) from exc
     if not image_bytes:
-        raise ImageRejected("'image' decoded to zero bytes")
+        raise ImageRejected("'image' decoded to zero bytes", code=ERROR_CODE_INVALID_IMAGE)
     if len(image_bytes) > MAX_IMAGE_BYTES:
-        raise ImageRejected(f"image is {len(image_bytes)} bytes, limit is {MAX_IMAGE_BYTES}")
+        raise ImageRejected(
+            f"image is {len(image_bytes)} bytes, limit is {MAX_IMAGE_BYTES}", code=ERROR_CODE_INVALID_IMAGE
+        )
     return image_bytes
 
 
@@ -145,23 +167,25 @@ def _parse_box(raw: Any) -> tuple[int, int, int, int]:
         try:
             values = (raw["top"], raw["right"], raw["bottom"], raw["left"])
         except KeyError as exc:
-            raise ImageRejected(f"box is missing key {exc}") from exc
+            raise ImageRejected(f"box is missing key {exc}", code=ERROR_CODE_INVALID_BOX) from exc
     elif isinstance(raw, (list, tuple)) and len(raw) == 4:
         values = tuple(raw)
     else:
-        raise ImageRejected("box must be an object with top/right/bottom/left, or a 4-element list")
+        raise ImageRejected(
+            "box must be an object with top/right/bottom/left, or a 4-element list", code=ERROR_CODE_INVALID_BOX
+        )
 
     try:
         top, right, bottom, left = (int(v) for v in values)
     except (TypeError, ValueError) as exc:
-        raise ImageRejected("box coordinates must be integers") from exc
+        raise ImageRejected("box coordinates must be integers", code=ERROR_CODE_INVALID_BOX) from exc
 
     if min(top, right, bottom, left) < 0 or max(top, right, bottom, left) > MAX_BBOX_PX:
-        raise ImageRejected(f"box coordinates must be within 0..{MAX_BBOX_PX}")
+        raise ImageRejected(f"box coordinates must be within 0..{MAX_BBOX_PX}", code=ERROR_CODE_INVALID_BOX)
     if right <= left or bottom <= top:
-        raise ImageRejected("box must have right > left and bottom > top")
+        raise ImageRejected("box must have right > left and bottom > top", code=ERROR_CODE_INVALID_BOX)
     if (right - left) * (bottom - top) < MIN_BBOX_AREA:
-        raise ImageRejected(f"box area must be at least {MIN_BBOX_AREA} pixels")
+        raise ImageRejected(f"box area must be at least {MIN_BBOX_AREA} pixels", code=ERROR_CODE_INVALID_BOX)
     return top, right, bottom, left
 
 
@@ -170,15 +194,17 @@ def _parse_box_space(raw: Any) -> tuple[int, int] | None:
     if raw is None:
         return None
     if not isinstance(raw, dict):
-        raise ImageRejected("'box_space' must be an object with width and height")
+        raise ImageRejected("'box_space' must be an object with width and height", code=ERROR_CODE_INVALID_BOX)
     try:
         width, height = int(raw["width"]), int(raw["height"])
     except KeyError as exc:
-        raise ImageRejected(f"'box_space' is missing key {exc}") from exc
+        raise ImageRejected(f"'box_space' is missing key {exc}", code=ERROR_CODE_INVALID_BOX) from exc
     except (TypeError, ValueError) as exc:
-        raise ImageRejected("'box_space' width and height must be integers") from exc
+        raise ImageRejected("'box_space' width and height must be integers", code=ERROR_CODE_INVALID_BOX) from exc
     if not (0 < width <= MAX_BOX_SPACE_PX and 0 < height <= MAX_BOX_SPACE_PX):
-        raise ImageRejected(f"'box_space' width and height must be within 1..{MAX_BOX_SPACE_PX}")
+        raise ImageRejected(
+            f"'box_space' width and height must be within 1..{MAX_BOX_SPACE_PX}", code=ERROR_CODE_INVALID_BOX
+        )
     return width, height
 
 
@@ -203,7 +229,7 @@ def _fit_box(
     top, left = max(0, top), max(0, left)
     bottom, right = min(height, bottom), min(width, right)
     if right <= left or bottom <= top:
-        raise ImageRejected(f"box {box} lies outside the {width}x{height} image")
+        raise ImageRejected(f"box {box} lies outside the {width}x{height} image", code=ERROR_CODE_INVALID_BOX)
     return top, right, bottom, left
 
 
@@ -222,7 +248,9 @@ def _encode_vector(vector: np.ndarray, dim: int) -> str:
     """
     raw = np.ascontiguousarray(vector, dtype=np.float32).astype("<f4", copy=False).tobytes()
     if len(raw) != dim * 4:
-        raise ImageRejected(f"unexpected embedding length {len(raw)}, expected {dim * 4}")
+        raise ImageRejected(
+            f"unexpected embedding length {len(raw)}, expected {dim * 4}", code=ERROR_CODE_SERVICE_ERROR
+        )
     return base64.b64encode(raw).decode("ascii")
 
 
@@ -294,20 +322,23 @@ class WikiVisageModel(kserve.Model):
             probe = PILImage.open(io.BytesIO(image_bytes))
             width, height = probe.size
         except PILImage.DecompressionBombError as exc:
-            raise ImageRejected(f"image rejected as decompression bomb: {exc}") from exc
+            raise ImageRejected(f"image rejected as decompression bomb: {exc}", code=ERROR_CODE_INVALID_IMAGE) from exc
         except Exception as exc:
-            raise ImageRejected(f"could not read image: {exc}") from exc
+            raise ImageRejected(f"could not read image: {exc}", code=ERROR_CODE_INVALID_IMAGE) from exc
 
         if width * height > MAX_IMAGE_PIXELS:
-            raise ImageRejected(f"image is {width}x{height} ({width * height:,} px), limit is {MAX_IMAGE_PIXELS:,}")
+            raise ImageRejected(
+                f"image is {width}x{height} ({width * height:,} px), limit is {MAX_IMAGE_PIXELS:,}",
+                code=ERROR_CODE_INVALID_IMAGE,
+            )
 
         try:
             with PILImage.open(io.BytesIO(image_bytes)) as image:
                 return np.array(image.convert("RGB"))
         except PILImage.DecompressionBombError as exc:
-            raise ImageRejected(f"image rejected as decompression bomb: {exc}") from exc
+            raise ImageRejected(f"image rejected as decompression bomb: {exc}", code=ERROR_CODE_INVALID_IMAGE) from exc
         except Exception as exc:
-            raise ImageRejected(f"could not decode image: {exc}") from exc
+            raise ImageRejected(f"could not decode image: {exc}", code=ERROR_CODE_INVALID_IMAGE) from exc
 
     def _run_instance(self, instance: dict[str, Any]) -> dict[str, Any]:
         """Detect or encode faces for one instance. Never raises."""
@@ -336,7 +367,7 @@ class WikiVisageModel(kserve.Model):
 
             backend = self._backend
             if backend is None:
-                raise ImageRejected("model is not loaded")
+                raise ImageRejected("model is not loaded", code=ERROR_CODE_SERVICE_ERROR)
 
             faces: list[dict[str, Any]]
             if boxes is None:
@@ -372,13 +403,23 @@ class WikiVisageModel(kserve.Model):
                 "faces": faces,
             }
         except ImageRejected as exc:
-            return {"id": instance_id, "status": "error", "error": str(exc)}
+            return {"id": instance_id, "status": "error", "error": str(exc), "error_code": exc.code}
         except FaceBackendError as exc:
             logger.exception("Face backend failed for instance id=%r", instance_id)
-            return {"id": instance_id, "status": "error", "error": f"face backend failed: {exc}"}
+            return {
+                "id": instance_id,
+                "status": "error",
+                "error": f"face backend failed: {exc}",
+                "error_code": ERROR_CODE_SERVICE_ERROR,
+            }
         except Exception as exc:  # noqa: BLE001 — a bad image must not kill the batch
             logger.exception("Face processing failed for instance id=%r", instance_id)
-            return {"id": instance_id, "status": "error", "error": f"{type(exc).__name__}: {exc}"}
+            return {
+                "id": instance_id,
+                "status": "error",
+                "error": f"{type(exc).__name__}: {exc}",
+                "error_code": ERROR_CODE_SERVICE_ERROR,
+            }
 
     async def predict(
         self,
