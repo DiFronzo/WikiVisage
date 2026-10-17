@@ -172,7 +172,7 @@ babel = Babel(app, locale_selector=get_locale)
 
 @app.route("/set-language/<lang>")
 def set_language(lang: str):
-    """Set the user's preferred language via cookie (if consent given)."""
+    """Set the user's preferred language via cookie (persistent only with consent)."""
     if lang not in LANGUAGES:
         lang = "en"
     referrer = (request.referrer or "").replace("\\", "")
@@ -192,11 +192,13 @@ def set_language(lang: str):
     if parsed_ref.scheme or parsed_ref.netloc or referrer.startswith("//"):
         referrer = url_for("index")
     resp = redirect(referrer)
-    if not request.args.get("nocookie"):
-        resp.set_cookie("locale", lang, max_age=60 * 60 * 24 * 365, httponly=True, samesite="Lax")
+    if request.args.get("nocookie"):
+        # No consent (yet): still honour the choice for this visit with a
+        # session-scoped cookie, so switching language works without having to
+        # accept the banner first. Nothing is remembered afterwards.
+        resp.set_cookie("locale", lang, httponly=True, samesite="Lax")
     else:
-        # Delete any existing locale cookie when consent is withdrawn
-        resp.delete_cookie("locale")
+        resp.set_cookie("locale", lang, max_age=60 * 60 * 24 * 365, httponly=True, samesite="Lax")
     return resp
 
 

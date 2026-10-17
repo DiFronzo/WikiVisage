@@ -1237,7 +1237,9 @@ def test_set_language_valid_lang_sets_cookie(monkeypatch):
     resp = client.get("/set-language/es", headers={"Referer": "http://localhost/dashboard"})
     assert resp.status_code == 302
     assert resp.headers["Location"].endswith("/dashboard")
-    assert "locale=es" in resp.headers.get("Set-Cookie", "")
+    locale_cookie = next((c for c in resp.headers.getlist("Set-Cookie") if c.startswith("locale=")), "")
+    assert "locale=es" in locale_cookie
+    assert "Max-Age=" in locale_cookie
 
 
 def test_set_language_invalid_lang_falls_back_to_en(monkeypatch):
@@ -1262,7 +1264,8 @@ def test_set_language_invalid_lang_falls_back_to_en(monkeypatch):
     assert "locale=en" in resp.headers.get("Set-Cookie", "")
 
 
-def test_set_language_nocookie_deletes_cookie(monkeypatch):
+def test_set_language_nocookie_uses_session_scoped_cookie(monkeypatch):
+    """Without consent the choice still applies for the visit, but is not persisted."""
     flask_app.config["TESTING"] = True
     client = flask_app.test_client()
 
@@ -1281,9 +1284,24 @@ def test_set_language_nocookie_deletes_cookie(monkeypatch):
 
     resp = client.get("/set-language/es?nocookie=1", headers={"Referer": "http://localhost/dashboard"})
     assert resp.status_code == 302
-    set_cookie = resp.headers.get("Set-Cookie", "")
-    assert "locale=" in set_cookie
-    assert "Expires=" in set_cookie
+    locale_cookie = next((c for c in resp.headers.getlist("Set-Cookie") if c.startswith("locale=")), "")
+    assert "locale=es" in locale_cookie
+    # Session-scoped: no persistence attributes, so the choice lasts until the browser closes.
+    assert "Expires=" not in locale_cookie
+    assert "Max-Age=" not in locale_cookie
+
+
+def test_set_language_without_consent_changes_language():
+    """A visitor who has not accepted cookies still gets the language they picked."""
+    flask_app.config["TESTING"] = True
+    client = flask_app.test_client()
+
+    resp = client.get("/set-language/es?nocookie=1", headers={"Referer": "http://localhost/"})
+    assert resp.status_code == 302
+
+    page = client.get("/")
+    assert page.status_code == 200
+    assert b'<html lang="es"' in page.data
 
 
 def test_set_language_cross_host_referrer_redirects_to_index(monkeypatch):
