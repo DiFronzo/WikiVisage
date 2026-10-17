@@ -20,6 +20,7 @@ with patch("database.init_db"):
         _claim_active_projects,
         _claim_inference_projects,
         _claim_sdc_projects,
+        _claim_shadow_project,
         _fetch_metadata,
         _infer_and_release,
         _plain_text,
@@ -31,6 +32,8 @@ with patch("database.init_db"):
         _release_all_claims,
         _release_project,
         _run_new_inference_projects,
+        _shadow_prefilter_loop,
+        _sweep_shadow_prefilter,
         _touch_heartbeat_file,
         bootstrap_from_sparql,
         prefilter_images,
@@ -692,6 +695,206 @@ def test_inference_does_not_touch_human_classified(db_pool, db_conn, seed_projec
         after_rows = cur.fetchall()
 
     assert before_rows == after_rows
+
+
+@pytest.mark.integration
+def test_claim_shadow_project_real_db_picks_finished_project(db_pool, db_conn, seed_project):
+    """A completed project with unchecked crawled images is sweep-claimable."""
+    with db_conn.cursor() as cur:
+        cur.execute(
+            "UPDATE projects SET status = 'completed', prefilter_mode = 'shadow' WHERE id = %s",
+            (seed_project["id"],),
+        )
+        cur.execute(
+            "INSERT INTO images (project_id, commons_page_id, file_title, status, bootstrapped, "
+            "face_count, detection_width, detection_height) "
+            "VALUES (%s, %s, %s, 'processed', 0, 0, 800, 600)",
+            (seed_project["id"], 900001, "File:Finished_1.jpg"),
+        )
+
+    with patch("worker._worker_id", "test-worker-1"):
+        project = _claim_shadow_project()
+
+    assert project is not None
+    assert project["id"] == seed_project["id"]
+
+    with db_conn.cursor() as cur:
+        cur.execute("SELECT worker_claimed_by FROM projects WHERE id = %s", (seed_project["id"],))
+        assert cur.fetchone()["worker_claimed_by"] == "test-worker-1"
+
+
+@pytest.mark.integration
+def test_claim_shadow_project_real_db_picks_quiescent_active_project(db_pool, db_conn, seed_project):
+    """Active but fully processed and classified: the pipelines leave it alone."""
+    with db_conn.cursor() as cur:
+        cur.execute("UPDATE projects SET prefilter_mode = 'shadow' WHERE id = %s", (seed_project["id"],))
+        cur.execute(
+            "INSERT INTO images (project_id, commons_page_id, file_title, status, bootstrapped, "
+            "face_count, detection_width, detection_height) "
+            "VALUES (%s, %s, %s, 'processed', 0, 0, 800, 600)",
+            (seed_project["id"], 900003, "File:Quiescent_1.jpg"),
+        )
+
+    with patch("worker._worker_id", "test-worker-1"):
+        project = _claim_shadow_project()
+
+    assert project is not None
+    assert project["id"] == seed_project["id"]
+
+
+@pytest.mark.integration
+def test_claim_shadow_project_real_db_skips_project_with_pending_images(db_pool, db_conn, seed_project):
+    """An active project with pending images belongs to the active pipeline."""
+    with db_conn.cursor() as cur:
+        cur.execute("UPDATE projects SET prefilter_mode = 'shadow' WHERE id = %s", (seed_project["id"],))
+        cur.execute(
+            "INSERT INTO images (project_id, commons_page_id, file_title, status, bootstrapped, "
+            "face_count, detection_width, detection_height) "
+            "VALUES (%s, %s, %s, 'pending', 0, 0, 800, 600)",
+            (seed_project["id"], 900002, "File:Pending_1.jpg"),
+        )
+
+    with patch("worker._worker_id", "test-worker-1"):
+        assert _claim_shadow_project() is None
+
+
+@pytest.mark.integration
+def test_claim_shadow_project_real_db_skips_inference_eligible_completed_project(
+    db_pool, db_conn, seed_project, seed_images, seed_faces, seed_unclassified_faces
+):
+    """The inference path owns a completed project that crossed min_confirmed."""
+    with db_conn.cursor() as cur:
+        cur.execute(
+            "UPDATE projects SET status = 'completed', prefilter_mode = 'shadow' WHERE id = %s",
+            (seed_project["id"],),
+        )
+
+    with patch("worker._worker_id", "test-worker-1"):
+        # The inference claim does take it …
+        assert [p["id"] for p in _claim_inference_projects(1)] == [seed_project["id"]]
+        # … and the sweep must leave it alone even after that claim is released.
+        _release_project(seed_project["id"])
+        assert _claim_shadow_project() is None
+
+
+@pytest.mark.integration
+def test_claim_shadow_project_real_db_respects_other_worker_claims(db_pool, db_conn, seed_project):
+    """A fresh claim by the other worker defers the sweep; an expired one does not."""
+    with db_conn.cursor() as cur:
+        cur.execute("UPDATE projects SET prefilter_mode = 'shadow' WHERE id = %s", (seed_project["id"],))
+        cur.execute(
+            "INSERT INTO images (project_id, commons_page_id, file_title, status, bootstrapped, "
+            "face_count, detection_width, detection_height) "
+            "VALUES (%s, %s, %s, 'processed', 0, 0, 800, 600)",
+            (seed_project["id"], 900010, "File:Claimed_1.jpg"),
+        )
+        cur.execute(
+            "UPDATE projects SET worker_claimed_by = 'other-worker', worker_claimed_at = NOW() WHERE id = %s",
+            (seed_project["id"],),
+        )
+
+    with patch("worker._worker_id", "test-worker-1"):
+        assert _claim_shadow_project() is None
+
+    with db_conn.cursor() as cur:
+        cur.execute(
+            "UPDATE projects SET worker_claimed_at = NOW() - INTERVAL 20 MINUTE WHERE id = %s",
+            (seed_project["id"],),
+        )
+
+    with patch("worker._worker_id", "test-worker-1"):
+        project = _claim_shadow_project()
+
+    assert project is not None
+    assert project["id"] == seed_project["id"]
+
+
+@pytest.mark.integration
+def test_claim_shadow_project_real_db_skips_sdc_requested_project(db_pool, db_conn, seed_project):
+    """A queued Send Edits request belongs to the SDC path, not the sweep."""
+    with db_conn.cursor() as cur:
+        cur.execute(
+            "UPDATE projects SET prefilter_mode = 'shadow', sdc_write_requested = 1 WHERE id = %s",
+            (seed_project["id"],),
+        )
+        cur.execute(
+            "INSERT INTO images (project_id, commons_page_id, file_title, status, bootstrapped, "
+            "face_count, detection_width, detection_height) "
+            "VALUES (%s, %s, %s, 'processed', 0, 0, 800, 600)",
+            (seed_project["id"], 900011, "File:Sdc_1.jpg"),
+        )
+
+    with patch("worker._worker_id", "test-worker-1"):
+        assert _claim_shadow_project() is None
+
+    with db_conn.cursor() as cur:
+        cur.execute("UPDATE projects SET sdc_write_requested = 0 WHERE id = %s", (seed_project["id"],))
+
+    with patch("worker._worker_id", "test-worker-1"):
+        project = _claim_shadow_project()
+
+    assert project is not None
+    assert project["id"] == seed_project["id"]
+
+
+@pytest.mark.integration
+def test_claim_shadow_project_real_db_skips_mode_off_and_bootstrapped_backlog(db_pool, db_conn, seed_project):
+    """Mode off or an only-bootstrapped backlog are never sweep candidates."""
+    with db_conn.cursor() as cur:
+        # prefilter_mode defaults to 'off'
+        cur.execute(
+            "INSERT INTO images (project_id, commons_page_id, file_title, status, bootstrapped, "
+            "face_count, detection_width, detection_height) "
+            "VALUES (%s, %s, %s, 'processed', 0, 0, 800, 600)",
+            (seed_project["id"], 900012, "File:Off_1.jpg"),
+        )
+
+    with patch("worker._worker_id", "test-worker-1"):
+        assert _claim_shadow_project() is None
+
+    with db_conn.cursor() as cur:
+        cur.execute("UPDATE projects SET prefilter_mode = 'shadow' WHERE id = %s", (seed_project["id"],))
+        cur.execute("UPDATE images SET bootstrapped = 1 WHERE commons_page_id = %s", (900012,))
+
+    with patch("worker._worker_id", "test-worker-1"):
+        assert _claim_shadow_project() is None
+
+
+@pytest.mark.integration
+def test_claim_shadow_project_real_db_rotates_to_least_recently_claimed(db_pool, db_conn, seed_project):
+    """A never-claimed candidate is picked before a freshly claimed one."""
+    with db_conn.cursor() as cur:
+        cur.execute("UPDATE projects SET prefilter_mode = 'shadow' WHERE id = %s", (seed_project["id"],))
+        cur.execute(
+            "INSERT INTO images (project_id, commons_page_id, file_title, status, bootstrapped, "
+            "face_count, detection_width, detection_height) "
+            "VALUES (%s, %s, %s, 'processed', 0, 0, 800, 600)",
+            (seed_project["id"], 900013, "File:Rotation_1.jpg"),
+        )
+        cur.execute(
+            "INSERT INTO projects (user_id, wikidata_qid, commons_category, label, "
+            "distance_threshold, min_confirmed, status, images_total, images_processed, prefilter_mode) "
+            "VALUES (%s, 'Q43', 'Category_B', 'B', 0.6, 5, 'active', 1, 1, 'shadow')",
+            (seed_project["user_id"],),
+        )
+        other_id = cur.lastrowid
+        cur.execute(
+            "INSERT INTO images (project_id, commons_page_id, file_title, status, bootstrapped, "
+            "face_count, detection_width, detection_height) "
+            "VALUES (%s, %s, %s, 'processed', 0, 0, 800, 600)",
+            (other_id, 900014, "File:B_1.jpg"),
+        )
+        # The seed project was just swept by the other worker; the second one never was.
+        cur.execute(
+            "UPDATE projects SET worker_claimed_by = 'other-worker', worker_claimed_at = NOW() WHERE id = %s",
+            (seed_project["id"],),
+        )
+
+    with patch("worker._worker_id", "test-worker-1"):
+        project = _claim_shadow_project()
+
+    assert project is not None
+    assert project["id"] == other_id
 
 
 # ---------------------------------------------------------------------------
@@ -3738,6 +3941,7 @@ def test_prefilter_records_verdicts_and_keeps_missing_pages():
     stored: list[tuple] = []
     select_sql: list[str] = []
     up_updates: list[tuple] = []
+    claim_refreshes: list[tuple] = []
 
     def mock_execute_query(sql, params=None, fetch=True):
         if "SELECT status FROM service_status" in sql:
@@ -3752,6 +3956,9 @@ def test_prefilter_records_verdicts_and_keeps_missing_pages():
             return rows
         if "SET status = 'up'" in sql:
             up_updates.append((sql, params))
+            return 1
+        if "UPDATE projects SET worker_claimed_at = NOW()" in sql:
+            claim_refreshes.append(params)
             return 1
         raise AssertionError(f"Unexpected query: {sql}")
 
@@ -3773,6 +3980,7 @@ def test_prefilter_records_verdicts_and_keeps_missing_pages():
         patch("worker._store_prefilter_verdicts", side_effect=lambda updates: stored.extend(updates)),
         patch("worker.liftwing_client.get_client", return_value=fake_client),
         patch("worker.shutdown_requested", False),
+        patch("worker._worker_id", "test-worker-1"),
     ):
         checked = prefilter_images(project)
 
@@ -3781,12 +3989,65 @@ def test_prefilter_records_verdicts_and_keeps_missing_pages():
     assert len(select_sql) == 1
     # A stored batch is a real success; service_status is updated accordingly (H3).
     assert len(up_updates) == 1
+    # The claim is refreshed after every stored batch, so a slow pass cannot
+    # expire while the sweep thread runs and the main loop is idle.
+    assert claim_refreshes == [(7, "test-worker-1")]
 
     items = fake_client.filter_metadata.call_args.args[0]
     assert [item.page_id for item in items] == [501, 502, 503]
     assert items[0].description == "portrait"
     assert items[0].categories == ("Category:X",)
     assert items[2].mime == "audio/ogg"
+
+
+def test_prefilter_stops_when_claim_refresh_fails():
+    """A failed keepalive stops the pass — no processing on without a claim."""
+    from database import DatabaseError
+
+    rows = [
+        {"id": 301, "commons_page_id": 701, "file_title": "File:A.jpg"},
+        {"id": 302, "commons_page_id": 702, "file_title": "File:B.jpg"},
+    ]
+    stored: list[tuple] = []
+
+    def mock_execute_query(sql, params=None, fetch=True):
+        if "SELECT status FROM service_status" in sql:
+            return [{"status": "up"}]
+        if "SELECT id, commons_page_id, file_title FROM images" in sql:
+            return rows
+        if "UPDATE projects SET worker_claimed_at = NOW()" in sql:
+            raise DatabaseError("claim refresh failed")
+        if "SET status = 'up'" in sql:
+            return 1
+        raise AssertionError(f"Unexpected query: {sql}")
+
+    fake_client = MagicMock()
+    fake_client.filter_metadata.return_value = {
+        701: liftwing_client.Verdict(page_id=701, keep=True, reason="portrait"),
+    }
+
+    with (
+        patch("worker.execute_query", side_effect=mock_execute_query),
+        patch(
+            "worker._fetch_metadata",
+            return_value={
+                "File:A.jpg": {"description": "", "categories": (), "mime": "image/jpeg"},
+                "File:B.jpg": {"description": "", "categories": (), "mime": "image/jpeg"},
+            },
+        ),
+        patch("worker._store_prefilter_verdicts", side_effect=lambda updates: stored.extend(updates)),
+        patch("worker.liftwing_client.get_client", return_value=fake_client),
+        patch("worker.shutdown_requested", False),
+        patch("worker._worker_id", "test-worker-1"),
+        patch("worker.LIFTWING_BATCH_SIZE", 1),
+    ):
+        assert prefilter_images({"id": 11, "prefilter_mode": "shadow"}) == 1
+
+    # The first batch landed, then the refresh failed and the pass stopped:
+    # File:B.jpg is left for a later pass instead of being processed without
+    # a live claim.
+    assert stored == [(1, "portrait", 301)]
+    assert fake_client.filter_metadata.call_count == 1
 
 
 def test_prefilter_fail_open_when_client_returns_none():
@@ -3922,6 +4183,154 @@ def test_process_project_runs_prefilter_after_image_processing():
         process_project(project)
 
     assert order == ["images", "prefilter"]
+
+
+def test_claim_shadow_project_claims_and_refetches():
+    """The sweep claim targets non-off projects with unchecked crawled images."""
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = [
+        {"id": 42},
+        {"id": 42, "status": "completed", "prefilter_mode": "shadow"},
+    ]
+
+    def run_txn(operations):
+        return operations(MagicMock(), cursor)
+
+    with (
+        patch("worker.execute_transaction", side_effect=run_txn),
+        patch("worker._worker_id", "test-worker-1"),
+    ):
+        project = _claim_shadow_project()
+
+    assert project["id"] == 42
+    select_sql = cursor.execute.call_args_list[0].args[0]
+    assert "prefilter_mode != 'off'" in select_sql
+    assert "p.sdc_write_requested = 0" in select_sql
+    assert "i.bootstrapped = 0 AND i.prefilter_checked_at IS NULL" in select_sql
+    assert "FOR UPDATE SKIP LOCKED" in select_sql
+    # The sweep must not compete with the pipelines: active projects with work
+    # and inference-eligible completed projects are left to their own claims.
+    assert "i.status = 'pending'" in select_sql
+    assert "f.is_target IS NULL" in select_sql
+    assert "p.min_confirmed" in select_sql
+    update_args = cursor.execute.call_args_list[1].args
+    assert "SET worker_claimed_by = %s" in update_args[0]
+    assert update_args[1] == ("test-worker-1", 42)
+
+
+def test_claim_shadow_project_returns_none_when_nothing_is_eligible():
+    cursor = MagicMock()
+    cursor.fetchone.return_value = None
+
+    with patch("worker.execute_transaction", side_effect=lambda operations: operations(MagicMock(), cursor)):
+        assert _claim_shadow_project() is None
+
+
+def test_claim_shadow_project_returns_none_on_db_error():
+    from database import DatabaseError
+
+    with patch("worker.execute_transaction", side_effect=DatabaseError("boom")):
+        assert _claim_shadow_project() is None
+
+
+def test_sweep_skips_when_service_marked_down():
+    with (
+        patch("worker._liftwing_service_down", return_value=True),
+        patch("worker._claim_shadow_project") as claim,
+        patch("worker.prefilter_images") as prefilter,
+    ):
+        assert _sweep_shadow_prefilter() == 0
+
+    claim.assert_not_called()
+    prefilter.assert_not_called()
+
+
+def test_sweep_records_verdicts_for_a_finished_project():
+    """Regression (prod report 2026-10-17): completed projects get swept."""
+    project = {"id": 7, "status": "completed", "prefilter_mode": "shadow"}
+
+    with (
+        patch("worker._liftwing_service_down", return_value=False),
+        patch("worker._claim_shadow_project", return_value=project),
+        patch("worker.prefilter_images", return_value=250) as prefilter,
+        patch("worker._release_project") as release,
+    ):
+        assert _sweep_shadow_prefilter() == 250
+
+    prefilter.assert_called_once_with(project)
+    release.assert_called_once_with(7)
+
+
+def test_sweep_releases_claim_when_prefilter_fails():
+    project = {"id": 7, "status": "completed", "prefilter_mode": "shadow"}
+
+    with (
+        patch("worker._liftwing_service_down", return_value=False),
+        patch("worker._claim_shadow_project", return_value=project),
+        patch("worker.prefilter_images", side_effect=RuntimeError("boom")),
+        patch("worker._release_project") as release,
+    ):
+        assert _sweep_shadow_prefilter() == 0
+
+    release.assert_called_once_with(7)
+
+
+def test_sweep_returns_zero_when_no_project_needs_coverage():
+    with (
+        patch("worker._liftwing_service_down", return_value=False),
+        patch("worker._claim_shadow_project", return_value=None),
+        patch("worker.prefilter_images") as prefilter,
+    ):
+        assert _sweep_shadow_prefilter() == 0
+
+    prefilter.assert_not_called()
+
+
+def test_shadow_loop_sweeps_until_shutdown():
+    calls = []
+
+    def sweep():
+        calls.append(1)
+        _worker_module.shutdown_requested = True
+        return 0
+
+    with (
+        patch("worker.shutdown_requested", False),
+        patch("worker._sweep_shadow_prefilter", side_effect=sweep),
+    ):
+        _shadow_prefilter_loop()
+
+    assert calls == [1]
+
+
+def test_shadow_loop_disabled_with_zero_interval():
+    with (
+        patch.object(_worker_module, "LIFTWING_SWEEP_INTERVAL", 0),
+        patch("worker._sweep_shadow_prefilter") as sweep,
+    ):
+        _shadow_prefilter_loop()
+
+    sweep.assert_not_called()
+
+
+def test_shadow_loop_survives_sweep_errors():
+    calls = []
+
+    def sweep():
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("boom")
+        _worker_module.shutdown_requested = True
+        return 0
+
+    with (
+        patch("worker.shutdown_requested", False),
+        patch("worker._sweep_shadow_prefilter", side_effect=sweep),
+        patch("worker.time.sleep"),
+    ):
+        _shadow_prefilter_loop()
+
+    assert len(calls) == 2
 
 
 def test_probe_disabled_interval_does_nothing():

@@ -605,3 +605,52 @@ has no source to run from: no dump exists on the Toolforge tool home or the
 owner's machine. The pre-wipe contributions of still-existing projects are
 accepted as lost; leaderboard numbers restart from the surviving `user_stats`
 rows plus new activity.
+
+### Shadow pre-filter never ran for finished projects (reported 2026-10-17)
+
+Owner report after v0.11.2 reached production: every project with Metadata
+Pre-Filter set to *shadow* sat at "No verdicts recorded yet." on the settings
+page, while `/health` showed `liftwing: reachable` and `database: connected`.
+
+Root cause (`worker.py`): `prefilter_images()` had exactly one call site —
+inside `process_project()`, which only runs for projects
+`_claim_active_projects()` claims (active, with a pending image, an
+unclassified face, or no images yet). Completed, paused or fully processed and
+classified projects are never claimed, so verdicts were never recorded for
+them at all; a finished project that still has unclassified faces is taken by
+the inference queue instead, which never runs the pre-filter. The settings
+text ("up to 250 checked files per project and cycle") only ever held while a
+project was in its active processing phase — exactly the phase finished
+projects are past, and exactly the projects the offline readout has
+human-confirmed targets for.
+
+Fix: a background shadow sweep.
+- `_claim_shadow_project()` atomically claims (same
+  `SELECT … FOR UPDATE SKIP LOCKED` pattern as the other claims) one
+  non-deleted project with `prefilter_mode != 'off'`, unchecked
+  non-bootstrapped images, and *not* claimable by `_claim_active_projects()` or
+  `_claim_inference_projects()` — so a sweep never delays real work.
+  Least-recently-claimed first, and the claim lives in
+  `worker_claimed_by`/`worker_claimed_at`, so two worker instances never sweep
+  the same project at once.
+- `_sweep_shadow_prefilter()` runs the existing `prefilter_images()` on the
+  claimed project (≤ `LIFTWING_MAX_IMAGES` files), skipped while LiftWing is
+  marked down, and releases the claim when the pass ends.
+- `_shadow_prefilter_loop()` is a daemon thread started by `main()`: sweep,
+  then sleep `LIFTWING_SWEEP_INTERVAL` (default 60 s; `0` disables) in 1 s
+  slices. Its own thread because one pass can take minutes, which would
+  otherwise stall the heartbeat refreshes the Toolforge health check watches.
+
+New tests (unit): `test_claim_shadow_project_claims_and_refetches`,
+`test_claim_shadow_project_returns_none_when_nothing_is_eligible`,
+`test_claim_shadow_project_returns_none_on_db_error`,
+`test_sweep_skips_when_service_marked_down`,
+`test_sweep_records_verdicts_for_a_finished_project`,
+`test_sweep_releases_claim_when_prefilter_fails`,
+`test_sweep_returns_zero_when_no_project_needs_coverage`,
+`test_shadow_loop_sweeps_until_shutdown`,
+`test_shadow_loop_disabled_with_zero_interval`,
+`test_shadow_loop_survives_sweep_errors`. Integration:
+`test_claim_shadow_project_real_db_picks_finished_project`,
+`test_claim_shadow_project_real_db_picks_quiescent_active_project`,
+`test_claim_shadow_project_real_db_skips_project_with_pending_images`.
