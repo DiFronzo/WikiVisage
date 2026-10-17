@@ -81,21 +81,22 @@ The landing page and `/health` endpoint work without OAuth. See [test-local.md](
 | `app.py` | Flask web app: OAuth, routes, classification API |
 | `worker.py` | Background pipeline: crawl, download, infer, write SDC (multi-instance) |
 | `face_client.py` | HTTP client for the face service — no ML dependencies |
+| `liftwing_client.py` | Worker-only client for the experimental LiftWing metadata pre-filter (fails open) |
 | `model-server/` | Face detection service (KServe + SCRFD/ArcFace on ONNX Runtime). The only place ML runs |
-| `scripts/` | `fetch_weights.sh` (re-create/verify the weights), `check_no_lfs.sh` (CI guard) |
+| `scripts/` | `fetch_weights.sh` (re-create/verify the weights), `check_no_lfs.sh` (CI guard), `eval_prefilter.py` (pre-filter readout) |
 | `token_crypto.py` | Fernet encrypt/decrypt helpers for OAuth tokens at rest |
 | `database.py` | MariaDB connection pool with retry logic |
-| `schema.sql` | DDL for 9 tables + indexes |
+| `schema.sql` | DDL for 10 tables + indexes |
 | `migrate.py` | Idempotent schema migrations with `--reset` flag |
 | `templates/` | Jinja2 templates (10 files, all extend `base.html`) |
 | `translations/` | i18n files (en, nb, es, fr) |
-| `tests/` | Hybrid test suite: unit + integration tests |
+| `tests/` | Hybrid test suite: unit + integration + contract tests |
 | `jobs.yaml` | Toolforge jobs definition (2 worker instances) |
 | `Procfile` | Gunicorn web + worker process definitions |
 | `pyproject.toml` | Ruff config, pytest config, project metadata |
 | `requirements.txt` | Runtime dependencies |
 | `requirements-dev.txt` | Dev/test deps (pytest, pytest-cov, ruff) |
-| `.github/workflows/` | CI (lint + test) and CD (release-triggered Toolforge deploy) |
+| `.github/workflows/` | CI (lint, tests on Python 3.11/3.15, face-service Docker/buildpack jobs) and CD (release-triggered deploy of both Toolforge tools) |
 | `SECURITY.md` | Vulnerability reporting policy |
 | `TESTING.md` | Face service: build, run, verify, troubleshoot |
 
@@ -119,7 +120,7 @@ The landing page and `/health` endpoint work without OAuth. See [test-local.md](
 - All POST routes require CSRF tokens.
 - All face bounding box inputs are validated against `MAX_BBOX_PX` and `MIN_BBOX_AREA`.
 - Rate limiting: global 200/hour default, 10/min on bbox endpoints. Uses Redis for shared storage across gunicorn workers (`WIKIVISAGE_REDIS_URL`), falls back to in-memory if unavailable.
-- Security headers set on all responses: `Content-Security-Policy`, `X-Content-Type-Options`, `X-Frame-Options`.
+- Security headers set on all responses: `Content-Security-Policy`, `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`, `Permissions-Policy`.
 - OAuth tokens can be encrypted at rest via `WIKIVISAGE_TOKEN_KEY` env var (Fernet). See `token_crypto.py`.
 - Never store secrets in code. Use environment variables.
 
@@ -178,7 +179,7 @@ gated on `faces.embedding_model`. Never run `migrate.py` against a database you 
 about without a dump, and do not add further one-time destructive steps without a
 similar guard and tests for both the first run and a re-run.
 
-Currently 9 tables: `users`, `sessions`, `projects`, `images`, `faces`, `user_stats`, `sdc_claims`, `project_members`, `worker_heartbeat`.
+Currently 10 tables: `users`, `sessions`, `projects`, `images`, `faces`, `user_stats`, `sdc_claims`, `project_members`, `worker_heartbeat`, `service_status`.
 
 ## Testing
 
@@ -200,6 +201,8 @@ WIKIVISAGE_TEST_DB=1 pytest tests/ --cov=. --cov-report=term-missing
 ```
 
 Integration tests are marked with `@pytest.mark.integration` and require a running MariaDB (see setup above). They use a separate `wikiface_test` database that is created and dropped automatically.
+
+Face-service tests need extra dependencies or a live service: `tests/test_face_service_backend.py` and `tests/test_face_service_model.py` import the ML stack (`onnxruntime`, `opencv`, `kserve`), and `tests/test_face_service_contract.py` runs against a running service — see [TESTING.md](TESTING.md).
 
 ## Submitting Changes
 

@@ -2,6 +2,58 @@
 
 {% block title %}{{ _('Settings') }} - {{ project.label or project.wikidata_qid }} - WikiVisage BETA{% endblock %}
 
+{% block extra_head %}
+<style nonce="{{ csp_nonce }}">
+    .prefilter-results {
+        margin-top: 1.25rem;
+        border: 2px solid var(--border);
+        background: var(--bg);
+        padding: 1.25rem 1rem;
+    }
+    .prefilter-results-title {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 0.25rem 0.75rem;
+        font-weight: 700;
+        font-size: 0.875rem;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        color: var(--primary);
+        margin-bottom: 1rem;
+    }
+    .prefilter-results-time {
+        font-weight: 400;
+        text-transform: none;
+        letter-spacing: 0;
+        font-size: 0.75rem;
+        color: var(--text-muted);
+    }
+    .prefilter-results .stats-grid {
+        margin: 0 0 1rem;
+        gap: 0.75rem;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+    .prefilter-results .stat-box {
+        border-color: color-mix(in srgb, var(--stat-color) 60%, var(--border));
+    }
+    .prefilter-results .stat-value {
+        color: var(--stat-color);
+        font-size: 1.75rem;
+    }
+    .prefilter-results .stat-label { font-size: 0.7rem; }
+    .prefilter-note {
+        font-size: 0.8rem;
+        color: var(--text-muted);
+        line-height: 1.5;
+        margin-top: 0.35rem;
+    }
+    .prefilter-note-ok { color: var(--success); }
+    .prefilter-note-bad { color: var(--danger); font-weight: 700; }
+</style>
+{% endblock %}
+
 {% block content %}
 <div class="header-actions">
     <h1>{{ _('Project Settings') }}</h1>
@@ -54,6 +106,52 @@
                 &middot; {{ _('last checked') }} {{ liftwing_last_checked.strftime('%Y-%m-%d %H:%M') }} UTC
                 {% endif %}
             </div>
+            {% if project.get('prefilter_mode', 'off') != 'off' %}
+            <div class="prefilter-results">
+                <div class="prefilter-results-title">
+                    <span>{{ _('Pre-filter results') }}</span>
+                    {% if prefilter_stats and prefilter_stats.last_checked %}
+                    <span class="prefilter-results-time">{{ _('last verdict') }} {{ prefilter_stats.last_checked.strftime('%Y-%m-%d %H:%M') }} UTC</span>
+                    {% endif %}
+                </div>
+                {% if prefilter_stats %}
+                {% if prefilter_stats.checked %}
+                <div class="stats-grid">
+                    <div class="stat-box stat-box-primary">
+                        <div class="stat-value">{{ prefilter_stats.checked }}</div>
+                        <div class="stat-label">{{ _('Files checked') }}</div>
+                    </div>
+                    <div class="stat-box stat-box-warning">
+                        <div class="stat-value">{{ prefilter_stats.dropped }}</div>
+                        <div class="stat-label">{{ _('Would skip') }} {{ prefilter_stats.skip_pct }}%</div>
+                    </div>
+                    <div class="stat-box {{ 'stat-box-danger' if prefilter_stats.human_targets_dropped else 'stat-box-success' }}">
+                        <div class="stat-value">{{ prefilter_stats.human_targets_dropped }}</div>
+                        <div class="stat-label">{{ _('Confirmed matches it would drop') }}</div>
+                    </div>
+                    <div class="stat-box stat-box-info">
+                        <div class="stat-value">{{ prefilter_stats.dropped_with_faces }}</div>
+                        <div class="stat-label">{{ _('Skips that had a face') }}</div>
+                    </div>
+                </div>
+                {% if prefilter_stats.human_targets_dropped %}
+                <div class="prefilter-note prefilter-note-bad">{{ _('It would have dropped %(dropped)d of the %(total)d images you confirmed contain the target. Do not enforce this filter on this project.', dropped=prefilter_stats.human_targets_dropped, total=prefilter_stats.human_targets_total) }}</div>
+                {% elif prefilter_stats.human_targets_total %}
+                <div class="prefilter-note prefilter-note-ok">{{ _('It would not have dropped any of the %(total)d images you confirmed contain the target.', total=prefilter_stats.human_targets_total) }}</div>
+                {% else %}
+                <div class="prefilter-note">{{ _('No human-confirmed target images are among the checked files yet, so the safety check has no data.') }}</div>
+                {% endif %}
+                {% if prefilter_stats.kept_without_faces %}
+                <div class="prefilter-note">{{ _('It kept %(count)d checked files in which no face was found; those could have been skipped safely.', count=prefilter_stats.kept_without_faces) }}</div>
+                {% endif %}
+                {% else %}
+                <div class="help-text">{{ _('No verdicts recorded yet. While this mode is on, the worker stores verdicts for up to 250 checked files per project and cycle.') }}</div>
+                {% endif %}
+                {% else %}
+                <div class="help-text">{{ _('Pre-filter stats are unavailable right now.') }}</div>
+                {% endif %}
+            </div>
+            {% endif %}
         </div>
 
         <div class="grid-2">

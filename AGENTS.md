@@ -11,8 +11,8 @@ Face detection and 512D embedding (SCRFD-500M + ArcFace MobileFaceNet on ONNX Ru
 
 ```
 WikiVisage/
-├── app.py              # Flask web app: OAuth (PKCE), routes, classification API, CSP (~4500 lines)
-├── worker.py           # Background pipeline: crawl, remote detect, infer (~3400 lines)
+├── app.py              # Flask web app: OAuth (PKCE), routes, classification API, CSP (~4600 lines)
+├── worker.py           # Background pipeline: crawl, remote detect, infer (~3500 lines)
 ├── face_client.py      # HTTP client for the face service. ZERO ML deps — shared by app.py + worker.py
 ├── liftwing_client.py  # Experimental LiftWing Qwen metadata pre-filter client (fail-open, circuit breaker, completion probe, optional bearer token) — worker-only
 ├── config.py           # Shared config: WAKE_FILE_PATH, HEARTBEAT_FILE_DIR, COMMONS_THUMB_STEPS, DETECTION_WIDTH, LIFTWING_PROBE_INTERVAL, PROJECT_VERSION
@@ -76,9 +76,9 @@ WikiVisage/
 │   └── view-it-tool.png           # View it! Tool icon (local copy)
 ├── .github/
 │   └── workflows/
-│       ├── ci.yml      # CI: Ruff lint + no-LFS check, pytest on Python 3.11/3.13 (integration tests skipped), face-service unit/contract jobs
+│       ├── ci.yml      # CI: Ruff lint + no-LFS check, pytest on Python 3.11/3.15 (integration tests skipped), face-service unit/contract jobs
 │       └── deploy.yml  # CD: Release-triggered Toolforge deploy via SSH (2 workers + health checks)
-├── Procfile            # web: gunicorn (4 workers, app factory), worker: python -u worker.py
+├── Procfile            # web: gunicorn (2 workers, module-level app), worker: python -u worker.py
 ├── jobs.yaml           # Toolforge jobs definition (2 ml-worker instances, health check scripts)
 ├── how-to-run-it.md    # Toolforge deployment guide
 ├── test-local.md       # Local development setup guide
@@ -255,7 +255,8 @@ rejects it and the worker treats any non-`off` value as shadow).
   Commons metadata is sent (title, description flattened to plain text and
   capped at 250 chars, up to 15 categories with the `Category:` prefix
   stripped) — never image bytes, never the MIME type. One shared client per
-  worker process, requests serialised (concurrency 1), no streaming.
+  worker process, requests serialised (concurrency 1) and spaced by a jittered
+  minimum interval, no streaming.
 - **Non-visual media never reach the model.** Files whose MIME type is
   `audio/*`, `video/*`, `application/pdf`, `application/ogg`, `image/svg+xml`
   or `image/vnd.djvu` are settled as `keep=false` (reason `non-visual media
@@ -304,7 +305,9 @@ rejects it and the worker treats any non-`off` value as shadow).
   also pauses the recovery probe, and a later success cannot clear it early. The
   breaker check, the request and the recorded outcome run under one lock, so
   calls queued behind a failing one see the open breaker instead of each firing
-  their own request. The User-Agent is `WikiVisage/<version>`
+  their own request. Requests are also spaced by a jittered minimum interval
+  (`WIKIVISAGE_LIFTWING_MIN_INTERVAL`, default 2 s; `0` disables) so the tool
+  never bursts at the shared service. The User-Agent is `WikiVisage/<version>`
   (`config.PROJECT_VERSION`).
 - **Web side:** context processor `inject_liftwing_status` reads the row (no
   network call; failures read as "no message") and `base.html` shows a
@@ -312,6 +315,13 @@ rejects it and the worker treats any non-`off` value as shadow).
   only for projects using the filter. Settings shows the status and last check
   time next to the mode selector. A status older than 3 probe intervals reads
   as `unknown` (a dead worker hides the banner instead of showing stale data).
+  When the mode is not `off`, settings also renders a results box built by the
+  settings route from `images.prefilter_*` joined with `faces`
+  (`_get_prefilter_stats`, one read-only query; DB failure degrades to an
+  "unavailable" line): files checked, would-skip count and rate, skips that had
+  a detected face, human-confirmed target images it would drop (the safety
+  gate, also reporting whether any human-confirmed targets have been seen yet)
+  and the last verdict timestamp. The web app still never calls LiftWing.
   `/health` adds `"liftwing": "reachable" | "unreachable" | "disabled"`
   (`disabled` when unused or unknown) and it **never** sets `degraded`.
 
@@ -319,7 +329,7 @@ rejects it and the worker treats any non-`off` value as shadow).
 
 ### Web (app.py)
 
-Flask app served by gunicorn via app factory (`create_app()`). Handles OAuth 2.0 login, project CRUD, face classification UI, and a Commons thumbnail proxy. SDC write requests are queued via a flag; the background worker performs the actual API writes.
+Flask app served by gunicorn (2 workers, `app:app`; the module-level app is built at import, and `create_app()` remains as a backwards-compatible factory for tests and scripts). Handles OAuth 2.0 login, project CRUD, face classification UI, and a Commons thumbnail proxy. SDC write requests are queued via a flag; the background worker performs the actual API writes.
 
 **Security middleware:**
 - Open redirect protection on login (`_is_safe_url()`)
@@ -340,7 +350,7 @@ Flask app served by gunicorn via app factory (`create_app()`). Handles OAuth 2.0
 | `/dashboard` | GET | User's project list (paginated), includes collaborator count badges |
 | `/api/category-info` | GET | Return total file count for a Commons category (BFS subcategory traversal) |
 | `/project/new` | GET/POST | Create project (QID + Commons category, validates P31=Q5 and category existence). Detects cross-user duplicates and offers join option |
-| `/project/<id>` | GET | Project stats, classification breakdown, model results gallery with approve/reject/edit-bbox, collaborator count badge |
+| `/project/<id>` | GET | Project stats, classification breakdown, model results gallery with approve/reject/edit-bbox, collaborator count badge, live inference-status card |
 | `/project/<id>/classify` | GET | Active learning face classification UI |
 | `/project/<id>/classify/clear-skips` | POST | Reset skipped faces for this session |
 | `/api/classify` | POST | Submit face classification (yes/no/none) |
@@ -352,8 +362,8 @@ Flask app served by gunicorn via app factory (`create_app()`). Handles OAuth 2.0
 | `/api/sdc-status/<id>` | GET | Poll SDC write progress (written/pending counts, in_progress flag) |
 | `/api/stop-sdc/<id>` | POST | Cancel an in-progress SDC write (clears sdc_write_requested flag) |
 | `/api/project/<id>/gallery` | GET | Paginated JSON API for Classification Results gallery (filter by result/source/sdc) |
-| `/api/progress/<id>` | GET | Poll image processing progress (processed/total/pending counts) |
-| `/project/<id>/settings` | GET/POST | Edit project params (incl. `prefilter_mode`: `off`/`shadow`), view member list (owner-only). Shows the LiftWing status line next to the mode selector |
+| `/api/progress/<id>` | GET | Poll image processing progress (processed/total/pending counts, `face_stats`, `inference_eligible`, `complete`); feeds the progress card and the live inference-status card |
+| `/project/<id>/settings` | GET/POST | Edit project params (incl. `prefilter_mode`: `off`/`shadow`), view member list (owner-only). Shows the LiftWing status line next to the mode selector and, when the mode is not `off`, a shadow-results stats box |
 | `/project/<id>/settings/remove-member` | POST | Remove a member from the project (owner-only, CSRF protected) |
 | `/project/<id>/settings/unban-member` | POST | Unban a member so they can rejoin the project (owner-only) |
 | `/project/<id>/leave` | POST | Leave a project (non-owner members only, CSRF protected) |
@@ -433,7 +443,7 @@ Two query paths:
 Both processes import from `database.py`. Thread-safe connection pool (`Queue`-based) with exponential backoff retry (3 attempts).
 
 **Exports:**
-- `init_db(pool_size)` — Initialize connection pool. Web default: 5 connections. Worker calls with explicit `pool_size=15`.
+- `init_db(pool_size)` — Initialize connection pool. The web app calls it at import with `pool_size=2` per gunicorn worker; the worker passes `WIKIVISAGE_DB_POOL_SIZE` when set, else `min(MAX_CONCURRENT_PROJECTS * IMAGE_THREADS + 3, 6)`.
 - `execute_query(sql, params, fetch)` — Universal read/write. Returns `List[Dict]` (fetch=True) or `int` rowcount (fetch=False).
 - `execute_insert(sql, params)` — INSERT with `cursor.lastrowid` return (race-free).
 - `execute_transaction(queries)` — Atomic multi-statement transaction. Takes list of `(sql, params)` tuples.
@@ -542,6 +552,7 @@ images.prefilter_checked_at DATETIME NULL  -- when the verdict was stored
 | `REQUEST_TIMEOUT` / `PROBE_TIMEOUT` | 90 s / 20 s | Whole-batch timeout / one tiny probe (`WIKIVISAGE_LIFTWING_TIMEOUT`, `WIKIVISAGE_LIFTWING_PROBE_TIMEOUT`) |
 | `PROBE_MAX_TOKENS` | 8 | The probe is a minimal **real completion**, not `GET /models` (`WIKIVISAGE_LIFTWING_PROBE_MAX_TOKENS` is not read; constant only) |
 | `MAX_TOKENS` | 2000 | Room for ~50 short verdicts plus a reasoning preamble (`WIKIVISAGE_LIFTWING_MAX_TOKENS`) |
+| `MIN_CALL_INTERVAL` | 2.0 s | Minimum quiet gap between outbound requests, plus a jitter of up to half the interval (`WIKIVISAGE_LIFTWING_MIN_INTERVAL`; `0` disables) |
 | `CIRCUIT_FAILURE_THRESHOLD` / `CIRCUIT_COOLDOWN` | 3 / 600 s | Per-process circuit breaker (`WIKIVISAGE_LIFTWING_CIRCUIT_FAILURES`, `WIKIVISAGE_LIFTWING_CIRCUIT_COOLDOWN`) |
 | `MAX_REASON_CHARS` / `MAX_DESCRIPTION_CHARS` / `MAX_CATEGORIES_PER_FILE` | 160 / 250 / 15 | Truncation of what is sent and stored |
 | `NON_VISUAL_MIME_PREFIXES` / `NON_VISUAL_MIME_TYPES` | `audio/`, `video/` / `application/pdf`, `application/ogg`, `image/svg+xml`, `image/vnd.djvu` | Settled as `keep=false` without a model call (`is_visual_media()`; unknown MIME types still go to the model) |
@@ -627,6 +638,7 @@ images.prefilter_checked_at DATETIME NULL  -- when the verdict was stored
 - `WIKIVISAGE_LIFTWING_TIMEOUT` — Default: `90` (whole-batch read timeout, seconds)
 - `WIKIVISAGE_LIFTWING_PROBE_TIMEOUT` — Default: `20` (the tiny probe request)
 - `WIKIVISAGE_LIFTWING_MAX_TOKENS` — Default: `2000`
+- `WIKIVISAGE_LIFTWING_MIN_INTERVAL` — Default: `2` (minimum quiet gap between calls, in seconds; a jitter of up to half the interval is added; `0` disables)
 - `WIKIVISAGE_LIFTWING_CIRCUIT_FAILURES` / `WIKIVISAGE_LIFTWING_CIRCUIT_COOLDOWN` — Default: `3` / `600` (per-process circuit breaker; a 429 opens it immediately and `Retry-After` extends the cooldown)
 - `WIKIVISAGE_LIFTWING_API_TOKEN` — Unset by default. A Wikimedia personal API token: sent as `Authorization: Bearer <token>` and moves calls from the anonymous to the authenticated quota.
 - `WIKIVISAGE_LIFTWING_USER_AGENT` — Default: `WikiVisage/<version> (https://github.com/DiFronzo/WikiVisage)`
@@ -806,6 +818,9 @@ The worker writes `REPLACE INTO worker_heartbeat (id, last_seen) VALUES (1, NOW(
 
 The LiftWing pre-filter has its own status path: the worker's probe writes `service_status`, and the web app's `inject_liftwing_status` context processor reads it (no network call). `base.html` shows a dismissible banner on the project detail/settings pages when the filter is down **and** the project uses it; the settings page also renders `reachable`/`unreachable`/`unknown` with the last check time. A row older than 3 probe intervals reads as `unknown`.
 
+### The inference-status card follows cycles by polling, not a page-load snapshot
+`project_detail.html`'s `#inferenceBanner` tracks the whole processing → inference lifecycle, not just the moment the page was opened. The card renders whenever inference can still happen — the viewer crossed `min_confirmed` and (eligible faces > 0 or the project is still processing images) — or the page came from a re-run (`?inference_triggered=1`); with nothing eligible at render time it starts hidden (`style="display:none"`) and the `/api/progress` poller is what makes it live: it reveals the card when a model cycle begins, hides it again between cycles, and shows "Model inference complete — N new matches found" only once `complete` **and** `pending_images == 0`, then stops; a quiescent page stops after the first poll. Do not re-gate the card or its poller on "running right now" — a page loaded while nothing was eligible used to show no live status at all, and once `images_processed == images_total` the progress poller is off too. The poller's live `SDC Pending` update must add `sdc_removal_pending_faces` to match the server-rendered combined figure. Two review-driven rules: the poller stops itself the moment the banner element is gone (a dismissed card must not leave a 5 s `/api/progress` loop), and the observed-work marker persists across the hidden gaps — eligible faces seen in any poll, or `by_model` growth since page load — so a cycle that finishes between two polls still finalizes the card instead of stopping silently.
+
 ### Toolforge health check (file-based liveness)
 Separate from the DB heartbeat above, each worker also writes a per-worker file at `$HOME/.wikivisage-worker-alive-{worker_id}` via `_touch_heartbeat_file()`. The `healthcheck.sh` script accepts a worker ID as `$1`, checks the file exists and was modified within 5 minutes (`find -mmin +5`). Toolforge's `--health-check-script` runs this every 10s; 3 consecutive failures trigger automatic pod restart. Per-worker files are critical because `$HOME` is shared NFS on Toolforge — a single file would be kept fresh by any surviving worker, hiding a dead one.
 
@@ -861,6 +876,8 @@ The follow-up round added: `test_eval_prefilter.py` (the readout math under mock
 
 The Copilot-review round added: `test_run_migration_upgrades_a_legacy_faces_schema_end_to_end` (full migration entry point against a simulated 0.10.x `faces` table), the `encode` rejection-classification tests (`invalid_image` re-raised vs an unusable region staying `None`) in `test_face_client.py`, both bbox routes (through the real client parsing path — only `_post` stubbed) and the live contract suite, `error_code` assertions on per-instance error entries in `test_face_service_model.py` (plus a parity check against `face_client`'s constant), and the LiftWing breaker-serialization (`test_queued_calls_see_the_breaker_the_running_call_opens`) and 429-deadline probe tests.
 
+The inference-card round added: four real-template `test_project_detail_inference_banner_*` cases in `test_app.py` — hidden while processing (banner present with `style="display:none"` plus the poller), absent when idle, visible while running (with the combined `sdc_removal_pending_faces` stat expression pinned), and the `?inference_triggered=1` completion state.
+
 ### Commands
 
 ```bash
@@ -910,7 +927,7 @@ test_db (session) → creates/drops wikiface_test DB
 Runs on push/PR to `main`. Five jobs:
 
 1. **Lint**: Ruff check + format check (Python 3.11), then `scripts/check_no_lfs.sh` — fails if `.gitmodules` exists, a weight file is routed through the LFS filter, or a weight file is an LFS pointer.
-2. **Test**: `pytest --tb=short -q` on Python 3.11 and 3.13 matrix. Integration tests auto-skipped (no `WIKIVISAGE_TEST_DB` env var in CI); the face-service unit and contract files skip too (no ML stack here). No system deps needed — the ML stack lives in the face service, and the suite mocks `face_client` rather than reaching the network. Caches pip dependencies.
+2. **Test**: `pytest --tb=short -q` on Python 3.11 and 3.15 matrix. Integration tests auto-skipped (no `WIKIVISAGE_TEST_DB` env var in CI); the face-service unit and contract files skip too (no ML stack here). No system deps needed — the ML stack lives in the face service, and the suite mocks `face_client` rather than reaching the network. Caches pip dependencies.
 3. **Face service (backend + model unit tests)** (`face-service-unit`): verifies `model-server/weights/SHA256SUMS`, installs `model-server/requirements.txt` + dev requirements on Python 3.11, and runs `test_face_service_backend.py` and `test_face_service_model.py` with `WIKIVISAGE_REQUIRE_SAMPLE=1`.
 4. **Face service** (`face-service`): verifies `SHA256SUMS`, builds `model-server/` with buildx (gha layer cache), starts the container **with a random token**, waits for readiness, runs the contract tests through the guard, and fails if the service log contains ONNX Runtime `VerifyOutputSizes` warnings. It builds the Dockerfile.
 5. **Face service (Toolforge buildpack)** (`face-service-buildpack`): verifies `SHA256SUMS`, builds `model-server/` with `pack` and Toolforge's own builder (`tools-harbor.wmcloud.org/toolforge/heroku-builder:24_0.21.8`, buildpacks `heroku/python` + `heroku/procfile` only — no deb packages are needed) — the production image — starts it via the `web` Procfile entry on port 8000 with `TOOL_TOOLFORGE_API_URL` set (so the fail-closed token check is live), and runs the same contract tests and log check. Catches `requirements.txt` / `Procfile` breakage that only affects the buildpack path.

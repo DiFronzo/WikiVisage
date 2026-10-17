@@ -44,7 +44,7 @@ The following are in scope:
 - Cross-site scripting (XSS) in templates
 - Wikibase API abuse via SDC write endpoints
 - Sensitive data exposure (tokens, credentials)
-- Denial of service against the worker or web process
+- Denial of service against the worker, web process, or face service
 
 The following are **out of scope**:
 
@@ -68,6 +68,7 @@ The following are **out of scope**:
 - Image download size cap (50 MB) and pixel dimension validation (100 megapixel limit)
 - Face detection isolation: ONNX Runtime/libjpeg/libpng parse untrusted image bytes only inside the face service, which runs as a separate Toolforge tool under memory/CPU limits with no NFS mount. Toolforge envvars are tool-wide, so the separate tool is what keeps WikiVisage's OAuth, database, and token-encryption secrets out of that process; a parser exploit there has nothing of ours to exfiltrate
 - Face service authentication: the service is published on the internet, so `model-server/guard.py` requires a constant-time-compared bearer token (>= 32 chars) on every route except the readiness check — including KServe's model-unload endpoint — rejects bodies over 40 MiB before parsing, and gRPC is disabled. The service refuses to start on Toolforge without a token
+- Metadata pre-filter data minimisation (worker-only, experimental): only public Commons metadata (title, flattened description, a capped category list) is ever sent to Wikimedia LiftWing — never image bytes — and any error fails open (every image is kept)
 - Distributed worker locking (`SELECT … FOR UPDATE`) with stale-claim expiry
 - Cross-project SDC write deduplication (`sdc_claims` table prevents duplicate P180 claims)
 - Idempotent SDC removals: `no-such-entity` / `no-such-claim` / `no-such-statement` / `notfound` are treated as already-gone successes

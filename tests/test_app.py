@@ -3574,6 +3574,114 @@ def test_project_detail_inference_eligible_db_error_defaults_zero(monkeypatch):
     assert captured["context"]["inference_eligible"] == 0
 
 
+def _project_detail_banner_eq(project_overrides=None, stats_overrides=None, pending=0, eligible=0):
+    """execute_query mock for real-render /project/<id> inference-banner tests."""
+    project_row = {
+        "id": 1,
+        "user_id": 1,
+        "wikidata_qid": "Q42",
+        "p18_thumb_url": "https://thumb.jpg",
+        "status": "active",
+        "min_confirmed": 5,
+        "images_total": 10,
+        "images_processed": 10,
+        "completion_reason": None,
+    }
+    project_row.update(project_overrides or {})
+    stats_row = {
+        "total_faces": 10,
+        "confirmed_matches": 6,
+        "confirmed_non_matches": 2,
+        "unclassified": 2,
+        "human_confirmed": 5,
+        "sdc_written": 0,
+        "sdc_pending": 1,
+        "sdc_removal_pending_faces": 0,
+        "sdc_removal_pending": 0,
+        "by_human": 5,
+        "by_model": 1,
+        "by_bootstrap": 0,
+    }
+    stats_row.update(stats_overrides or {})
+
+    def eq(sql, params=None, fetch=True):
+        del params, fetch
+        if "FROM users WHERE id = %s" in sql:
+            return [
+                {
+                    "id": 1,
+                    "wiki_username": "tester",
+                    "access_token": "token",
+                    "refresh_token": "refresh",
+                    "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
+                }
+            ]
+        if "FROM projects p LEFT JOIN project_members" in sql:
+            return [project_row]
+        if "COUNT(*) AS total_faces" in sql:
+            return [stats_row]
+        if "status = 'pending'" in sql:
+            return [{"cnt": pending}]
+        if "f.is_target IS NULL" in sql:
+            return [{"cnt": eligible}]
+        if "COUNT(*) AS cnt" in sql:
+            return [{"cnt": 0}]
+        if "LIMIT 200" in sql:
+            return []
+        return ()
+
+    return eq
+
+
+def test_project_detail_inference_banner_hidden_while_processing(monkeypatch):
+    """Queued image work with no eligible faces → banner exists hidden so the poller can reveal it."""
+    eq = _project_detail_banner_eq(
+        project_overrides={"images_processed": 3, "images_total": 10},
+        pending=4,
+        eligible=0,
+    )
+    client, _ = _auth_client_chunk4(monkeypatch, eq)
+    body = client.get("/project/1").get_data(as_text=True)
+
+    assert 'id="inferenceBanner" role="status" aria-live="polite" style="display:none"' in body
+    assert "pollInference" in body
+    # Regression pins for the poller's stop/finalize rules (Copilot review, PR #118):
+    # a removed banner must stop the timer, and the observed-work marker must persist.
+    assert "if (!document.getElementById('inferenceBanner')) {" in body
+    assert "var sawWork" in body
+
+
+def test_project_detail_inference_banner_absent_when_idle(monkeypatch):
+    """Processing finished and no eligible faces → no banner and no polling at all."""
+    eq = _project_detail_banner_eq()
+    client, _ = _auth_client_chunk4(monkeypatch, eq)
+    body = client.get("/project/1").get_data(as_text=True)
+
+    assert 'id="inferenceBanner"' not in body
+    assert "pollInference" not in body
+
+
+def test_project_detail_inference_banner_visible_while_running(monkeypatch):
+    """Eligible faces at load → visible banner, and the poller keeps the removal count consistent."""
+    eq = _project_detail_banner_eq(eligible=7)
+    client, _ = _auth_client_chunk4(monkeypatch, eq)
+    body = client.get("/project/1").get_data(as_text=True)
+
+    assert '<div class="card inference-banner" id="inferenceBanner" role="status" aria-live="polite">' in body
+    assert "Model inference in progress — 7 faces remaining…" in body
+    assert "(fs.sdc_pending || 0) + (fs.sdc_removal_pending_faces || 0)" in body
+
+
+def test_project_detail_inference_banner_renders_for_rerun_done_state(monkeypatch):
+    """?inference_triggered=1 with nothing to classify still shows the completion banner."""
+    eq = _project_detail_banner_eq()
+    client, _ = _auth_client_chunk4(monkeypatch, eq)
+    body = client.get("/project/1?inference_triggered=1").get_data(as_text=True)
+
+    assert "inference-banner-done" in body
+    assert "Model inference complete." in body
+
+
 def test_classify_project_not_found(monkeypatch):
     def eq(sql, params=None, fetch=True):
         del params, fetch
@@ -11778,6 +11886,33 @@ def test_project_settings_success_persists_prefilter_mode(monkeypatch, fake_user
     assert updates[0][0][4] == "shadow"
 
 
+def _prefilter_stats_row(**overrides):
+    row = {
+        "checked": 250,
+        "kept": 230,
+        "dropped": 20,
+        "dropped_with_faces": 3,
+        "kept_without_faces": 5,
+        "human_targets_dropped": 0,
+        "human_targets_total": 7,
+        "last_checked": datetime(2026, 10, 17, 9, 30),
+    }
+    row.update(overrides)
+    return row
+
+
+def _empty_prefilter_stats_row():
+    return _prefilter_stats_row(
+        checked=0,
+        kept=0,
+        dropped=0,
+        dropped_with_faces=0,
+        kept_without_faces=0,
+        human_targets_total=0,
+        last_checked=None,
+    )
+
+
 def test_project_settings_shows_liftwing_banner_and_status(monkeypatch, fake_user):
     project = _project_settings_base_row()
     project["prefilter_mode"] = "shadow"
@@ -11789,6 +11924,8 @@ def test_project_settings_shows_liftwing_banner_and_status(monkeypatch, fake_use
             return []
         if "SELECT status, last_checked, last_ok" in sql:
             return [_liftwing_status_row("down")]
+        if "prefilter_checked_at" in sql:
+            return [_prefilter_stats_row()]
         raise AssertionError(f"Unexpected SQL: {sql}")
 
     client = _make_authed_client(monkeypatch, fake_user, route_execute)
@@ -11817,3 +11954,171 @@ def test_project_settings_hides_liftwing_banner_when_mode_off(monkeypatch, fake_
 
     assert response.status_code == 200
     assert b"The LiftWing AI service used for the metadata filter" not in response.data
+
+
+def _prefilter_stats_client(monkeypatch, fake_user, project, stats_row):
+    def route_execute(sql, _params=None, _fetch=True):
+        if "SELECT * FROM projects" in sql:
+            return [project.copy()]
+        if "project_members" in sql:
+            return []
+        if "prefilter_checked_at" in sql:
+            if isinstance(stats_row, Exception):
+                raise stats_row
+            return [stats_row]
+        raise AssertionError(f"Unexpected SQL: {sql}")
+
+    return _make_authed_client(monkeypatch, fake_user, route_execute)
+
+
+def test_project_settings_prefilter_stats_in_shadow_mode(monkeypatch, fake_user):
+    project = _project_settings_base_row()
+    project["prefilter_mode"] = "shadow"
+
+    client = _prefilter_stats_client(monkeypatch, fake_user, project, _prefilter_stats_row())
+
+    body = client.get("/project/1/settings").get_data(as_text=True)
+
+    assert "Pre-filter results" in body
+    assert "Files checked" in body
+    assert 'stat-value">250</div>' in body
+    assert "Would skip 8.0%" in body
+    assert 'stat-value">20</div>' in body
+    assert "Confirmed matches it would drop" in body
+    assert "Skips that had a face" in body
+    assert 'stat-value">3</div>' in body
+    assert "It would not have dropped any of the 7 images you confirmed contain the target." in body
+    assert "It kept 5 checked files in which no face was found" in body
+    assert "last verdict 2026-10-17 09:30 UTC" in body
+    assert 'class="stat-box stat-box-success"' in body
+
+
+def test_project_settings_prefilter_stats_warns_on_confirmed_match_drop(monkeypatch, fake_user):
+    project = _project_settings_base_row()
+    project["prefilter_mode"] = "shadow"
+
+    client = _prefilter_stats_client(monkeypatch, fake_user, project, _prefilter_stats_row(human_targets_dropped=2))
+
+    body = client.get("/project/1/settings").get_data(as_text=True)
+
+    assert "It would have dropped 2 of the 7 images you confirmed contain the target." in body
+    assert "Do not enforce this filter on this project." in body
+    assert 'class="prefilter-note prefilter-note-bad"' in body
+    assert 'class="stat-box stat-box-danger"' in body
+
+
+def test_project_settings_prefilter_stats_no_human_confirmed_data(monkeypatch, fake_user):
+    project = _project_settings_base_row()
+    project["prefilter_mode"] = "shadow"
+
+    client = _prefilter_stats_client(
+        monkeypatch,
+        fake_user,
+        project,
+        _prefilter_stats_row(human_targets_total=0, kept_without_faces=0),
+    )
+
+    body = client.get("/project/1/settings").get_data(as_text=True)
+
+    assert "No human-confirmed target images are among the checked files yet" in body
+    assert 'class="prefilter-note prefilter-note-ok"' not in body
+
+
+def test_project_settings_prefilter_stats_empty_state(monkeypatch, fake_user):
+    project = _project_settings_base_row()
+    project["prefilter_mode"] = "shadow"
+
+    client = _prefilter_stats_client(monkeypatch, fake_user, project, _empty_prefilter_stats_row())
+
+    body = client.get("/project/1/settings").get_data(as_text=True)
+
+    assert "No verdicts recorded yet." in body
+    assert "Files checked" not in body
+    assert "last verdict" not in body
+
+
+def test_project_settings_prefilter_stats_hidden_when_mode_off(monkeypatch, fake_user):
+    project = _project_settings_base_row()
+    project["prefilter_mode"] = "off"
+
+    def route_execute(sql, _params=None, _fetch=True):
+        if "SELECT * FROM projects" in sql:
+            return [project.copy()]
+        if "project_members" in sql:
+            return []
+        raise AssertionError(f"Unexpected SQL: {sql}")
+
+    client = _make_authed_client(monkeypatch, fake_user, route_execute)
+
+    response = client.get("/project/1/settings")
+
+    assert response.status_code == 200
+    assert b"Pre-filter results" not in response.data
+
+
+def test_project_settings_prefilter_stats_db_error_keeps_page(monkeypatch, fake_user):
+    project = _project_settings_base_row()
+    project["prefilter_mode"] = "shadow"
+
+    client = _prefilter_stats_client(monkeypatch, fake_user, project, DatabaseError("stats failed"))
+
+    response = client.get("/project/1/settings")
+
+    assert response.status_code == 200
+    assert b"Pre-filter stats are unavailable right now." in response.data
+
+
+def test_get_prefilter_stats_computes_skip_pct(monkeypatch):
+    monkeypatch.setattr(app_module, "execute_query", lambda *_a, **_k: [_prefilter_stats_row(checked=3, dropped=1)])
+
+    stats = app_module._get_prefilter_stats(1)
+
+    assert stats["checked"] == 3
+    assert stats["skip_pct"] == 33.3
+    assert stats["last_checked"] == datetime(2026, 10, 17, 9, 30)
+
+
+def test_get_prefilter_stats_zero_checked(monkeypatch):
+    monkeypatch.setattr(app_module, "execute_query", lambda *_a, **_k: [_empty_prefilter_stats_row()])
+
+    stats = app_module._get_prefilter_stats(1)
+
+    assert stats["skip_pct"] == 0.0
+    assert stats["last_checked"] is None
+
+
+def test_get_prefilter_stats_db_error_returns_empty(monkeypatch):
+    def boom(*_a, **_k):
+        raise DatabaseError("boom")
+
+    monkeypatch.setattr(app_module, "execute_query", boom)
+
+    assert app_module._get_prefilter_stats(1) == {}
+
+
+@pytest.mark.integration
+def test_project_settings_prefilter_stats_from_db(integration_client, db_conn, seed_project, seed_images, seed_faces):
+    client, _, _ = integration_client
+
+    with db_conn.cursor() as cur:
+        cur.execute("UPDATE projects SET prefilter_mode = 'shadow' WHERE id = %s", (seed_project["id"],))
+        for image, keep in zip(seed_images, (1, 1, 0, 0, 0)):
+            cur.execute(
+                "UPDATE images SET prefilter_keep = %s, prefilter_reason = 'test verdict', "
+                "prefilter_checked_at = NOW() WHERE id = %s",
+                (keep, image["id"]),
+            )
+        # The middle dropped image has no human-confirmed target: deleting its
+        # target face must keep it out of the safety counter.
+        cur.execute("DELETE FROM faces WHERE image_id = %s AND is_target = 1", (seed_images[2]["id"],))
+
+    response = client.get(f"/project/{seed_project['id']}/settings")
+    body = response.get_data(as_text=True)
+
+    assert response.status_code == 200
+    assert "Pre-filter results" in body
+    assert 'stat-value">5</div>' in body  # checked
+    assert 'stat-value">3</div>' in body  # would skip
+    assert "Would skip 60.0%" in body
+    assert 'stat-value">2</div>' in body  # confirmed matches it would drop
+    assert "It would have dropped 2 of the 4 images you confirmed contain the target." in body

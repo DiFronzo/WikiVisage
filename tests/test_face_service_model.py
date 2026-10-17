@@ -126,8 +126,13 @@ def test_service_no_longer_references_dlib():
 def test_requirements_drop_dlib_and_pin_the_onnx_stack():
     text = (MODEL_SERVER / "requirements.txt").read_text()
     pins = {line.split("#")[0].strip() for line in text.splitlines()} - {""}
-    assert {"kserve==0.15.2", "onnxruntime==1.31.0", "opencv-python-headless==5.0.0.93"} <= pins
-    assert not any(p.startswith(("dlib", "face_recognition", "setuptools")) for p in pins)
+    assert {"kserve==0.21.0", "onnxruntime==1.31.0", "opencv-python-headless==5.0.0.93"} <= pins
+    assert not any(p.startswith(("dlib", "face_recognition")) for p in pins)
+    # The old face_recognition stack needed a top-level ``setuptools<81`` cap
+    # (its models imported pkg_resources). Nothing constrains setuptools at the
+    # top level anymore — it may only appear in the lock as a transitive pin
+    # (grpcio-tools, via kserve).
+    assert "setuptools" not in (MODEL_SERVER / "requirements.in").read_text()
 
 
 def test_no_deb_packages_are_needed():

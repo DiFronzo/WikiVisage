@@ -1,6 +1,6 @@
 # Plan: SCRFD + ArcFace MBF in the face service, with an experimental Qwen metadata pre-filter
 
-Status: **validated 2026-10-16, ready for a worker.** All decisions are in section 3; measured results are in section 1b.
+Status: **validated 2026-10-16; implemented and released as v0.11.0 (PR #116).** All decisions are in section 3; measured results are in section 1b; the post-implementation findings are resolved in [face-model-upgrade-followups.md](face-model-upgrade-followups.md).
 
 Owner decisions (2026-10-16):
 - Use **SCRFD-500M + ArcFace MobileFaceNet (512D) on ONNX Runtime**. The goal is a large quality improvement, not the licence-clean option.
@@ -32,7 +32,7 @@ External facts were checked 2026-10-16. The Wikitech LiftWing page is a draft la
 
 Checked by actually running things, not by reading docs. Throwaway scripts lived outside the repo.
 
-**Dependencies resolve** (`uv pip compile`, Python 3.11, `x86_64-manylinux_2_28`): `kserve==0.15.2`, `onnxruntime==1.31.0`, `opencv-python-headless==5.0.0.93`, `numpy==2.4.6`, `Pillow==12.3.0`, `protobuf==4.25.9`. No conflicts. Pin these.
+**Dependencies resolve** (`uv pip compile`, Python 3.11, `x86_64-manylinux_2_28`): `kserve==0.15.2`, `onnxruntime==1.31.0`, `opencv-python-headless==5.0.0.93`, `numpy==2.4.6`, `Pillow==12.3.0`, `protobuf==4.25.9`. No conflicts. Pin these. *(v0.11.0 shipped with exactly these pins; the post-release refresh moved `kserve` to `0.21.0`, `protobuf` to `6.33.6` and `Pillow` to `13.0.0` — `onnxruntime`, `opencv-python-headless` and `numpy` are unchanged. See `model-server/requirements.in`.)*
 
 **Weights** (`buffalo_sc.zip` from `https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_sc.zip`):
 

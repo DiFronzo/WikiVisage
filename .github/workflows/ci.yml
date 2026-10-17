@@ -18,14 +18,14 @@ jobs:
     name: Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 
       - name: Install Ruff
-        run: pip install "ruff>=0.9.0"
+        run: pip install "ruff>=0.17"
 
       - name: Ruff check
         run: ruff check .
@@ -45,12 +45,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.13"]
+        python-version: ["3.11", "3.15"]
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
@@ -69,13 +69,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Verify model weights (SHA256SUMS)
         working-directory: model-server/weights
         run: sha256sum -c SHA256SUMS
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
           cache: pip
@@ -98,7 +98,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       # A Git LFS pointer file or a truncated weight file fails here, before
       # any image is built. model.py repeats the check at startup.
@@ -106,14 +106,14 @@ jobs:
         working-directory: model-server/weights
         run: sha256sum -c SHA256SUMS
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
       # Builds model-server/ and runs face_client.py against the real container;
       # this is the only job that crosses the HTTP boundary for real, so it
       # catches a broken Dockerfile, an unresolvable dependency, or wire-format
       # drift between the client and the server.
       - name: Build face service image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: ./model-server
           load: true
@@ -148,7 +148,7 @@ jobs:
           docker logs face-service
           exit 1
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
           cache: pip
@@ -185,7 +185,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Verify model weights (SHA256SUMS)
         working-directory: model-server/weights
@@ -232,7 +232,7 @@ jobs:
           docker logs face-service
           exit 1
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
           cache: pip

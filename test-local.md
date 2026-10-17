@@ -65,7 +65,7 @@ export OAUTHLIB_INSECURE_TRANSPORT=1
 python migrate.py
 ```
 
-This creates all 9 tables (`users`, `sessions`, `projects`, `images`, `faces`, `user_stats`, `sdc_claims`, `project_members`, `worker_heartbeat`) and their indexes. Safe to re-run.
+This creates all 10 tables (`users`, `sessions`, `projects`, `images`, `faces`, `user_stats`, `sdc_claims`, `project_members`, `worker_heartbeat`, `service_status`) and their indexes. Safe to re-run.
 
 ## 5. Run the Web App
 
@@ -105,7 +105,7 @@ VALUES (1, 'TestUser', 'fake-token', 'fake-refresh', '2099-01-01 00:00:00');
 
 -- Create a test project (e.g., Q42 = Douglas Adams, in a real Commons category)
 INSERT INTO projects (user_id, wikidata_qid, commons_category, label, distance_threshold, min_confirmed)
-VALUES (1, 'Q42', 'Douglas Adams', 'Douglas Adams', 0.6, 5);
+VALUES (1, 'Q42', 'Douglas Adams', 'Douglas Adams', 0.5, 5);
 ```
 
 Then restart the worker — it'll start crawling the "Douglas Adams" category on Commons, downloading images, and detecting faces.
@@ -185,6 +185,7 @@ ruff format .             # Auto-format
 | Face detection | Same — check `faces` table after worker processes images | Yes |
 | SPARQL bootstrap | Worker logs will show bootstrap attempts | Yes |
 | Autonomous inference | Manually insert 5+ confirmed faces, worker auto-classifies rest | Yes |
+| Inference status card | Log in, open a project that is mid-processing or has eligible faces; the card follows each cycle live | No |
 | Leaderboard | Browser → `http://localhost:8000/leaderboard` | Yes |
 | Classification UI | Needs a logged-in session (use OAuth or hack the session) | No |
 | Model Results / validation | Needs a logged-in session with classified faces | No |
