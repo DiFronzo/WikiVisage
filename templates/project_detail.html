@@ -2123,7 +2123,12 @@
         var apiProgressUrl = {{ url_for('api_progress', project_id=project.id)|tojson }};
         var inferenceTimer = null;
         var inferencePollInFlight = false;
-        var lastEligible = {{ inference_eligible }};
+        // Observed-work marker: set when the page rendered mid-run, a poll sees
+        // eligible faces, or model classifications grew since load (a cycle
+        // finished between polls). It is not reset while the inference gate
+        // holds, so the completion note appears even when the final poll only
+        // sees a finished project.
+        var sawWork = {{ inference_eligible }} > 0;
         var minConfirmed = {{ project.min_confirmed or 5 }};
         var i18nInference = {
             inProgressOne: {{ _('Model inference in progress — {num} face remaining…')|tojson }},
@@ -2134,13 +2139,23 @@
 
         function pollInference() {
             if (inferencePollInFlight) return;
+            if (!document.getElementById('inferenceBanner')) {
+                // Banner dismissed or removed — stop polling.
+                clearInterval(inferenceTimer);
+                inferenceTimer = null;
+                return;
+            }
             inferencePollInFlight = true;
             fetch(apiProgressUrl).then(function(r) {
                 if (!r.ok) throw new Error('HTTP ' + r.status);
                 return r.json();
             }).then(function(data) {
                 var banner = document.getElementById('inferenceBanner');
-                if (!banner) return;
+                if (!banner) {
+                    clearInterval(inferenceTimer);
+                    inferenceTimer = null;
+                    return;
+                }
 
                 var fs = data.face_stats || {};
                 var eligible = data.inference_eligible || 0;
@@ -2167,44 +2182,53 @@
 
                 var canInfer = (fs.human_confirmed || 0) >= minConfirmed;
                 var running = eligible > 0 && canInfer;
+                var quiescent = data.complete && (data.pending_images || 0) === 0;
+
+                // Eligible faces or model-classification growth since load mean a
+                // cycle is (or has been) working; keep that fact across the hidden
+                // gaps so a between-polls cycle still finalizes the card below.
+                if (eligible > 0 || (fs.by_model || 0) > initialByModel) sawWork = true;
+
                 if (running) {
                     // Still running
                     var msg = eligible === 1 ? i18nInference.inProgressOne : i18nInference.inProgressMany;
                     if (textEl) textEl.textContent = msg.replace('{num}', eligible);
-                    banner.style.display = '';
-                    lastEligible = eligible;
-                } else if (lastEligible > 0) {
-                    if (canInfer && data.complete && (data.pending_images || 0) === 0) {
-                        // Everything is finished — show the completion note and stop polling
-                        clearInterval(inferenceTimer);
-                        inferenceTimer = null;
-                        var newMatches = Math.max(0, (fs.by_model || 0) - initialByModel);
-                        banner.classList.add('inference-banner-done');
-                        var spinner = document.getElementById('inferenceSpinner');
-                        if (spinner) spinner.outerHTML = '<span class="inference-done-icon" aria-hidden="true">✓</span>';
-                        if (textEl) textEl.textContent = i18nInference.done.replace('{matches}', newMatches);
-
-                        // Clear dismissal so the completed banner shows fresh
-                        try { localStorage.removeItem('inference_dismissed_{{ project.id }}'); } catch(e) {}
-
-                        // Ensure banner is visible (user may have dismissed in-progress state)
-                        banner.style.display = '';
-
-                        // Also hide the info banner if visible (no longer relevant)
-                        var infoBanner = document.getElementById('infoBanner');
-                        if (infoBanner) infoBanner.style.display = 'none';
-
-                        // Refresh gallery to show new model results
-                        if (typeof loadGalleryPage === 'function') loadGalleryPage(1);
-                    } else {
-                        // More image work remains — inference runs again next cycle
-                        banner.style.display = 'none';
-                        lastEligible = 0;
+                    if (banner.classList.contains('inference-banner-done')) {
+                        // A late cycle started after a completion card — back to the running look
+                        banner.classList.remove('inference-banner-done');
+                        var doneIcon = banner.querySelector('.inference-done-icon');
+                        if (doneIcon) doneIcon.outerHTML = '<div class="inference-spinner" id="inferenceSpinner" aria-hidden="true"></div>';
                     }
-                } else if (data.complete && (data.pending_images || 0) === 0) {
-                    // Nothing left to watch
+                    banner.style.display = '';
+                } else if (sawWork && canInfer && quiescent) {
+                    // Everything finished after observed work — show the completion note
                     clearInterval(inferenceTimer);
                     inferenceTimer = null;
+                    var newMatches = Math.max(0, (fs.by_model || 0) - initialByModel);
+                    banner.classList.add('inference-banner-done');
+                    var spinner = document.getElementById('inferenceSpinner');
+                    if (spinner) spinner.outerHTML = '<span class="inference-done-icon" aria-hidden="true">✓</span>';
+                    if (textEl) textEl.textContent = i18nInference.done.replace('{matches}', newMatches);
+
+                    // Clear dismissal so the completed banner shows fresh
+                    try { localStorage.removeItem('inference_dismissed_{{ project.id }}'); } catch(e) {}
+
+                    // Ensure banner is visible (user may have dismissed in-progress state)
+                    banner.style.display = '';
+
+                    // Also hide the info banner if visible (no longer relevant)
+                    var infoBanner = document.getElementById('infoBanner');
+                    if (infoBanner) infoBanner.style.display = 'none';
+
+                    // Refresh gallery to show new model results
+                    if (typeof loadGalleryPage === 'function') loadGalleryPage(1);
+                } else if (quiescent) {
+                    // Nothing left to watch — stop polling (leave the banner as rendered)
+                    clearInterval(inferenceTimer);
+                    inferenceTimer = null;
+                } else {
+                    // More work remains — hide the in-progress look until the next cycle
+                    if (!banner.classList.contains('inference-banner-done')) banner.style.display = 'none';
                 }
             }).catch(function(e) {
                 console.error('Inference poll error:', e);

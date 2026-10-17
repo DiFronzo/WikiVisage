@@ -3645,6 +3645,10 @@ def test_project_detail_inference_banner_hidden_while_processing(monkeypatch):
 
     assert 'id="inferenceBanner" role="status" aria-live="polite" style="display:none"' in body
     assert "pollInference" in body
+    # Regression pins for the poller's stop/finalize rules (Copilot review, PR #118):
+    # a removed banner must stop the timer, and the observed-work marker must persist.
+    assert "if (!document.getElementById('inferenceBanner')) {" in body
+    assert "var sawWork" in body
 
 
 def test_project_detail_inference_banner_absent_when_idle(monkeypatch):

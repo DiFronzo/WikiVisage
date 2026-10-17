@@ -582,3 +582,26 @@ New real-template tests: `test_project_detail_inference_banner_hidden_while_proc
 `test_project_detail_inference_banner_renders_for_rerun_done_state`. Gates:
 ruff clean; 993 unit / 1031 integration tests green. `AGENTS.md`'s Known
 Issues section carries the same invariant.
+
+Copilot review of the release PR flagged two poller issues, both fixed in the
+same template: polling continued indefinitely after the banner was dismissed
+or removed (the poller now stops itself when `#inferenceBanner` is gone — both
+before fetching and after a response), and the completion note was lost when
+the observed-work marker reset between polls (the marker now persists across
+the hidden gaps, with growth in `by_model` since page load as the
+between-polls signal, so a cycle that finishes between two polls still shows
+the completion note and refreshes the gallery).
+
+### Leaderboard history lost in the one-time wipe (recorded 2026-10-17)
+
+The v0.11.0 embedding-model wipe (`apply_embedding_model_upgrade()`) deleted
+`images`, `faces` and `sdc_claims` — the tables the leaderboard aggregates its
+per-user counts from. `user_stats` survived, but it only ever held rows
+archived from *deleted* projects; the live per-user totals were never copied
+into it. ToolsDB has no offline backups and the read-only replica mirrors the
+wiped state, so the recovery route (import a pre-wipe dump into a scratch DB,
+aggregate `faces` per `classified_by_user_id`, additive `user_stats` upsert)
+has no source to run from: no dump exists on the Toolforge tool home or the
+owner's machine. The pre-wipe contributions of still-existing projects are
+accepted as lost; leaderboard numbers restart from the surviving `user_stats`
+rows plus new activity.
