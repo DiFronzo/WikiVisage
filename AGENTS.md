@@ -827,7 +827,7 @@ The project detail page includes approve/reject/edit-bbox controls on each Model
 - **Filter interaction**: After reclassification, `data-source` is NOT changed — the card remains visible under its original source filter (Model/Bootstrap). Only the visible method label updates to "human".
 
 ### Cookies
-Only 2 cookies: `session` (strictly necessary, managed by Flask's built-in signed session cookie mechanism) and `locale` (functional, language preference). No tracking cookies. A non-blocking consent banner is shown.
+Only 2 cookies: `session` (strictly necessary, managed by Flask's built-in signed session cookie mechanism) and `locale` (functional, language preference). No tracking cookies. A non-blocking consent banner is shown. Without consent the `locale` cookie is session-scoped: switching language still works, but the choice is only persisted (1 year) once the visitor accepts the banner.
 
 ### Worker memory is bounded by DETECTION_WAVE_SIZE, not BATCH_SIZE
 `process_images` works in waves. A wave's downloaded image bytes are all resident at once while its detection request is in flight, so `DETECTION_WAVE_SIZE` (8) is what caps peak memory — not `BATCH_SIZE` (10). Downloading a whole batch up front would be 50 x 50 MB worst case. Inference itself is cheap: each encoding is 1024 bytes, so even 10K faces is ~10 MB.

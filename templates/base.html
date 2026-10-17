@@ -65,7 +65,7 @@
         .nav-toggle { display: none; background: none; border: none; color: var(--primary); font-size: 1.5rem; cursor: pointer; padding: 0.5rem; line-height: 1; min-width: 44px; min-height: 44px; align-items: center; justify-content: center; }
         .nav-toggle:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
         .nav-links a:focus-visible, .nav-links .btn:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
-        .lang-select { background: var(--bg); color: var(--text-main); border: 2px solid var(--border); padding: 0.5rem 0.75rem; font-size: 0.75rem; font-weight: 700; text-transform: uppercase; cursor: pointer; font-family: inherit; letter-spacing: 0.05em; transition: border-color 0.2s; width: auto; }
+        .lang-select { background-color: var(--bg); color: var(--text-main); border: 2px solid var(--border); padding: 0.5rem 2.5rem 0.5rem 0.75rem; font-size: 0.75rem; font-weight: 700; text-transform: uppercase; cursor: pointer; font-family: inherit; letter-spacing: 0.05em; transition: border-color 0.2s; width: auto; }
         .lang-select:hover { border-color: var(--primary); }
         .lang-select:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; border-color: var(--primary); }
 
@@ -177,6 +177,16 @@
         }
         input:focus, select:focus { outline: none; border-color: var(--primary); }
         input[readonly] { opacity: 0.6; cursor: not-allowed; }
+        select {
+            appearance: none;
+            -webkit-appearance: none;
+            -moz-appearance: none;
+            cursor: pointer;
+            padding-right: 2.75rem;
+            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%2394a3b8' d='M2 4l4 4 4-4'/%3E%3C/svg%3E");
+            background-repeat: no-repeat;
+            background-position: right 1.25rem center;
+        }
         .help-text { font-size: 0.875rem; color: var(--text-muted); margin-top: 0.5rem; font-style: italic; }
 
         .flash-messages { margin-bottom: 2.5rem; }
