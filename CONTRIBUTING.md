@@ -19,8 +19,10 @@ source venv/bin/activate
 pip install -r requirements-dev.txt   # Includes runtime deps + pytest, ruff
 ```
 
-No compiler or ML libraries are needed: `requirements.txt` has no dlib. Face
-detection runs in the face service container (see step 4).
+No compiler or ML libraries are needed: `requirements.txt` has no ML packages.
+Face detection runs in the face service container (see step 4). Its model
+weights are committed in `model-server/weights/` and are licensed for
+non-commercial research use only (see [LICENSES.md](LICENSES.md)).
 
 ### 2. Start a local MariaDB
 
@@ -79,7 +81,8 @@ The landing page and `/health` endpoint work without OAuth. See [test-local.md](
 | `app.py` | Flask web app: OAuth, routes, classification API |
 | `worker.py` | Background pipeline: crawl, download, infer, write SDC (multi-instance) |
 | `face_client.py` | HTTP client for the face service — no ML dependencies |
-| `model-server/` | Face detection service (KServe + dlib). The only place dlib lives |
+| `model-server/` | Face detection service (KServe + SCRFD/ArcFace on ONNX Runtime). The only place ML runs |
+| `scripts/` | `fetch_weights.sh` (re-create/verify the weights), `check_no_lfs.sh` (CI guard) |
 | `token_crypto.py` | Fernet encrypt/decrypt helpers for OAuth tokens at rest |
 | `database.py` | MariaDB connection pool with retry logic |
 | `schema.sql` | DDL for 9 tables + indexes |
@@ -168,6 +171,12 @@ pybabel compile -d translations
 3. Add any new tables to `_ALL_TABLES` and `expected_tables` in `migrate.py`.
 4. Run `python migrate.py` to verify it applies cleanly.
 5. Migrations must be safe to run repeatedly without error.
+
+The embedding-model switch (`apply_embedding_model_upgrade` in `migrate.py`) is the
+one deliberately destructive migration: it wipes images, faces and SDC claims once,
+gated on `faces.embedding_model`. Never run `migrate.py` against a database you care
+about without a dump, and do not add further one-time destructive steps without a
+similar guard and tests for both the first run and a re-run.
 
 Currently 9 tables: `users`, `sessions`, `projects`, `images`, `faces`, `user_stats`, `sdc_claims`, `project_members`, `worker_heartbeat`.
 

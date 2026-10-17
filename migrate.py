@@ -3,6 +3,8 @@ Database schema migration script for WikiVisage.
 
 Reads schema.sql and executes it against the configured MariaDB database.
 Safe to run multiple times — all CREATE TABLE statements use IF NOT EXISTS.
+The one destructive step, the embedding-model wipe (see
+``apply_embedding_model_upgrade``), runs exactly once per database.
 
 Usage:
     python migrate.py            # Apply migrations
@@ -13,6 +15,7 @@ import argparse
 import logging
 import os
 import sys
+from typing import Any
 
 from database import DatabaseError, close_pool, get_connection, init_db
 
@@ -34,6 +37,7 @@ _ALL_TABLES = [
     "sessions",
     "user_stats",
     "worker_heartbeat",
+    "service_status",
     "users",
 ]
 
@@ -146,10 +150,24 @@ def run_migration() -> None:
 
         # Apply incremental ALTER TABLE migrations for existing databases
         _apply_alter_migrations()
+        apply_embedding_model_upgrade()
 
     finally:
         close_pool()
 
+
+# MySQL/MariaDB error codes that mean "this DDL was already applied".
+_IDEMPOTENT_ERROR_CODES = {
+    1060,  # ER_DUP_FIELDNAME — column already exists
+    1061,  # ER_DUP_KEYNAME — index/key already exists
+    1091,  # ER_CANT_DROP_FIELD_OR_KEY — column/key doesn't exist (already dropped)
+    1826,  # ER_DUP_CONSTRAINT_NAME — FK constraint already exists
+}
+
+# Default projects.distance_threshold since the switch to cosine distance on
+# ArcFace embeddings. Provisional until Phase 0 calibration (see
+# docs/plans/face-model-upgrade.md); keep in step with schema.sql.
+DEFAULT_DISTANCE_THRESHOLD = 0.5
 
 # Incremental migrations: each entry is (description, SQL).
 # These are idempotent — they check before altering.
@@ -389,17 +407,60 @@ _ALTER_MIGRATIONS = [
         "ALTER TABLE projects ADD COLUMN invite_code_created_at DATETIME NULL DEFAULT NULL "
         "COMMENT 'When invite_code was generated (for TTL expiry)' AFTER invite_code",
     ),
+    (
+        "Add prefilter_mode to projects for the experimental LiftWing pre-filter",
+        "ALTER TABLE projects ADD COLUMN prefilter_mode ENUM('off', 'shadow', 'enforce') NOT NULL DEFAULT 'off' "
+        "COMMENT 'LiftWing metadata pre-filter (experimental): off, shadow=record verdicts only' "
+        "AFTER invite_code_created_at",
+    ),
+    (
+        "Add prefilter_keep to images",
+        "ALTER TABLE images ADD COLUMN prefilter_keep TINYINT(1) NULL "
+        "COMMENT 'LiftWing metadata pre-filter verdict (experimental): 1=keep, 0=drop, NULL=not checked' "
+        "AFTER bootstrapped",
+    ),
+    (
+        "Add prefilter_reason to images",
+        "ALTER TABLE images ADD COLUMN prefilter_reason VARCHAR(160) NULL "
+        "COMMENT 'LiftWing reason for the pre-filter verdict' AFTER prefilter_keep",
+    ),
+    (
+        "Add prefilter_checked_at to images",
+        "ALTER TABLE images ADD COLUMN prefilter_checked_at DATETIME NULL "
+        "COMMENT 'When the LiftWing pre-filter checked this image' AFTER prefilter_reason",
+    ),
+    (
+        "Add aligned to faces (record unaligned manual embeddings)",
+        # AFTER confidence, not AFTER det_score: det_score is created by
+        # apply_embedding_model_upgrade(), which runs after this list, so on a
+        # pre-upgrade database "AFTER det_score" fails with error 1054 before
+        # the upgrade can add it. confidence exists in every legacy schema, and
+        # the final column order still matches schema.sql
+        # (confidence, det_score, aligned).
+        "ALTER TABLE faces ADD COLUMN aligned TINYINT(1) NOT NULL DEFAULT 1 "
+        "COMMENT '0=embedded without landmark alignment (drawn box, detector missed it)' AFTER confidence",
+    ),
+    (
+        "Create service_status table for optional-service reachability",
+        "CREATE TABLE IF NOT EXISTS service_status ("
+        "  name VARCHAR(32) NOT NULL PRIMARY KEY,"
+        "  status ENUM('up', 'down', 'unknown') NOT NULL DEFAULT 'unknown',"
+        "  consecutive_failures INT UNSIGNED NOT NULL DEFAULT 0,"
+        "  last_checked DATETIME NULL COMMENT 'When the worker last probed the service',"
+        "  last_ok DATETIME NULL COMMENT 'When the probe last succeeded',"
+        "  last_error VARCHAR(255) NULL COMMENT 'Why the last probe failed',"
+        "  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
+    ),
+    (
+        "Seed the liftwing row in service_status",
+        "INSERT IGNORE INTO service_status (name) VALUES ('liftwing')",
+    ),
 ]
 
 
 def _apply_alter_migrations() -> None:
     """Apply ALTER TABLE migrations, skipping those already applied."""
-    IDEMPOTENT_ERROR_CODES = {
-        1060,  # ER_DUP_FIELDNAME — column already exists
-        1061,  # ER_DUP_KEYNAME — index/key already exists
-        1091,  # ER_CANT_DROP_FIELD_OR_KEY — column/key doesn't exist (already dropped)
-        1826,  # ER_DUP_CONSTRAINT_NAME — FK constraint already exists
-    }
     logger.info(f"Applying {len(_ALTER_MIGRATIONS)} incremental migrations")
     with get_connection() as conn, conn.cursor() as cursor:
         for desc, sql in _ALTER_MIGRATIONS:
@@ -410,7 +471,7 @@ def _apply_alter_migrations() -> None:
             except Exception as e:
                 conn.rollback()
                 errno = getattr(e, "args", (None,))[0] if hasattr(e, "args") else None
-                if isinstance(errno, int) and errno in IDEMPOTENT_ERROR_CODES:
+                if isinstance(errno, int) and errno in _IDEMPOTENT_ERROR_CODES:
                     logger.info(f"Skipped migration (already applied): {desc}")
                 elif isinstance(errno, int) and errno == 1005 and "errno: 121" in str(e):
                     # MariaDB reports duplicate FK constraint names as
@@ -418,6 +479,135 @@ def _apply_alter_migrations() -> None:
                     logger.info(f"Skipped migration (already applied): {desc}")
                 else:
                     raise DatabaseError(f"Migration failed: {desc} — {e}") from e
+
+
+# Schema changes that ship with the embedding-model switch. They run together
+# with the wipe, as one step, and are idempotent (MODIFY is a no-op the second
+# time; ADD COLUMN is skipped on error 1060).
+_EMBEDDING_MODEL_SCHEMA = [
+    (
+        "Document faces.encoding as a float32 embedding",
+        "ALTER TABLE faces MODIFY COLUMN encoding BLOB NOT NULL COMMENT 'float32 embedding, 2048 bytes for 512D'",
+    ),
+    (
+        "Document faces.confidence as cosine distance",
+        "ALTER TABLE faces MODIFY COLUMN confidence FLOAT NULL "
+        "COMMENT 'Cosine distance (1 - cosine similarity) from the target centroid'",
+    ),
+    (
+        "Add det_score to faces",
+        "ALTER TABLE faces ADD COLUMN det_score FLOAT NULL "
+        "COMMENT 'Detector confidence; NULL for manually drawn faces' AFTER confidence",
+    ),
+    (
+        "Set the cosine-distance default on projects.distance_threshold",
+        f"ALTER TABLE projects MODIFY COLUMN distance_threshold FLOAT NOT NULL DEFAULT {DEFAULT_DISTANCE_THRESHOLD} "
+        "COMMENT 'Cosine distance threshold for autonomous inference "
+        "(provisional default, see docs/plans/face-model-upgrade.md)'",
+    ),
+]
+
+# Added LAST, and only once the wipe has committed: its presence is what tells a
+# later run that the wipe already happened. If anything before it fails, the
+# column is absent and the next run safely repeats the (idempotent) wipe.
+_EMBEDDING_MODEL_MARKER_COLUMN = (
+    "Add embedding_model to faces",
+    "ALTER TABLE faces ADD COLUMN embedding_model VARCHAR(32) NOT NULL "
+    "COMMENT 'Model that produced the encoding, e.g. scrfd500m+arcface_mbf' AFTER encoding",
+)
+
+
+def _column_exists(cursor: Any, table: str, column: str) -> bool:
+    """True if ``table.column`` exists in the current database (via information_schema)."""
+    cursor.execute(
+        "SELECT COUNT(*) AS cnt FROM information_schema.COLUMNS "
+        "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s AND COLUMN_NAME = %s",
+        (table, column),
+    )
+    row = cursor.fetchone()
+    return bool(row and row["cnt"])
+
+
+def _wipe_derived_data(conn: Any, cursor: Any) -> None:
+    """Delete every image, face and SDC claim, and reset per-project progress.
+
+    Keeps users, sessions, projects, project_members, user_stats and
+    worker_heartbeat. ``DELETE`` rather than ``TRUNCATE``: InnoDB refuses
+    TRUNCATE on a table a foreign key references. Deleting images cascades to
+    faces and from there to sdc_claims; the explicit sdc_claims delete is a
+    belt-and-braces sweep. Safe on Commons: ``write_sdc_claims`` checks the file
+    for an existing P180 claim before writing, so wiping the dedup table cannot
+    cause duplicate claims.
+
+    Runs in one transaction: either everything is wiped and reset, or nothing.
+    """
+    try:
+        cursor.execute("DELETE FROM images")
+        logger.warning(f"Wipe: deleted {cursor.rowcount} images (and, by cascade, their faces and SDC claims)")
+        cursor.execute("DELETE FROM sdc_claims")
+        logger.warning(f"Wipe: deleted {cursor.rowcount} leftover sdc_claims rows")
+        cursor.execute(
+            "UPDATE projects SET images_total = 0, images_processed = 0, faces_confirmed = 0, "
+            "last_inference_threshold = NULL, last_inference_min_confirmed = NULL, "
+            "completion_reason = NULL, sdc_write_requested = 0, sdc_write_user_id = NULL, "
+            "sdc_write_error = NULL, worker_claimed_by = NULL, worker_claimed_at = NULL, "
+            "distance_threshold = %s",
+            (DEFAULT_DISTANCE_THRESHOLD,),
+        )
+        logger.warning(f"Wipe: reset progress counters on {cursor.rowcount} projects")
+        cursor.execute("UPDATE projects SET status = 'active' WHERE status = 'completed'")
+        logger.warning(f"Wipe: reactivated {cursor.rowcount} completed projects")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def _run_idempotent_ddl(conn: Any, cursor: Any, description: str, sql: str) -> None:
+    """Execute one DDL statement, treating "already applied" errors as success."""
+    try:
+        cursor.execute(sql)
+        conn.commit()
+        logger.info(f"Applied migration: {description}")
+    except Exception as e:
+        conn.rollback()
+        errno = e.args[0] if getattr(e, "args", None) else None
+        if isinstance(errno, int) and errno in _IDEMPOTENT_ERROR_CODES:
+            logger.info(f"Skipped migration (already applied): {description}")
+        else:
+            raise DatabaseError(f"Migration failed: {description} — {e}") from e
+
+
+def apply_embedding_model_upgrade() -> bool:
+    """Wipe derived face data once, when moving to the ArcFace embedding model.
+
+    Old 128D dlib encodings and new 512D ArcFace embeddings are not comparable,
+    so on the first run against a pre-upgrade database every image, face and SDC
+    claim is deleted (the images are re-crawled and re-detected by the worker)
+    and the new columns are added. ``migrate.py`` has no run-once mechanism of
+    its own, so this step is gated on ``faces.embedding_model``:
+
+    * column absent  -> wipe, apply the schema changes, then add the column;
+    * column present -> do nothing (every later migrate run, and fresh
+      databases, whose ``schema.sql`` already has it).
+
+    The column is added last so an interrupted run repeats the wipe instead of
+    skipping it. Returns True if the wipe ran.
+
+    Take a database dump before the first run on a database with real data.
+    """
+    with get_connection() as conn, conn.cursor() as cursor:
+        if _column_exists(cursor, "faces", "embedding_model"):
+            logger.info("faces.embedding_model exists — embedding-model upgrade already applied, no wipe")
+            return False
+
+        logger.warning("faces.embedding_model is missing — wiping images, faces and SDC claims (one time)")
+        _wipe_derived_data(conn, cursor)
+        for description, sql in _EMBEDDING_MODEL_SCHEMA:
+            _run_idempotent_ddl(conn, cursor, description, sql)
+        _run_idempotent_ddl(conn, cursor, *_EMBEDDING_MODEL_MARKER_COLUMN)
+        logger.warning("Embedding-model upgrade complete; projects will be re-crawled by the worker")
+        return True
 
 
 def verify_tables() -> None:
@@ -434,6 +624,7 @@ def verify_tables() -> None:
         "worker_heartbeat",
         "sdc_claims",
         "project_members",
+        "service_status",
     ]
 
     init_db(pool_size=1)

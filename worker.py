@@ -1,3 +1,4 @@
+import html
 import io
 import json
 import logging
@@ -34,9 +35,10 @@ from requests.adapters import HTTPAdapter
 from requests.packages.urllib3.util.retry import Retry
 
 import face_client
-from config import HEARTBEAT_FILE_DIR, WAKE_FILE_PATH
+import liftwing_client
+from config import DETECTION_WIDTH, HEARTBEAT_FILE_DIR, LIFTWING_PROBE_INTERVAL, PROJECT_VERSION, WAKE_FILE_PATH
 from database import DatabaseError, close_pool, execute_query, execute_transaction, init_db
-from face_client import FaceServiceError, FaceServiceRejected
+from face_client import FaceServiceError, FaceServiceModelMismatch, FaceServiceRejected
 from redis_lock import single_flight
 from token_crypto import TokenDecryptionError, decrypt_token, encrypt_token
 
@@ -47,9 +49,12 @@ logger = logging.getLogger("worker")
 # Constants
 COMMONS_API_URL = "https://commons.wikimedia.org/w/api.php"
 SPARQL_URL = "https://commons-query.wikimedia.org/sparql"  # Requires OAuth; unused, kept for reference
-FILE_PATH_URL = "https://commons.wikimedia.org/wiki/Special:FilePath/{file_title}?width=500"
+# Detection runs on this Commons thumbnail width (WIKIVISAGE_DETECTION_WIDTH, default 960).
+FILE_PATH_URL = f"https://commons.wikimedia.org/wiki/Special:FilePath/{{file_title}}?width={DETECTION_WIDTH}"
 
-USER_AGENT = "WikiVisage/1.0 (Wikimedia Toolforge; https://toolsadmin.wikimedia.org)"
+# Wikimedia's User-Agent policy wants ``<client>/<version> (<contact>)``; the
+# LiftWing client uses the same string.
+USER_AGENT = f"WikiVisage/{PROJECT_VERSION} (https://github.com/DiFronzo/WikiVisage)"
 
 POLL_INTERVAL = int(os.environ.get("WIKIVISAGE_WORKER_POLL_INTERVAL", 60))
 BATCH_SIZE = int(os.environ.get("WIKIVISAGE_WORKER_BATCH_SIZE", 50))
@@ -62,6 +67,16 @@ IMAGE_THREADS = int(os.environ.get("WIKIVISAGE_WORKER_IMAGE_THREADS", 4))
 # full detection batch so neither stage starves the other.
 DETECTION_WAVE_SIZE = max(IMAGE_THREADS, face_client.FACE_SERVICE_BATCH_SIZE)
 
+# Cosine-distance threshold used when a project row carries none. Provisional
+# until Phase 0 calibration; keep in step with schema.sql / migrate.py.
+DEFAULT_DISTANCE_THRESHOLD = 0.5
+
+# A stored embedding is L2-normalised, so its norm is 1. Anything this far off
+# is corrupt (or from another model) and is skipped; values inside the band are
+# float noise and are renormalised.
+EMBEDDING_NORM_MIN = 0.9
+EMBEDDING_NORM_MAX = 1.1
+
 # Distributed locking: stale claims from crashed workers expire after this many minutes
 CLAIM_EXPIRY_MINUTES = 15
 
@@ -73,6 +88,18 @@ MAX_IMAGE_PIXELS = 100_000_000
 
 # Maximum images per project — stops category traversal once this limit is reached
 MAX_IMAGES_PER_PROJECT = 9000
+
+# --- Experimental LiftWing metadata pre-filter (Phase 2) ---------------------
+# Files sent per LiftWing request (the model returns one verdict per file).
+# Measured 2026-10-17: ~1 s per file, so 20 keeps a request ~20 s, well inside
+# the client's 90 s timeout even under load.
+LIFTWING_BATCH_SIZE = int(os.environ.get("WIKIVISAGE_LIFTWING_BATCH_SIZE", "20"))
+# Images the pre-filter records per project cycle. Because the pre-filter now
+# runs after detection, a large backlog is worked off over several cycles
+# without delaying images; verdicts are only shadow data.
+LIFTWING_MAX_IMAGES = int(os.environ.get("WIKIVISAGE_LIFTWING_MAX_IMAGES", "250"))
+# Consecutive failed probes before service_status flips to 'down' (banner).
+LIFTWING_FAIL_THRESHOLD = int(os.environ.get("WIKIVISAGE_LIFTWING_FAIL_THRESHOLD", "3"))
 
 # Bootstrap processing cap — limits how many bootstrap images process_images() will
 # download/detect per project.  All P180 images are inserted into the DB by
@@ -136,41 +163,72 @@ def _get_redis_client() -> Any:
 _SKIP_EXTENSIONS = {".webm", ".ogv", ".ogg", ".mp3", ".wav", ".flac", ".opus", ".mid", ".oga"}
 
 
-def _validate_encoding(enc_bytes: bytes | None, face_id: int | str = "unknown") -> np.ndarray | None:
-    """Decode and validate a 128D face encoding from a DB BLOB.
+def _load_embedding(
+    blob: bytes | None, dim: int = face_client.EMBEDDING_DIM, face_id: int | str = "unknown"
+) -> np.ndarray | None:
+    """Decode and validate a face embedding from a DB BLOB.
 
-    Returns a writable numpy array on success, or None if the bytes are missing,
-    the wrong length, or contain non-finite / out-of-range values. This prevents
-    DB-level tampering (e.g., NaN/Inf injection) from corrupting the centroid
-    and silently mass-misclassifying faces. face_recognition encodings are
-    L2-normalized into roughly [-1, 1]; values outside [-10, 10] are rejected
-    as obviously invalid.
+    The BLOB must be exactly ``dim`` little-endian float32 values, all finite,
+    with an L2 norm in ``[EMBEDDING_NORM_MIN, EMBEDDING_NORM_MAX]``. Returns a
+    writable, renormalised unit-length ``float32`` array, or None (with a
+    warning) otherwise. This keeps DB-level tampering, truncation or a vector
+    from another model (e.g. a leftover 1024-byte dlib encoding) from corrupting
+    the centroid and silently mass-misclassifying faces.
     """
-    if enc_bytes is None or len(enc_bytes) != 1024:
+    expected = dim * 4
+    if blob is None or len(blob) != expected:
         logger.warning(
-            f"Face {face_id}: invalid encoding length ({len(enc_bytes) if enc_bytes else 'None'} bytes), expected 1024"
+            f"Face {face_id}: invalid embedding length ({len(blob) if blob else 'None'} bytes), expected {expected}"
         )
         return None
-    arr = np.frombuffer(enc_bytes, dtype=np.float64).copy()
+    arr = np.frombuffer(blob, dtype="<f4").astype(np.float32)
     if not np.isfinite(arr).all():
-        logger.warning(f"Face {face_id}: encoding contains NaN/Inf — skipping")
+        logger.warning(f"Face {face_id}: embedding contains NaN/Inf — skipping")
         return None
-    if np.any(np.abs(arr) > 10.0):
-        logger.warning(f"Face {face_id}: encoding values out of expected range — skipping")
+    norm = float(np.linalg.norm(arr))
+    if not EMBEDDING_NORM_MIN <= norm <= EMBEDDING_NORM_MAX:
+        logger.warning(f"Face {face_id}: embedding norm {norm:.3f} outside expected range — skipping")
         return None
-    return arr
+    return arr / norm
 
 
-def _face_distance(centroid: np.ndarray, encoding: np.ndarray) -> float:
-    """Euclidean distance between a candidate encoding and the project centroid.
+def _face_distance(centroid: np.ndarray, embedding: np.ndarray) -> float:
+    """Cosine distance ``1 - cos`` between a candidate embedding and the project centroid.
 
-    Reproduces ``face_recognition.face_distance([centroid], encoding)[0]``,
-    which is defined as ``numpy.linalg.norm(face_encodings - face_to_compare,
-    axis=1)``. Inlining it keeps the comparison numerically identical to every
-    ``confidence`` value already stored in the database while removing this
-    module's last import of the dlib-backed package.
+    Both arguments must be unit vectors (the centroid is the *renormalised* mean
+    of unit embeddings), so the cosine similarity is just their dot product. The
+    result lies in ``[0, 2]``; 0 is identical. Float rounding can push a
+    near-identical pair a hair below zero, so it is clamped.
     """
-    return float(np.linalg.norm(centroid - encoding))
+    return max(0.0, 1.0 - float(np.dot(centroid, embedding)))
+
+
+def _convert_box_to_stored_space(
+    box: tuple[int, int, int, int],
+    from_size: tuple[int, int],
+    stored_size: tuple[int, int],
+) -> tuple[int, int, int, int]:
+    """Re-express a ``(top, right, bottom, left)`` box from one pixel space in another.
+
+    ``from_size`` and ``stored_size`` are ``(width, height)``. Boxes are always
+    stored in the space recorded in ``images.detection_width/height``. If a face
+    is found later on an image at a different size (for example a re-detection
+    at 960 px on an image whose stored boxes are in a 500 px space), the new box
+    must be converted into the stored space before it is inserted, or it would
+    sit beside the old boxes in a different coordinate system. Result is clipped
+    to ``stored_size`` and kept at least 1 px wide and tall.
+    """
+    from_w, from_h = from_size
+    stored_w, stored_h = stored_size
+    if min(from_w, from_h, stored_w, stored_h) <= 0:
+        raise ValueError(f"invalid image size: from={from_size} stored={stored_size}")
+    top, right, bottom, left = box
+    scale_x, scale_y = stored_w / from_w, stored_h / from_h
+    left_s = min(max(0, round(left * scale_x)), stored_w - 1)
+    top_s = min(max(0, round(top * scale_y)), stored_h - 1)
+    right_s = min(max(left_s + 1, round(right * scale_x)), stored_w)
+    bottom_s = min(max(top_s + 1, round(bottom * scale_y)), stored_h)
+    return top_s, right_s, bottom_s, left_s
 
 
 def _build_skip_extensions_regex(extensions: set[str]) -> str:
@@ -753,8 +811,14 @@ def _persist_detection(
     *,
     bootstrapped: bool = False,
     project_id: int | None = None,
+    stored_size: tuple[int, int] | None = None,
 ) -> bool:
     """Store detected faces and mark the image processed.
+
+    ``stored_size`` is ``(width, height)`` of an existing detection space the
+    boxes must stay in (see ``_convert_box_to_stored_space``). Normal processing
+    handles pending images that have no stored space, so it is None: boxes are
+    stored as detected and the result's size becomes ``detection_width/height``.
 
     If the image is bootstrapped (already has a P180 depicts claim on Commons)
     and exactly one face was detected, auto-classify it as a target match.
@@ -762,26 +826,33 @@ def _persist_detection(
     """
     face_locations = result.locations
     encodings_bytes = result.encodings
+    scores = [face.score for face in result.faces]
     face_count = len(face_locations)
+    detection_size = (result.width, result.height)
+    if stored_size is not None and stored_size != detection_size:
+        face_locations = [_convert_box_to_stored_space(loc, detection_size, stored_size) for loc in face_locations]
+        detection_size = stored_size
 
     try:
         # Batch-insert detected faces in chunks to stay within max_allowed_packet.
         # All faces start unclassified (is_target=NULL). Classification
         # happens via human confirmation or autonomous inference.
         if face_locations:
-            FACE_INSERT_CHUNK = 100  # ~100KB per chunk (1024-byte encoding + ints)
+            FACE_INSERT_CHUNK = 100  # ~200KB per chunk (2048-byte embedding + ints)
             for chunk_start in range(0, face_count, FACE_INSERT_CHUNK):
                 chunk_locs = face_locations[chunk_start : chunk_start + FACE_INSERT_CHUNK]
                 chunk_encs = encodings_bytes[chunk_start : chunk_start + FACE_INSERT_CHUNK]
+                chunk_scores = scores[chunk_start : chunk_start + FACE_INSERT_CHUNK]
                 chunk_size = len(chunk_locs)
-                placeholders = ", ".join(["(%s, %s, %s, %s, %s, %s)"] * chunk_size)
+                placeholders = ", ".join(["(%s, %s, %s, %s, %s, %s, %s, %s)"] * chunk_size)
                 flat_params: list = []
-                for location, enc_bytes in zip(chunk_locs, chunk_encs):
+                for location, enc_bytes, score in zip(chunk_locs, chunk_encs, chunk_scores):
                     top, right, bottom, left = location
-                    flat_params.extend([img_id, enc_bytes, top, right, bottom, left])
+                    flat_params.extend([img_id, enc_bytes, result.model_id, score, top, right, bottom, left])
 
                 execute_query(
-                    f"INSERT INTO faces (image_id, encoding, bbox_top, bbox_right, bbox_bottom, bbox_left) "
+                    f"INSERT INTO faces "
+                    f"(image_id, encoding, embedding_model, det_score, bbox_top, bbox_right, bbox_bottom, bbox_left) "
                     f"VALUES {placeholders}",
                     tuple(flat_params),
                     fetch=False,
@@ -790,7 +861,7 @@ def _persist_detection(
         execute_query(
             "UPDATE images SET status = 'processed', face_count = %s, "
             "detection_width = %s, detection_height = %s WHERE id = %s",
-            (face_count, result.width, result.height, img_id),
+            (face_count, detection_size[0], detection_size[1], img_id),
             fetch=False,
         )
 
@@ -1264,6 +1335,217 @@ def bootstrap_from_sparql(project: dict[str, Any]) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# Experimental LiftWing metadata pre-filter (Phase 2, shadow mode)
+# ---------------------------------------------------------------------------
+
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+# Descriptions regularly embed wikitext templates ({{…}}) that are pure noise
+# to the pre-filter; they are removed rather than forwarded as tokens.
+_WIKITEXT_TEMPLATE_RE = re.compile(r"\{\{.*?\}\}", re.DOTALL)
+
+
+def _plain_text(value: Any, limit: int = 250) -> str:
+    """Flatten the HTML/wikitext fragment extmetadata returns into plain text."""
+    text = html.unescape(str(value or ""))
+    text = _HTML_TAG_RE.sub(" ", text)
+    text = _WIKITEXT_TEMPLATE_RE.sub(" ", text)
+    return " ".join(text.split())[:limit]
+
+
+def _fetch_metadata(titles: list[str]) -> dict[str, dict[str, Any]]:
+    """Batched Commons metadata for the pre-filter, keyed by file title.
+
+    One POST for the whole list (50 titles fit comfortably in a form body,
+    unlike a URL). Returns ``{}`` on any failure so the caller leaves those
+    images unchecked for a later cycle instead of dropping them.
+    """
+    if not titles:
+        return {}
+    try:
+        response = _api_request(
+            COMMONS_API_URL,
+            method="post",
+            data={
+                "action": "query",
+                "format": "json",
+                "formatversion": "2",
+                "prop": "imageinfo|categories",
+                "iiprop": "extmetadata|mime",
+                "cllimit": "50",
+                "maxlag": "5",
+                "titles": "|".join(titles),
+            },
+            timeout=30,
+        )
+        data = response.json()
+    except Exception as exc:
+        logger.warning(f"Pre-filter: Commons metadata request failed: {exc}")
+        return {}
+
+    pages = data.get("query", {}).get("pages", [])
+    if isinstance(pages, dict):
+        pages = list(pages.values())
+    by_title: dict[str, dict[str, Any]] = {page["title"]: page for page in pages if page.get("title")}
+
+    # The API answers under canonical titles (e.g. spaces instead of
+    # underscores, first letter capitalised) and lists the corrections in
+    # ``query.normalized``. Look each requested title up through that map so a
+    # non-canonical title does not silently get an empty description.
+    normalized = {
+        entry["from"]: entry["to"]
+        for entry in (data.get("query", {}).get("normalized") or [])
+        if isinstance(entry, dict) and entry.get("from") and entry.get("to")
+    }
+
+    result: dict[str, dict[str, Any]] = {}
+    for requested in titles:
+        page = by_title.get(requested)
+        if page is None:
+            page = by_title.get(normalized.get(requested, ""))
+        if page is None:
+            continue
+        info = (page.get("imageinfo") or [{}])[0]
+        extmetadata = info.get("extmetadata") or {}
+        description = _plain_text((extmetadata.get("ImageDescription") or {}).get("value", ""))
+        if not description:
+            description = _plain_text((extmetadata.get("ObjectName") or {}).get("value", ""))
+        categories = tuple(
+            category.get("title", "") for category in (page.get("categories") or []) if category.get("title")
+        )
+        result[requested] = {
+            "description": description,
+            "categories": categories,
+            "mime": info.get("mime", ""),
+        }
+    return result
+
+
+def _liftwing_service_down() -> bool:
+    """True when the last probe marked LiftWing down (pre-filter backs off)."""
+    try:
+        rows = execute_query("SELECT status FROM service_status WHERE name = 'liftwing'", fetch=True)
+    except DatabaseError:
+        return False
+    return bool(rows) and rows[0]["status"] == "down"
+
+
+def _store_prefilter_verdicts(updates: list[tuple[int, str | None, int]]) -> None:
+    """Apply a batch of ``(keep, reason, image_id)`` verdicts atomically."""
+
+    def _txn(conn: Any, cursor: Any) -> int:
+        for keep, reason, image_id in updates:
+            cursor.execute(
+                "UPDATE images SET prefilter_keep = %s, prefilter_reason = %s, prefilter_checked_at = NOW() "
+                "WHERE id = %s AND prefilter_checked_at IS NULL",
+                (keep, reason, image_id),
+            )
+        return len(updates)
+
+    execute_transaction(_txn)
+
+
+def prefilter_images(project: dict[str, Any]) -> int:
+    """Record shadow-mode LiftWing verdicts for crawled images.
+
+    Experimental (Phase 2). Changes no behaviour: whatever the verdict, the
+    image is still processed — the verdicts land on the image row for the
+    offline readout (``scripts/eval_prefilter.py``). Bootstrapped images always
+    bypass the filter (they carry a P180 claim already), and ``enforce`` is not
+    built yet, so any mode other than ``off`` behaves as shadow.
+
+    Shadow verdicts are metadata-only, so an image's processing status is
+    irrelevant: this runs *after* ``process_images`` and selects any not-yet
+    checked image, not just pending ones, so a backlog larger than one cycle's
+    cap is fully covered over time. (A future ``enforce`` mode is different:
+    it must select pending images and run *before* detection, because dropping
+    has to happen before a download.)
+
+    Fail open: an outage, a rate limit or an unparseable answer leaves the batch
+    unchecked for a later cycle; the circuit breaker in ``liftwing_client``
+    backs off, and a service already marked down is skipped entirely. Files the
+    model omitted are kept and recorded with a NULL reason. Real request
+    outcomes are mirrored into ``service_status`` so the banner reflects what
+    the pre-filter actually experiences, not just what the probe sees. Returns
+    the number of images whose verdicts were stored.
+    """
+    if project.get("prefilter_mode", "off") == "off":
+        return 0
+    if _liftwing_service_down():
+        logger.info(f"Pre-filter: LiftWing is marked down, skipping project {project['id']}")
+        return 0
+
+    project_id = project["id"]
+    try:
+        rows = execute_query(
+            "SELECT id, commons_page_id, file_title FROM images "
+            "WHERE project_id = %s AND bootstrapped = 0 AND prefilter_checked_at IS NULL "
+            "ORDER BY id LIMIT %s",
+            (project_id, LIFTWING_MAX_IMAGES),
+            fetch=True,
+        )
+    except DatabaseError:
+        logger.exception(f"Pre-filter: could not load unchecked images for project {project_id}")
+        return 0
+    rows = list(rows or [])
+    if not rows:
+        return 0
+
+    client = liftwing_client.get_client()
+    checked = 0
+    failed = False
+    for start in range(0, len(rows), LIFTWING_BATCH_SIZE):
+        if shutdown_requested:
+            break
+        batch = rows[start : start + LIFTWING_BATCH_SIZE]
+        metadata = _fetch_metadata([row["file_title"] for row in batch])
+        if not metadata:
+            logger.warning(f"Pre-filter: no metadata for {len(batch)} image(s); leaving them unchecked")
+            break
+
+        items = []
+        for row in batch:
+            info = metadata.get(row["file_title"], {})
+            items.append(
+                liftwing_client.MetadataItem(
+                    page_id=int(row["commons_page_id"]),
+                    title=row["file_title"],
+                    description=info.get("description", ""),
+                    categories=info.get("categories", ()),
+                    mime=info.get("mime", ""),
+                )
+            )
+
+        t0 = time.monotonic()
+        verdicts = client.filter_metadata(items)
+        elapsed = time.monotonic() - t0
+        if verdicts is None:
+            failed = True
+            logger.warning(f"Pre-filter: LiftWing returned no verdicts for {len(batch)} image(s) in {elapsed:.1f}s")
+            _record_liftwing_failure("pre-filter request failed (see worker log)")
+            break  # fail open: keep everything and retry on a later cycle
+        logger.info(f"Pre-filter: LiftWing batch of {len(batch)} in {elapsed:.1f}s")
+
+        updates: list[tuple[int, str | None, int]] = []
+        for row in batch:
+            verdict = verdicts.get(int(row["commons_page_id"]))
+            keep = True if verdict is None else verdict.keep
+            reason = None if verdict is None or not verdict.reason else verdict.reason
+            updates.append((1 if keep else 0, reason, row["id"]))
+        try:
+            _store_prefilter_verdicts(updates)
+        except DatabaseError:
+            logger.exception(f"Pre-filter: could not store verdicts for project {project_id}")
+            break
+        checked += len(batch)
+
+    if checked and not failed:
+        _record_liftwing_success()
+    if checked:
+        logger.info(f"Pre-filter (shadow): recorded LiftWing verdicts for {checked} image(s) in project {project_id}")
+    return checked
+
+
 def run_autonomous_inference(project: dict[str, Any]) -> int:
     """
     Run model inference on unclassified faces based on confirmed faces.
@@ -1286,7 +1568,7 @@ def run_autonomous_inference(project: dict[str, Any]) -> int:
     ...     if "COUNT(*) AS cnt" in sql:
     ...         return [{"cnt": 0}]
     ...     # Simulate existing confirmed encodings for the second query.
-    ...     if "SELECT f.encoding FROM faces f" in sql:
+    ...     if "f.encoding FROM faces f" in sql:
     ...         return [{"encoding": b"fake-encoding"}]
     ...     return []
     >>> try:
@@ -1322,13 +1604,15 @@ def run_autonomous_inference(project: dict[str, Any]) -> int:
     logger.info(f"Running autonomous inference for project {project['id']} ({human_confirmed} human-confirmed faces)")
 
     # Get confirmed faces
+    # Only embeddings from the current model are comparable with each other.
     confirmed_rows = execute_query(
         """
-        SELECT f.encoding FROM faces f
+        SELECT f.id, f.encoding FROM faces f
         JOIN images i ON f.image_id = i.id
         WHERE i.project_id = %s AND f.is_target = 1 AND f.superseded_by IS NULL
+          AND f.embedding_model = %s
         """,
-        (project["id"],),
+        (project["id"], face_client.EXPECTED_MODEL_ID),
         fetch=True,
     )
 
@@ -1337,22 +1621,29 @@ def run_autonomous_inference(project: dict[str, Any]) -> int:
 
     t_query = time.monotonic()
 
-    # Load all confirmed encodings to compute centroid. Each encoding is 128 float64
-    # values (1024 bytes). Even 10K confirmed faces = ~10 MB — well within Toolforge
+    # Load all confirmed embeddings to compute the centroid. Each is 512 float32
+    # values (2048 bytes). Even 10K confirmed faces = ~20 MB — well within Toolforge
     # memory limits. Batching would add complexity with no practical benefit.
-    confirmed_encodings = []
+    confirmed_embeddings = []
     for row in confirmed_rows:
-        validated = _validate_encoding(row["encoding"], row.get("id", "confirmed"))
+        validated = _load_embedding(row["encoding"], face_client.EMBEDDING_DIM, row.get("id", "confirmed"))
         if validated is None:
             continue
-        confirmed_encodings.append(validated)
+        confirmed_embeddings.append(validated)
 
-    if not confirmed_encodings:
-        logger.warning(f"Project {project['id']}: all confirmed encodings invalid, skipping inference")
+    if not confirmed_embeddings:
+        logger.warning(f"Project {project['id']}: all confirmed embeddings invalid, skipping inference")
         return 0
 
     try:
-        centroid = np.mean(confirmed_encodings, axis=0)
+        # Mean of unit vectors, renormalised: the centroid must itself be a unit
+        # vector for the cosine distance in _face_distance to be a dot product.
+        centroid = np.mean(confirmed_embeddings, axis=0)
+        centroid_norm = float(np.linalg.norm(centroid))
+        if centroid_norm < 1e-6:
+            logger.warning(f"Project {project['id']}: confirmed embeddings cancel out (norm {centroid_norm}), skipping")
+            return 0
+        centroid = centroid / centroid_norm
     except Exception:
         logger.exception(f"Project {project['id']}: failed to compute centroid")
         return 0
@@ -1372,18 +1663,19 @@ def run_autonomous_inference(project: dict[str, Any]) -> int:
           AND f.is_target IS NULL
           AND f.superseded_by IS NULL
           AND f.classified_by_user_id IS NULL
+          AND f.embedding_model = %s
         """,
-        (project["id"],),
+        (project["id"], face_client.EXPECTED_MODEL_ID),
         fetch=True,
     )
 
     candidate_count = len(unclassified_rows) if unclassified_rows else 0
     logger.info(
-        f"Project {project['id']}: {candidate_count} candidate faces for inference (non-bootstrap, no human edits)"
+        f"Project {project['id']}: {candidate_count} candidate faces for inference (unclassified, no human edits)"
     )
 
     classified_count = 0
-    threshold = project.get("distance_threshold", 0.6)
+    threshold = project.get("distance_threshold", DEFAULT_DISTANCE_THRESHOLD)
 
     # Compute all classifications in memory first (pure numpy, very fast),
     # then batch-UPDATE in chunks to minimize DB round-trips.
@@ -1398,10 +1690,10 @@ def run_autonomous_inference(project: dict[str, Any]) -> int:
         if shutdown_requested:
             break
 
-        encoding = _validate_encoding(row["encoding"], row["id"])
-        if encoding is None:
+        embedding = _load_embedding(row["encoding"], face_client.EMBEDDING_DIM, row["id"])
+        if embedding is None:
             continue
-        distance = _face_distance(centroid, encoding)
+        distance = _face_distance(centroid, embedding)
         face_distances.append((row["id"], row["image_id"], float(distance)))
 
     # Phase 2: per-image dedup — only the closest face below threshold is a match;
@@ -2479,6 +2771,27 @@ def _infer_and_release(project: dict[str, Any]) -> int:
         _release_project(project["id"])
 
 
+def _run_new_inference_projects(max_count: int = 1) -> int:
+    """Claim and run up to ``max_count`` inference-eligible projects inline.
+
+    Called from the wake handler and the 60 s heartbeat checks of the running
+    loops, so a project whose classifications just crossed ``min_confirmed``
+    does not have to wait for the next cycle while active projects hold the
+    executor slots.  Inference is seconds of numpy plus one batched UPDATE, so
+    running it inline keeps the project page's "within the next minute" promise.
+    Returns the number of projects classified.
+    """
+    classified_projects = 0
+    for project in _claim_inference_projects(max_count):
+        try:
+            classified = _infer_and_release(project)
+            classified_projects += 1
+            logger.info(f"Inference classified {classified} faces for project {project['id']}")
+        except Exception:
+            logger.exception(f"Inline inference failed for project {project['id']}")
+    return classified_projects
+
+
 def process_project(project: dict[str, Any], *, skip_discovery: bool = False) -> None:
     """Orchestrate all phases for a single project.
 
@@ -2575,6 +2888,16 @@ def process_project(project: dict[str, Any], *, skip_discovery: bool = False) ->
             if not _is_still_active():
                 break
         t_images = time.monotonic() - t0
+
+        # 3a. Experimental LiftWing metadata pre-filter (shadow mode: verdicts are
+        #     recorded for an offline readout and change no behaviour). Runs after
+        #     detection on purpose: verdicts are metadata-only, and selecting
+        #     already-processed images too means a backlog larger than one
+        #     cycle's cap is fully covered over time. (An eventual `enforce`
+        #     mode must instead select pending images and run *before* this
+        #     loop, so drops happen before any download.)
+        if not shutdown_requested and _is_still_active():
+            prefilter_images(project)
 
         # 3b. Auto-complete if no faces or insufficient faces detected
         if not shutdown_requested and _is_still_active():
@@ -2689,6 +3012,110 @@ def signal_handler(signum, frame):
     shutdown_requested = True
 
 
+def _check_face_service_model() -> None:
+    """Refuse to run against a face service that produces a different embedding.
+
+    Readiness says nothing about *which* embedding the service returns. Storing
+    vectors from the wrong model would corrupt every project, so a definite
+    mismatch stops the worker (exit 1); anything transient is only logged and
+    retried, because the service may still be starting.
+    """
+    try:
+        service_model, service_dim = face_client.check_service_model()
+        logger.info("Face service embedding model: %s (dim=%d)", service_model, service_dim)
+    except FaceServiceModelMismatch as e:
+        logger.critical(f"Face service runs a different embedding model than this worker expects: {e}")
+        sys.exit(1)
+    except FaceServiceError as e:
+        logger.warning(f"Could not verify the face service's embedding model at startup: {e}")
+
+
+def _record_liftwing_failure(error: str | None) -> None:
+    """Record one failed LiftWing call; flip to 'down' at ``LIFTWING_FAIL_THRESHOLD``.
+
+    Used for both probe failures and pre-filter request failures, so the banner
+    reflects what real completions experience, not just what the probe sees.
+    Hysteresis: one slow reply must not flap the banner, so 'down' needs
+    consecutive failures, and a single success flips it back (see
+    ``_probe_liftwing_if_due`` and ``_record_liftwing_success``).
+    """
+    rows = execute_query("SELECT status, consecutive_failures FROM service_status WHERE name = 'liftwing'", fetch=True)
+    if not rows:
+        return
+    failures = int(rows[0]["consecutive_failures"]) + 1
+    status = "down" if failures >= LIFTWING_FAIL_THRESHOLD else rows[0]["status"]
+    execute_query(
+        "UPDATE service_status SET status = %s, consecutive_failures = %s, last_error = %s WHERE name = 'liftwing'",
+        (status, failures, (error or "")[:255] or None),
+        fetch=False,
+    )
+    if status == "down":
+        logger.warning(f"LiftWing marked down after {failures} consecutive failures: {error}")
+    else:
+        logger.info(f"LiftWing failure ({failures}/{LIFTWING_FAIL_THRESHOLD}): {error}")
+
+
+def _record_liftwing_success() -> None:
+    """Record one successful real LiftWing call: clear failures, mark it up.
+
+    Called by the pre-filter after a stored batch, so a working service flips
+    the banner back without waiting for the next probe.
+    """
+    try:
+        execute_query(
+            "UPDATE service_status SET status = 'up', consecutive_failures = 0, "
+            "last_ok = NOW(), last_error = NULL WHERE name = 'liftwing'",
+            fetch=False,
+        )
+    except DatabaseError:
+        logger.debug("LiftWing success update skipped: database error")
+
+
+def _probe_liftwing_if_due() -> None:
+    """Probe LiftWing at most once per interval, across all worker instances.
+
+    Only runs while at least one non-deleted project has the pre-filter on, so
+    nothing calls LiftWing while the experiment is unused. The claim is a
+    single atomic UPDATE on ``service_status``: whichever worker gets rowcount 1
+    probes, so two workers cannot probe at once. Errors are swallowed — a probe
+    must never take the main loop down.
+    """
+    if LIFTWING_PROBE_INTERVAL <= 0:
+        return
+    try:
+        in_use = execute_query(
+            "SELECT COUNT(*) AS cnt FROM projects WHERE status != 'deleted' AND prefilter_mode != 'off'",
+            fetch=True,
+        )
+        if not in_use or not in_use[0]["cnt"]:
+            return
+
+        claimed = execute_query(
+            "UPDATE service_status SET last_checked = NOW() "
+            "WHERE name = 'liftwing' "
+            "AND (last_checked IS NULL OR last_checked < NOW() - INTERVAL %s SECOND)",
+            (LIFTWING_PROBE_INTERVAL,),
+            fetch=False,
+        )
+        if not claimed:
+            return
+
+        up, error = liftwing_client.get_client().probe()
+        if up:
+            execute_query(
+                "UPDATE service_status SET status = 'up', consecutive_failures = 0, "
+                "last_ok = NOW(), last_error = NULL WHERE name = 'liftwing'",
+                fetch=False,
+            )
+            logger.info("LiftWing probe: up")
+        else:
+            _record_liftwing_failure(error)
+    except DatabaseError:
+        logger.debug("LiftWing probe skipped: database error")
+    except Exception:
+        logger.exception("LiftWing probe failed unexpectedly")
+
+
 def main():
     """Main worker loop with distributed locking for concurrent multi-instance processing."""
     global _worker_id
@@ -2737,6 +3164,7 @@ def main():
     # every poll cycle anyway.
     if face_client.is_healthy():
         logger.info("Face service ready at %s (model=%s)", face_client.FACE_SERVICE_URL, face_client.FACE_SERVICE_MODEL)
+        _check_face_service_model()
     else:
         logger.warning(
             "Face service not ready at %s (model=%s) — image processing will retry each poll cycle. "
@@ -2778,6 +3206,7 @@ def main():
                     fetch=False,
                 )
                 _touch_heartbeat_file()
+                _probe_liftwing_if_due()
 
                 # ---- Purge soft-deleted projects FIRST (quick, unblocks re-creation) ----
                 try:
@@ -2817,20 +3246,100 @@ def main():
                 # ---- Claim active projects (atomic, distributed-safe) ----
                 active_projects = _claim_active_projects(MAX_CONCURRENT_PROJECTS)
 
-                # ---- Claim inference-eligible projects (skip those we already claimed above) ----
+                # ---- Inference-eligible projects are claimed in the drain loop below ----
                 active_ids = {p["id"] for p in active_projects}
-                inference_projects = _claim_inference_projects(MAX_CONCURRENT_PROJECTS)
-                inference_only = [p for p in inference_projects if p["id"] not in active_ids]
 
-                logger.info(f"Poll: claimed {len(active_projects)} active, {len(inference_only)} inference-only")
+                logger.info(f"Poll: claimed {len(active_projects)} active project(s)")
+
+                seen_ids = set()
+
+                # Drain the inference queue FIRST. Inference is a few seconds of numpy
+                # plus one batched UPDATE per project, whereas an active project can hold
+                # all slots for a long time looping through its image backlog. With the
+                # old order (a single inference batch per cycle, run after the active
+                # batch) a project whose classifications had just crossed min_confirmed
+                # sat behind that backlog while its page said "Model inference in
+                # progress" the whole time. Keep claiming until no unseen eligible
+                # project remains; `seen_ids` guarantees termination when a project stays
+                # eligible because some of its faces have unusable encodings.
+                while not shutdown_requested:
+                    claimed = _claim_inference_projects(MAX_CONCURRENT_PROJECTS)
+                    inference_only = [p for p in claimed if p["id"] not in active_ids and p["id"] not in seen_ids]
+                    run_ids = {p["id"] for p in inference_only}
+                    # Release claims we will not run (already processed this cycle, or
+                    # covered by the active pipeline) instead of holding them until the
+                    # claim expiry.
+                    for project in claimed:
+                        if project["id"] not in run_ids and project["id"] not in active_ids:
+                            _release_project(project["id"])
+                    if not inference_only:
+                        break
+
+                    with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_PROJECTS) as executor:
+                        futures = {}
+                        for project in inference_only:
+                            if shutdown_requested:
+                                break
+                            seen_ids.add(project["id"])
+                            logger.info(
+                                f"Running inference-only for project {project['id']} (status={project.get('status')})"
+                            )
+                            future = executor.submit(_infer_and_release, project)
+                            futures[future] = project["id"]
+
+                        last_heartbeat_inf = time.time()
+                        last_sdc_check_inf = time.time()
+                        while futures:
+                            if shutdown_requested:
+                                break
+
+                            # Refresh heartbeat + claims during inference
+                            if time.time() - last_heartbeat_inf >= 60:
+                                try:
+                                    execute_query(
+                                        "REPLACE INTO worker_heartbeat (id, last_seen) VALUES (1, NOW())",
+                                        fetch=False,
+                                    )
+                                    _touch_heartbeat_file()
+                                except Exception:
+                                    pass
+                                _refresh_claims()
+                                _probe_liftwing_if_due()
+                                _run_new_inference_projects(1)
+                                last_heartbeat_inf = time.time()
+
+                            # Check for wake-up signal during inference
+                            if os.path.exists(WAKE_FILE_PATH):
+                                try:
+                                    os.remove(WAKE_FILE_PATH)
+                                except OSError:
+                                    pass
+                                _process_sdc_writes()
+                                last_sdc_check_inf = time.time()
+                                # Pick up any project that just became inference-ready.
+                                _run_new_inference_projects(1)
+
+                            # Periodic SDC check (works across pods where wake file doesn't)
+                            if time.time() - last_sdc_check_inf >= 10:
+                                _process_sdc_writes()
+                                last_sdc_check_inf = time.time()
+
+                            done = {f for f in futures if f.done()}
+                            if not done:
+                                time.sleep(1)
+                                continue
+
+                            for future in done:
+                                project_id = futures.pop(future)
+                                try:
+                                    classified = future.result()
+                                    logger.info(f"Inference classified {classified} faces for project {project_id}")
+                                except Exception as e:
+                                    logger.error(f"Inference failed for project {project_id}: {e}")
 
                 # Process active projects concurrently (claims released in wrapper).
                 # Each thread handles its own discovery (traverse_category + bootstrap)
                 # so all claimed projects start working immediately — no serial bottleneck.
-                #
-                # A dedicated single-thread executor (sdc_executor) handles SDC writes so
-                # they never block the main thread's heartbeat refresh or result processing.
-                seen_ids = set()
                 if active_projects:
                     with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_PROJECTS) as executor:
                         futures = {}
@@ -2858,6 +3367,8 @@ def main():
                                 except Exception:
                                     pass
                                 _refresh_claims()
+                                _probe_liftwing_if_due()
+                                _run_new_inference_projects(1)
                                 last_heartbeat = time.time()
 
                             # Check for wake-up signal every iteration (even if no futures done)
@@ -2887,6 +3398,11 @@ def main():
                                             future = executor.submit(_process_and_release, project)
                                             futures[future] = project["id"]
 
+                                # A classification can make a project inference-ready
+                                # even when all slots are busy; inference is cheap, so
+                                # run it inline instead of waiting for the next cycle.
+                                _run_new_inference_projects(1)
+
                             # Periodic SDC check (works across pods where wake file doesn't)
                             if time.time() - last_sdc_check >= 10:
                                 _process_sdc_writes()
@@ -2903,65 +3419,6 @@ def main():
                                     future.result()
                                 except Exception as e:
                                     logger.error(f"Project {project_id} processing failed: {e}")
-
-                # Run inference for eligible projects not already processed (claims released in wrapper)
-                if inference_only:
-                    with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_PROJECTS) as executor:
-                        futures = {}
-                        for project in inference_only:
-                            if shutdown_requested:
-                                break
-                            logger.info(
-                                f"Running inference-only for project {project['id']} (status={project.get('status')})"
-                            )
-                            future = executor.submit(_infer_and_release, project)
-                            futures[future] = project["id"]
-
-                        last_heartbeat_inf = time.time()
-                        last_sdc_check_inf = time.time()
-                        while futures:
-                            if shutdown_requested:
-                                break
-
-                            # Refresh heartbeat + claims during inference
-                            if time.time() - last_heartbeat_inf >= 60:
-                                try:
-                                    execute_query(
-                                        "REPLACE INTO worker_heartbeat (id, last_seen) VALUES (1, NOW())",
-                                        fetch=False,
-                                    )
-                                    _touch_heartbeat_file()
-                                except Exception:
-                                    pass
-                                _refresh_claims()
-                                last_heartbeat_inf = time.time()
-
-                            # Check for wake-up signal during inference
-                            if os.path.exists(WAKE_FILE_PATH):
-                                try:
-                                    os.remove(WAKE_FILE_PATH)
-                                except OSError:
-                                    pass
-                                _process_sdc_writes()
-                                last_sdc_check_inf = time.time()
-
-                            # Periodic SDC check (works across pods where wake file doesn't)
-                            if time.time() - last_sdc_check_inf >= 10:
-                                _process_sdc_writes()
-                                last_sdc_check_inf = time.time()
-
-                            done = {f for f in futures if f.done()}
-                            if not done:
-                                time.sleep(1)
-                                continue
-
-                            for future in done:
-                                project_id = futures.pop(future)
-                                try:
-                                    classified = future.result()
-                                    logger.info(f"Inference classified {classified} faces for project {project_id}")
-                                except Exception as e:
-                                    logger.error(f"Inference failed for project {project_id}: {e}")
 
                 # Add random jitter (0–15s) so multiple workers desynchronize
                 # and don't all race to claim the same projects every cycle.
@@ -2995,6 +3452,7 @@ def main():
         logger.info("Worker %s shutting down, releasing claims and closing resources.", _worker_id)
         _release_all_claims()
         face_client.reset_session()
+        liftwing_client.reset_client()
         close_pool()
 
 

@@ -12,6 +12,7 @@ import pytest
 import requests
 
 import face_client
+import liftwing_client
 
 with patch("database.init_db"):
     import worker as _worker_module
@@ -19,14 +20,20 @@ with patch("database.init_db"):
         _claim_active_projects,
         _claim_inference_projects,
         _claim_sdc_projects,
+        _fetch_metadata,
         _infer_and_release,
+        _plain_text,
+        _probe_liftwing_if_due,
         _process_and_release,
         _process_image_wave,
+        _record_liftwing_failure,
         _refresh_claims,
         _release_all_claims,
         _release_project,
+        _run_new_inference_projects,
         _touch_heartbeat_file,
         bootstrap_from_sparql,
+        prefilter_images,
         process_images,
         process_project,
         run_autonomous_inference,
@@ -36,9 +43,19 @@ with patch("database.init_db"):
 _handle_detection_failure = _worker_module._handle_detection_failure
 
 
-def _make_encoding(seed: int) -> bytes:
+def _make_embedding(seed: int, dim: int = 512) -> bytes:
     rng = np.random.default_rng(seed)
-    return rng.random(128).astype(np.float64).tobytes()
+    vector = rng.standard_normal(dim).astype("<f4")
+    vector /= np.linalg.norm(vector)
+    return vector.tobytes()
+
+
+MODEL_ID = face_client.EXPECTED_MODEL_ID
+DIM = face_client.EMBEDDING_DIM
+
+
+def _detection_result(width: int, height: int, faces: list) -> face_client.DetectionResult:
+    return face_client.DetectionResult(width=width, height=height, faces=faces, model_id=MODEL_ID, dim=DIM)
 
 
 def _extract_update_maps(
@@ -76,18 +93,18 @@ def test_inference_skips_below_min_confirmed():
 def test_inference_single_face_per_image():
     project = {"id": 11, "min_confirmed": 5, "distance_threshold": 0.6}
 
-    confirmed_rows = [{"encoding": _make_encoding(i)} for i in range(5)]
+    confirmed_rows = [{"encoding": _make_embedding(i)} for i in range(5)]
     unclassified_rows = [
-        {"id": 101, "image_id": 1, "encoding": _make_encoding(101)},
-        {"id": 102, "image_id": 2, "encoding": _make_encoding(102)},
-        {"id": 103, "image_id": 3, "encoding": _make_encoding(103)},
+        {"id": 101, "image_id": 1, "encoding": _make_embedding(101)},
+        {"id": 102, "image_id": 2, "encoding": _make_embedding(102)},
+        {"id": 103, "image_id": 3, "encoding": _make_embedding(103)},
     ]
     update_params: list[tuple] = []
 
     def mock_execute_query(sql, params=None, fetch=True):
         if "SELECT COUNT(*) AS cnt FROM faces f" in sql:
             return [{"cnt": 5}]
-        if "SELECT f.encoding FROM faces f" in sql and "f.is_target = 1" in sql:
+        if "SELECT f.id, f.encoding FROM faces f" in sql and "f.is_target = 1" in sql:
             return confirmed_rows
         if "SELECT f.id, f.image_id, f.encoding FROM faces f" in sql:
             return unclassified_rows
@@ -121,18 +138,18 @@ def test_inference_single_face_per_image():
 def test_inference_multi_face_dedup():
     project = {"id": 12, "min_confirmed": 5, "distance_threshold": 0.6}
 
-    confirmed_rows = [{"encoding": _make_encoding(i)} for i in range(5)]
+    confirmed_rows = [{"encoding": _make_embedding(i)} for i in range(5)]
     unclassified_rows = [
-        {"id": 201, "image_id": 1, "encoding": _make_encoding(201)},
-        {"id": 202, "image_id": 1, "encoding": _make_encoding(202)},
-        {"id": 203, "image_id": 2, "encoding": _make_encoding(203)},
+        {"id": 201, "image_id": 1, "encoding": _make_embedding(201)},
+        {"id": 202, "image_id": 1, "encoding": _make_embedding(202)},
+        {"id": 203, "image_id": 2, "encoding": _make_embedding(203)},
     ]
     update_params: list[tuple] = []
 
     def mock_execute_query(sql, params=None, fetch=True):
         if "SELECT COUNT(*) AS cnt FROM faces f" in sql:
             return [{"cnt": 5}]
-        if "SELECT f.encoding FROM faces f" in sql and "f.is_target = 1" in sql:
+        if "SELECT f.id, f.encoding FROM faces f" in sql and "f.is_target = 1" in sql:
             return confirmed_rows
         if "SELECT f.id, f.image_id, f.encoding FROM faces f" in sql:
             return unclassified_rows
@@ -162,17 +179,17 @@ def test_inference_multi_face_dedup():
 def test_inference_multi_face_all_above_threshold():
     project = {"id": 13, "min_confirmed": 5, "distance_threshold": 0.6}
 
-    confirmed_rows = [{"encoding": _make_encoding(i)} for i in range(5)]
+    confirmed_rows = [{"encoding": _make_embedding(i)} for i in range(5)]
     unclassified_rows = [
-        {"id": 301, "image_id": 1, "encoding": _make_encoding(301)},
-        {"id": 302, "image_id": 1, "encoding": _make_encoding(302)},
+        {"id": 301, "image_id": 1, "encoding": _make_embedding(301)},
+        {"id": 302, "image_id": 1, "encoding": _make_embedding(302)},
     ]
     update_params: list[tuple] = []
 
     def mock_execute_query(sql, params=None, fetch=True):
         if "SELECT COUNT(*) AS cnt FROM faces f" in sql:
             return [{"cnt": 5}]
-        if "SELECT f.encoding FROM faces f" in sql and "f.is_target = 1" in sql:
+        if "SELECT f.id, f.encoding FROM faces f" in sql and "f.is_target = 1" in sql:
             return confirmed_rows
         if "SELECT f.id, f.image_id, f.encoding FROM faces f" in sql:
             return unclassified_rows
@@ -199,18 +216,18 @@ def test_inference_multi_face_all_above_threshold():
 def test_inference_returns_classified_count():
     project = {"id": 14, "min_confirmed": 5, "distance_threshold": 0.6}
 
-    confirmed_rows = [{"encoding": _make_encoding(i)} for i in range(5)]
+    confirmed_rows = [{"encoding": _make_embedding(i)} for i in range(5)]
     unclassified_rows = [
-        {"id": 401, "image_id": 1, "encoding": _make_encoding(401)},
-        {"id": 402, "image_id": 1, "encoding": _make_encoding(402)},
-        {"id": 403, "image_id": 2, "encoding": _make_encoding(403)},
-        {"id": 404, "image_id": 3, "encoding": _make_encoding(404)},
+        {"id": 401, "image_id": 1, "encoding": _make_embedding(401)},
+        {"id": 402, "image_id": 1, "encoding": _make_embedding(402)},
+        {"id": 403, "image_id": 2, "encoding": _make_embedding(403)},
+        {"id": 404, "image_id": 3, "encoding": _make_embedding(404)},
     ]
 
     def mock_execute_query(sql, params=None, fetch=True):
         if "SELECT COUNT(*) AS cnt FROM faces f" in sql:
             return [{"cnt": 5}]
-        if "SELECT f.encoding FROM faces f" in sql and "f.is_target = 1" in sql:
+        if "SELECT f.id, f.encoding FROM faces f" in sql and "f.is_target = 1" in sql:
             return confirmed_rows
         if "SELECT f.id, f.image_id, f.encoding FROM faces f" in sql:
             return unclassified_rows
@@ -231,8 +248,8 @@ def test_inference_returns_classified_count():
 def test_process_image_wave_bootstrapped_single_face_auto_classifies():
     """Single-face bootstrapped image should auto-classify as target, set sdc_written=1, and increment faces_confirmed."""
     fake_location = (10, 110, 110, 10)
-    fake_encoding = _make_encoding(1)
-    detection_result = face_client.DetectionResult(
+    fake_encoding = _make_embedding(1)
+    detection_result = _detection_result(
         width=800,
         height=600,
         faces=[face_client.DetectedFace(*fake_location, encoding=fake_encoding)],
@@ -272,8 +289,8 @@ def test_process_image_wave_bootstrapped_single_face_auto_classifies():
 def test_process_image_wave_bootstrapped_multi_face_no_auto_classify():
     """Multi-face bootstrapped image should NOT trigger auto-classify or faces_confirmed update."""
     fake_locations = [(10, 110, 110, 10), (200, 310, 310, 200)]
-    fake_encodings = [_make_encoding(2), _make_encoding(3)]
-    detection_result = face_client.DetectionResult(
+    fake_encodings = [_make_embedding(2), _make_embedding(3)]
+    detection_result = _detection_result(
         width=800,
         height=600,
         faces=[
@@ -303,8 +320,8 @@ def test_process_image_wave_bootstrapped_multi_face_no_auto_classify():
 def test_process_image_wave_non_bootstrapped_no_auto_classify():
     """Non-bootstrapped single-face image should NOT trigger auto-classify or faces_confirmed update."""
     fake_location = (10, 110, 110, 10)
-    fake_encoding = _make_encoding(4)
-    detection_result = face_client.DetectionResult(
+    fake_encoding = _make_embedding(4)
+    detection_result = _detection_result(
         width=800,
         height=600,
         faces=[face_client.DetectedFace(*fake_location, encoding=fake_encoding)],
@@ -358,10 +375,10 @@ def test_process_images_prioritises_non_bootstrap():
         persisted.append((img_id, bootstrapped, len(result.faces), project_id))
         return True
 
-    detect_result = face_client.DetectionResult(
+    detect_result = _detection_result(
         width=100,
         height=80,
-        faces=[face_client.DetectedFace(1, 2, 3, 4, encoding=_make_encoding(10))],
+        faces=[face_client.DetectedFace(1, 2, 3, 4, encoding=_make_embedding(10))],
     )
 
     with (
@@ -417,9 +434,9 @@ def test_process_images_caps_bootstrap_when_already_processed():
 
 
 try:
-    from conftest import _make_encoding
+    from conftest import _make_embedding
 except ModuleNotFoundError:
-    from tests.conftest import _make_encoding
+    from tests.conftest import _make_embedding
 
 
 @pytest.mark.integration
@@ -434,9 +451,9 @@ def test_inference_with_real_db_skips_below_min_confirmed(db_pool, db_conn, seed
 
         for idx in range(3):
             cur.execute(
-                "INSERT INTO faces (image_id, encoding, bbox_top, bbox_right, bbox_bottom, bbox_left, is_target, classified_by, classified_by_user_id) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
-                (image_id, _make_encoding(idx), 50, 200, 200, 50, 1, "human", seed_user["id"]),
+                "INSERT INTO faces (image_id, encoding, embedding_model, bbox_top, bbox_right, bbox_bottom, bbox_left, is_target, classified_by, classified_by_user_id) "
+                "VALUES (%s, %s, 'scrfd500m+arcface_mbf', %s, %s, %s, %s, %s, %s, %s)",
+                (image_id, _make_embedding(idx), 50, 200, 200, 50, 1, "human", seed_user["id"]),
             )
 
     project = {"id": seed_project["id"], "min_confirmed": 5, "distance_threshold": 0.6}
@@ -487,22 +504,22 @@ def test_inference_with_real_db_respects_threshold(db_pool, db_conn, seed_user, 
     with db_conn.cursor() as cur:
         for img in seed_images:
             cur.execute(
-                "INSERT INTO faces (image_id, encoding, bbox_top, bbox_right, bbox_bottom, bbox_left, is_target, classified_by, classified_by_user_id) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
-                (img["id"], _make_encoding(0), 50, 200, 200, 50, 1, "human", seed_user["id"]),
+                "INSERT INTO faces (image_id, encoding, embedding_model, bbox_top, bbox_right, bbox_bottom, bbox_left, is_target, classified_by, classified_by_user_id) "
+                "VALUES (%s, %s, 'scrfd500m+arcface_mbf', %s, %s, %s, %s, %s, %s, %s)",
+                (img["id"], _make_embedding(0), 50, 200, 200, 50, 1, "human", seed_user["id"]),
             )
 
         cur.execute(
-            "INSERT INTO faces (image_id, encoding, bbox_top, bbox_right, bbox_bottom, bbox_left) "
-            "VALUES (%s, %s, %s, %s, %s, %s)",
-            (seed_images[0]["id"], _make_encoding(0), 100, 300, 300, 100),
+            "INSERT INTO faces (image_id, encoding, embedding_model, bbox_top, bbox_right, bbox_bottom, bbox_left) "
+            "VALUES (%s, %s, 'scrfd500m+arcface_mbf', %s, %s, %s, %s)",
+            (seed_images[0]["id"], _make_embedding(0), 100, 300, 300, 100),
         )
         close_face_id = cur.lastrowid
 
         cur.execute(
-            "INSERT INTO faces (image_id, encoding, bbox_top, bbox_right, bbox_bottom, bbox_left) "
-            "VALUES (%s, %s, %s, %s, %s, %s)",
-            (seed_images[1]["id"], _make_encoding(9999), 120, 320, 320, 120),
+            "INSERT INTO faces (image_id, encoding, embedding_model, bbox_top, bbox_right, bbox_bottom, bbox_left) "
+            "VALUES (%s, %s, 'scrfd500m+arcface_mbf', %s, %s, %s, %s)",
+            (seed_images[1]["id"], _make_embedding(9999), 120, 320, 320, 120),
         )
         far_face_id = cur.lastrowid
 
@@ -527,7 +544,7 @@ def test_inference_with_real_db_respects_threshold(db_pool, db_conn, seed_user, 
 
 
 @pytest.mark.integration
-def test_inference_does_not_touch_bootstrap_images(
+def test_inference_classifies_unclassified_faces_on_bootstrap_images(
     db_pool,
     db_conn,
     seed_project,
@@ -535,6 +552,15 @@ def test_inference_does_not_touch_bootstrap_images(
     seed_faces,
     seed_bootstrap_image,
 ):
+    """Bootstrapped images are inference candidates, by design.
+
+    Bootstrap auto-classifies the single best face (is_target = 1), so in the
+    normal flow that face is never a candidate — candidates require
+    is_target IS NULL. Multi-face bootstrap images still get their remaining
+    faces classified. The original version of this test asserted the opposite;
+    that expectation predates the worker change that deliberately included
+    bootstrapped images so multi-face images are handled.
+    """
     with db_conn.cursor() as cur:
         cur.execute(
             "UPDATE faces SET is_target = NULL, classified_by = NULL, confidence = NULL WHERE id = %s",
@@ -550,8 +576,8 @@ def test_inference_does_not_touch_bootstrap_images(
         cur.execute("SELECT is_target, classified_by FROM faces WHERE id = %s", (seed_bootstrap_image["face_id"],))
         bootstrap_face = cur.fetchone()
 
-    assert bootstrap_face["is_target"] is None
-    assert bootstrap_face["classified_by"] is None
+    assert bootstrap_face["is_target"] is not None
+    assert bootstrap_face["classified_by"] == "model"
 
 
 @pytest.mark.integration
@@ -581,10 +607,10 @@ def test_soft_delete_recreate_no_fk_errors(db_pool, db_conn, seed_user):
     face_ids = []
     for i, img_id in enumerate(img_ids):
         cur.execute(
-            "INSERT INTO faces (image_id, encoding, bbox_top, bbox_right, bbox_bottom, bbox_left, "
+            "INSERT INTO faces (image_id, encoding, embedding_model, bbox_top, bbox_right, bbox_bottom, bbox_left, "
             "is_target, classified_by, classified_by_user_id) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
-            (img_id, _make_encoding(700 + i), 50, 200, 200, 50, 1, "human", seed_user["id"]),
+            "VALUES (%s, %s, 'scrfd500m+arcface_mbf', %s, %s, %s, %s, %s, %s, %s)",
+            (img_id, _make_embedding(700 + i), 50, 200, 200, 50, 1, "human", seed_user["id"]),
         )
         face_ids.append(cur.lastrowid)
 
@@ -624,9 +650,9 @@ def test_soft_delete_recreate_no_fk_errors(db_pool, db_conn, seed_user):
     new_img_id = cur.lastrowid
 
     cur.execute(
-        "INSERT INTO faces (image_id, encoding, bbox_top, bbox_right, bbox_bottom, bbox_left) "
-        "VALUES (%s, %s, %s, %s, %s, %s)",
-        (new_img_id, _make_encoding(800), 50, 200, 200, 50),
+        "INSERT INTO faces (image_id, encoding, embedding_model, bbox_top, bbox_right, bbox_bottom, bbox_left) "
+        "VALUES (%s, %s, 'scrfd500m+arcface_mbf', %s, %s, %s, %s)",
+        (new_img_id, _make_embedding(800), 50, 200, 200, 50),
     )
     new_face_id = cur.lastrowid
 
@@ -882,6 +908,39 @@ def test_infer_and_release_releases_even_on_exception():
             pass
 
     mock_release.assert_called_once_with(21)
+
+
+def test_run_new_inference_projects_claims_and_runs_each_project():
+    """_run_new_inference_projects claims once and runs every claimed project inline."""
+    projects = [{"id": 30}, {"id": 31}]
+
+    with (
+        patch("worker._claim_inference_projects", return_value=projects) as mock_claim,
+        patch("worker._infer_and_release", side_effect=[5, 0]) as mock_infer,
+    ):
+        result = _run_new_inference_projects(2)
+
+    assert result == 2
+    mock_claim.assert_called_once_with(2)
+    assert [call.args[0]["id"] for call in mock_infer.call_args_list] == [30, 31]
+
+
+def test_run_new_inference_projects_handles_empty_and_failed_projects():
+    """No claims means no inference; one failing project does not stop the pass."""
+    with (
+        patch("worker._claim_inference_projects", return_value=[]) as mock_claim,
+        patch("worker._infer_and_release") as mock_infer,
+    ):
+        assert _run_new_inference_projects() == 0
+
+    mock_claim.assert_called_once_with(1)
+    mock_infer.assert_not_called()
+
+    with (
+        patch("worker._claim_inference_projects", return_value=[{"id": 40}, {"id": 41}]),
+        patch("worker._infer_and_release", side_effect=[RuntimeError("boom"), 3]),
+    ):
+        assert _run_new_inference_projects(2) == 1
 
 
 def test_write_sdc_marks_image_bootstrapped_on_idempotency_hit():
@@ -2676,7 +2735,7 @@ def test_process_image_wave_no_faces_no_auto_classify():
         db_calls.append((sql.strip(), params))
         return None
 
-    detection_result = face_client.DetectionResult(width=800, height=600, faces=[])
+    detection_result = _detection_result(width=800, height=600, faces=[])
 
     with (
         patch("worker.execute_query", side_effect=mock_execute_query),
@@ -2692,10 +2751,10 @@ def test_process_image_wave_no_faces_no_auto_classify():
 
 def test_process_image_wave_mixed_success_and_failure():
     """One unusable image in a wave must not stop its siblings being persisted."""
-    good = face_client.DetectionResult(
+    good = _detection_result(
         width=800,
         height=600,
-        faces=[face_client.DetectedFace(10, 110, 110, 10, encoding=_make_encoding(9))],
+        faces=[face_client.DetectedFace(10, 110, 110, 10, encoding=_make_embedding(9))],
     )
     batch = {
         "1": good,
@@ -2995,15 +3054,15 @@ def test_inference_skips_invalid_confirmed_encodings():
 
     confirmed_rows = [
         {"encoding": b"short"},  # Invalid: not 1024 bytes
-        {"encoding": _make_encoding(1)},  # Valid
-        {"encoding": _make_encoding(2)},  # Valid
+        {"encoding": _make_embedding(1)},  # Valid
+        {"encoding": _make_embedding(2)},  # Valid
     ]
     unclassified_rows = []
 
     def mock_execute_query(sql, params=None, fetch=True):
         if "SELECT COUNT(*) AS cnt FROM faces f" in sql:
             return [{"cnt": 2}]
-        if "SELECT f.encoding FROM faces f" in sql and "f.is_target = 1" in sql:
+        if "SELECT f.id, f.encoding FROM faces f" in sql and "f.is_target = 1" in sql:
             return confirmed_rows
         if "SELECT f.id, f.image_id, f.encoding FROM faces f" in sql:
             return unclassified_rows
@@ -3033,7 +3092,7 @@ def test_inference_all_confirmed_encodings_invalid_returns_zero():
     def mock_execute_query(sql, params=None, fetch=True):
         if "SELECT COUNT(*) AS cnt FROM faces f" in sql:
             return [{"cnt": 2}]
-        if "SELECT f.encoding FROM faces f" in sql and "f.is_target = 1" in sql:
+        if "SELECT f.id, f.encoding FROM faces f" in sql and "f.is_target = 1" in sql:
             return confirmed_rows
         return []
 
@@ -3050,17 +3109,17 @@ def test_inference_skips_invalid_candidate_encodings():
     """Candidate faces with invalid encoding lengths are skipped without crashing."""
     project = {"id": 22, "min_confirmed": 2, "distance_threshold": 0.6}
 
-    confirmed_rows = [{"encoding": _make_encoding(i)} for i in range(3)]
+    confirmed_rows = [{"encoding": _make_embedding(i)} for i in range(3)]
     unclassified_rows = [
         {"id": 500, "image_id": 1, "encoding": b"bad"},  # Invalid — should be skipped
-        {"id": 501, "image_id": 2, "encoding": _make_encoding(500)},  # Valid
+        {"id": 501, "image_id": 2, "encoding": _make_embedding(500)},  # Valid
     ]
     update_calls = []
 
     def mock_execute_query(sql, params=None, fetch=True):
         if "SELECT COUNT(*) AS cnt FROM faces f" in sql:
             return [{"cnt": 3}]
-        if "SELECT f.encoding FROM faces f" in sql and "f.is_target = 1" in sql:
+        if "SELECT f.id, f.encoding FROM faces f" in sql and "f.is_target = 1" in sql:
             return confirmed_rows
         if "SELECT f.id, f.image_id, f.encoding FROM faces f" in sql:
             return unclassified_rows
@@ -3225,57 +3284,340 @@ def test_worker_download_image_too_many_redirects_raises():
 
 
 # ---------------------------------------------------------------------------
-# Security: face encoding validation (anti-poisoning)
+# Security: face embedding validation (anti-poisoning)
 # ---------------------------------------------------------------------------
 
 
-def test_validate_encoding_accepts_valid_128d_array():
-    arr = np.linspace(-0.5, 0.5, 128, dtype=np.float64)
-    result = _worker_module._validate_encoding(arr.tobytes(), face_id=1)
+def _unit(seed: int, dim: int = DIM) -> np.ndarray:
+    return np.frombuffer(_make_embedding(seed, dim), dtype="<f4").astype(np.float32)
+
+
+def test_load_embedding_accepts_unit_512d_float32():
+    vec = _unit(1)
+    result = _worker_module._load_embedding(vec.astype("<f4").tobytes(), DIM, face_id=1)
     assert result is not None
-    assert result.shape == (128,)
-    assert np.allclose(result, arr)
-    # Must be writable (np.frombuffer returns read-only views; we .copy())
+    assert result.shape == (DIM,)
+    assert result.dtype == np.float32
+    assert np.allclose(result, vec)
+    # Must be writable (np.frombuffer returns read-only views; we copy)
     assert result.flags.writeable
 
 
-def test_validate_encoding_rejects_none():
-    assert _worker_module._validate_encoding(None, face_id="x") is None
+def test_load_embedding_is_little_endian_on_the_wire():
+    vec = _unit(2)
+    assert np.allclose(_worker_module._load_embedding(vec.astype("<f4").tobytes(), DIM, face_id=1), vec)
+    # The same numbers written big-endian must not be silently accepted as this vector.
+    swapped = _worker_module._load_embedding(vec.astype(">f4").tobytes(), DIM, face_id=1)
+    assert swapped is None or not np.allclose(swapped, vec)
 
 
-def test_validate_encoding_rejects_wrong_length():
-    assert _worker_module._validate_encoding(b"\x00" * 512, face_id=2) is None
-    assert _worker_module._validate_encoding(b"\x00" * 2048, face_id=3) is None
-    assert _worker_module._validate_encoding(b"", face_id=4) is None
+def test_load_embedding_rejects_none():
+    assert _worker_module._load_embedding(None, DIM, face_id="x") is None
 
 
-def test_validate_encoding_rejects_nan():
-    arr = np.zeros(128, dtype=np.float64)
-    arr[42] = np.nan
-    assert _worker_module._validate_encoding(arr.tobytes(), face_id=5) is None
+def test_load_embedding_rejects_wrong_length_including_legacy_dlib_encodings():
+    assert _worker_module._load_embedding(b"\x00" * 1024, DIM, face_id=2) is None  # old 128 x float64
+    assert _worker_module._load_embedding(b"\x00" * 2047, DIM, face_id=3) is None
+    assert _worker_module._load_embedding(b"\x00" * 4096, DIM, face_id=4) is None
+    assert _worker_module._load_embedding(b"", DIM, face_id=5) is None
 
 
-def test_validate_encoding_rejects_inf():
-    arr = np.zeros(128, dtype=np.float64)
-    arr[7] = np.inf
-    assert _worker_module._validate_encoding(arr.tobytes(), face_id=6) is None
-    arr[7] = -np.inf
-    assert _worker_module._validate_encoding(arr.tobytes(), face_id=7) is None
+def test_load_embedding_rejects_nan_and_inf():
+    vec = _unit(3)
+    vec[42] = np.nan
+    assert _worker_module._load_embedding(vec.tobytes(), DIM, face_id=6) is None
+    vec[42] = np.inf
+    assert _worker_module._load_embedding(vec.tobytes(), DIM, face_id=7) is None
+    vec[42] = -np.inf
+    assert _worker_module._load_embedding(vec.tobytes(), DIM, face_id=8) is None
 
 
-def test_validate_encoding_rejects_out_of_range_values():
-    """Encodings outside [-10, 10] are rejected as obviously poisoned."""
-    arr = np.zeros(128, dtype=np.float64)
-    arr[0] = 100.0
-    assert _worker_module._validate_encoding(arr.tobytes(), face_id=8) is None
-    arr[0] = -50.5
-    assert _worker_module._validate_encoding(arr.tobytes(), face_id=9) is None
+@pytest.mark.parametrize("factor", [0.0, 0.5, 0.89, 1.11, 3.0, 100.0])
+def test_load_embedding_rejects_norm_outside_band(factor):
+    vec = _unit(4) * np.float32(factor)
+    assert _worker_module._load_embedding(vec.astype("<f4").tobytes(), DIM, face_id=9) is None
 
 
-def test_validate_encoding_accepts_edge_values():
-    """Boundary values just inside the [-10, 10] bound are accepted."""
-    arr = np.full(128, 9.99, dtype=np.float64)
-    assert _worker_module._validate_encoding(arr.tobytes(), face_id=10) is not None
+@pytest.mark.parametrize("factor", [0.91, 0.95, 1.0, 1.05, 1.09])
+def test_load_embedding_renormalises_values_inside_the_band(factor):
+    vec = _unit(5) * np.float32(factor)
+    result = _worker_module._load_embedding(vec.astype("<f4").tobytes(), DIM, face_id=10)
+    assert result is not None
+    assert np.linalg.norm(result) == pytest.approx(1.0, abs=1e-6)
+
+
+def test_load_embedding_honours_a_different_dim():
+    vec = _unit(6, 64)
+    assert _worker_module._load_embedding(vec.tobytes(), 64, face_id=11) is not None
+    assert _worker_module._load_embedding(vec.tobytes(), DIM, face_id=12) is None
+
+
+# ---------------------------------------------------------------------------
+# Cosine distance, centroid and threshold gating (real math, no patched distance)
+# ---------------------------------------------------------------------------
+
+
+def test_face_distance_is_cosine_distance_of_unit_vectors():
+    a, b = _unit(10), _unit(11)
+    assert _worker_module._face_distance(a, a) == pytest.approx(0.0, abs=1e-6)
+    assert _worker_module._face_distance(a, b) == pytest.approx(1.0 - float(a @ b), abs=1e-6)
+    assert _worker_module._face_distance(a, -a) == pytest.approx(2.0, abs=1e-6)
+
+
+def test_face_distance_never_negative():
+    a = _unit(12)
+    assert _worker_module._face_distance(a, a * np.float32(1.0000001)) >= 0.0
+
+
+def test_face_distance_orders_close_before_far():
+    base = _unit(20)
+    near = base + 0.05 * _unit(21)
+    near /= np.linalg.norm(near)
+    far = _unit(22)
+    assert _worker_module._face_distance(base, near) < _worker_module._face_distance(base, far)
+
+
+def _run_inference_with(project, confirmed, candidates):
+    """Run inference with real distance math; return {face_id: (is_target, confidence)}."""
+    updates: list[tuple] = []
+
+    def mock_execute_query(sql, params=None, fetch=True):
+        if "SELECT COUNT(*) AS cnt FROM faces f" in sql:
+            return [{"cnt": len(confirmed)}]
+        if "SELECT f.id, f.encoding FROM faces f" in sql and "f.is_target = 1" in sql:
+            return [{"id": i, "encoding": blob} for i, blob in enumerate(confirmed)]
+        if "SELECT f.id, f.image_id, f.encoding FROM faces f" in sql:
+            return [{"id": fid, "image_id": img, "encoding": blob} for fid, img, blob in candidates]
+        if "UPDATE faces SET" in sql:
+            updates.append(params)
+            return len(candidates)
+        return 1
+
+    with (
+        patch("worker.execute_query", side_effect=mock_execute_query),
+        patch("worker.shutdown_requested", False),
+    ):
+        run_autonomous_inference(project)
+
+    result = {}
+    for params in updates:
+        is_target_map, confidence_map, _ = _extract_update_maps(params)
+        for fid in is_target_map:
+            result[fid] = (is_target_map[fid], confidence_map[fid])
+    return result
+
+
+def test_inference_uses_renormalised_mean_centroid_and_cosine_threshold():
+    """Same-person vectors (small perturbations of one direction) match; unrelated vectors do not."""
+    person = _unit(30)
+    confirmed = []
+    for i in range(5):
+        v = person + 0.15 * _unit(40 + i)
+        confirmed.append((v / np.linalg.norm(v)).astype("<f4").tobytes())
+    same = person + 0.15 * _unit(60)
+    same /= np.linalg.norm(same)
+    stranger = _unit(70)
+
+    project = {"id": 31, "min_confirmed": 5, "distance_threshold": 0.5}
+    result = _run_inference_with(
+        project,
+        confirmed,
+        [(901, 1, same.astype("<f4").tobytes()), (902, 2, stranger.astype("<f4").tobytes())],
+    )
+
+    assert result[901][0] == 1
+    assert result[901][1] < 0.5
+    assert result[902][0] == 0
+    assert result[902][1] > 0.5
+
+
+def test_inference_threshold_gates_on_strictly_less_than():
+    """A candidate exactly at the threshold is not a match; one just inside is."""
+    person = _unit(80)
+    confirmed = [person.astype("<f4").tobytes()] * 5
+
+    def at_distance(d: float) -> np.ndarray:
+        # unit vector at cosine distance d from `person`
+        other = _unit(81)
+        other -= person * float(other @ person)
+        other /= np.linalg.norm(other)
+        cos = 1.0 - d
+        return (cos * person + np.sqrt(1 - cos**2) * other).astype(np.float32)
+
+    inside, outside = at_distance(0.45), at_distance(0.55)
+    result = _run_inference_with(
+        {"id": 32, "min_confirmed": 5, "distance_threshold": 0.5},
+        confirmed,
+        [(911, 1, inside.tobytes()), (912, 2, outside.tobytes())],
+    )
+
+    assert result[911][0] == 1
+    assert result[911][1] == pytest.approx(0.45, abs=1e-4)
+    assert result[912][0] == 0
+    assert result[912][1] == pytest.approx(0.55, abs=1e-4)
+
+
+def test_inference_keeps_only_the_closest_face_per_image():
+    person = _unit(90)
+    confirmed = [person.astype("<f4").tobytes()] * 5
+    close = (person + 0.05 * _unit(91)) / np.linalg.norm(person + 0.05 * _unit(91))
+    closer = (person + 0.02 * _unit(92)) / np.linalg.norm(person + 0.02 * _unit(92))
+
+    result = _run_inference_with(
+        {"id": 33, "min_confirmed": 5, "distance_threshold": 0.5},
+        confirmed,
+        [(921, 1, close.astype("<f4").tobytes()), (922, 1, closer.astype("<f4").tobytes())],
+    )
+
+    assert result[922][0] == 1
+    assert result[921][0] == 0
+
+
+def test_inference_skips_when_confirmed_embeddings_cancel_out():
+    person = _unit(100)
+    confirmed = [person.astype("<f4").tobytes(), (-person).astype("<f4").tobytes()] * 3
+
+    result = _run_inference_with(
+        {"id": 34, "min_confirmed": 5, "distance_threshold": 0.5},
+        confirmed,
+        [(931, 1, person.astype("<f4").tobytes())],
+    )
+
+    assert result == {}
+
+
+def test_inference_only_reads_embeddings_of_the_expected_model():
+    seen = []
+
+    def mock_execute_query(sql, params=None, fetch=True):
+        if "SELECT COUNT(*) AS cnt FROM faces f" in sql:
+            return [{"cnt": 5}]
+        if "embedding_model = %s" in sql:
+            seen.append(params)
+        return []
+
+    with (
+        patch("worker.execute_query", side_effect=mock_execute_query),
+        patch("worker.shutdown_requested", False),
+    ):
+        run_autonomous_inference({"id": 35, "min_confirmed": 5, "distance_threshold": 0.5})
+
+    assert seen, "confirmed-faces query must filter on embedding_model"
+    assert all(p[1] == face_client.EXPECTED_MODEL_ID for p in seen)
+
+
+def test_inference_default_threshold_is_the_cosine_default():
+    assert _worker_module.DEFAULT_DISTANCE_THRESHOLD == 0.5
+
+
+# ---------------------------------------------------------------------------
+# Mixed detection spaces
+# ---------------------------------------------------------------------------
+
+
+def test_convert_box_is_identity_for_same_space():
+    assert _worker_module._convert_box_to_stored_space((10, 110, 90, 20), (500, 400), (500, 400)) == (10, 110, 90, 20)
+
+
+def test_convert_box_scales_a_960_box_into_a_stored_500_space():
+    # width 960 -> 500, height 720 -> 375: factors 0.5208 / 0.5208
+    top, right, bottom, left = _worker_module._convert_box_to_stored_space((96, 480, 288, 192), (960, 720), (500, 375))
+    assert (top, right, bottom, left) == (50, 250, 150, 100)
+
+
+def test_convert_box_scales_up_and_handles_non_uniform_scale():
+    assert _worker_module._convert_box_to_stored_space((10, 20, 30, 5), (100, 50), (200, 150)) == (30, 40, 90, 10)
+
+
+def test_convert_box_clips_to_stored_space_and_keeps_positive_extent():
+    top, right, bottom, left = _worker_module._convert_box_to_stored_space((0, 10_000, 10_000, 0), (100, 100), (50, 50))
+    assert (top, right, bottom, left) == (0, 50, 50, 0)
+    top, right, bottom, left = _worker_module._convert_box_to_stored_space((10, 10, 10, 10), (100, 100), (50, 50))
+    assert right > left and bottom > top
+
+
+def test_convert_box_rejects_degenerate_sizes():
+    with pytest.raises(ValueError):
+        _worker_module._convert_box_to_stored_space((1, 2, 3, 4), (0, 100), (50, 50))
+    with pytest.raises(ValueError):
+        _worker_module._convert_box_to_stored_space((1, 2, 3, 4), (100, 100), (50, 0))
+
+
+def test_persist_detection_converts_boxes_into_a_stored_space():
+    calls = []
+    result = _detection_result(
+        960, 720, [face_client.DetectedFace(96, 480, 288, 192, encoding=_make_embedding(1), score=0.9)]
+    )
+
+    with patch(
+        "worker.execute_query", side_effect=lambda sql, params=None, fetch=True: calls.append((sql, params)) or 1
+    ):
+        assert _worker_module._persist_detection(7, result, stored_size=(500, 375)) is True
+
+    insert = next(c for c in calls if c[0].startswith("INSERT INTO faces"))
+    assert insert[1][4:] == (50, 250, 150, 100)
+    update = next(c for c in calls if c[0].startswith("UPDATE images SET status = 'processed'"))
+    # The stored detection space is kept, not overwritten by the new image size.
+    assert update[1] == (1, 500, 375, 7)
+
+
+def test_persist_detection_without_stored_space_keeps_boxes_and_records_size():
+    calls = []
+    result = _detection_result(
+        960, 720, [face_client.DetectedFace(96, 480, 288, 192, encoding=_make_embedding(1), score=0.9)]
+    )
+
+    with patch(
+        "worker.execute_query", side_effect=lambda sql, params=None, fetch=True: calls.append((sql, params)) or 1
+    ):
+        assert _worker_module._persist_detection(7, result) is True
+
+    insert = next(c for c in calls if c[0].startswith("INSERT INTO faces"))
+    assert insert[1][4:] == (96, 480, 288, 192)
+    update = next(c for c in calls if c[0].startswith("UPDATE images SET status = 'processed'"))
+    assert update[1] == (1, 960, 720, 7)
+
+
+def test_persist_detection_stores_embedding_model_and_detector_score():
+    calls = []
+    faces = [
+        face_client.DetectedFace(1, 50, 50, 1, encoding=_make_embedding(1), score=0.93),
+        face_client.DetectedFace(60, 90, 90, 60, encoding=_make_embedding(2), score=None),
+    ]
+
+    with patch(
+        "worker.execute_query", side_effect=lambda sql, params=None, fetch=True: calls.append((sql, params)) or 1
+    ):
+        _worker_module._persist_detection(8, _detection_result(100, 100, faces))
+
+    sql, params = next(c for c in calls if c[0].startswith("INSERT INTO faces"))
+    assert "embedding_model" in sql and "det_score" in sql
+    assert sql.count("(%s, %s, %s, %s, %s, %s, %s, %s)") == 2
+    # image_id, encoding, embedding_model, det_score, then the box
+    assert params[:4] == (8, _make_embedding(1), MODEL_ID, 0.93)
+    assert params[8:12] == (8, _make_embedding(2), MODEL_ID, None)
+    assert len(params) == 16
+
+
+def test_detection_url_uses_the_960_thumbnail():
+    assert _worker_module.FILE_PATH_URL.endswith("?width=960")
+    assert _worker_module.FILE_PATH_URL.format(file_title="X.jpg").endswith("/X.jpg?width=960")
+
+
+def test_detection_width_must_be_a_standard_commons_step(monkeypatch):
+    import importlib
+
+    import config
+
+    monkeypatch.setenv("WIKIVISAGE_DETECTION_WIDTH", "1024")
+    try:
+        with pytest.raises(ValueError, match="thumbnail step"):
+            importlib.reload(config)
+        monkeypatch.setenv("WIKIVISAGE_DETECTION_WIDTH", "1280")
+        assert importlib.reload(config).DETECTION_WIDTH == 1280
+    finally:
+        monkeypatch.delenv("WIKIVISAGE_DETECTION_WIDTH", raising=False)
+        importlib.reload(config)
 
 
 @pytest.mark.parametrize(
@@ -3305,3 +3647,550 @@ def test_download_for_detection_marks_permanent_http_errors():
     ):
         assert _worker_module._download_for_detection(1, "File:X.jpg") is None
     mark.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Startup check of the face service's embedding model
+# ---------------------------------------------------------------------------
+
+
+def test_startup_model_check_accepts_the_expected_model(caplog):
+    with (
+        patch("worker.face_client.check_service_model", return_value=(MODEL_ID, DIM)),
+        caplog.at_level("INFO", logger="worker"),
+    ):
+        _worker_module._check_face_service_model()
+
+    assert any(MODEL_ID in rec.getMessage() for rec in caplog.records)
+
+
+def test_startup_model_check_exits_on_a_different_model():
+    err = face_client.FaceServiceModelMismatch("face service model_id is 'other', expected 'scrfd500m+arcface_mbf'")
+    with patch("worker.face_client.check_service_model", side_effect=err), pytest.raises(SystemExit) as exc:
+        _worker_module._check_face_service_model()
+
+    assert exc.value.code == 1
+
+
+@pytest.mark.parametrize(
+    "err",
+    [face_client.FaceServiceUnavailable("connection refused"), face_client.FaceServiceRejected("probe image refused")],
+)
+def test_startup_model_check_only_warns_when_the_service_is_not_answering(err, caplog):
+    with (
+        patch("worker.face_client.check_service_model", side_effect=err),
+        caplog.at_level("WARNING", logger="worker"),
+    ):
+        _worker_module._check_face_service_model()  # must not raise or exit
+
+    assert any("Could not verify" in rec.getMessage() for rec in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Experimental LiftWing metadata pre-filter (Phase 2, shadow mode)
+# ---------------------------------------------------------------------------
+
+
+def test_prefilter_disabled_mode_makes_no_calls():
+    with (
+        patch("worker.execute_query") as mock_db,
+        patch("worker.liftwing_client.get_client") as get_client,
+    ):
+        assert prefilter_images({"id": 1, "prefilter_mode": "off"}) == 0
+
+    mock_db.assert_not_called()
+    get_client.assert_not_called()
+
+
+def test_prefilter_defaults_to_off_when_column_missing():
+    with (
+        patch("worker.execute_query") as mock_db,
+        patch("worker.liftwing_client.get_client") as get_client,
+    ):
+        assert prefilter_images({"id": 1}) == 0
+
+    mock_db.assert_not_called()
+    get_client.assert_not_called()
+
+
+def test_prefilter_skips_when_service_marked_down():
+    def mock_execute_query(sql, params=None, fetch=True):
+        if "SELECT status FROM service_status" in sql:
+            return [{"status": "down"}]
+        raise AssertionError(f"Unexpected query: {sql}")
+
+    with (
+        patch("worker.execute_query", side_effect=mock_execute_query),
+        patch("worker.liftwing_client.get_client") as get_client,
+    ):
+        assert prefilter_images({"id": 1, "prefilter_mode": "shadow"}) == 0
+
+    get_client.assert_not_called()
+
+
+def test_prefilter_records_verdicts_and_keeps_missing_pages():
+    project = {"id": 7, "prefilter_mode": "shadow"}
+    rows = [
+        {"id": 101, "commons_page_id": 501, "file_title": "File:A.jpg"},
+        {"id": 102, "commons_page_id": 502, "file_title": "File:B.svg"},
+        {"id": 103, "commons_page_id": 503, "file_title": "File:C.ogg"},
+    ]
+    stored: list[tuple] = []
+    select_sql: list[str] = []
+    up_updates: list[tuple] = []
+
+    def mock_execute_query(sql, params=None, fetch=True):
+        if "SELECT status FROM service_status" in sql:
+            return [{"status": "up"}]
+        if "SELECT id, commons_page_id, file_title FROM images" in sql:
+            select_sql.append(sql)
+            assert "bootstrapped = 0" in sql
+            assert "prefilter_checked_at IS NULL" in sql
+            # Shadow verdicts are metadata-only: already-processed images are
+            # eligible too, so a backlog is worked off over later cycles (H1).
+            assert "status = 'pending'" not in sql
+            return rows
+        if "SET status = 'up'" in sql:
+            up_updates.append((sql, params))
+            return 1
+        raise AssertionError(f"Unexpected query: {sql}")
+
+    fake_client = MagicMock()
+    fake_client.filter_metadata.return_value = {
+        501: liftwing_client.Verdict(page_id=501, keep=True, reason="portrait"),
+        502: liftwing_client.Verdict(page_id=502, keep=False, reason="diagram"),
+        # 503 is missing: the model omitted it, so it must be kept with a NULL reason
+    }
+    metadata = {
+        "File:A.jpg": {"description": "portrait", "categories": ("Category:X",), "mime": "image/jpeg"},
+        "File:B.svg": {"description": "", "categories": (), "mime": "image/svg+xml"},
+        "File:C.ogg": {"description": "", "categories": (), "mime": "audio/ogg"},
+    }
+
+    with (
+        patch("worker.execute_query", side_effect=mock_execute_query),
+        patch("worker._fetch_metadata", return_value=metadata),
+        patch("worker._store_prefilter_verdicts", side_effect=lambda updates: stored.extend(updates)),
+        patch("worker.liftwing_client.get_client", return_value=fake_client),
+        patch("worker.shutdown_requested", False),
+    ):
+        checked = prefilter_images(project)
+
+    assert checked == 3
+    assert set(stored) == {(1, "portrait", 101), (0, "diagram", 102), (1, None, 103)}
+    assert len(select_sql) == 1
+    # A stored batch is a real success; service_status is updated accordingly (H3).
+    assert len(up_updates) == 1
+
+    items = fake_client.filter_metadata.call_args.args[0]
+    assert [item.page_id for item in items] == [501, 502, 503]
+    assert items[0].description == "portrait"
+    assert items[0].categories == ("Category:X",)
+    assert items[2].mime == "audio/ogg"
+
+
+def test_prefilter_fail_open_when_client_returns_none():
+    rows = [{"id": 201, "commons_page_id": 601, "file_title": "File:A.jpg"}]
+    stored: list[tuple] = []
+    failure_updates: list[tuple] = []
+
+    def mock_execute_query(sql, params=None, fetch=True):
+        if "SELECT status FROM service_status" in sql:
+            return [{"status": "up"}]
+        if "SELECT id, commons_page_id, file_title FROM images" in sql:
+            return rows
+        if sql.startswith("SELECT status, consecutive_failures"):
+            return [{"status": "up", "consecutive_failures": 0}]
+        if sql.startswith("UPDATE service_status SET status = %s"):
+            failure_updates.append(params)
+            return 1
+        raise AssertionError(f"Unexpected query: {sql}")
+
+    fake_client = MagicMock()
+    fake_client.filter_metadata.return_value = None
+
+    with (
+        patch("worker.execute_query", side_effect=mock_execute_query),
+        patch(
+            "worker._fetch_metadata",
+            return_value={"File:A.jpg": {"description": "", "categories": (), "mime": ""}},
+        ),
+        patch("worker._store_prefilter_verdicts", side_effect=lambda updates: stored.extend(updates)),
+        patch("worker.liftwing_client.get_client", return_value=fake_client),
+        patch("worker.shutdown_requested", False),
+    ):
+        checked = prefilter_images({"id": 8, "prefilter_mode": "shadow"})
+
+    assert checked == 0
+    assert stored == []
+    # H3: a real failed batch is a recorded failure, not just a log line, so the
+    # banner cannot claim "up" while completions fail.
+    assert failure_updates == [("up", 1, "pre-filter request failed (see worker log)")]
+
+
+def test_prefilter_leaves_rows_unchecked_when_metadata_lookup_fails():
+    rows = [{"id": 202, "commons_page_id": 602, "file_title": "File:A.jpg"}]
+
+    def mock_execute_query(sql, params=None, fetch=True):
+        if "SELECT status FROM service_status" in sql:
+            return [{"status": "up"}]
+        if "SELECT id, commons_page_id, file_title FROM images" in sql:
+            return rows
+        raise AssertionError(f"Unexpected query: {sql}")
+
+    fake_client = MagicMock()
+
+    with (
+        patch("worker.execute_query", side_effect=mock_execute_query),
+        patch("worker._fetch_metadata", return_value={}),
+        patch("worker.liftwing_client.get_client", return_value=fake_client),
+        patch("worker.shutdown_requested", False),
+    ):
+        checked = prefilter_images({"id": 9, "prefilter_mode": "shadow"})
+
+    assert checked == 0
+    fake_client.filter_metadata.assert_not_called()
+
+
+def test_prefilter_no_unchecked_rows_returns_zero():
+    def mock_execute_query(sql, params=None, fetch=True):
+        if "SELECT status FROM service_status" in sql:
+            return [{"status": "up"}]
+        if "SELECT id, commons_page_id, file_title FROM images" in sql:
+            return []
+        raise AssertionError(f"Unexpected query: {sql}")
+
+    with (
+        patch("worker.execute_query", side_effect=mock_execute_query),
+        patch("worker.liftwing_client.get_client") as get_client,
+        patch("worker.shutdown_requested", False),
+    ):
+        assert prefilter_images({"id": 10, "prefilter_mode": "shadow"}) == 0
+
+    get_client.assert_not_called()
+
+
+def test_process_project_runs_prefilter_after_image_processing():
+    """H1: the shadow pre-filter is metadata-only, so detection comes first.
+
+    It used to run before the image loop with ``status='pending'`` in its
+    selection, which both delayed downloads and left every processed image
+    permanently unchecked (so a backlog could never be evaluated).
+    """
+    project = {
+        "id": 98,
+        "user_id": 1,
+        "wikidata_qid": "Q42",
+        "commons_category": "Some_Category",
+        "status": "active",
+        "distance_threshold": 0.6,
+        "min_confirmed": 5,
+        "prefilter_mode": "shadow",
+    }
+    order: list[str] = []
+
+    def mock_eq(sql, params=None, fetch=True):
+        sql_s = sql if isinstance(sql, str) else str(sql)
+        if "SELECT status, worker_claimed_by FROM projects" in sql_s:
+            return [{"status": "active", "worker_claimed_by": "test-worker"}]
+        if "UPDATE projects SET worker_claimed_at" in sql_s:
+            return 1
+        if "COUNT(*) AS cnt FROM faces" in sql_s:
+            return [{"cnt": 0}]
+        if "UPDATE projects SET status = 'completed'" in sql_s:
+            return 1
+        return ()
+
+    def fake_process_images(_project):
+        order.append("images")
+        return 0  # a single empty batch ends the loop
+
+    def fake_prefilter(_project):
+        order.append("prefilter")
+        return 0
+
+    with (
+        patch("worker.execute_query", side_effect=mock_eq),
+        patch("worker.traverse_category", return_value=0),
+        patch("worker.bootstrap_from_sparql", return_value=0),
+        patch("worker.process_images", side_effect=fake_process_images),
+        patch("worker.prefilter_images", side_effect=fake_prefilter),
+        patch("worker.run_autonomous_inference"),
+        patch("worker.shutdown_requested", False),
+        patch("worker._worker_id", "test-worker"),
+    ):
+        process_project(project)
+
+    assert order == ["images", "prefilter"]
+
+
+def test_probe_disabled_interval_does_nothing():
+    with (
+        patch("worker.LIFTWING_PROBE_INTERVAL", 0),
+        patch("worker.execute_query") as mock_db,
+    ):
+        _probe_liftwing_if_due()
+
+    mock_db.assert_not_called()
+
+
+def test_probe_skipped_when_no_project_uses_the_filter():
+    def mock_execute_query(sql, params=None, fetch=True):
+        if "COUNT(*) AS cnt FROM projects" in sql:
+            return [{"cnt": 0}]
+        raise AssertionError(f"Unexpected query: {sql}")
+
+    with (
+        patch("worker.LIFTWING_PROBE_INTERVAL", 300),
+        patch("worker.execute_query", side_effect=mock_execute_query),
+        patch("worker.liftwing_client.get_client") as get_client,
+    ):
+        _probe_liftwing_if_due()
+
+    get_client.assert_not_called()
+
+
+def test_probe_skipped_when_claim_lost_to_another_worker():
+    def mock_execute_query(sql, params=None, fetch=True):
+        if "COUNT(*) AS cnt FROM projects" in sql:
+            return [{"cnt": 1}]
+        if sql.startswith("UPDATE service_status SET last_checked = NOW()"):
+            return 0  # another worker probed first
+        raise AssertionError(f"Unexpected query: {sql}")
+
+    with (
+        patch("worker.LIFTWING_PROBE_INTERVAL", 300),
+        patch("worker.execute_query", side_effect=mock_execute_query),
+        patch("worker.liftwing_client.get_client") as get_client,
+    ):
+        _probe_liftwing_if_due()
+
+    get_client.assert_not_called()
+
+
+def test_probe_claims_with_the_interval_and_marks_up_on_success():
+    claim_params: list = []
+    up_updates: list = []
+
+    def mock_execute_query(sql, params=None, fetch=True):
+        if "COUNT(*) AS cnt FROM projects" in sql:
+            return [{"cnt": 2}]
+        if sql.startswith("UPDATE service_status SET last_checked = NOW()"):
+            claim_params.append(params)
+            return 1
+        if "SET status = 'up'" in sql:
+            up_updates.append(sql)
+            return 1
+        raise AssertionError(f"Unexpected query: {sql}")
+
+    fake_client = MagicMock()
+    fake_client.probe.return_value = (True, None)
+
+    with (
+        patch("worker.LIFTWING_PROBE_INTERVAL", 300),
+        patch("worker.execute_query", side_effect=mock_execute_query),
+        patch("worker.liftwing_client.get_client", return_value=fake_client),
+    ):
+        _probe_liftwing_if_due()
+
+    assert claim_params == [(300,)]
+    assert len(up_updates) == 1
+    fake_client.probe.assert_called_once()
+
+
+def test_probe_records_failure_without_marking_down_below_threshold():
+    captured: list = []
+
+    def mock_execute_query(sql, params=None, fetch=True):
+        if "COUNT(*) AS cnt FROM projects" in sql:
+            return [{"cnt": 1}]
+        if sql.startswith("UPDATE service_status SET last_checked = NOW()"):
+            return 1
+        if sql.startswith("SELECT status, consecutive_failures"):
+            return [{"status": "unknown", "consecutive_failures": 0}]
+        if sql.startswith("UPDATE service_status SET status = %s"):
+            captured.append((sql, params))
+            return 1
+        raise AssertionError(f"Unexpected query: {sql}")
+
+    fake_client = MagicMock()
+    fake_client.probe.return_value = (False, "HTTP 429")
+
+    with (
+        patch("worker.LIFTWING_PROBE_INTERVAL", 300),
+        patch("worker.LIFTWING_FAIL_THRESHOLD", 3),
+        patch("worker.execute_query", side_effect=mock_execute_query),
+        patch("worker.liftwing_client.get_client", return_value=fake_client),
+    ):
+        _probe_liftwing_if_due()
+
+    assert len(captured) == 1
+    sql, params = captured[0]
+    assert "status = %s" in sql
+    assert params == ("unknown", 1, "HTTP 429")
+
+
+def test_record_liftwing_failure_below_threshold_keeps_status():
+    captured: list = []
+
+    def mock_execute_query(sql, params=None, fetch=True):
+        if sql.startswith("SELECT status, consecutive_failures"):
+            return [{"status": "up", "consecutive_failures": 1}]
+        if sql.startswith("UPDATE service_status SET status = %s"):
+            captured.append(params)
+            return 1
+        raise AssertionError(f"Unexpected query: {sql}")
+
+    with (
+        patch("worker.execute_query", side_effect=mock_execute_query),
+        patch("worker.LIFTWING_FAIL_THRESHOLD", 3),
+    ):
+        _record_liftwing_failure("timeout")
+
+    assert captured == [("up", 2, "timeout")]
+
+
+def test_record_liftwing_failure_at_threshold_marks_down():
+    captured: list = []
+
+    def mock_execute_query(sql, params=None, fetch=True):
+        if sql.startswith("SELECT status, consecutive_failures"):
+            return [{"status": "up", "consecutive_failures": 2}]
+        if sql.startswith("UPDATE service_status SET status = %s"):
+            captured.append(params)
+            return 1
+        raise AssertionError(f"Unexpected query: {sql}")
+
+    with (
+        patch("worker.execute_query", side_effect=mock_execute_query),
+        patch("worker.LIFTWING_FAIL_THRESHOLD", 3),
+    ):
+        _record_liftwing_failure("HTTP 500")
+
+    assert captured == [("down", 3, "HTTP 500")]
+
+
+def test_fetch_metadata_parses_extmetadata_and_categories():
+    payload = {
+        "query": {
+            "pages": [
+                {
+                    "pageid": 501,
+                    "title": "File:A.jpg",
+                    "imageinfo": [
+                        {
+                            "mime": "image/jpeg",
+                            "extmetadata": {"ImageDescription": {"value": "<b>A</b> &amp; B <i>photo</i>"}},
+                        }
+                    ],
+                    "categories": [{"title": "Category:People"}, {"title": "Category:X"}],
+                }
+            ]
+        }
+    }
+    response = MagicMock()
+    response.json.return_value = payload
+
+    with patch("worker._api_request", return_value=response) as api:
+        result = _fetch_metadata(["File:A.jpg"])
+
+    assert result == {
+        "File:A.jpg": {
+            "description": "A & B photo",
+            "categories": ("Category:People", "Category:X"),
+            "mime": "image/jpeg",
+        }
+    }
+    assert api.call_args.kwargs["method"] == "post"
+
+
+def test_fetch_metadata_falls_back_to_object_name():
+    payload = {
+        "query": {
+            "pages": [
+                {
+                    "title": "File:B.jpg",
+                    "imageinfo": [
+                        {
+                            "mime": "image/jpeg",
+                            "extmetadata": {"ObjectName": {"value": "Photo of a person"}},
+                        }
+                    ],
+                    "categories": [],
+                }
+            ]
+        }
+    }
+    response = MagicMock()
+    response.json.return_value = payload
+
+    with patch("worker._api_request", return_value=response):
+        result = _fetch_metadata(["File:B.jpg"])
+
+    assert result["File:B.jpg"]["description"] == "Photo of a person"
+
+
+def test_plain_text_strips_wikitext_and_truncates():
+    text = _plain_text("{{en|noise}} Photo of a person " + "x" * 400)
+
+    assert text.startswith("Photo of a person")
+    assert "{{" not in text
+    assert len(text) == 250
+
+
+def test_fetch_metadata_maps_non_canonical_titles_through_normalized():
+    """The API answers under the canonical title and lists the rewrite in
+    ``query.normalized``; results stay keyed by the requested title (L8)."""
+    payload = {
+        "query": {
+            "normalized": [{"from": "File:photo_of_a_person.jpg", "to": "File:Photo of a person.jpg"}],
+            "pages": [
+                {
+                    "title": "File:Photo of a person.jpg",
+                    "imageinfo": [
+                        {
+                            "mime": "image/jpeg",
+                            "extmetadata": {"ImageDescription": {"value": "A portrait"}},
+                        }
+                    ],
+                    "categories": [{"title": "Category:People"}],
+                }
+            ],
+        }
+    }
+    response = MagicMock()
+    response.json.return_value = payload
+
+    with patch("worker._api_request", return_value=response):
+        result = _fetch_metadata(["File:photo_of_a_person.jpg"])
+
+    assert result == {
+        "File:photo_of_a_person.jpg": {
+            "description": "A portrait",
+            "categories": ("Category:People",),
+            "mime": "image/jpeg",
+        }
+    }
+
+
+def test_fetch_metadata_tolerates_a_page_without_imageinfo():
+    payload = {"query": {"pages": [{"title": "File:C.jpg", "categories": []}]}}
+    response = MagicMock()
+    response.json.return_value = payload
+
+    with patch("worker._api_request", return_value=response):
+        result = _fetch_metadata(["File:C.jpg"])
+
+    assert result == {"File:C.jpg": {"description": "", "categories": (), "mime": ""}}
+
+
+def test_fetch_metadata_returns_empty_on_failure():
+    with patch("worker._api_request", side_effect=RuntimeError("boom")):
+        assert _fetch_metadata(["File:A.jpg"]) == {}
+
+
+def test_fetch_metadata_empty_titles_makes_no_request():
+    with patch("worker._api_request") as api:
+        assert _fetch_metadata([]) == {}
+
+    api.assert_not_called()

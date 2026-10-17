@@ -1,0 +1,57 @@
+WikiVisage face service — third-party model weights
+====================================================
+
+STATUS: EXPERIMENTAL. Accepted by the project owner on 2026-10-16 as a known
+licence risk; see docs/plans/face-model-upgrade.md, section 3.
+
+Files in this directory
+-----------------------
+
+  det_500m.onnx    SCRFD-500M with 5-point keypoints (face detector)
+  w600k_mbf.onnx   ArcFace MobileFaceNet, 512-dimensional (face embedding)
+  SHA256SUMS       Expected SHA-256 of both files (see "Verification")
+
+Both files come unmodified from the InsightFace `buffalo_sc` model pack:
+
+  https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_sc.zip
+
+Terms
+-----
+
+The InsightFace project releases its *code* under the MIT License, but states
+that its pre-trained models and the training data they were built from are
+available for NON-COMMERCIAL RESEARCH PURPOSES ONLY. These two files are such
+pre-trained models. They are NOT covered by this repository's MIT licence
+(see the top-level LICENSE) and are not offered under any open-source licence.
+
+InsightFace publishes no licence file inside the model pack; the terms are
+stated in the project's README (https://github.com/deepinsight/insightface).
+Read them there before relying on this notice.
+
+What this means in practice
+---------------------------
+
+* Do not use these weights for commercial purposes.
+* Wikimedia Cloud Services' Terms of Use restrict hosting non-Open-Source
+  software. A research-only licence may be objected to by Toolforge
+  administrators; the owner has accepted that the files could be removed.
+* The face service keeps its detector/embedder behind the `FaceBackend`
+  interface in `model-server/backend.py`, so a permissively licensed pair
+  (for example YuNet + SFace) can replace these files without touching the
+  KServe envelope, `face_client.py`, or the database.
+* Removing these files makes the face service refuse to start (it verifies
+  them at load time). That is intentional: it never runs on unknown weights.
+
+Verification
+------------
+
+`model.py` verifies the SHA-256 of both files at startup and exits on any
+mismatch. CI verifies `SHA256SUMS` before running the contract tests. To
+re-create or re-check the files from the official release:
+
+  scripts/fetch_weights.sh            # download, verify, install
+  scripts/fetch_weights.sh --check    # verify the committed files only
+
+The files are ordinary git blobs (about 16 MB). Do not convert them to Git LFS:
+the Toolforge build service does not support it reliably, and a pointer file
+would silently break the build. CI fails if that happens.

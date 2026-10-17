@@ -42,7 +42,7 @@ CREATE TABLE IF NOT EXISTS projects (
     wikidata_qid        VARCHAR(20)     NOT NULL COMMENT 'e.g. Q42',
     commons_category    VARCHAR(255)    NOT NULL COMMENT 'Category name without "Category:" prefix',
     label               VARCHAR(255)    NOT NULL DEFAULT '' COMMENT 'Human-readable label for the target entity',
-    distance_threshold  FLOAT           NOT NULL DEFAULT 0.6 COMMENT 'Face distance threshold for autonomous inference',
+    distance_threshold  FLOAT           NOT NULL DEFAULT 0.5 COMMENT 'Cosine distance threshold for autonomous inference (provisional default, see docs/plans/face-model-upgrade.md)',
     min_confirmed       INT UNSIGNED    NOT NULL DEFAULT 5 COMMENT 'Minimum confirmed faces before autonomous mode',
     status              ENUM('active', 'paused', 'completed', 'deleted') NOT NULL DEFAULT 'active',
     completion_reason   ENUM('no_faces', 'insufficient_faces') NULL COMMENT 'Why the project was auto-completed by the worker',
@@ -57,6 +57,7 @@ CREATE TABLE IF NOT EXISTS projects (
     sdc_write_error     VARCHAR(1024)   NULL COMMENT 'Error message from last SDC write attempt',
     invite_code         VARCHAR(8)       NULL DEFAULT NULL COMMENT 'Unique code for others to join this project',
     invite_code_created_at DATETIME     NULL DEFAULT NULL COMMENT 'When invite_code was generated (for TTL expiry)',
+    prefilter_mode      ENUM('off', 'shadow', 'enforce') NOT NULL DEFAULT 'off' COMMENT 'LiftWing metadata pre-filter (experimental): off, shadow=record verdicts only',
     worker_claimed_by   VARCHAR(255)    NULL COMMENT 'Worker instance ID that claimed this project',
     worker_claimed_at   DATETIME        NULL COMMENT 'When the worker claimed this project',
     created_at          DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -87,6 +88,9 @@ CREATE TABLE IF NOT EXISTS images (
     detection_width MEDIUMINT UNSIGNED NULL COMMENT 'Image width in pixels at which face detection was run',
     detection_height MEDIUMINT UNSIGNED NULL COMMENT 'Image height in pixels at which face detection was run',
     bootstrapped    TINYINT(1)      NOT NULL DEFAULT 0 COMMENT '1=image found via P180 bootstrap',
+    prefilter_keep  TINYINT(1)      NULL COMMENT 'LiftWing metadata pre-filter verdict (experimental): 1=keep, 0=drop, NULL=not checked',
+    prefilter_reason VARCHAR(160)   NULL COMMENT 'LiftWing reason for the pre-filter verdict',
+    prefilter_checked_at DATETIME   NULL COMMENT 'When the LiftWing pre-filter checked this image',
     error_message   VARCHAR(1024)   NULL COMMENT 'Error details if status is error',
     created_at      DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at      DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -103,19 +107,28 @@ CREATE TABLE IF NOT EXISTS images (
 
 
 -- Faces table: stores each detected face encoding and its classification state.
--- encoding: 128-dimensional float64 numpy array stored as raw bytes (1024 bytes).
+-- encoding: 512-dimensional L2-normalised float32 embedding stored as raw
+--   little-endian bytes (2048 bytes). Only comparable with embeddings of the
+--   same embedding_model.
+-- embedding_model: which model produced the encoding (e.g. 'scrfd500m+arcface_mbf').
+-- det_score: detector confidence (NULL for faces drawn by hand).
+-- aligned: 0 = embedding computed without landmark alignment (a hand-drawn box
+--   the detector did not confirm) — such embeddings are noticeably weaker.
 -- is_target: NULL = unclassified, TRUE = confirmed match, FALSE = confirmed non-match.
 -- superseded_by: FK to replacement face row (after bbox edit). NULL = active face.
 CREATE TABLE IF NOT EXISTS faces (
     id              BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
     image_id        BIGINT UNSIGNED NOT NULL,
-    encoding        BLOB            NOT NULL COMMENT '128D float64 numpy array as raw bytes (1024 bytes)',
+    encoding        BLOB            NOT NULL COMMENT 'float32 embedding, 2048 bytes for 512D',
+    embedding_model VARCHAR(32)     NOT NULL COMMENT 'Model that produced the encoding, e.g. scrfd500m+arcface_mbf',
     bbox_top        SMALLINT UNSIGNED NOT NULL,
     bbox_right      SMALLINT UNSIGNED NOT NULL,
     bbox_bottom     SMALLINT UNSIGNED NOT NULL,
     bbox_left       SMALLINT UNSIGNED NOT NULL,
     is_target       TINYINT(1)      NULL DEFAULT NULL COMMENT 'NULL=unclassified, 1=match, 0=non-match',
-    confidence      FLOAT           NULL COMMENT 'Face distance from known target centroid',
+    confidence      FLOAT           NULL COMMENT 'Cosine distance (1 - cosine similarity) from the target centroid',
+    det_score       FLOAT           NULL COMMENT 'Detector confidence (NULL for manually drawn faces)',
+    aligned         TINYINT(1)      NOT NULL DEFAULT 1 COMMENT '0=embedded without landmark alignment (drawn box, detector missed it)',
     classified_by   ENUM('human', 'model', 'bootstrap') NULL COMMENT 'How this face was classified',
     classified_by_user_id BIGINT UNSIGNED NULL COMMENT 'User who classified this face (human classifications)',
     classified_at   DATETIME        NULL DEFAULT NULL COMMENT 'When face was classified (set once per classification, not auto-updated)',
@@ -209,3 +222,20 @@ CREATE TABLE IF NOT EXISTS worker_heartbeat (
 
     CONSTRAINT single_row CHECK (id = 1)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+
+-- Service status table: last-known reachability of external services that are
+-- optional to the pipeline. The worker's probe writes it, and the web app only
+-- reads it (never a live call from a request handler). The one row is seeded
+-- below and is NOT touched by the embedding-model wipe.
+CREATE TABLE IF NOT EXISTS service_status (
+    name                VARCHAR(32)     NOT NULL PRIMARY KEY,
+    status              ENUM('up', 'down', 'unknown') NOT NULL DEFAULT 'unknown',
+    consecutive_failures INT UNSIGNED   NOT NULL DEFAULT 0,
+    last_checked        DATETIME        NULL COMMENT 'When the worker last probed the service',
+    last_ok             DATETIME        NULL COMMENT 'When the probe last succeeded',
+    last_error          VARCHAR(255)    NULL COMMENT 'Why the last probe failed',
+    updated_at          DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+INSERT IGNORE INTO service_status (name) VALUES ('liftwing');

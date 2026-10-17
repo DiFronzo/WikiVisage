@@ -7,7 +7,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: PROJECT VERSION\n"
 "Report-Msgid-Bugs-To: EMAIL@ADDRESS\n"
-"POT-Creation-Date: 2026-05-02 21:21+0200\n"
+"POT-Creation-Date: 2026-10-17 00:32+0200\n"
 "PO-Revision-Date: 2026-03-06 22:34+0100\n"
 "Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
 "Language: nb\n"
@@ -18,77 +18,77 @@ msgstr ""
 "Content-Transfer-Encoding: 8bit\n"
 "Generated-By: Babel 2.18.0\n"
 
-#: app.py:370
+#: app.py:388
 msgid "Invalid bounding box dimensions"
 msgstr "Ugyldige dimensjoner for markeringsboks"
 
-#: app.py:379
+#: app.py:397
 msgid "Bounding box out of allowed range"
 msgstr "Markeringsboks utenfor tillatt område"
 
-#: app.py:438
+#: app.py:456
 msgid "Please log in to continue."
 msgstr "Vennligst logg inn for å fortsette."
 
-#: app.py:1053
+#: app.py:1127
 msgid "Invalid OAuth state. Please try again."
 msgstr "Ugyldig OAuth-tilstand. Prøv igjen."
 
-#: app.py:1072
+#: app.py:1146
 msgid "Authentication failed. Please try again."
 msgstr "Autentisering mislyktes. Prøv igjen."
 
-#: app.py:1086
+#: app.py:1160
 msgid "Could not retrieve your profile. Please try again."
 msgstr "Kunne ikke hente profilen din. Prøv igjen."
 
-#: app.py:1093
+#: app.py:1167
 msgid "Invalid profile data received."
 msgstr "Mottok ugyldige profildata."
 
-#: app.py:1135
+#: app.py:1209
 msgid "Database error. Please try again."
 msgstr "Databasefeil. Prøv igjen."
 
-#: app.py:1160
+#: app.py:1234
 msgid "You have been logged out."
 msgstr "Du er nå logget ut."
 
-#: app.py:1360
+#: app.py:1435
 msgid "Failed to load projects."
 msgstr "Kunne ikke laste prosjekter."
 
-#: app.py:1553 app.py:2109 app.py:2289 app.py:2388 app.py:2705 app.py:2928
-#: app.py:3124 app.py:3247 app.py:3580 app.py:3682 app.py:3730 app.py:3773
-#: app.py:3809 app.py:3866 app.py:3941 app.py:4074 app.py:4104
+#: app.py:1628 app.py:2184 app.py:2364 app.py:2476 app.py:2806 app.py:3021
+#: app.py:3224 app.py:3347 app.py:3680 app.py:3792 app.py:3840 app.py:3883
+#: app.py:3919 app.py:3976 app.py:4051 app.py:4184 app.py:4214
 msgid "Invalid CSRF token"
 msgstr "Ugyldig CSRF-token"
 
-#: app.py:1564
+#: app.py:1639
 msgid "Wikidata Q-ID must start with 'Q' (e.g., Q42)."
 msgstr "Wikidata Q-ID må starte med 'Q' (f.eks. Q42)."
 
-#: app.py:1566
+#: app.py:1641
 msgid "Commons category is required."
 msgstr "Commons-kategori er påkrevd."
 
-#: app.py:1571 app.py:3591
+#: app.py:1646 app.py:3692
 msgid "Distance threshold must be between 0.1 and 1.0."
 msgstr "Avstandsterskel må være mellom 0,1 og 1,0."
 
-#: app.py:1573 app.py:3593
+#: app.py:1648 app.py:3694
 msgid "Distance threshold must be a number."
 msgstr "Avstandsterskel må være et tall."
 
-#: app.py:1579 app.py:3599
+#: app.py:1654 app.py:3700
 msgid "Minimum confirmed must be at least 1."
 msgstr "Minimum bekreftet må være minst 1."
 
-#: app.py:1581 app.py:3601
+#: app.py:1656 app.py:3702
 msgid "Minimum confirmed must be a whole number."
 msgstr "Minimum bekreftet må være et heltall."
 
-#: app.py:1589
+#: app.py:1664
 #, python-format
 msgid ""
 "The Wikidata entity %(qid)s is not an instance of human (Q5). Only human "
@@ -97,25 +97,25 @@ msgstr ""
 "Wikidata-entiteten %(qid)s er ikke en instans av menneske (Q5). Kun "
 "menneskelige entiteter støttes."
 
-#: app.py:1599
+#: app.py:1674
 #, python-format
 msgid "The Commons category \"%(category)s\" does not exist."
 msgstr "Commons-kategorien «%(category)s» finnes ikke."
 
-#: app.py:1606
+#: app.py:1681
 #, python-format
 msgid "The Commons category \"%(category)s\" exists but contains no files."
 msgstr "Commons-kategorien «%(category)s» finnes, men inneholder ingen filer."
 
-#: app.py:1631
+#: app.py:1706
 msgid "A project with this Q-ID and category already exists."
 msgstr "Et prosjekt med denne Q-ID-en og kategorien finnes allerede."
 
-#: app.py:1661 app.py:3912
+#: app.py:1736 app.py:4022
 msgid "You are already a member of this project."
 msgstr "Du er allerede medlem av dette prosjektet."
 
-#: app.py:1666
+#: app.py:1741
 #, python-format
 msgid ""
 "%(username)s already has a project for this Q-ID and category. You can "
@@ -125,15 +125,15 @@ msgstr ""
 " kan be dem om en invitasjonskode for å bli med, eller opprette ditt "
 "eget."
 
-#: app.py:1717
+#: app.py:1792
 msgid "Project created successfully!"
 msgstr "Prosjektet ble opprettet!"
 
-#: app.py:1736 app.py:1748
+#: app.py:1811 app.py:1823
 msgid "Failed to create project. Please try again."
 msgstr "Kunne ikke opprette prosjekt. Prøv igjen."
 
-#: app.py:1741
+#: app.py:1816
 msgid ""
 "A previously deleted project with this Q-ID and category is still being "
 "cleaned up. Please try again in a minute."
@@ -141,54 +141,62 @@ msgstr ""
 "Et tidligere slettet prosjekt med denne Q-ID-en og kategorien ryddes "
 "fortsatt opp. Prøv igjen om et minutt."
 
-#: app.py:2117 app.py:2407 app.py:2711 app.py:2937
+#: app.py:2192 app.py:2495 app.py:2812 app.py:3030
 msgid "Missing required fields"
 msgstr "Mangler påkrevde felt"
 
-#: app.py:2123 app.py:2417 app.py:2719 app.py:2946
+#: app.py:2198 app.py:2505 app.py:2820 app.py:3039
 msgid "Invalid field values"
 msgstr "Ugyldige feltverdier"
 
-#: app.py:2129 app.py:2328 app.py:2443
+#: app.py:2204 app.py:2403 app.py:2531
 msgid "Image not found or access denied"
 msgstr "Bildet ble ikke funnet eller tilgang ble nektet"
 
-#: app.py:2131 app.py:2305 app.py:2330 app.py:2445 app.py:2739 app.py:2761
-#: app.py:2771 app.py:2974 app.py:3132 app.py:3153 app.py:3181 app.py:3204
-#: app.py:3226 app.py:3254 app.py:3266 app.py:3289 app.py:3344 app.py:3437
-#: app.py:3505
+#: app.py:2206 app.py:2380 app.py:2405 app.py:2533 app.py:2840 app.py:2861
+#: app.py:2871 app.py:3067 app.py:3232 app.py:3253 app.py:3281 app.py:3304
+#: app.py:3326 app.py:3354 app.py:3366 app.py:3389 app.py:3444 app.py:3537
+#: app.py:3605
 msgid "Database error"
 msgstr "Databasefeil"
 
-#: app.py:2205
+#: app.py:2280
 msgid "Invalid face ID"
 msgstr "Ugyldig ansikts-ID"
 
-#: app.py:2278
+#: app.py:2353
 msgid "Failed to save classification"
 msgstr "Kunne ikke lagre klassifisering"
 
-#: app.py:2293 app.py:2322
+#: app.py:2368 app.py:2397
 msgid "Nothing to undo"
 msgstr "Ingenting å angre"
 
-#: app.py:2303
+#: app.py:2378
 msgid "Project not found"
 msgstr "Fant ikke prosjektet"
 
-#: app.py:2376
+#: app.py:2451
 msgid "Failed to undo classification"
 msgstr "Kunne ikke angre klassifisering"
 
-#: app.py:2435
+#: app.py:2523
 msgid "Too many face IDs in dismiss list"
 msgstr "For mange ansikts-ID-er i avvisningslisten"
 
-#: app.py:2448 app.py:2978
+#: app.py:2536 app.py:3071
 msgid "Image has not finished processing yet"
 msgstr "Bildet er ikke ferdig behandlet ennå"
 
-#: app.py:2468 app.py:3021
+#: app.py:2553 app.py:3108
+msgid "This image could not be read by the face detection service."
+msgstr "Dette bildet kunne ikke leses av ansiktsgjenkjenningstjenesten."
+
+#: app.py:2556 app.py:3111
+msgid "Face detection service is unavailable. Please try again in a moment."
+msgstr "Ansiktsdeteksjonstjenesten er utilgjengelig. Prøv igjen om litt."
+
+#: app.py:2562 app.py:3117
 msgid ""
 "Could not compute face encoding for the selected region. Try drawing a "
 "slightly larger box."
@@ -196,71 +204,76 @@ msgstr ""
 "Kunne ikke beregne ansiktskoding for det valgte området. Prøv å tegne en "
 "litt større boks."
 
-#: app.py:2570 app.py:3091
+#: app.py:2671 app.py:3192
 msgid "Failed to download image from Commons"
 msgstr "Kunne ikke laste ned bilde fra Commons"
 
-#: app.py:2573 app.py:3110
+#: app.py:2674 app.py:3210
 msgid "Failed to save face"
 msgstr "Kunne ikke lagre ansikt"
 
-#: app.py:2576 app.py:3113
+#: app.py:2677 app.py:3213
 msgid "Failed to process face region"
 msgstr "Kunne ikke behandle ansiktsområdet"
 
-#: app.py:2737 app.py:2972 app.py:3106
+#: app.py:2838 app.py:3065 app.py:3206
 msgid "Face not found or access denied"
 msgstr "Ansiktet ble ikke funnet eller tilgang ble nektet"
 
-#: app.py:2776
+#: app.py:2876
 msgid "OAuth token expired. Please log in again."
 msgstr "OAuth-tokenet er utløpt. Vennligst logg inn igjen."
 
-#: app.py:2781
+#: app.py:2881
 msgid "Failed to remove SDC claim from Commons. The face was not reclassified."
 msgstr ""
 "Kunne ikke fjerne SDC-påstand fra Commons. Ansiktet ble ikke "
 "omklassifisert."
 
-#: app.py:2893 app.py:2992 app.py:3098
+#: app.py:2987 app.py:3082 app.py:3199
 #, python-format
 msgid ""
 "This face was already classified by %(user)s. Only they can change their "
 "own classification."
 msgstr ""
+"Dette ansiktet er allerede klassifisert av %(user)s. Bare de kan endre sin "
+"egen klassifisering."
 
-#: app.py:2898 app.py:2997 app.py:3103
-#, fuzzy
+#: app.py:2991 app.py:3086 app.py:3203
 msgid "This face has already been classified by another contributor."
 msgstr "Dette ansiktet er allerede gjennomgått av en annen bruker"
 
-#: app.py:2903
+#: app.py:2996
 msgid "Failed to save reclassification"
 msgstr "Kunne ikke lagre omklassifisering"
 
-#: app.py:3130 app.py:3202 app.py:3252 app.py:3287 app.py:3503
+#: app.py:3230 app.py:3302 app.py:3352 app.py:3387 app.py:3603
 msgid "Project not found or access denied"
 msgstr "Prosjekt ikke funnet eller tilgang nektet"
 
-#: app.py:3171
+#: app.py:3271
 msgid "Your session has expired. Please log out and log in again to re-authorize."
 msgstr ""
 "Økten din har utløpt. Vennligst logg ut og logg inn igjen for å "
 "autorisere på nytt."
 
-#: app.py:3295
+#: app.py:3395
 msgid "Invalid pagination parameters"
 msgstr "Ugyldige pagineringsparametre"
 
-#: app.py:3605
+#: app.py:3706
 msgid "Invalid status."
 msgstr "Ugyldig status."
 
-#: app.py:3632
+#: app.py:3712
+msgid "Invalid metadata pre-filter mode."
+msgstr "Ugyldig modus for metadataforfilter."
+
+#: app.py:3742
 msgid "Settings updated."
 msgstr "Innstillinger oppdatert."
 
-#: app.py:3651 app.py:4035
+#: app.py:3761 app.py:4145
 #, python-format
 msgid ""
 "Warning: You currently have %(confirmed)d/%(min)d human-confirmed target "
@@ -269,7 +282,7 @@ msgstr ""
 "Advarsel: Du har for øyeblikket %(confirmed)d/%(min)d menneskebekreftede "
 "målansikter. Autonom inferens vil ikke kjøre før denne terskelen er nådd."
 
-#: app.py:3661 app.py:4045
+#: app.py:3771 app.py:4155
 #, python-format
 msgid ""
 "Tip: You have %(count)d bootstrapped matches from existing Commons "
@@ -280,114 +293,114 @@ msgstr ""
 "påstander på Commons. Godkjenn dem i Modellresultater for å telle dem som"
 " menneskebekreftet."
 
-#: app.py:3673
+#: app.py:3783
 msgid "Failed to update settings."
 msgstr "Kunne ikke oppdatere innstillingene."
 
-#: app.py:3694 app.py:3742
+#: app.py:3804 app.py:3852
 msgid "No member specified."
 msgstr "Ingen medlem angitt."
 
-#: app.py:3700 app.py:3748
+#: app.py:3810 app.py:3858
 msgid "Invalid member."
 msgstr "Ugyldig medlem."
 
-#: app.py:3705
+#: app.py:3815
 msgid "You cannot remove yourself from your own project."
 msgstr "Du kan ikke fjerne deg selv fra ditt eget prosjekt."
 
-#: app.py:3715
+#: app.py:3825
 msgid "Member removed and banned from rejoining."
 msgstr "Medlem fjernet og utestengt fra å bli med igjen."
 
-#: app.py:3717 app.py:3760
+#: app.py:3827 app.py:3870
 msgid "Member not found."
 msgstr "Medlem ikke funnet."
 
-#: app.py:3720
+#: app.py:3830
 msgid "Failed to remove member."
 msgstr "Kunne ikke fjerne medlem."
 
-#: app.py:3758
+#: app.py:3868
 msgid "Member unbanned."
 msgstr "Medlem er ikke lenger utestengt."
 
-#: app.py:3763
+#: app.py:3873
 msgid "Failed to unban member."
 msgstr "Kunne ikke oppheve utestengelsen av medlem."
 
-#: app.py:3784
+#: app.py:3894
 msgid "You cannot leave a project you own. Delete it instead."
 msgstr "Du kan ikke forlate et prosjekt du eier. Slett det i stedet."
 
-#: app.py:3794
+#: app.py:3904
 msgid "You have left the project."
 msgstr "Du har forlatt prosjektet."
 
-#: app.py:3796
+#: app.py:3906
 msgid "You are not a member of this project."
 msgstr "Du er ikke medlem av dette prosjektet."
 
-#: app.py:3799
+#: app.py:3909
 msgid "Failed to leave the project."
 msgstr "Kunne ikke forlate prosjektet."
 
-#: app.py:3831
+#: app.py:3941
 msgid "Invite code generated."
 msgstr "Invitasjonskode generert."
 
-#: app.py:3843
+#: app.py:3953
 msgid "Failed to generate invite code."
 msgstr "Kunne ikke generere invitasjonskode."
 
-#: app.py:3852
+#: app.py:3962
 msgid "Invite code revoked."
 msgstr "Invitasjonskode tilbakekalt."
 
-#: app.py:3855
+#: app.py:3965
 msgid "Failed to revoke invite code."
 msgstr "Kunne ikke tilbakekalle invitasjonskode."
 
-#: app.py:3857
+#: app.py:3967
 msgid "Invalid action."
 msgstr "Ugyldig handling."
 
-#: app.py:3870
+#: app.py:3980
 msgid "Please enter an invite code."
 msgstr "Vennligst skriv inn en invitasjonskode."
 
-#: app.py:3885 app.py:3905
+#: app.py:3995 app.py:4015
 msgid "Something went wrong. Please try again."
 msgstr "Noe gikk galt. Vennligst prøv igjen."
 
-#: app.py:3889
+#: app.py:3999
 msgid "Invalid invite code."
 msgstr "Ugyldig invitasjonskode."
 
-#: app.py:3895
+#: app.py:4005
 msgid "You are the owner of this project."
 msgstr "Du er eieren av dette prosjektet."
 
-#: app.py:3910
+#: app.py:4020
 msgid "You have been banned from this project."
 msgstr "Du har blitt utestengt fra dette prosjektet."
 
-#: app.py:3923
+#: app.py:4033
 #, python-format
 msgid "Joined %(username)s's project \"%(label)s\" successfully!"
 msgstr "Ble med i %(username)s sitt prosjekt «%(label)s»!"
 
-#: app.py:3932
+#: app.py:4042
 msgid "Failed to join project."
 msgstr "Kunne ikke bli med i prosjektet."
 
-#: app.py:3957
+#: app.py:4067
 msgid "Settings have not changed since the last inference run. No re-run needed."
 msgstr ""
 "Innstillingene er ikke endret siden forrige inferenskjøring. Ingen ny "
 "kjøring nødvendig."
 
-#: app.py:3992
+#: app.py:4102
 #, python-format
 msgid ""
 "Reset %(num)d model-classified faces. The worker will re-classify them on"
@@ -396,11 +409,11 @@ msgstr ""
 "Nullstilte %(num)d modellklassifiserte ansikter. Arbeideren vil "
 "klassifisere dem på nytt i neste syklus."
 
-#: app.py:4004
+#: app.py:4114
 msgid "No model-classified faces to reset."
 msgstr "Ingen modellklassifiserte ansikter å nullstille."
 
-#: app.py:4025
+#: app.py:4135
 #, python-format
 msgid ""
 "You have %(confirmed)d/%(min)d human-confirmed target faces — inference "
@@ -409,51 +422,51 @@ msgstr ""
 "Du har %(confirmed)d/%(min)d menneskebekreftede målansikter — inferens "
 "kjøres ved neste arbeidssyklus."
 
-#: app.py:4056
+#: app.py:4166
 msgid "Failed to re-run inference."
 msgstr "Kunne ikke kjøre inferens på nytt."
 
-#: app.py:4083
+#: app.py:4193
 msgid "Project deleted."
 msgstr "Prosjekt slettet."
 
-#: app.py:4085
+#: app.py:4195
 msgid "Project not found."
 msgstr "Fant ikke prosjektet."
 
-#: app.py:4088
+#: app.py:4198
 msgid "Failed to delete project."
 msgstr "Kunne ikke slette prosjekt."
 
-#: app.py:4113
+#: app.py:4223
 msgid "Settings saved."
 msgstr "Innstillinger lagret."
 
-#: app.py:4116
+#: app.py:4226
 msgid "Failed to save settings."
 msgstr "Kunne ikke lagre innstillingene."
 
-#: app.py:4207
+#: app.py:4317
 msgid "Failed to load leaderboard."
 msgstr "Kunne ikke laste ledertavle."
 
-#: app.py:4333
+#: app.py:4470
 msgid "Bad request"
 msgstr "Ugyldig forespørsel"
 
-#: app.py:4340
+#: app.py:4477
 msgid "Forbidden"
 msgstr "Forbudt"
 
-#: app.py:4347
+#: app.py:4484
 msgid "Page not found"
 msgstr "Siden ble ikke funnet"
 
-#: app.py:4357
+#: app.py:4494
 msgid "Rate limit exceeded. Please try again later."
 msgstr "Hastighetsbegrensningen er nådd. Prøv igjen senere."
 
-#: app.py:4368
+#: app.py:4505
 msgid "Internal server error"
 msgstr "Intern serverfeil"
 
@@ -473,11 +486,11 @@ msgstr ""
 "Bidragene dine teller fortsatt, men navnet ditt vises ikke på den "
 "offentlige ledertavlen."
 
-#: templates/account_settings.html:91 templates/project_settings.html:55
+#: templates/account_settings.html:91 templates/project_settings.html:74
 msgid "Save Settings"
 msgstr "Lagre innstillinger"
 
-#: templates/base.html:13
+#: templates/base.html:14
 msgid ""
 "Active learning facial recognition for Wikimedia Commons. Train a model "
 "to recognize people and add P180 depicts Structured Data automatically."
@@ -486,37 +499,37 @@ msgstr ""
 "modell til å gjenkjenne personer og legg til P180 depicts i Structured "
 "Data automatisk."
 
-#: templates/base.html:491
+#: templates/base.html:492
 msgid "Toggle menu"
 msgstr "Åpne meny"
 
-#: templates/base.html:494 templates/dashboard.html:3
+#: templates/base.html:495 templates/dashboard.html:3
 msgid "Dashboard"
 msgstr "Kontrollpanel"
 
-#: templates/base.html:495 templates/base.html:503 templates/leaderboard.html:3
+#: templates/base.html:496 templates/base.html:504 templates/leaderboard.html:3
 #: templates/leaderboard.html:154
 msgid "Leaderboard"
 msgstr "Ledertavle"
 
-#: templates/base.html:496 templates/dashboard.html:427
+#: templates/base.html:497 templates/dashboard.html:427
 #: templates/project_detail.html:726 templates/project_settings.html:3
 msgid "Settings"
 msgstr "Innstillinger"
 
-#: templates/base.html:500
+#: templates/base.html:501
 msgid "Logout"
 msgstr "Logg ut"
 
-#: templates/base.html:505
+#: templates/base.html:506
 msgid "Log in"
 msgstr "Logg inn"
 
-#: templates/base.html:508
+#: templates/base.html:509
 msgid "Language"
 msgstr "Språk"
 
-#: templates/base.html:531
+#: templates/base.html:532
 msgid ""
 "The background worker appears to be offline. Image processing and face "
 "detection are paused."
@@ -524,17 +537,26 @@ msgstr ""
 "Bakgrunnsarbeideren ser ut til å være frakoblet. Bildebehandling og "
 "ansiktsgjenkjenning er satt på pause."
 
-#: templates/base.html:531 templates/base.html:537 templates/base.html:595
-#: templates/project_detail.html:534 templates/project_detail.html:708
-#: templates/project_detail.html:716 templates/project_detail.html:821
+#: templates/base.html:532 templates/base.html:538 templates/base.html:544
+#: templates/base.html:602 templates/project_detail.html:534
+#: templates/project_detail.html:708 templates/project_detail.html:716
+#: templates/project_detail.html:821
 msgid "Close"
 msgstr "Lukk"
 
-#: templates/base.html:546
+#: templates/base.html:538
+msgid ""
+"The LiftWing AI service used for the metadata filter is currently "
+"unavailable. Image processing continues without it."
+msgstr ""
+"LiftWing-tjenesten som brukes til metadataforfilteret er utilgjengelig. "
+"Bildebehandlingen fortsetter uten den."
+
+#: templates/base.html:553
 msgid "Bring back the pet"
 msgstr "Hent tilbake kjæledyret"
 
-#: templates/base.html:553
+#: templates/base.html:560
 msgid ""
 "This site uses a cookie to remember your language preference. The session"
 " cookie is required for the site to function."
@@ -542,19 +564,19 @@ msgstr ""
 "Denne siden bruker en informasjonskapsel for å huske språkvalget ditt. "
 "Øktinformasjonskapselen er nødvendig for at siden skal fungere."
 
-#: templates/base.html:555
+#: templates/base.html:562
 msgid "Accept"
 msgstr "Godta"
 
-#: templates/base.html:556
+#: templates/base.html:563
 msgid "Decline"
 msgstr "Avslå"
 
-#: templates/base.html:602
+#: templates/base.html:609
 msgid "Install"
 msgstr "Installer"
 
-#: templates/base.html:870
+#: templates/base.html:877
 msgid ""
 "Classify faces on the go! Tap Share, then \"Add to Home Screen\" to get "
 "the app."
@@ -562,7 +584,7 @@ msgstr ""
 "Klassifiser ansikter på farten! Trykk Del, deretter \"Legg til på Hjem-"
 "skjerm\" for å få appen."
 
-#: templates/base.html:884
+#: templates/base.html:891
 msgid ""
 "Classify faces faster! Add WikiVisage to your home screen for instant, "
 "full-screen access."
@@ -570,7 +592,7 @@ msgstr ""
 "Klassifiser ansikter raskere! Legg WikiVisage til startskjermen for "
 "umiddelbar fullskjermtilgang."
 
-#: templates/base.html:897
+#: templates/base.html:904
 msgid ""
 "Classify faces on the go! Tap your browser menu and choose \"Install\" to"
 " get the app."
@@ -798,7 +820,6 @@ msgid "New Project"
 msgstr "Nytt prosjekt"
 
 #: templates/dashboard.html:301
-#, fuzzy
 msgid "Join project"
 msgstr "Bli med i prosjekt"
 
@@ -1752,15 +1773,15 @@ msgstr "Prosjektnavn (valgfritt)"
 msgid "Human-readable name for your dashboard"
 msgstr "Et gjenkjennelig navn for kontrollpanelet ditt"
 
-#: templates/project_new.html:37 templates/project_settings.html:43
+#: templates/project_new.html:37 templates/project_settings.html:61
 msgid "Distance Threshold"
 msgstr "Avstandsterskel"
 
-#: templates/project_new.html:39
-msgid "Lower = stricter matching (default 0.6)"
+#: templates/project_new.html:39 templates/project_settings.html:63
+msgid "Cosine distance to the target: lower = stricter matching (default 0.5)"
 msgstr "Lavere = strengere gjenkjenning (standard 0,6)"
 
-#: templates/project_new.html:43 templates/project_settings.html:48
+#: templates/project_new.html:43 templates/project_settings.html:67
 msgid "Min Confirmed Faces"
 msgstr "Minimum bekreftede ansikter"
 
@@ -1862,7 +1883,51 @@ msgstr "Pauset - Ingen merking"
 msgid "Completed"
 msgstr "Fullført"
 
+#: templates/project_settings.html:42
+msgid "Metadata Pre-Filter (experimental)"
+msgstr "Metadataforfilter (eksperimentell)"
+
+#: templates/project_settings.html:44
+msgid "Off"
+msgstr "Av"
+
+#: templates/project_settings.html:45
+msgid "Shadow mode - record model verdicts only"
+msgstr "Skyggemodus - registrer bare modellvurderinger"
+
+#: templates/project_settings.html:47
+msgid ""
+"Asks the experimental LiftWing Qwen model to judge from Commons metadata "
+"whether a file could show a person. Shadow mode only records those "
+"verdicts for evaluation; nothing is filtered out and processing is "
+"unchanged."
+msgstr ""
+"Ber den eksperimentelle LiftWing Qwen-modellen om å vurdere ut fra "
+"Commons-metadata om en fil kan vise en person. Skyggemodus registrerer "
+"bare vurderingene for evaluering; ingenting filtreres bort og "
+"behandlingen er uendret."
+
+#: templates/project_settings.html:49
+msgid "LiftWing service status:"
+msgstr "Status for LiftWing-tjenesten:"
+
+#: templates/project_settings.html:50
+msgid "reachable"
+msgstr "tilgjengelig"
+
+#: templates/project_settings.html:51
+msgid "unreachable"
+msgstr "utilgjengelig"
+
 #: templates/project_settings.html:52
+msgid "unknown"
+msgstr "ukjent"
+
+#: templates/project_settings.html:54
+msgid "last checked"
+msgstr "sist sjekket"
+
+#: templates/project_settings.html:71
 msgid ""
 "Changes to these values only affect future classifications. Use Re-run "
 "Inference below to reclassify existing model results."
@@ -1871,65 +1936,65 @@ msgstr ""
 "Bruk Kjør inferens på nytt nedenfor for å omklassifisere eksisterende "
 "modellresultater."
 
-#: templates/project_settings.html:62
+#: templates/project_settings.html:81
 msgid "Invite Code"
 msgstr "Invitasjonskode"
 
-#: templates/project_settings.html:67
+#: templates/project_settings.html:86
 msgid "Share this code with others to let them join your project."
 msgstr "Del denne koden med andre for å la dem bli med i prosjektet ditt."
 
-#: templates/project_settings.html:73 templates/project_settings.html:87
+#: templates/project_settings.html:92 templates/project_settings.html:106
 msgid "Regenerate"
 msgstr "Generer på nytt"
 
-#: templates/project_settings.html:78
+#: templates/project_settings.html:97
 msgid "Revoke Code"
 msgstr "Tilbakekall kode"
 
-#: templates/project_settings.html:83
+#: templates/project_settings.html:102
 msgid "Invite code has been revoked. Regenerate to allow new members to join."
 msgstr ""
 "Invitasjonskoden er trukket tilbake. Generer en ny for å la nye medlemmer"
 " bli med."
 
-#: templates/project_settings.html:94
+#: templates/project_settings.html:113
 msgid "Project Members"
 msgstr "Prosjektmedlemmer"
 
-#: templates/project_settings.html:102
+#: templates/project_settings.html:121
 msgid "Username"
 msgstr "Brukernavn"
 
-#: templates/project_settings.html:103
+#: templates/project_settings.html:122
 msgid "Role"
 msgstr "Rolle"
 
-#: templates/project_settings.html:104
+#: templates/project_settings.html:123
 msgid "Joined"
 msgstr "Ble med"
 
-#: templates/project_settings.html:119
+#: templates/project_settings.html:138
 msgid "Remove"
 msgstr "Fjern"
 
-#: templates/project_settings.html:129
+#: templates/project_settings.html:148
 msgid "No members have joined this project yet."
 msgstr "Ingen medlemmer har blitt med i dette prosjektet ennå."
 
-#: templates/project_settings.html:133
+#: templates/project_settings.html:152
 msgid "Banned"
 msgstr "Utestengt"
 
-#: templates/project_settings.html:145
+#: templates/project_settings.html:164
 msgid "Unban"
 msgstr "Opphev utestengelse"
 
-#: templates/project_settings.html:158 templates/project_settings.html:162
+#: templates/project_settings.html:177 templates/project_settings.html:181
 msgid "Re-run Inference"
 msgstr "Kjør inferens på nytt"
 
-#: templates/project_settings.html:159
+#: templates/project_settings.html:178
 msgid ""
 "Reset all model-classified faces and let the worker reclassify them using"
 " current settings. Human classifications and faces already written to "
@@ -1939,11 +2004,11 @@ msgstr ""
 " dem på nytt med gjeldende innstillinger. Menneskelige klassifiseringer "
 "og ansikter som allerede er skrevet til Commons bevares."
 
-#: templates/project_settings.html:167
+#: templates/project_settings.html:186
 msgid "Danger Zone"
 msgstr "Faresone"
 
-#: templates/project_settings.html:168
+#: templates/project_settings.html:187
 msgid ""
 "Deleting this project will remove all face bounding boxes and "
 "classification data. Images on Commons will remain untouched."
@@ -1951,11 +2016,11 @@ msgstr ""
 "Sletting av dette prosjektet vil fjerne alle ansiktsmarkeringer og "
 "klassifiseringsdata. Bilder på Commons vil ikke bli berørt."
 
-#: templates/project_settings.html:171
+#: templates/project_settings.html:190
 msgid "Delete Project"
 msgstr "Slett prosjekt"
 
-#: templates/project_settings.html:176
+#: templates/project_settings.html:195
 msgid ""
 "Are you absolutely sure you want to delete this project? This cannot be "
 "undone."
@@ -1963,7 +2028,7 @@ msgstr ""
 "Er du helt sikker på at du vil slette dette prosjektet? Dette kan ikke "
 "angres."
 
-#: templates/project_settings.html:177
+#: templates/project_settings.html:196
 msgid ""
 "This will reset all model-classified faces. The worker will reclassify "
 "them on the next cycle. Continue?"
@@ -1971,17 +2036,17 @@ msgstr ""
 "Dette vil nullstille alle modellklassifiserte ansikter. Arbeideren vil "
 "klassifisere dem på nytt i neste syklus. Fortsette?"
 
-#: templates/project_settings.html:178
+#: templates/project_settings.html:197
 #, python-brace-format
 msgid "Remove and ban {username} from this project?"
 msgstr "Fjerne og utestenge {username} fra dette prosjektet?"
 
-#: templates/project_settings.html:179
+#: templates/project_settings.html:198
 #, python-brace-format
 msgid "Unban {username} and allow them to rejoin?"
 msgstr "Oppheve utestengelsen av {username} og la dem bli med igjen?"
 
-#: templates/project_settings.html:180
+#: templates/project_settings.html:199
 msgid ""
 "Revoke the invite code? Existing members will not be affected, but no new"
 " members can join with this code."

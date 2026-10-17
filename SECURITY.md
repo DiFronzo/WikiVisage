@@ -66,7 +66,7 @@ The following are **out of scope**:
 - Security headers: `Content-Security-Policy` (with `object-src 'none'`, `base-uri 'none'`, `frame-ancestors 'none'`), `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`, `Permissions-Policy`
 - Input validation on bounding box coordinates
 - Image download size cap (50 MB) and pixel dimension validation (100 megapixel limit)
-- Face detection isolation: dlib/libjpeg/libpng parse untrusted image bytes only inside the face service, which runs as a separate Toolforge tool under memory/CPU limits with no NFS mount. Toolforge envvars are tool-wide, so the separate tool is what keeps WikiVisage's OAuth, database, and token-encryption secrets out of that process; a parser exploit there has nothing of ours to exfiltrate
+- Face detection isolation: ONNX Runtime/libjpeg/libpng parse untrusted image bytes only inside the face service, which runs as a separate Toolforge tool under memory/CPU limits with no NFS mount. Toolforge envvars are tool-wide, so the separate tool is what keeps WikiVisage's OAuth, database, and token-encryption secrets out of that process; a parser exploit there has nothing of ours to exfiltrate
 - Face service authentication: the service is published on the internet, so `model-server/guard.py` requires a constant-time-compared bearer token (>= 32 chars) on every route except the readiness check — including KServe's model-unload endpoint — rejects bodies over 40 MiB before parsing, and gRPC is disabled. The service refuses to start on Toolforge without a token
 - Distributed worker locking (`SELECT … FOR UPDATE`) with stale-claim expiry
 - Cross-project SDC write deduplication (`sdc_claims` table prevents duplicate P180 claims)
@@ -74,4 +74,4 @@ The following are **out of scope**:
 - Interruptible SDC writes: re-checks `sdc_write_requested` every 5 faces so users can stop a running batch quickly
 - Membership-aware access control (project owners and members via `project_members`)
 - `maxlag=5` compliance on all Wikimedia API writes
-- `/health` endpoint reports `degraded: true` (200 OK) when the rate limiter has fallen back to in-memory storage, signaling that the OAuth refresh single-flight is also a no-op
+- `/health` endpoint reports `degraded: true` (200 OK) when the rate limiter has fallen back to in-memory storage (signaling that the OAuth refresh single-flight is a no-op) or when the face service is unreachable

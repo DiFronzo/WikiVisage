@@ -1,8 +1,9 @@
 # WikiVisage face detection model server — local development and CI.
 #
 # Production does NOT use this file: Toolforge builds the service with Cloud
-# Native Buildpacks from requirements.txt + Procfile + project.toml. Both paths
-# install the same requirements.txt, so keep it installable with plain pip.
+# Native Buildpacks from requirements.txt + Procfile. Both paths install the same
+# requirements.txt, so keep it installable with plain pip. Neither needs system
+# packages beyond curl (this image's health check).
 #
 # Two-stage build: the builder stage carries a compiler toolchain for sdists
 # without wheels; the runtime stage does not.
@@ -32,11 +33,10 @@ RUN pip install --upgrade pip \
 # ---------- runtime ----------
 FROM python:3.11-slim-bookworm AS production
 
-# dlib-bin links against the system BLAS/LAPACK shared objects at runtime.
+# onnxruntime and opencv-python-headless ship self-contained wheels; curl is
+# only for the container health check.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        libopenblas0 \
-        liblapack3 \
         curl \
     && rm -rf /var/lib/apt/lists/*
 
@@ -48,7 +48,10 @@ ENV PATH="/opt/venv/bin:$PATH" \
 
 WORKDIR /srv/wikivisage
 
-COPY model.py guard.py ./
+COPY model.py backend.py guard.py ./
+# Committed ONNX weights (non-commercial; see weights/LICENSE-NOTICE). The
+# service verifies their SHA-256 at startup and refuses to run on a mismatch.
+COPY weights ./weights
 
 # Run unprivileged. The service performs no outbound network I/O and writes
 # nothing to disk, so it needs no writable paths beyond /tmp.

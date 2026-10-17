@@ -532,6 +532,12 @@
     <div class="system-banner"><span>⚠ {{ _('The background worker appears to be offline. Image processing and face detection are paused.') }}</span><button class="banner-close" onclick="this.parentElement.remove()" aria-label="{{ _('Close') }}">&times;</button></div>
     {% endif %}
 
+    {# Experimental LiftWing metadata pre-filter: only on the pages of a project
+       that actually uses it, and only while the worker's probe says it is down. #}
+    {% if liftwing_down and request.endpoint in ('project_detail', 'project_settings') and project and project.get('prefilter_mode', 'off') != 'off' %}
+    <div class="system-banner"><span>⚠ {{ _('The LiftWing AI service used for the metadata filter is currently unavailable. Image processing continues without it.') }}</span><button class="banner-close" onclick="this.parentElement.remove()" aria-label="{{ _('Close') }}">&times;</button></div>
+    {% endif %}
+
     <main class="container">
         <div class="flash-messages">
             {% for category, message in get_flashed_messages(with_categories=true) %}

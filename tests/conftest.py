@@ -52,6 +52,17 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker(skip_contract)
 
 
+def require_sample_env() -> bool:
+    """True only for an explicit affirmative in ``WIKIVISAGE_REQUIRE_SAMPLE``.
+
+    The face-service tests read this to decide whether a missing portrait
+    sample is a skip (local) or a failure (CI). An explicit ``"0"``/``"false"``
+    must read as unset — the old truthiness check treated every non-empty
+    value, including ``"0"``, as "required".
+    """
+    return os.environ.get("WIKIVISAGE_REQUIRE_SAMPLE", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 # ---------------------------------------------------------------------------
 # Unit-test fixtures (no DB)
 # ---------------------------------------------------------------------------
@@ -96,6 +107,10 @@ def flask_app(monkeypatch):
 
     application.config["TESTING"] = True
     application.config["SECRET_KEY"] = "test-secret"
+    # In-memory rate-limit quotas are shared for the whole test process, so a
+    # full run would exhaust them part-way through and turn unrelated
+    # assertions into 429s. Rate limiting is covered by its own tests.
+    app_module.limiter.enabled = False
     return application
 
 
@@ -215,9 +230,20 @@ def db_conn(test_db):
         # Clean up: truncate all data tables (order matters due to FKs)
         with conn.cursor() as cur:
             cur.execute("SET FOREIGN_KEY_CHECKS = 0")
-            for table in ("faces", "images", "projects", "sessions", "user_stats", "users", "worker_heartbeat"):
+            for table in (
+                "faces",
+                "images",
+                "projects",
+                "sessions",
+                "user_stats",
+                "users",
+                "worker_heartbeat",
+                "service_status",
+            ):
                 cur.execute(f"TRUNCATE TABLE `{table}`")
             cur.execute("SET FOREIGN_KEY_CHECKS = 1")
+            # Restore the seed row schema.sql inserts (the worker's probe row).
+            cur.execute("INSERT IGNORE INTO service_status (name) VALUES ('liftwing')")
         conn.close()
 
 
@@ -249,10 +275,12 @@ def db_pool(test_db, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def _make_encoding(seed: int = 0) -> bytes:
-    """Generate a deterministic 128D float64 face encoding (1024 bytes)."""
+def _make_embedding(seed: int = 0, dim: int = 512) -> bytes:
+    """Generate a deterministic unit-norm float32 face embedding (``dim * 4`` bytes)."""
     rng = np.random.default_rng(seed)
-    return rng.random(128).astype(np.float64).tobytes()
+    vector = rng.standard_normal(dim).astype("<f4")
+    vector /= np.linalg.norm(vector)
+    return vector.tobytes()
 
 
 @pytest.fixture
@@ -337,19 +365,19 @@ def seed_faces(db_conn, seed_images, seed_user):
         for i, img in enumerate(seed_images):
             # One target face per image
             cur.execute(
-                "INSERT INTO faces (image_id, encoding, bbox_top, bbox_right, "
+                "INSERT INTO faces (image_id, encoding, embedding_model, bbox_top, bbox_right, "
                 "bbox_bottom, bbox_left, is_target, classified_by, classified_by_user_id) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
-                (img["id"], _make_encoding(i), 50, 200, 200, 50, 1, "human", seed_user["id"]),
+                "VALUES (%s, %s, 'scrfd500m+arcface_mbf', %s, %s, %s, %s, %s, %s, %s)",
+                (img["id"], _make_embedding(i), 50, 200, 200, 50, 1, "human", seed_user["id"]),
             )
             targets.append(cur.lastrowid)
 
             # One non-target face per image
             cur.execute(
-                "INSERT INTO faces (image_id, encoding, bbox_top, bbox_right, "
+                "INSERT INTO faces (image_id, encoding, embedding_model, bbox_top, bbox_right, "
                 "bbox_bottom, bbox_left, is_target, classified_by, classified_by_user_id) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
-                (img["id"], _make_encoding(100 + i), 300, 450, 450, 300, 0, "human", seed_user["id"]),
+                "VALUES (%s, %s, 'scrfd500m+arcface_mbf', %s, %s, %s, %s, %s, %s, %s)",
+                (img["id"], _make_embedding(100 + i), 300, 450, 450, 300, 0, "human", seed_user["id"]),
             )
             non_targets.append(cur.lastrowid)
 
@@ -363,10 +391,10 @@ def seed_unclassified_faces(db_conn, seed_images):
     with db_conn.cursor() as cur:
         for i, img in enumerate(seed_images):
             cur.execute(
-                "INSERT INTO faces (image_id, encoding, bbox_top, bbox_right, "
+                "INSERT INTO faces (image_id, encoding, embedding_model, bbox_top, bbox_right, "
                 "bbox_bottom, bbox_left) "
-                "VALUES (%s, %s, %s, %s, %s, %s)",
-                (img["id"], _make_encoding(200 + i), 100, 300, 300, 100),
+                "VALUES (%s, %s, 'scrfd500m+arcface_mbf', %s, %s, %s, %s)",
+                (img["id"], _make_embedding(200 + i), 100, 300, 300, 100),
             )
             face_ids.append(cur.lastrowid)
     return face_ids
@@ -385,10 +413,10 @@ def seed_bootstrap_image(db_conn, seed_project):
         image_id = cur.lastrowid
 
         cur.execute(
-            "INSERT INTO faces (image_id, encoding, bbox_top, bbox_right, "
+            "INSERT INTO faces (image_id, encoding, embedding_model, bbox_top, bbox_right, "
             "bbox_bottom, bbox_left, is_target, classified_by, sdc_written) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
-            (image_id, _make_encoding(500), 50, 200, 200, 50, 1, "bootstrap", 1),
+            "VALUES (%s, %s, 'scrfd500m+arcface_mbf', %s, %s, %s, %s, %s, %s, %s)",
+            (image_id, _make_embedding(500), 50, 200, 200, 50, 1, "bootstrap", 1),
         )
         face_id = cur.lastrowid
 
@@ -427,6 +455,12 @@ def integration_app(test_db, monkeypatch):
     application = app_module.create_app()
     application.config["TESTING"] = True
     application.config["SECRET_KEY"] = "test-secret-key"
+    # The limiter keys on the client address, which is always 127.0.0.1 here, so
+    # a full integration run would exhaust the global 200/hour quota part-way
+    # through and turn unrelated assertions into 429s. Rate limiting is covered
+    # by the unit tests (and test_error_handler_429); integration tests want the
+    # routes.
+    app_module.limiter.enabled = False
 
     yield application, app_module
 

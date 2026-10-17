@@ -11,7 +11,9 @@
 #     as external API consumers only.
 #     https://wikitech.wikimedia.org/wiki/Machine_Learning/LiftWing/Deploy
 #   * A face-embedding service would need WMF Legal + ML team + community
-#     review. LiftWing hosts no biometric models today.
+#     review. LiftWing hosts no biometric models today. The SCRFD/ArcFace
+#     weights are also non-commercial research only (weights/LICENSE-NOTICE),
+#     which would have to be resolved, e.g. by swapping in YuNet + SFace.
 #
 # Until then, production runs on Toolforge (buildpacks) and local development
 # uses the Dockerfile alongside this file.
@@ -52,8 +54,14 @@ variants:
         source: model.py
         destination: model.py
       - from: local
+        source: backend.py
+        destination: backend.py
+      - from: local
         source: guard.py
         destination: guard.py
+      - from: local
+        source: weights
+        destination: weights
       - from: build
         source: /opt/lib/python/site-packages
         destination: /opt/lib/python/site-packages
@@ -61,7 +69,5 @@ variants:
       packages:
         - python3
         - python3-setuptools
-        - libopenblas0
-        - liblapack3
         - wmf-certificates
     entrypoint: ["python3", "model.py", "--model_name", "wikivisage", "--http_port", "8080"]

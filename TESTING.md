@@ -1,24 +1,36 @@
 # Testing the WikiVisage face service
 
-The face service (`model-server/`) owns the only dlib dependency in the stack.
-`app.py` and `worker.py` reach it over HTTP via `face_client.py` and ship
-without any ML libraries.
+The face service (`model-server/`) is the only place ML runs: SCRFD-500M face
+detection and ArcFace MobileFaceNet 512D embedding on ONNX Runtime. `app.py` and
+`worker.py` reach it over HTTP via `face_client.py` and ship without any ML
+libraries.
 
 This guide covers running and exercising the service locally. In production it
 runs on Toolforge as its own tool, built with buildpacks — see
 [how-to-run-it.md](how-to-run-it.md#face-service-deployment-second-tool). The
 Dockerfile here is for local development and CI only; both install the same
-`requirements.txt`.
+fully pinned `requirements.txt` lock (generated from `requirements.in` — see
+[Regenerating the Python lock](#7-regenerating-the-python-lock)).
 
 ---
 
-## A note on `/mnt/models`
+## A note on the model weights
 
-KServe conventionally mounts model weights at `/mnt/models`, so you may expect
-a `-v $(pwd)/models:/mnt/models` flag. **This service does not need one.** The
-dlib weights ship inside the `face_recognition_models` wheel and are already in
-the image after `pip install` — `load()` just imports the package and warms it.
-Reintroduce a mount only if you ever swap in externally-managed weights.
+KServe conventionally mounts model weights at `/mnt/models`, so you may expect a
+`-v $(pwd)/models:/mnt/models` flag. **This service does not need one.** The two
+ONNX files are committed in `model-server/weights/` (about 16 MB, ordinary git
+blobs, **not** Git LFS) and are copied into the image. On startup `load()`
+verifies their SHA-256 against the values pinned in `backend.py` and the process
+exits if either file is missing, truncated, an LFS pointer, or different.
+
+The weights are InsightFace's `buffalo_sc` models, which are **non-commercial
+research only** — read `model-server/weights/LICENSE-NOTICE`. To check or
+re-create them:
+
+```bash
+scripts/fetch_weights.sh --check   # verify the committed files (no network)
+scripts/fetch_weights.sh           # download from the official release, verify, install
+```
 
 ---
 
@@ -33,7 +45,9 @@ The build is two-stage: the builder stage carries a compiler toolchain (some
 kserve transitive deps, notably `psutil` on arm64, have no prebuilt wheel); the
 runtime image carries none.
 
-First build takes a few minutes, mostly downloading the `dlib-bin` wheel.
+First build takes a few minutes, mostly downloading the `onnxruntime`,
+`opencv-python-headless` and `kserve` wheels. No system packages are needed
+beyond `curl` (used by the image's health check).
 
 ---
 
@@ -51,8 +65,8 @@ docker run --rm \
 
 The resource and isolation flags are not optional extras. Before this split,
 detection ran in a subprocess hardened with `RLIMIT_AS` / `RLIMIT_CPU` /
-`RLIMIT_FSIZE` and a scrubbed environment, because dlib, libjpeg, and libpng
-parse untrusted bytes. Locally those guarantees come from the container flags
+`RLIMIT_FSIZE` and a scrubbed environment, because libjpeg, libpng and the ML
+runtime parse untrusted bytes. Locally those guarantees come from the container flags
 above; on Toolforge from the job's `--mem` / `--cpu` limits and `--mount=none`.
 Environment scrubbing is no longer needed at all — the service runs in its own
 tool and never holds OAuth, database, or token-encryption secrets in the first
@@ -65,7 +79,11 @@ cd model-server
 docker compose up --build
 ```
 
-Wait for `Model 'wikivisage' loaded` in the logs before sending requests.
+Wait for `Model 'wikivisage' loaded (model_id=scrfd500m+arcface_mbf, ...)` in the
+logs before sending requests. The line before it, `Weights verified: ...`, shows
+the SHA-256 of both weight files; on a bad deploy the process instead logs
+`Face backend failed to load, refusing to start` and exits 1, so it never
+becomes ready.
 
 ### Readiness
 
@@ -113,9 +131,9 @@ request for you (standard library only, no install needed):
 ```bash
 cd model-server
 
-# Grab a test image with a face in it
+# Grab a test image with a face in it (960 px is what the worker sends)
 curl -sL -o test.jpg \
-  "https://commons.wikimedia.org/wiki/Special:FilePath/Douglas%20adams%20portrait%20cropped.jpg?width=500"
+  "https://commons.wikimedia.org/wiki/Special:FilePath/Douglas%20adams%20portrait%20cropped.jpg?width=960"
 
 # Build the request body
 python3 make_input.py test.jpg > input.json
@@ -134,12 +152,15 @@ Response shape:
     {
       "id": "0",
       "status": "ok",
-      "width": 500,
-      "height": 600,
+      "width": 960,
+      "height": 1152,
+      "model_id": "scrfd500m+arcface_mbf",
+      "dim": 512,
       "faces": [
         {
-          "box": {"top": 104, "right": 355, "bottom": 293, "left": 166},
-          "encoding": "<base64 of 1024 raw float64 bytes>"
+          "box": {"top": 208, "right": 710, "bottom": 586, "left": 332},
+          "score": 0.91,
+          "encoding": "<base64 of 512 little-endian float32 values>"
         }
       ]
     }
@@ -147,8 +168,17 @@ Response shape:
 }
 ```
 
-The `encoding` decodes to exactly 1024 bytes (128 × float64) and is written
-straight into the `faces.encoding` BLOB column.
+The `encoding` decodes to exactly `dim * 4` = 2048 bytes (512 × little-endian
+float32, L2-normalised, so cosine similarity is a dot product) and is written
+straight into the `faces.encoding` BLOB column together with `model_id`
+(`faces.embedding_model`) and `score` (`faces.det_score`). `face_client` rejects
+a response whose `model_id` or `dim` is not the expected one, or whose encodings
+have any other width (for example the old 1024-byte float64 format).
+
+Detection notes: faces whose short side is under `WIKIVISAGE_MIN_FACE_PX` (20)
+are dropped; a second half-scale pass finds very large faces that SCRFD-500M
+misses at full size; at most `WIKIVISAGE_MAX_FACES` (300) are returned, best
+score first.
 
 ### Batching
 
@@ -159,8 +189,12 @@ curl -s -X POST http://localhost:8080/v1/models/wikivisage:predict \
 ```
 
 `predictions` is always the same length and order as `instances`. One bad image
-yields `{"status": "error", "error": "..."}` for that entry only — its siblings
-still return results.
+yields `{"status": "error", "error": "...", "error_code": "..."}` for that entry
+only — its siblings still return results. `error_code` is one of `invalid_image`
+(the image bytes cannot be decoded or are over the size limit), `invalid_box`,
+`invalid_request` or `service_error`. `face_client.encode_known_face` re-raises
+`invalid_image` (no other box can help) and turns every other rejection into
+"unusable region"; `detect_faces` raises `FaceServiceRejected` either way.
 
 ### Encoding a known bounding box
 
@@ -168,9 +202,24 @@ This is the path `/api/manual-face` and `/api/update-face-bbox` use when a user
 draws a box by hand. Coordinates are CSS order: `TOP,RIGHT,BOTTOM,LEFT`.
 
 ```bash
-python3 make_input.py --task encode --box 104,355,293,166 test.jpg > encode.json
+python3 make_input.py --task encode --box 208,710,586,332 test.jpg > encode.json
 curl -s -X POST http://localhost:8080/v1/models/wikivisage:predict \
   -H 'Content-Type: application/json' -d @encode.json | python3 -m json.tool
+```
+
+A drawn box has no landmarks, so the service runs the detector on the box grown
+by 50% and aligns the detection that overlaps the box best (IoU >= 0.3). Each
+returned face carries `aligned: true` and the detector `score`; if no detection
+overlaps enough, the box is just resized and embedded (`aligned: false`,
+`score: null`), which gives a weaker embedding.
+
+If the box was measured on an image of a different size than the one you send,
+say so with `box_space` and the service scales it to the decoded image
+(`--box-space WIDTH,HEIGHT` in `make_input.py`). The app passes the stored
+`images.detection_width/height`:
+
+```bash
+python3 make_input.py --task encode --box 104,355,293,166 --box-space 480,576 test.jpg
 ```
 
 ### Error handling
@@ -189,7 +238,10 @@ curl -s -i -X POST http://localhost:8080/v1/models/wikivisage:predict \
 The distinction matters to the worker: a per-instance error is treated as
 terminal and marks the image `status='error'`, while a transport or envelope
 failure is treated as transient and leaves the image `pending` for the next
-poll cycle.
+poll cycle. For the `encode` path the `error_code` adds a second distinction:
+`invalid_image` is what makes `face_client.encode_known_face` raise (both bbox
+routes then answer HTTP 422 "could not be read"), while `invalid_box` comes back
+as `None` ("try drawing a slightly larger box").
 
 ---
 
@@ -222,6 +274,9 @@ curl -s http://localhost:8000/health | python3 -m json.tool
 | `WIKIVISAGE_FACE_SERVICE_MAX_BATCH_BYTES` | `25165824` (24 MiB) | Max raw bytes per request |
 | `WIKIVISAGE_FACE_SERVICE_TIMEOUT` | `30` | Base read timeout (seconds) |
 | `WIKIVISAGE_FACE_SERVICE_TIMEOUT_PER_IMAGE` | `15` | Added per image in the batch |
+| `WIKIVISAGE_FACE_MODEL_ID` | `scrfd500m+arcface_mbf` | The only `model_id` the client accepts |
+| `WIKIVISAGE_FACE_EMBEDDING_DIM` | `512` | Embedding length the client expects |
+| `WIKIVISAGE_DETECTION_WIDTH` | `960` | Commons thumbnail width the worker detects on and the app downloads for manual drawing (must be a standard Commons step) |
 
 Batches split on whichever of the count/byte budgets is hit first, so a few
 large images cannot produce a huge request body.
@@ -232,20 +287,26 @@ large images cannot produce a huge request body.
 |---|---|---|
 | `WIKIVISAGE_FACE_SERVICE_TOKEN` | *(unset)* | Required bearer token (>= 32 chars); mandatory on Toolforge |
 | `WIKIVISAGE_MAX_REQUEST_BYTES` | `41943040` (40 MiB) | Request body cap, enforced before parsing |
-| `WIKIVISAGE_FACE_WORKERS` | `1` | Threads decoding images. dlib itself always runs one call at a time |
+| `WIKIVISAGE_FACE_WORKERS` | `2` | Executor threads running inference on the shared (thread-safe) ONNX sessions; set to the vCPU count |
 | `WIKIVISAGE_MAX_BATCH_SIZE` | `32` | Reject requests with more instances |
 | `WIKIVISAGE_MAX_IMAGE_BYTES` | `20971520` (20 MiB) | Per-image decoded size ceiling |
-| `WIKIVISAGE_MAX_IMAGE_PIXELS` | `100000000` | Pixel-area ceiling before dlib |
+| `WIKIVISAGE_MAX_IMAGE_PIXELS` | `100000000` | Pixel-area ceiling before decoding |
 | `WIKIVISAGE_MAX_BOXES` | `64` | Max boxes per `encode` instance |
+| `WIKIVISAGE_WEIGHTS_DIR` | `<model-server>/weights` | Directory holding the two ONNX files |
+| `WIKIVISAGE_DET_MAX_SIDE` | `1280` | Longest image side fed to the detector |
+| `WIKIVISAGE_MIN_FACE_PX` | `20` | Drop detected faces whose short side is smaller |
+| `WIKIVISAGE_MAX_FACES` | `300` | Per-image cap on returned faces |
+| `WIKIVISAGE_DET_COARSE_MIN_SIDE` | `640` | Long side from which the half-scale pass runs (`0` disables it) |
 
 ---
 
 ## 5. Run the Python test suite
 
-The suite never touches the network — `face_client` is mocked throughout.
+The main suite never touches the network — `face_client` is mocked throughout.
 
 ```bash
-# Unit tests only (what CI runs)
+# Unit tests only (what the CI "test" job runs). The face-service unit and
+# contract tests skip here: they need onnxruntime/opencv/kserve or a service.
 pytest tests/ -q
 
 # Unit + integration (needs local MariaDB)
@@ -254,82 +315,65 @@ WIKIVISAGE_TEST_DB=1 pytest tests/ -v
 # Just the client, and the request guard (stdlib only, no kserve needed)
 pytest tests/test_face_client.py tests/test_face_service_guard.py -v
 
+# The face-service unit tests: backend.py (fake ONNX sessions plus the real
+# weights) and model.py (the KServe envelope with a scripted backend). They
+# import model-server/ directly, so install its requirements first.
+pip install -r model-server/requirements.txt -r requirements-dev.txt
+pytest tests/test_face_service_backend.py tests/test_face_service_model.py -v
+
 # Contract tests against a running container. With a token set on both sides
 # the auth tests run too; this is how CI runs them.
 WIKIVISAGE_FACE_SERVICE_CONTRACT=1 WIKIVISAGE_FACE_SERVICE_TOKEN="$TOKEN" \
   pytest tests/test_face_service_contract.py -v
 ```
 
+Tests that need a **real face** read `tests/data/portrait_sample.jpg` (committed;
+provenance in `tests/data/README.md` — a close-cropped public-domain portrait
+whose ~514x756 px face at 960 px exercises the half-scale pass). Without it they
+skip, unless `WIKIVISAGE_REQUIRE_SAMPLE` is an explicit affirmative
+(`1`/`true`/`yes`/`on` — CI sets `1`), in which case they fail.
+`WIKIVISAGE_TEST_SAMPLE_IMAGE=/path/to/photo.jpg` points them at another photo.
+
+CI also checks that the service log has no ONNX Runtime `VerifyOutputSizes`
+warnings after the contract tests (the detector's declared output shapes come
+from a 640x640 trace; `backend._make_session` sets `log_severity_level = 3` so
+other input sizes do not flood the log).
+
 ---
 
 ## Verified behaviour
 
-The following was measured against a locally built container, comparing the
-new remote path to the old in-process path on the same image.
+Checked locally against a freshly started service process (real KServe 0.15.2,
+real weights, Python 3.11, Apple-silicon laptop; **not** inside Docker or the
+Toolforge buildpack image):
 
 | Check | Result |
 |---|---|
-| Bounding boxes | **Identical** — `[(155, 295, 229, 220)]` from both paths |
-| Image dimensions | Identical (500 x 718) |
-| Encoding width | Exactly 1024 bytes (128 x float64) |
-| Encoding values | Agree to **7.7e-07 L2** (see below) |
-| Per-instance error isolation | A corrupt image in a 3-image batch returns `FaceServiceRejected` for that entry only; siblings still return faces |
-| Byte-aware batching | 20 images at `BATCH_SIZE=8` split into `[8, 8, 4]` |
-| Too-small bbox | `encode_known_face` returns `None` (drives the HTTP 422 path) |
+| Weights | Both SHA-256 values match the pinned ones; the log shows them at startup |
+| Same person, 2 official portraits | Cosine similarity 0.73 |
+| Different people (Obama, Biden, Harris) | Cosine similarity -0.02 – 0.15 |
+| Family portrait | 4 faces |
+| Large close-up (532 px face on a 960x1307 image) | Missed at full size by SCRFD-500M, found by the half-scale pass |
+| Sloppy hand-drawn box around a face | Landmarks recovered (`aligned: true`), embedding 0.957 cosine to the detected face |
+| Same box, unaligned fallback | 0.69 cosine to the aligned embedding — why `aligned` is reported |
+| `box_space` | A box given in a 2x larger space embeds identically to the same region given directly |
+| Per-instance error isolation | A corrupt image in a batch returns an error (with a machine-readable `error_code`) for that entry only |
 | Unreachable service | Raises `FaceServiceUnavailable`, not a crash |
-| Malformed envelope | HTTP 400 |
+| Service log | No `VerifyOutputSizes` warnings after the contract suite |
 
-### On encoding equivalence
+Not measured: behaviour on Toolforge CPUs (expect 2–3x slower than a laptop),
+recall on hard Commons images against your own labelled faces (that is the
+plan's Phase 0), and encodings across machines.
 
-The encodings are **not bit-identical across machines**, and that is expected.
-dlib's ResNet runs in float32, so CPU and BLAS differences change the last
-couple of digits:
+### Embeddings across machines
 
-```
-local vs local (same process, rerun) : max delta 0.000e+00
-local vs remote container            : max delta 2.086e-07
-float32 epsilon                      : 1.192e-07
-L2 distance local <-> remote         : 7.736e-07
-classification threshold             : 0.6
-ratio (drift / threshold)            : 1.29e-06
-```
-
-The path is bit-deterministic against itself, so nothing in this service
-introduces nondeterminism. The residual is platform float32 drift, about one
-part in a million of the decision margin — roughly a millionth of the distance
-between two photos of the same person. It is not specific to this
-architecture: the same drift exists between any two machines, including
-between two Toolforge nodes, and existed before the split.
-
-What *would* invalidate stored encodings is changing the `dlib-bin` version or
-the `face_recognition_models` weights, or changing the dlib calls (upsampling,
-the 5-point landmark model, `num_jitters`). All three are pinned and commented
-in `model-server/requirements.txt` and `model.py`.
-
-### Dropping the `face_recognition` package
-
-The service no longer depends on `face_recognition`: its metadata requires the
-source-only `dlib`, which a buildpack cannot skip the way the Dockerfile's
-`--no-deps` used to. `model.py`'s `_Dlib` makes the same calls directly. This
-was checked by running the old image (with the package) and the new one side
-by side on the same bytes:
-
-| Check | Result |
-|---|---|
-| 40 real Commons images, 67 faces — boxes | **Identical** |
-| Same — `detect` encodings | **Byte-identical** |
-| Same — `encode` task with known boxes | **Byte-identical** |
-| Truncated JPEG (70% of the file) | Identical (both decode it) |
-| Buildpack image (amd64) vs old image (arm64) | 6.5e-07 – 7.7e-07 L2, the usual cross-platform drift |
-
-Comparing against encodings stored in March also showed three faces off by
-0.06–0.2 L2 — but the old package shows exactly the same gap on those images.
-Commons now serves different thumbnail bytes for them than it did then; it is
-input drift, not a code change.
-
-To re-run this comparison yourself, the checks above are in the test suite
-(`tests/test_face_client.py`); the cross-path numeric comparison requires a
-running container and a local dlib install, so it is not part of CI.
+The ONNX models run in float32, so the same image embedded on different CPU or
+ONNX Runtime builds can differ in the last digits. On one machine the path is
+deterministic against itself (a unit test asserts it). What *would* invalidate
+stored embeddings is a different set of weights, a changed alignment template,
+or changed preprocessing in `backend.py`; every face therefore records the
+`embedding_model` that produced it, and the worker only compares faces of the
+current model.
 
 ---
 
@@ -349,68 +393,98 @@ for or build on Python 3.11+.
 
 ---
 
-## 7. Building the production image locally (buildpacks)
+## 7. Regenerating the Python lock
+
+`requirements.txt` is a fully pinned transitive lock generated from
+`requirements.in`. Edit `requirements.in`, then regenerate:
+
+```bash
+cd model-server
+uv pip compile --python-version 3.11 --python-platform x86_64-manylinux_2_28 \
+  requirements.in -o requirements.txt
+```
+
+The target is the buildpack's Python and platform (Python 3.11, x86_64
+manylinux). Never edit `requirements.txt` by hand and never reduce it to
+top-level-only pins — that is how transitive versions drifted under a file
+labelled "pinned". Both the Docker image and the Toolforge buildpack install
+the generated lock with a plain `pip install -r requirements.txt`.
+
+---
+
+## 8. Building the production image locally (buildpacks)
 
 Toolforge builds the face service with Cloud Native Buildpacks, not the
 Dockerfile. To reproduce that build — worth doing after touching
-`requirements.txt`, `project.toml` or the `Procfile` — run `pack` with
-Toolforge's builder against a copy of `model-server/`:
+`requirements.txt` or the `Procfile` — run `pack` with Toolforge's builder
+against a copy of `model-server/`:
 
 ```bash
 docker run --rm -u root -v /var/run/docker.sock:/var/run/docker.sock \
   -v "$PWD/model-server":/workspace -w /workspace buildpacksio/pack \
   build wikivisage-face-bp --platform linux/amd64 \
   --builder tools-harbor.wmcloud.org/toolforge/heroku-builder:24_0.21.8 \
-  --buildpack heroku/deb-packages --buildpack heroku/python --buildpack heroku/procfile
+  --buildpack heroku/python --buildpack heroku/procfile
 
 docker run --rm -p 8082:8000 --entrypoint web \
   -e WIKIVISAGE_FACE_SERVICE_TOKEN="$TOKEN" wikivisage-face-bp
 ```
 
-The deb-packages buildpack must be named explicitly here; Toolforge injects it
-automatically. The image is about 1 GB.
+The service needs no system packages (there is no `project.toml`), so the
+deb-packages buildpack is not requested. The weights directory is part of the
+build context, so it ends up in the image.
 
 ---
 
 ## Troubleshooting
 
+**The service exits at startup with `Face backend failed to load, refusing to
+start` / `WeightsError`** — a weights file is missing or its SHA-256 does not
+match `backend.WEIGHT_SHA256`. The message names the file and shows both hashes.
+Typical causes: the files were replaced by Git LFS pointer files, a download was
+truncated, or someone swapped the model. Run `scripts/fetch_weights.sh --check`;
+`scripts/fetch_weights.sh` restores the official files. Because the process
+never reports ready, `deploy.yml`'s readiness wait fails and no worker is
+restarted against it.
+
 **`NoModelReady` on startup** — `load()` raised before setting `self.ready`.
-Almost always a missing `face_recognition_models` install. Check the traceback
-above the error.
+Check the traceback above the error.
 
-**`could not read Username for 'https://github.com'` during build** — you are
-building an older revision that still pins the `face-recognition` Git fork
-(`github.com/DiFronzo/face_recognition`). That repository has been deleted and
-now 404s, so pip's `git clone` falls through to an interactive credential
-prompt. The current `requirements.txt` does not use `face_recognition` at all.
+**Worker exits at startup with "Face service runs a different embedding model"**
+— the service reports a `model_id` or `dim` other than `scrfd500m+arcface_mbf` /
+512 (a stale service, or `WIKIVISAGE_FACE_MODEL_ID` set differently). Redeploy the
+face tool first; the worker refuses to store vectors from another model.
 
-**Build tries to compile `dlib` (CMake errors)** — something reintroduced the
-`face_recognition` package, whose metadata requires the `dlib` sdist. Keep it
-out of `requirements.txt`; `model.py` calls dlib directly.
+**Every image stays `pending` and the log says "face encoding is N bytes,
+expected 2048"** — an old face service (1024-byte float64 encodings) is still
+answering. Same fix: deploy the face tool before the workers.
 
 **HTTP 401 from the service** — the client and server hold different
 `WIKIVISAGE_FACE_SERVICE_TOKEN` values, or the client has none. The web app
 logs `rejected WIKIVISAGE_FACE_SERVICE_TOKEN` and `/health` reports
 `face_service: unreachable`.
 
-**`pkg_resources is deprecated` warning** — harmless. `face_recognition_models`
-still uses it, which is why `setuptools<81` is pinned in the service's
-requirements.
-
 **Worker logs "Face service not ready"** — the worker probes once at startup and
 continues regardless; images stay `pending` and retry every poll cycle. Confirm
 `WIKIVISAGE_FACE_SERVICE_URL` and that `curl $URL/v1/models/wikivisage` returns
 `ready: true`.
 
-**Detection is slow** — dlib HOG is CPU-bound and, because dlib is not
-thread-safe, each replica detects one image at a time. Add replicas
-(`--replicas N` on the Toolforge job) rather than raising
-`WIKIVISAGE_FACE_WORKERS`, which only overlaps image decoding. The worker
-downloads Commons thumbnails at `?width=500`, so images are small.
+**Detection is slow** — inference is CPU-bound. Throughput scales with
+`WIKIVISAGE_FACE_WORKERS` up to the CPU count (the Toolforge job has 2 vCPUs);
+beyond that add replicas (`--replicas N` on the Toolforge job). The worker
+downloads Commons thumbnails at `?width=960`, about 3x the bytes of the former
+500 px, and detection on them is correspondingly heavier.
 
-**Server exits with SIGSEGV (exit 139)** — two threads were inside dlib at once.
-Every dlib call must stay under `_dlib_lock` in `model.py`.
+**Faces are missing on a close-up portrait** — SCRFD-500M misses very large
+faces at full size; the half-scale pass covers them when the image's long side is
+at least `WIKIVISAGE_DET_COARSE_MIN_SIDE` (640). If you disabled it (`0`) or set
+`WIKIVISAGE_DET_MAX_SIDE` very high, that is the cause. Tiny faces below
+`WIKIVISAGE_MIN_FACE_PX` (20) are dropped on purpose.
+
+**Logs flooded with `VerifyOutputSizes` warnings** — the ONNX session's log
+level was changed; `backend._make_session` must keep `log_severity_level = 3`.
 
 **OOM / container killed** — lower `WIKIVISAGE_FACE_SERVICE_BATCH_SIZE` on the
-client, or `WIKIVISAGE_MAX_IMAGE_PIXELS` on the server. A single dlib call on a
-large image can transiently allocate several hundred MB.
+client, `WIKIVISAGE_MAX_IMAGE_PIXELS` on the server, or `WIKIVISAGE_FACE_WORKERS`
+(each concurrent decode of a large image holds a full RGB copy). A crowd photo
+is embedded in chunks of 32 faces to bound activation memory.
