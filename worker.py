@@ -94,12 +94,17 @@ MAX_IMAGES_PER_PROJECT = 9000
 # Measured 2026-10-17: ~1 s per file, so 20 keeps a request ~20 s, well inside
 # the client's 90 s timeout even under load.
 LIFTWING_BATCH_SIZE = int(os.environ.get("WIKIVISAGE_LIFTWING_BATCH_SIZE", "20"))
-# Images the pre-filter records per project cycle. Because the pre-filter now
-# runs after detection, a large backlog is worked off over several cycles
-# without delaying images; verdicts are only shadow data.
+# Images the pre-filter records per call — a project cycle or a sweep pass.
+# Because the pre-filter runs after detection, a large backlog is worked off
+# over several cycles without delaying images; verdicts are only shadow data.
 LIFTWING_MAX_IMAGES = int(os.environ.get("WIKIVISAGE_LIFTWING_MAX_IMAGES", "250"))
 # Consecutive failed probes before service_status flips to 'down' (banner).
 LIFTWING_FAIL_THRESHOLD = int(os.environ.get("WIKIVISAGE_LIFTWING_FAIL_THRESHOLD", "3"))
+# Pause between background shadow-sweep passes, in seconds. The sweep records
+# verdicts for projects the processing pipelines never claim (completed, paused
+# or fully processed); each pass covers up to LIFTWING_MAX_IMAGES files of one
+# project. 0 disables the sweep.
+LIFTWING_SWEEP_INTERVAL = int(os.environ.get("WIKIVISAGE_LIFTWING_SWEEP_INTERVAL", "60"))
 
 # Bootstrap processing cap — limits how many bootstrap images process_images() will
 # download/detect per project.  All P180 images are inserted into the DB by
@@ -1466,8 +1471,11 @@ def prefilter_images(project: dict[str, Any]) -> int:
     backs off, and a service already marked down is skipped entirely. Files the
     model omitted are kept and recorded with a NULL reason. Real request
     outcomes are mirrored into ``service_status`` so the banner reflects what
-    the pre-filter actually experiences, not just what the probe sees. Returns
-    the number of images whose verdicts were stored.
+    the pre-filter actually experiences, not just what the probe sees. While a
+    pass runs, the caller's claim is refreshed after every stored batch, so a
+    pass longer than the claim expiry (a sweep can hold a project for many
+    minutes with nothing else refreshing it) cannot be claimed by the other
+    worker too. Returns the number of images whose verdicts were stored.
     """
     if project.get("prefilter_mode", "off") == "off":
         return 0
@@ -1538,12 +1546,142 @@ def prefilter_images(project: dict[str, Any]) -> int:
             logger.exception(f"Pre-filter: could not store verdicts for project {project_id}")
             break
         checked += len(batch)
+        # Keep our claim fresh for the whole pass: a sweep runs in its own
+        # thread while the main loop is idle, so nothing else refreshes it.
+        try:
+            execute_query(
+                "UPDATE projects SET worker_claimed_at = NOW() WHERE id = %s AND worker_claimed_by = %s",
+                (project_id, _worker_id),
+                fetch=False,
+            )
+        except DatabaseError:
+            logger.warning(f"Pre-filter: could not refresh the claim on project {project_id}")
 
     if checked and not failed:
         _record_liftwing_success()
     if checked:
         logger.info(f"Pre-filter (shadow): recorded LiftWing verdicts for {checked} image(s) in project {project_id}")
     return checked
+
+
+def _claim_shadow_project() -> dict[str, Any] | None:
+    """Atomically claim one project the processing pipelines will not take.
+
+    ``_claim_active_projects`` only takes active projects with pending images
+    or unclassified faces, and ``_claim_inference_projects`` the ones that
+    crossed ``min_confirmed`` — so a completed, paused or fully processed
+    project would never receive pre-filter verdicts even with the mode on.
+    This claim picks exactly those projects (non-deleted, mode not ``off``,
+    unchecked non-bootstrapped images still present), so a sweep can never
+    delay work the pipelines would otherwise do; projects with a pending SDC
+    write request are left to the SDC path. The work predicates below mirror
+    those of ``_claim_active_projects`` / ``_claim_inference_projects``; keep
+    them in sync. Ordering by last claim time rotates sweeps across projects:
+    a just-swept project sorts last, so it is only picked again once every
+    other candidate has been swept.
+    """
+
+    def _txn(conn: Any, cursor: Any) -> dict[str, Any] | None:
+        cursor.execute(
+            "SELECT p.id FROM projects p "
+            "WHERE p.status != 'deleted' "
+            "AND p.prefilter_mode != 'off' "
+            "AND p.sdc_write_requested = 0 "
+            "AND (p.worker_claimed_by IS NULL "
+            "     OR p.worker_claimed_at < NOW() - INTERVAL %s MINUTE) "
+            "AND EXISTS ("
+            "  SELECT 1 FROM images i "
+            "  WHERE i.project_id = p.id AND i.bootstrapped = 0 AND i.prefilter_checked_at IS NULL"
+            ") "
+            "AND NOT ("
+            "  (p.status = 'active' AND ("
+            "    NOT EXISTS (SELECT 1 FROM images i WHERE i.project_id = p.id) "
+            "    OR EXISTS (SELECT 1 FROM images i WHERE i.project_id = p.id AND i.status = 'pending') "
+            "    OR EXISTS ("
+            "      SELECT 1 FROM faces f JOIN images i ON f.image_id = i.id "
+            "      WHERE i.project_id = p.id AND f.is_target IS NULL AND f.superseded_by IS NULL"
+            "    )"
+            "  )) "
+            "  OR (p.status = 'completed' AND EXISTS ("
+            "    SELECT 1 FROM faces f JOIN images i ON f.image_id = i.id "
+            "    WHERE i.project_id = p.id AND f.is_target IS NULL AND f.superseded_by IS NULL"
+            "  ) AND ("
+            "    SELECT COUNT(*) FROM faces f JOIN images i ON f.image_id = i.id "
+            "    WHERE i.project_id = p.id AND f.is_target = 1 AND f.superseded_by IS NULL "
+            "    AND f.classified_by_user_id IS NOT NULL"
+            "  ) >= p.min_confirmed)"
+            ") "
+            "ORDER BY COALESCE(p.worker_claimed_at, '1970-01-01') ASC, p.id DESC "
+            "LIMIT 1 "
+            "FOR UPDATE SKIP LOCKED",
+            (CLAIM_EXPIRY_MINUTES,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None
+        project_id = row["id"]
+        cursor.execute(
+            "UPDATE projects SET worker_claimed_by = %s, worker_claimed_at = NOW() WHERE id = %s",
+            (_worker_id, project_id),
+        )
+        cursor.execute("SELECT p.* FROM projects p WHERE p.id = %s", (project_id,))
+        return dict(cursor.fetchone())
+
+    try:
+        project = execute_transaction(_txn)
+    except DatabaseError:
+        logger.exception("Shadow pre-filter: could not claim a project")
+        return None
+    if project:
+        logger.info(f"Shadow pre-filter: claimed project {project['id']} (status={project.get('status')})")
+    return project
+
+
+def _sweep_shadow_prefilter() -> int:
+    """Record one project's worth of shadow verdicts (up to LIFTWING_MAX_IMAGES).
+
+    Runs from the background sweep thread so projects the processing pipelines
+    never claim are covered too. The claim is released when the pass ends, so
+    other cycles and the other worker instance can continue the backlog.
+    Fail-open and paced exactly like the in-pipeline call — only the trigger
+    differs; verdicts still change nothing.
+    """
+    if _liftwing_service_down():
+        return 0
+    project = _claim_shadow_project()
+    if project is None:
+        return 0
+    try:
+        return prefilter_images(project)
+    except Exception:
+        logger.exception(f"Shadow pre-filter: sweep failed for project {project.get('id')}")
+        return 0
+    finally:
+        _release_project(project["id"])
+
+
+def _shadow_prefilter_loop() -> None:
+    """Daemon-thread loop (started by ``main()``) recording shadow verdicts.
+
+    Runs independently of the main loop because one pass can take minutes,
+    which would otherwise stall the heartbeat refreshes the Toolforge health
+    check watches. Sleeps in one-second slices so shutdown stays prompt.
+    """
+    if LIFTWING_SWEEP_INTERVAL <= 0:
+        return
+    logger.info(
+        f"Shadow pre-filter sweep started (pause {LIFTWING_SWEEP_INTERVAL}s between "
+        f"passes, up to {LIFTWING_MAX_IMAGES} files per project per pass)"
+    )
+    while not shutdown_requested:
+        try:
+            _sweep_shadow_prefilter()
+        except Exception:
+            logger.exception("Shadow pre-filter: unexpected sweep error")
+        for _ in range(LIFTWING_SWEEP_INTERVAL):
+            if shutdown_requested:
+                break
+            time.sleep(1)
 
 
 def run_autonomous_inference(project: dict[str, Any]) -> int:
@@ -2501,6 +2639,8 @@ def _claim_active_projects(max_count: int) -> list[dict[str, Any]]:
     Only claims projects that have remaining work: at least one pending image
     to process OR at least one unclassified face.  This avoids wasting worker
     slots on fully-processed projects that the user hasn't marked completed.
+    The work predicate is mirrored (negated) by ``_claim_shadow_project``,
+    which must never take a project this function can claim; keep them in sync.
 
     Returns:
         List of project dicts that were successfully claimed by this worker.
@@ -2561,6 +2701,8 @@ def _claim_inference_projects(max_count: int) -> list[dict[str, Any]]:
 
     An inference-eligible project is active or completed, has enough human-confirmed
     target faces (>= min_confirmed), and still has unclassified faces remaining.
+    The work predicate is mirrored (negated) by ``_claim_shadow_project``; keep
+    them in sync.
     """
 
     def _txn(conn: Any, cursor: Any) -> list[dict[str, Any]]:
@@ -3197,6 +3339,12 @@ def main():
                 )
     except Exception as e:
         logger.warning(f"Diagnostic query failed: {e}")
+
+    # Background shadow sweep: records LiftWing verdicts for projects the
+    # processing pipelines never claim (completed, paused or fully processed).
+    # Own daemon thread — one pass can take minutes, and an inline call would
+    # stall the heartbeat refreshes the Toolforge health check watches.
+    threading.Thread(target=_shadow_prefilter_loop, name="shadow-prefilter-sweep", daemon=True).start()
 
     try:
         while not shutdown_requested:

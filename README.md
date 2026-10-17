@@ -285,7 +285,10 @@ In shadow mode the worker asks Wikimedia LiftWing's `llm-qwen36-27b` whether a f
 could show a person, using only public Commons metadata — never image bytes. The
 verdicts are stored for evaluation, **never block processing**, and the settings
 page shows the shadow results (files checked, would-skip rate, and any
-human-confirmed matches it would have dropped). Calls are serialised and spaced
+human-confirmed matches it would have dropped). A background sweep records
+verdicts for any project with the mode on — including completed ones the main
+pipeline no longer touches — up to 250 files per project per pass. Calls are
+serialised and spaced
 by a jittered minimum interval (default 2 s) so the worker never bursts at the
 shared service; anonymous access works (rate-limited per IP) and
 `WIKIVISAGE_LIFTWING_API_TOKEN` (a Wikimedia personal API token) moves calls to

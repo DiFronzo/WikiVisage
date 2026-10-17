@@ -283,6 +283,26 @@ rejects it and the worker treats any non-`off` value as shadow).
   against the 90 s timeout. `scripts/eval_prefilter.py` reads the verdicts back
   (keep recall on human-confirmed target images, skip rate, dropped-with-faces
   and kept-without-faces detector signal, sample reasons).
+- **Background shadow sweep:** a daemon thread (`_shadow_prefilter_loop`,
+  started in `main()`, pausing `LIFTWING_SWEEP_INTERVAL` = 60 s between
+  passes; `0` disables) covers the projects the pipelines never claim.
+  `_sweep_shadow_prefilter()` atomically claims one project through
+  `_claim_shadow_project()` — any non-deleted project with the mode on,
+  unchecked non-bootstrapped images, and *not* claimable by
+  `_claim_active_projects` or `_claim_inference_projects` (projects with a
+  pending SDC write request are left to the SDC path), so a sweep never
+  delays real work — and runs the same `prefilter_images()` on it (≤ 250
+  files), releasing the claim when the pass ends. `prefilter_images()`
+  refreshes the claim after every stored batch, so a slow pass cannot outlive
+  the 15-minute claim expiry. Without this, completed,
+  paused or fully processed projects never received verdicts at all (prod
+  report 2026-10-17: the settings box sat at "No verdicts recorded yet" for
+  every shadow-mode project). The least-recently-claimed ordering rotates
+  passes across projects, and the shared
+  `worker_claimed_by`/`worker_claimed_at` columns mean two worker instances
+  never sweep the same project at once. The thread exists because a pass can
+  take minutes, which would otherwise stall the heartbeat refreshes the
+  Toolforge health check watches.
 - **Probe and status (`service_status`):** the worker probes only while at
   least one non-deleted project has `prefilter_mode != 'off'`, at most once per
   `LIFTWING_PROBE_INTERVAL` (300 s; 0 disables). The claim is one atomic
@@ -430,6 +450,9 @@ Two query paths:
 | `_record_liftwing_failure` | Increments `consecutive_failures`; flips to `down` at `LIFTWING_FAIL_THRESHOLD` (3). A real failed pre-filter batch lands here too |
 | `_record_liftwing_success` | Resets `consecutive_failures`, sets `status='up'`, stamps `last_ok`; called after each stored pre-filter batch and by the probe |
 | `_probe_liftwing_if_due` | Atomic once-per-`LIFTWING_PROBE_INTERVAL` claim + real probe; runs only while a project uses the filter. Called from the outer poll loop and both 60 s heartbeat loops |
+| `_claim_shadow_project` | Atomic claim of one project the active/inference paths leave alone (non-deleted, mode on, unchecked non-bootstrapped backlog; skips projects with a pending SDC write); least-recently-claimed first, so sweeps rotate |
+| `_sweep_shadow_prefilter` | One `prefilter_images()` pass (≤ 250 files) on a swept project, releasing the claim afterwards; skipped while LiftWing is marked down |
+| `_shadow_prefilter_loop` | Daemon sweep thread started by `main()`: sweep, then sleep `LIFTWING_SWEEP_INTERVAL` in 1 s slices |
 | `_load_embedding` | Validates a `faces.encoding` BLOB: exactly `dim * 4` bytes, little-endian float32, finite, L2 norm in `[0.9, 1.1]`; returns a renormalised unit vector or `None` (rejects stale 1024-byte dlib encodings) |
 | `_face_distance` | Cosine distance `1 - dot(centroid, embedding)`, clamped at 0; stored in `faces.confidence` |
 | `_convert_box_to_stored_space` | Re-expresses a box from one pixel space into the stored `detection_width/height` space (for re-detection on images whose boxes live in another size) |
@@ -541,7 +564,8 @@ images.prefilter_checked_at DATETIME NULL  -- when the verdict was stored
 | `DEFAULT_DISTANCE_THRESHOLD` | 0.5 | Used when a project row carries none |
 | `EMBEDDING_NORM_MIN` / `EMBEDDING_NORM_MAX` | 0.9 / 1.1 | Accepted L2-norm band for stored embeddings |
 | `LIFTWING_BATCH_SIZE` | 20 | Files per pre-filter completion; measured ~20 s per batch vs the 90 s timeout (`WIKIVISAGE_LIFTWING_BATCH_SIZE`) |
-| `LIFTWING_MAX_IMAGES` | 250 | Pre-filter cap per worker cycle (`WIKIVISAGE_LIFTWING_MAX_IMAGES`) |
+| `LIFTWING_MAX_IMAGES` | 250 | Pre-filter cap per `prefilter_images()` call — a project cycle or a sweep pass (`WIKIVISAGE_LIFTWING_MAX_IMAGES`) |
+| `LIFTWING_SWEEP_INTERVAL` | 60 s | Pause between background shadow-sweep passes; `0` disables the sweep (`WIKIVISAGE_LIFTWING_SWEEP_INTERVAL`) |
 | `LIFTWING_FAIL_THRESHOLD` | 3 | Consecutive probe **or filter-batch** failures before `service_status.status` flips to `down` (`WIKIVISAGE_LIFTWING_FAIL_THRESHOLD`) |
 
 ### liftwing_client.py (worker-only, experimental)
@@ -644,6 +668,7 @@ images.prefilter_checked_at DATETIME NULL  -- when the verdict was stored
 - `WIKIVISAGE_LIFTWING_USER_AGENT` — Default: `WikiVisage/<version> (https://github.com/DiFronzo/WikiVisage)`
 - `WIKIVISAGE_LIFTWING_BATCH_SIZE` — Default: `20` (files per completion)
 - `WIKIVISAGE_LIFTWING_MAX_IMAGES` — Default: `250` (pre-filter cap per worker cycle)
+- `WIKIVISAGE_LIFTWING_SWEEP_INTERVAL` — Default: `60` (seconds between background shadow-sweep passes; each pass covers up to `WIKIVISAGE_LIFTWING_MAX_IMAGES` files of one project; `0` disables the sweep)
 - `WIKIVISAGE_LIFTWING_FAIL_THRESHOLD` — Default: `3` (consecutive probe or filter-batch failures before `down`; also the worker's hysteresis)
 - `WIKIVISAGE_LIFTWING_PROBE_INTERVAL` — Default: `300` seconds (`0` disables probing; read by `config.py`, shared with the web app for staleness)
 
