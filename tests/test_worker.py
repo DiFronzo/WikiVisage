@@ -4000,11 +4000,14 @@ def test_prefilter_records_verdicts_and_keeps_missing_pages():
     assert items[2].mime == "audio/ogg"
 
 
-def test_prefilter_survives_a_failed_claim_refresh():
-    """A keepalive failure must not abort the pass — the verdicts still land."""
+def test_prefilter_stops_when_claim_refresh_fails():
+    """A failed keepalive stops the pass — no processing on without a claim."""
     from database import DatabaseError
 
-    rows = [{"id": 301, "commons_page_id": 701, "file_title": "File:A.jpg"}]
+    rows = [
+        {"id": 301, "commons_page_id": 701, "file_title": "File:A.jpg"},
+        {"id": 302, "commons_page_id": 702, "file_title": "File:B.jpg"},
+    ]
     stored: list[tuple] = []
 
     def mock_execute_query(sql, params=None, fetch=True):
@@ -4027,16 +4030,24 @@ def test_prefilter_survives_a_failed_claim_refresh():
         patch("worker.execute_query", side_effect=mock_execute_query),
         patch(
             "worker._fetch_metadata",
-            return_value={"File:A.jpg": {"description": "", "categories": (), "mime": "image/jpeg"}},
+            return_value={
+                "File:A.jpg": {"description": "", "categories": (), "mime": "image/jpeg"},
+                "File:B.jpg": {"description": "", "categories": (), "mime": "image/jpeg"},
+            },
         ),
         patch("worker._store_prefilter_verdicts", side_effect=lambda updates: stored.extend(updates)),
         patch("worker.liftwing_client.get_client", return_value=fake_client),
         patch("worker.shutdown_requested", False),
         patch("worker._worker_id", "test-worker-1"),
+        patch("worker.LIFTWING_BATCH_SIZE", 1),
     ):
         assert prefilter_images({"id": 11, "prefilter_mode": "shadow"}) == 1
 
+    # The first batch landed, then the refresh failed and the pass stopped:
+    # File:B.jpg is left for a later pass instead of being processed without
+    # a live claim.
     assert stored == [(1, "portrait", 301)]
+    assert fake_client.filter_metadata.call_count == 1
 
 
 def test_prefilter_fail_open_when_client_returns_none():

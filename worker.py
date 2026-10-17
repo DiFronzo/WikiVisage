@@ -105,6 +105,11 @@ LIFTWING_FAIL_THRESHOLD = int(os.environ.get("WIKIVISAGE_LIFTWING_FAIL_THRESHOLD
 # or fully processed); each pass covers up to LIFTWING_MAX_IMAGES files of one
 # project. 0 disables the sweep.
 LIFTWING_SWEEP_INTERVAL = int(os.environ.get("WIKIVISAGE_LIFTWING_SWEEP_INTERVAL", "60"))
+# How long shutdown waits for the sweep thread to leave its current batch
+# before claims are released and the DB pool / HTTP session are closed. Covers
+# an in-flight LiftWing request (liftwing_client.REQUEST_TIMEOUT) plus the
+# metadata fetch, verdict storage and claim release around it.
+SWEEP_JOIN_TIMEOUT = int(liftwing_client.REQUEST_TIMEOUT + 15)
 
 # Bootstrap processing cap — limits how many bootstrap images process_images() will
 # download/detect per project.  All P180 images are inserted into the DB by
@@ -1475,7 +1480,8 @@ def prefilter_images(project: dict[str, Any]) -> int:
     pass runs, the caller's claim is refreshed after every stored batch, so a
     pass longer than the claim expiry (a sweep can hold a project for many
     minutes with nothing else refreshing it) cannot be claimed by the other
-    worker too. Returns the number of images whose verdicts were stored.
+    worker too; a failed refresh stops the pass, leaving the remaining files
+    for a later pass. Returns the number of images whose verdicts were stored.
     """
     if project.get("prefilter_mode", "off") == "off":
         return 0
@@ -1548,6 +1554,8 @@ def prefilter_images(project: dict[str, Any]) -> int:
         checked += len(batch)
         # Keep our claim fresh for the whole pass: a sweep runs in its own
         # thread while the main loop is idle, so nothing else refreshes it.
+        # A failed refresh stops the pass instead of processing on without a
+        # live claim; the remaining files are retried on a later pass.
         try:
             execute_query(
                 "UPDATE projects SET worker_claimed_at = NOW() WHERE id = %s AND worker_claimed_by = %s",
@@ -1555,7 +1563,8 @@ def prefilter_images(project: dict[str, Any]) -> int:
                 fetch=False,
             )
         except DatabaseError:
-            logger.warning(f"Pre-filter: could not refresh the claim on project {project_id}")
+            logger.warning(f"Pre-filter: could not refresh the claim on project {project_id}; stopping the pass")
+            break
 
     if checked and not failed:
         _record_liftwing_success()
@@ -3260,7 +3269,7 @@ def _probe_liftwing_if_due() -> None:
 
 def main():
     """Main worker loop with distributed locking for concurrent multi-instance processing."""
-    global _worker_id
+    global _worker_id, shutdown_requested
     # Accept --worker-id from command line (used in jobs.yaml), fall back to hostname-pid.
     wid = None
     if "--worker-id" in sys.argv:
@@ -3343,8 +3352,10 @@ def main():
     # Background shadow sweep: records LiftWing verdicts for projects the
     # processing pipelines never claim (completed, paused or fully processed).
     # Own daemon thread — one pass can take minutes, and an inline call would
-    # stall the heartbeat refreshes the Toolforge health check watches.
-    threading.Thread(target=_shadow_prefilter_loop, name="shadow-prefilter-sweep", daemon=True).start()
+    # stall the heartbeat refreshes the Toolforge health check watches. The
+    # handle is kept so shutdown can join it before its resources go away.
+    sweep_thread = threading.Thread(target=_shadow_prefilter_loop, name="shadow-prefilter-sweep", daemon=True)
+    sweep_thread.start()
 
     try:
         while not shutdown_requested:
@@ -3598,6 +3609,16 @@ def main():
 
     finally:
         logger.info("Worker %s shutting down, releasing claims and closing resources.", _worker_id)
+        # Signal the sweep and let it leave its batch before the claims and the
+        # DB/HTTP resources go away: it checks shutdown_requested between
+        # batches, but an in-flight LiftWing request can still outlive the
+        # bounded join. After that the daemon thread dies with the process.
+        shutdown_requested = True
+        sweep_thread.join(timeout=SWEEP_JOIN_TIMEOUT)
+        if sweep_thread.is_alive():
+            logger.warning(
+                f"Shadow pre-filter sweep still running after {SWEEP_JOIN_TIMEOUT}s; closing resources anyway"
+            )
         _release_all_claims()
         face_client.reset_session()
         liftwing_client.reset_client()
