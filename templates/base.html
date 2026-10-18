@@ -72,8 +72,17 @@
         .nav-links a:not(.btn):hover, .nav-links a.active:not(.btn) { text-decoration: none; }
         .nav-links a.active:not(.btn) { color: var(--text-main); border-bottom: 2px solid var(--primary); padding-bottom: 0.15rem; }
         .nav-separator { display: none; }
+        /* A long Wikimedia username must not widen the nav past its container:
+           cap the label and truncate with an ellipsis (13rem keeps the longest
+           realistic log-out label, the French one, fully visible). */
+        .nav-logout { display: inline-block; max-width: 13rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-        @media (max-width: 600px) {
+        /* Collapse to the hamburger below the nav container's max width. The
+           full row (brand + 3 links + log-out + language picker) needs about
+           1050 px in the longest locale, so between 601 px and here the links
+           used to collide with the brand (reported on an iPad Mini at 768 px);
+           past 1100 px the container stops growing, so fitting is guaranteed. */
+        @media (max-width: 1100px) {
             .nav-inner { flex-wrap: wrap; }
             .nav-toggle { display: inline-flex; }
             .nav-links {

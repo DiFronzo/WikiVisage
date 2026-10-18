@@ -67,6 +67,7 @@ WikiVisage/
 │   ├── test_eval_prefilter.py # Unit tests for scripts/eval_prefilter.py readout math
 │   ├── test_migrate.py # Unit + integration tests, incl. the one-time wipe and its re-run gate
 │   ├── test_token_crypto.py # Unit tests
+│   ├── test_translations.py # Unit test: committed .mo catalogs match their .po sources (freshness)
 │   ├── test_worker.py  # Unit + integration tests
 │   └── test_security_round2.py # Round-2 security regression tests (CSP, PKCE, single-flight, /health, M3/M4)
 ├── static/             # Static assets
@@ -377,8 +378,8 @@ Flask app served by gunicorn (2 workers, `app:app`; the module-level app is buil
 | `/project/<id>/classify` | GET | Active learning face classification UI |
 | `/project/<id>/classify/clear-skips` | POST | Reset skipped faces for this session |
 | `/api/classify` | POST | Submit face classification (yes/no/none) |
-| `/api/undo-classify` | POST | Undo last classification (reverts manual face draws too) |
-| `/api/reclassify` | POST | Approve/reject model-classified face (removes SDC claim on reject if sdc_written) |
+| `/api/undo-classify` | POST | Undo last classification (reverts manual face draws too). Undoing a target removes its P180 claim immediately (queues the worker when removal fails or no token is available) so an undo cannot strand a claim; undoing a rejection cancels the removal the rejection queued and never deletes a claim; deletes manual faces only after their claim is gone. Flashes the claim outcome ("SDC claim was removed." / "SDC claim removal queued.") on the classify page the client redirects to |
+| `/api/reclassify` | POST | Approve/reject model-classified face. Reject removes the P180 claim immediately when a written claim is on record for a non-bootstrap face, and queues a worker removal otherwise (bootstrap faces and `sdc_written=0` faces whose write may be in flight) unless a sibling target still confirms the image. Response echoes the post-action `sdc_written` so the gallery card can stay in sync without a reload |
 | `/api/manual-face` | POST | Manually draw face bounding box (rate limited: 10/min) |
 | `/api/update-face-bbox` | POST | Redraw face bounding box from Model Results (rate limited: 10/min) |
 | `/api/write-sdc/<id>` | POST | Queue P180 depicts claims for writing by background worker (sets flag, returns immediately) |
@@ -459,8 +460,9 @@ Two query paths:
 | `_load_embedding` | Validates a `faces.encoding` BLOB: exactly `dim * 4` bytes, little-endian float32, finite, L2 norm in `[0.9, 1.1]`; returns a renormalised unit vector or `None` (rejects stale 1024-byte dlib encodings) |
 | `_face_distance` | Cosine distance `1 - dot(centroid, embedding)`, clamped at 0; stored in `faces.confidence` |
 | `_convert_box_to_stored_space` | Re-expresses a box from one pixel space into the stored `detection_width/height` space (for re-detection on images whose boxes live in another size) |
-| `run_autonomous_inference` | Cosine-distance classification on unclassified faces against the renormalised mean centroid (needs >= `min_confirmed` target faces). Only reads faces whose `embedding_model` equals `face_client.EXPECTED_MODEL_ID` |
-| `write_sdc_claims` | Writes P180 claims to Commons SDC via Wikibase API (idempotent). Triggered by `sdc_write_requested` flag set from web UI. Re-checks `sdc_write_requested` every 5 faces (`_PER_FACE_CANCEL_CHECK_EVERY`) so the user can stop a running batch quickly. Treats `no-such-entity` / `no-such-claim` / `no-such-statement` / `notfound` as already-gone successes (`_ALREADY_GONE_CODES`). |
+| `run_autonomous_inference` | Cosine-distance classification on unclassified faces against the renormalised mean centroid (needs >= `min_confirmed` target faces). Only reads faces whose `embedding_model` equals `face_client.EXPECTED_MODEL_ID`, and skips faces with `sdc_removal_pending = 1` so a model guess can never re-target a face whose claim a human asked to remove (the removal phase would then strip the claim of a fresh match) |
+| `write_sdc_claims` | Writes P180 claims to Commons SDC via Wikibase API (idempotent). Triggered by `sdc_write_requested` flag set from web UI. Before every write it re-reads the face's live `is_target`/`superseded_by` and skips faces that were rejected, undone or replaced while the batch was in flight (the web side queues a removal for those too; a whole unverifiable batch stops the run instead of looping). Re-checks `sdc_write_requested` every 5 faces (`_PER_FACE_CANCEL_CHECK_EVERY`) so the user can stop a running batch quickly, and calls `_keepalive_sdc_write` on the same cadence. Treats `no-such-entity` / `no-such-claim` / `no-such-statement` / `notfound` as already-gone successes (`_ALREADY_GONE_CODES`). |
+| `_keepalive_sdc_write` | Refreshes the DB heartbeat row, the heartbeat file and `projects.worker_claimed_at` (only for this worker's claim) while a long SDC run blocks the main loop — otherwise a run over 5 minutes trips `healthcheck.sh` and a run over `CLAIM_EXPIRY_MINUTES` lets the other worker claim the same project. Best-effort: every statement is wrapped in its own `try/except DatabaseError`. Called every 5 written faces and once per removal page. |
 | `_api_request` | Wrapper for Commons/Wikidata API calls with maxlag, retry, and User-Agent |
 | `_get_csrf_token` | Fetches CSRF token for Wikibase API writes |
 
@@ -557,6 +559,7 @@ images.prefilter_checked_at DATETIME NULL  -- when the verdict was stored
 |----------|-------|---------|
 | `POLL_INTERVAL` | 60s | DB polling frequency |
 | `BATCH_SIZE` | 50 | Images per processing batch (`WIKIVISAGE_WORKER_BATCH_SIZE`) |
+| `_PER_FACE_CANCEL_CHECK_EVERY` | 5 | SDC write-loop cadence: re-check `sdc_write_requested` and refresh liveness/claim via `_keepalive_sdc_write` (also once per removal page) |
 | `MAX_CONCURRENT_PROJECTS` | 4 | Parallel project processing |
 | `IMAGE_THREADS` | 4 | Parallel image download threads per project |
 | `DETECTION_WAVE_SIZE` | `max(IMAGE_THREADS, FACE_SERVICE_BATCH_SIZE)` = 8 | Images held in memory at once — this, not `BATCH_SIZE`, bounds worker peak memory |
@@ -862,6 +865,13 @@ Both `app.py` and `worker.py` enforce a 50MB download size cap (`MAX_IMAGE_DOWNL
 ### SDC writes are user-triggered only
 The "Send Edits to Wikimedia Commons" button on the project detail page is the ONLY way SDC claims are written. The button sets `sdc_write_requested=1` on the project; the background worker picks this up on the next poll cycle and writes claims in batches. The web UI polls `/api/sdc-status/<id>` for progress. SDC writes run in the worker process, not the web process. Writes include `maxlag=5` for Wikimedia API compliance.
 
+Rejections and undos must never leave a stale P180 claim behind, including when they race a write run that already selected the face:
+- The worker re-reads each face's `is_target`/`superseded_by` right before the `wbeditentity` call and skips faces that changed; the same run's removal phase then clears `sdc_removal_pending` (and `sdc_written`) for those faces.
+- The web side queues `sdc_removal_pending=1` for every rejection where no sibling target confirms the image (bootstrap faces and `sdc_written=0` faces included) and removes on-record claims for non-bootstrap written faces immediately (502 if that removal fails, so the rejection is not recorded).
+- Any transition back to `is_target = 1` (classify target, review approve, bbox redraw, worker bootstrap auto-classify and reconciliation) clears `sdc_removal_pending`, so a queued removal cannot strip the claim of a face that has become a target again. Model inference never creates such a transition: `run_autonomous_inference` skips faces with a queued removal, so a pending face stays unclassified until the queue is resolved and only then becomes eligible.
+- Undo removes the claim for faces with one on record (queueing on failure), queues unwritten targets only while a write run is active (`sdc_write_requested=1`, the only window where a claim can be in flight), and refuses to delete a manual face whose claim could not be removed first. Undoing a rejection ("none") is the opposite case and never deletes a claim: it cancels the removal the rejection queued (rejections only set the flag on bootstrapped images; on other images a queued flag predates the rejection — an earlier undo racing a write run — so it is kept for the worker to verify). Accepted residual: a manual face deleted in the same sub-second window between the worker's re-check and its `wbeditentity` call can still strand one claim; the re-check closes the realistic window.
+- A long write run keeps itself alive: `_keepalive_sdc_write` refreshes the DB heartbeat, the heartbeat file and the project claim every 5 faces and once per removal page, so runs longer than 5 minutes do not trip `healthcheck.sh` and runs longer than `CLAIM_EXPIRY_MINUTES` are not picked up by the other worker.
+
 ### Model Results validation UI
 The project detail page includes approve/reject/edit-bbox controls on each Model Results gallery card. Key behaviors:
 - **Approve** (checkmark): Sets `is_target=1, classified_by='human'` via `/api/reclassify`. Updates card badge in-place.
@@ -869,6 +879,7 @@ The project detail page includes approve/reject/edit-bbox controls on each Model
 - **Edit bbox** (pencil): Opens a modal with a 1280px image. User draws a new bounding box. Old face is kept; a new face row is inserted via `/api/update-face-bbox` (face encoding recomputed server-side; `faces.aligned` records whether the detector confirmed the box or the embedding fell back to an unaligned resize).
 - **Unreadable image**: if the face service rejects the image itself (`FaceServiceRejected` with `error_code: invalid_image`, which `encode_known_face` re-raises), both `/api/manual-face` and `/api/update-face-bbox` return **422** with "This image could not be read by the face detection service." (retryable service failures stay 503; box-level rejections still answer "draw a slightly larger box").
 - **Filter interaction**: After reclassification, `data-source` is NOT changed — the card remains visible under its original source filter (Model/Bootstrap). Only the visible method label updates to "human".
+- **State sync**: the reclassify success handler refreshes `data-sdc-written` from the response's `sdc_written` (the authoritative post-action value — reject always clears it, approve may set it when the P180 check finds the claim already on Commons) and computes the "send pending" badge from it, so a reject-then-approve cannot keep a stale written flag. The removal counter is decremented only when the card actually carried a queued removal; a synchronous removal (`sdc_removed`) shows the note without touching the counters, which keeps them consistent with the server stats between reloads.
 
 ### Cookies
 Only 2 cookies: `session` (strictly necessary, managed by Flask's built-in signed session cookie mechanism) and `locale` (functional, language preference). No tracking cookies. A non-blocking consent banner is shown. Without consent the `locale` cookie is session-scoped: switching language still works, but the choice is only persisted (1 year) once the visitor accepts the banner.
@@ -895,7 +906,7 @@ Hybrid test suite: unit tests (run in CI), integration tests (require local Dock
 
 ### Test files
 
-`test_app.py`, `test_database.py`, `test_face_client.py`, `test_face_service_backend.py`, `test_face_service_model.py`, `test_face_service_contract.py`, `test_face_service_guard.py`, `test_liftwing_client.py`, `test_migrate.py`, `test_security_round2.py`, `test_token_crypto.py`, `test_worker.py`. Counts are not tracked here: run `pytest tests/ -q` for the current numbers (unit tests that need the ML stack or a database show as skipped in the plain environment).
+`test_app.py`, `test_database.py`, `test_face_client.py`, `test_face_service_backend.py`, `test_face_service_model.py`, `test_face_service_contract.py`, `test_face_service_guard.py`, `test_liftwing_client.py`, `test_migrate.py`, `test_security_round2.py`, `test_token_crypto.py`, `test_translations.py`, `test_worker.py`. Counts are not tracked here: run `pytest tests/ -q` for the current numbers (unit tests that need the ML stack or a database show as skipped in the plain environment).
 
 `test_security_round2.py` no longer contains the `TestSubprocessHardening` tests, which covered `_harden_face_detect_subprocess()`; those guarantees are now container-level (see Architecture) and are not unit-testable.
 
@@ -906,6 +917,14 @@ The follow-up round added: `test_eval_prefilter.py` (the readout math under mock
 The Copilot-review round added: `test_run_migration_upgrades_a_legacy_faces_schema_end_to_end` (full migration entry point against a simulated 0.10.x `faces` table), the `encode` rejection-classification tests (`invalid_image` re-raised vs an unusable region staying `None`) in `test_face_client.py`, both bbox routes (through the real client parsing path — only `_post` stubbed) and the live contract suite, `error_code` assertions on per-instance error entries in `test_face_service_model.py` (plus a parity check against `face_client`'s constant), and the LiftWing breaker-serialization (`test_queued_calls_see_the_breaker_the_running_call_opens`) and 429-deadline probe tests.
 
 The inference-card round added: four real-template `test_project_detail_inference_banner_*` cases in `test_app.py` — hidden while processing (banner present with `style="display:none"` plus the poller), absent when idle, visible while running (with the combined `sdc_removal_pending_faces` stat expression pinned), and the `?inference_triggered=1` completion state.
+
+The stale-claim round added: worker tests for the pre-write live-state re-check (face rejected / superseded / vanished / unreadable, and the whole-batch guard), `_keepalive_sdc_write` statement coverage, the every-5-faces keepalive cadence, and the removal pass clearing `sdc_written`; app tests for undo claim handling (immediate removal, removal failure queues, missing token queues, sibling guard, in-flight write queues, no-in-flight does not queue, manual-face deletion blocked on failed removal and allowed after removal) and the reclassify `sdc_written=0` queue path.
+
+The review-follow-up round added: the reclassify `sdc_written` echo test (approve with an existing P180 echoes 1), the post-action `sdc_written == 0` assertions on the reject paths, and flash assertions on the undo tests (removed / queued flashes set only on success, empty otherwise or after a blocked manual-face undo).
+
+The undo-semantics round added: undo-of-rejection tests (a `sdc_removal_pending=1` state row cancels the queue instead of removing the claim; the written marker is preserved; a non-bootstrapped pre-existing queue is kept for the worker) and the model-inference exclusion test (`run_autonomous_inference`'s candidate query requires `sdc_removal_pending = 0`, plus an integration case proving a pending face is left unclassified).
+
+The DevOps-follow-up round added: `test_translations.py` (the committed `.mo` catalogs must serve exactly what their `.po` sources declare — catches a forgotten `pybabel compile` locally and in CI) and a pinned Ruff (`ruff==0.17.1`) in the CI lint job so a new Ruff release cannot turn it red on unchanged code.
 
 ### Commands
 
@@ -955,7 +974,7 @@ test_db (session) → creates/drops wikiface_test DB
 
 Runs on push/PR to `main`. Five jobs:
 
-1. **Lint**: Ruff check + format check (Python 3.11), then `scripts/check_no_lfs.sh` — fails if `.gitmodules` exists, a weight file is routed through the LFS filter, or a weight file is an LFS pointer.
+1. **Lint**: Ruff check + format check (Python 3.11; Ruff is version-pinned in the workflow so a new Ruff release cannot turn the job red on unchanged code), then `scripts/check_no_lfs.sh` — fails if `.gitmodules` exists, a weight file is routed through the LFS filter, or a weight file is an LFS pointer.
 2. **Test**: `pytest --tb=short -q` on Python 3.11 and 3.15 matrix. Integration tests auto-skipped (no `WIKIVISAGE_TEST_DB` env var in CI); the face-service unit and contract files skip too (no ML stack here). No system deps needed — the ML stack lives in the face service, and the suite mocks `face_client` rather than reaching the network. Caches pip dependencies.
 3. **Face service (backend + model unit tests)** (`face-service-unit`): verifies `model-server/weights/SHA256SUMS`, installs `model-server/requirements.txt` + dev requirements on Python 3.11, and runs `test_face_service_backend.py` and `test_face_service_model.py` with `WIKIVISAGE_REQUIRE_SAMPLE=1`.
 4. **Face service** (`face-service`): verifies `SHA256SUMS`, builds `model-server/` with buildx (gha layer cache), starts the container **with a random token**, waits for readiness, runs the contract tests through the guard, and fails if the service log contains ONNX Runtime `VerifyOutputSizes` warnings. It builds the Dockerfile.
@@ -1022,6 +1041,7 @@ WikiVisage/
 - **Jinja2 templates**: `{{ _('text') }}`
 - **Plurals**: `ngettext('%(num)d item', '%(num)d items', count, num=count)` with named `%(var)s` placeholders and explicit `num=` kwarg
 - **JS strings in templates**: Pass via `|tojson` filter into a JS object, never use `_()` in raw `<script>` blocks
+- **`|tojson` inside an HTML attribute**: always single-quote the attribute (`onsubmit='return confirm({{ _('...')|tojson }})'`) and double-quote the JS placeholder (`replace("{username}", ...)`); `|tojson` emits raw `"` (it escapes `'` as `\u0027`), so a double-quoted attribute lets the value close the attribute and inject markup
 - **JS parameterized strings**: Use `{placeholder}` style for `.replace()` substitution — NOT `%(name)d` (causes KeyError)
 - **Python/Jinja2 parameterized strings**: Always use named placeholders `%(name)s`, never positional `%s`
 - **Do NOT translate**: Worker log messages, health endpoint JSON values, technical terms (Wikidata, Q-ID, Commons, SDC, P180, OAuth, CSRF, WikiVisage, BETA)
@@ -1058,6 +1078,8 @@ pybabel compile -d translations
 ```
 
 **Important**: `babel.cfg` lists source files explicitly (not `**.py`) to avoid scanning the `venv/` directory.
+
+**Compiled catalogs are verified**: `tests/test_translations.py` fails whenever a committed `.mo` no longer matches its `.po` source (it runs in the plain `pytest` suite and in CI), so the compile step above is not optional.
 
 ### English .po File
 

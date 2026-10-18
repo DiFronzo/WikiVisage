@@ -3323,6 +3323,8 @@ def test_project_detail_full_success_with_lazy_p18_update(monkeypatch):
         if "status = 'pending'" in sql:
             return [{"cnt": 7}]
         if "f.is_target IS NULL" in sql and "classified_by_user_id IS NULL" in sql:
+            # Faces with a queued P180 removal are not inference candidates.
+            assert "AND f.sdc_removal_pending = 0" in sql
             return [{"cnt": 4}]
         return ()
 
@@ -3680,6 +3682,22 @@ def test_project_detail_inference_banner_renders_for_rerun_done_state(monkeypatc
 
     assert "inference-banner-done" in body
     assert "Model inference complete." in body
+
+
+def test_templates_never_put_tojson_in_a_double_quoted_attribute():
+    """``|tojson`` emits raw double quotes, so inside a double-quoted attribute the
+    rendered value closes the attribute and injects markup (owner-only forms) or
+    breaks the inline handler (translated strings with spaces). Inline handlers must
+    single-quote the attribute and double-quote the JS placeholder instead."""
+    templates_dir = Path(__file__).resolve().parent.parent / "templates"
+    pattern = re.compile(r'="[^"]*tojson[^"]*"', re.DOTALL)
+    offenders = []
+    for path in sorted(templates_dir.glob("*.html")):
+        source = path.read_text(encoding="utf-8")
+        for match in pattern.finditer(source):
+            line = source[: match.start()].count("\n") + 1
+            offenders.append(f"{path.name}:{line}: {match.group(0)[:120]}")
+    assert offenders == []
 
 
 def test_classify_project_not_found(monkeypatch):
@@ -4637,6 +4655,8 @@ def test_api_classify_target_normal_mode_updates_and_counter(monkeypatch):
     assert any("UPDATE faces SET is_target = 1" in sql for sql, _ in executed)
     assert any("id != %s AND is_target IS NULL" in sql for sql, _ in executed)
     assert any("UPDATE projects SET faces_confirmed = faces_confirmed + 1" in sql for sql, _ in executed)
+    # Re-targeting a face drops any queued P180 removal — the claim must stay.
+    assert any("UPDATE faces SET is_target = 1" in sql and "sdc_removal_pending = 0" in sql for sql, _ in executed)
     with client.session_transaction() as sess:
         assert sess["last_classify"]["action"] == "target"
         assert sess["last_classify"]["selected_face_id"] == 10
@@ -4991,7 +5011,420 @@ def test_api_undo_classify_manual_face_deletion_and_exclusion(monkeypatch):
     delete_sql = [sql for sql, _ in executed if sql.startswith("DELETE FROM faces")]
     assert delete_sql
     update_params = [params for sql, params in executed if "SET is_target = NULL" in sql][0]
-    assert update_params == (10, 2)
+    assert update_params == (0, 0, 10, 2)
+
+
+def _undo_state_eq(state_rows, sibling=False, write_requested=0):
+    """execute_query for the undo route's ownership, state and sibling lookups."""
+
+    def eq(sql, params=None, fetch=True):
+        del params, fetch
+        if "FROM users WHERE id = %s" in sql:
+            return [
+                {
+                    "id": 1,
+                    "wiki_username": "tester",
+                    "access_token": "token",
+                    "refresh_token": "refresh",
+                    "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
+                }
+            ]
+        if "SELECT i.id, i.file_title, i.status, i.detection_width, i.detection_height FROM images i" in sql:
+            return [{"id": 2, "file_title": "File:Test.jpg", "status": "processed"}]
+        if "f.sdc_removal_pending" in sql and "FROM faces f" in sql:
+            return list(state_rows)
+        if "has_sibling" in sql:
+            return [{"has_sibling": 1 if sibling else 0}]
+        if "SELECT sdc_write_requested FROM projects WHERE id = %s" in sql:
+            return [{"sdc_write_requested": write_requested}]
+        return ()
+
+    return eq
+
+
+def _undo_session(client, **overrides):
+    with client.session_transaction() as sess:
+        sess["last_classify"] = {
+            "project_id": 1,
+            "image_id": 2,
+            "action": "target",
+            "face_ids": [10],
+            "manual_face_ids": [],
+            "was_review": False,
+            **overrides,
+        }
+
+
+def _undo_tx(executed):
+    def tx(fn):
+        cursor = MagicMock()
+        cursor.execute.side_effect = lambda sql, params=None: executed.append((sql, params))
+        return fn(MagicMock(), cursor)
+
+    return tx
+
+
+def test_api_undo_removes_written_claim_immediately(monkeypatch):
+    """Undo of a written target removes its P180 claim right away when no sibling confirms it."""
+    executed = []
+    state_rows = [
+        {
+            "id": 10,
+            "is_target": 1,
+            "sdc_written": 1,
+            "sdc_removal_pending": 0,
+            "commons_page_id": 555,
+            "wikidata_qid": "Q42",
+        }
+    ]
+    remove_mock = MagicMock(return_value=True)
+    monkeypatch.setattr(app_module, "_get_valid_token", lambda: "valid-token")
+    monkeypatch.setattr(app_module, "_remove_sdc_claim", remove_mock)
+    monkeypatch.setattr(app_module, "execute_transaction", _undo_tx(executed))
+
+    client, _ = _auth_client_chunk4(monkeypatch, _undo_state_eq(state_rows))
+    _set_csrf_chunk4(client)
+    _undo_session(client)
+
+    response = client.post("/api/undo-classify", data={"csrf_token": "testtoken"})
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["sdc_removed"] is True
+    assert payload["sdc_removal_queued"] is False
+    remove_mock.assert_called_once_with(555, "Q42", "valid-token")
+    assert ("info", "SDC claim was removed.") in _get_flashes(client)
+    update_params = [params for sql, params in executed if "SET is_target = NULL" in sql][0]
+    assert update_params == (0, 0, 10, 2)
+
+
+def test_api_undo_removal_failure_queues_pending(monkeypatch):
+    """When the immediate removal fails, undo proceeds and queues the worker instead."""
+    executed = []
+    state_rows = [
+        {
+            "id": 10,
+            "is_target": 1,
+            "sdc_written": 1,
+            "sdc_removal_pending": 0,
+            "commons_page_id": 555,
+            "wikidata_qid": "Q42",
+        }
+    ]
+    monkeypatch.setattr(app_module, "_get_valid_token", lambda: "valid-token")
+    monkeypatch.setattr(app_module, "_remove_sdc_claim", MagicMock(return_value=False))
+    monkeypatch.setattr(app_module, "execute_transaction", _undo_tx(executed))
+
+    client, _ = _auth_client_chunk4(monkeypatch, _undo_state_eq(state_rows))
+    _set_csrf_chunk4(client)
+    _undo_session(client)
+
+    response = client.post("/api/undo-classify", data={"csrf_token": "testtoken"})
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["sdc_removed"] is False
+    assert payload["sdc_removal_queued"] is True
+    assert ("info", "SDC claim removal queued.") in _get_flashes(client)
+    update_params = [params for sql, params in executed if "SET is_target = NULL" in sql][0]
+    assert update_params == (1, 1, 10, 2)
+
+
+def test_api_undo_missing_token_queues_pending(monkeypatch):
+    """Without a usable token the removal is queued for the worker, not lost."""
+    executed = []
+    state_rows = [
+        {
+            "id": 10,
+            "is_target": 1,
+            "sdc_written": 1,
+            "sdc_removal_pending": 0,
+            "commons_page_id": 555,
+            "wikidata_qid": "Q42",
+        }
+    ]
+    remove_mock = MagicMock()
+    monkeypatch.setattr(app_module, "_get_valid_token", lambda: None)
+    monkeypatch.setattr(app_module, "_remove_sdc_claim", remove_mock)
+    monkeypatch.setattr(app_module, "execute_transaction", _undo_tx(executed))
+
+    client, _ = _auth_client_chunk4(monkeypatch, _undo_state_eq(state_rows))
+    _set_csrf_chunk4(client)
+    _undo_session(client)
+
+    response = client.post("/api/undo-classify", data={"csrf_token": "testtoken"})
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["sdc_removed"] is False
+    assert payload["sdc_removal_queued"] is True
+    assert ("info", "SDC claim removal queued.") in _get_flashes(client)
+    remove_mock.assert_not_called()
+
+
+def test_api_undo_sibling_target_keeps_claim(monkeypatch):
+    """A sibling target still confirms the person, so undo must not touch the claim."""
+    executed = []
+    state_rows = [
+        {
+            "id": 10,
+            "is_target": 1,
+            "sdc_written": 1,
+            "sdc_removal_pending": 0,
+            "commons_page_id": 555,
+            "wikidata_qid": "Q42",
+        }
+    ]
+    remove_mock = MagicMock()
+    monkeypatch.setattr(app_module, "_remove_sdc_claim", remove_mock)
+    monkeypatch.setattr(app_module, "execute_transaction", _undo_tx(executed))
+
+    client, _ = _auth_client_chunk4(monkeypatch, _undo_state_eq(state_rows, sibling=True))
+    _set_csrf_chunk4(client)
+    _undo_session(client)
+
+    response = client.post("/api/undo-classify", data={"csrf_token": "testtoken"})
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["sdc_removed"] is False
+    assert payload["sdc_removal_queued"] is False
+    assert _get_flashes(client) == []
+    remove_mock.assert_not_called()
+    update_params = [params for sql, params in executed if "SET is_target = NULL" in sql][0]
+    assert update_params == (0, 0, 10, 2)
+
+
+def test_api_undo_in_flight_write_queues_removal(monkeypatch):
+    """An unwritten target is queued when a write run is active (claim may be in flight)."""
+    executed = []
+    state_rows = [
+        {
+            "id": 10,
+            "is_target": 1,
+            "sdc_written": 0,
+            "sdc_removal_pending": 0,
+            "commons_page_id": 555,
+            "wikidata_qid": "Q42",
+        }
+    ]
+    monkeypatch.setattr(app_module, "execute_transaction", _undo_tx(executed))
+
+    client, _ = _auth_client_chunk4(monkeypatch, _undo_state_eq(state_rows, write_requested=1))
+    _set_csrf_chunk4(client)
+    _undo_session(client)
+
+    response = client.post("/api/undo-classify", data={"csrf_token": "testtoken"})
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["sdc_removed"] is False
+    assert payload["sdc_removal_queued"] is True
+    update_params = [params for sql, params in executed if "SET is_target = NULL" in sql][0]
+    assert update_params == (0, 1, 10, 2)
+
+
+def test_api_undo_no_in_flight_write_does_not_queue(monkeypatch):
+    """An unwritten target with no write run active cannot have a claim, so nothing is queued."""
+    executed = []
+    state_rows = [
+        {
+            "id": 10,
+            "is_target": 1,
+            "sdc_written": 0,
+            "sdc_removal_pending": 0,
+            "commons_page_id": 555,
+            "wikidata_qid": "Q42",
+        }
+    ]
+    monkeypatch.setattr(app_module, "execute_transaction", _undo_tx(executed))
+
+    client, _ = _auth_client_chunk4(monkeypatch, _undo_state_eq(state_rows, write_requested=0))
+    _set_csrf_chunk4(client)
+    _undo_session(client)
+
+    response = client.post("/api/undo-classify", data={"csrf_token": "testtoken"})
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["sdc_removed"] is False
+    assert payload["sdc_removal_queued"] is False
+    assert _get_flashes(client) == []
+    update_params = [params for sql, params in executed if "SET is_target = NULL" in sql][0]
+    assert update_params == (0, 0, 10, 2)
+
+
+def test_api_undo_none_action_cancels_the_removal_it_queued(monkeypatch):
+    """Undoing a rejection reverts its queued removal instead of confirming it.
+
+    The "none" action queues sdc_removal_pending=1 for rejected faces on
+    bootstrapped images; undoing that rejection must cancel the queue, not
+    delete the (pre-existing) P180 claim.
+    """
+    executed = []
+    state_rows = [
+        {
+            "id": 10,
+            "is_target": 0,
+            "sdc_written": 0,
+            "sdc_removal_pending": 1,
+            "commons_page_id": 555,
+            "wikidata_qid": "Q42",
+            "bootstrapped": 1,
+        }
+    ]
+    remove_mock = MagicMock()
+    monkeypatch.setattr(app_module, "_remove_sdc_claim", remove_mock)
+    monkeypatch.setattr(app_module, "execute_transaction", _undo_tx(executed))
+
+    client, _ = _auth_client_chunk4(monkeypatch, _undo_state_eq(state_rows))
+    _set_csrf_chunk4(client)
+    _undo_session(client, action="none")
+
+    response = client.post("/api/undo-classify", data={"csrf_token": "testtoken"})
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["sdc_removed"] is False
+    assert payload["sdc_removal_queued"] is False
+    remove_mock.assert_not_called()
+    assert _get_flashes(client) == []
+    update_params = [params for sql, params in executed if "SET is_target = NULL" in sql][0]
+    assert update_params == (0, 0, 10, 2)
+
+
+def test_api_undo_none_action_keeps_written_marker_without_touching_commons(monkeypatch):
+    """A claim marker on record survives undoing the rejection that queued its removal."""
+    executed = []
+    state_rows = [
+        {
+            "id": 10,
+            "is_target": 0,
+            "sdc_written": 1,
+            "sdc_removal_pending": 1,
+            "commons_page_id": 555,
+            "wikidata_qid": "Q42",
+            "bootstrapped": 1,
+        }
+    ]
+    remove_mock = MagicMock()
+    monkeypatch.setattr(app_module, "_remove_sdc_claim", remove_mock)
+    monkeypatch.setattr(app_module, "execute_transaction", _undo_tx(executed))
+
+    client, _ = _auth_client_chunk4(monkeypatch, _undo_state_eq(state_rows))
+    _set_csrf_chunk4(client)
+    _undo_session(client, action="none")
+
+    response = client.post("/api/undo-classify", data={"csrf_token": "testtoken"})
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["sdc_removed"] is False
+    assert payload["sdc_removal_queued"] is False
+    remove_mock.assert_not_called()
+    update_params = [params for sql, params in executed if "SET is_target = NULL" in sql][0]
+    assert update_params == (1, 0, 10, 2)
+
+
+def test_api_undo_none_action_preserves_a_preexisting_worker_queue(monkeypatch):
+    """Rejections only queue removals on bootstrapped images.
+
+    On any other image a queued flag predates the rejection (an earlier undo
+    racing a write run), so undoing the rejection keeps the queue for the
+    worker to verify.
+    """
+    executed = []
+    state_rows = [
+        {
+            "id": 10,
+            "is_target": 0,
+            "sdc_written": 0,
+            "sdc_removal_pending": 1,
+            "commons_page_id": 555,
+            "wikidata_qid": "Q42",
+            "bootstrapped": 0,
+        }
+    ]
+    remove_mock = MagicMock()
+    monkeypatch.setattr(app_module, "_remove_sdc_claim", remove_mock)
+    monkeypatch.setattr(app_module, "execute_transaction", _undo_tx(executed))
+
+    client, _ = _auth_client_chunk4(monkeypatch, _undo_state_eq(state_rows))
+    _set_csrf_chunk4(client)
+    _undo_session(client, action="none")
+
+    response = client.post("/api/undo-classify", data={"csrf_token": "testtoken"})
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["sdc_removed"] is False
+    assert payload["sdc_removal_queued"] is True
+    remove_mock.assert_not_called()
+    assert ("info", "SDC claim removal queued.") in _get_flashes(client)
+    update_params = [params for sql, params in executed if "SET is_target = NULL" in sql][0]
+    assert update_params == (0, 1, 10, 2)
+
+
+def test_api_undo_manual_face_claim_removal_failure_blocks_undo(monkeypatch):
+    """A manual face that cannot lose its claim before deletion blocks the undo (no orphan)."""
+    executed = []
+    state_rows = [
+        {
+            "id": 11,
+            "is_target": 1,
+            "sdc_written": 1,
+            "sdc_removal_pending": 0,
+            "commons_page_id": 555,
+            "wikidata_qid": "Q42",
+        }
+    ]
+    monkeypatch.setattr(app_module, "_get_valid_token", lambda: "valid-token")
+    monkeypatch.setattr(app_module, "_remove_sdc_claim", MagicMock(return_value=False))
+    monkeypatch.setattr(app_module, "execute_transaction", _undo_tx(executed))
+
+    client, _ = _auth_client_chunk4(monkeypatch, _undo_state_eq(state_rows))
+    _set_csrf_chunk4(client)
+    _undo_session(client, action="manual_face", face_ids=[11], manual_face_ids=[11])
+
+    response = client.post("/api/undo-classify", data={"csrf_token": "testtoken"})
+
+    assert response.status_code == 502
+    assert not any(sql.startswith("DELETE FROM faces") for sql, _ in executed)
+    assert _get_flashes(client) == []
+    with client.session_transaction() as sess:
+        assert "last_classify" in sess
+
+
+def test_api_undo_manual_face_claim_removed_then_deleted(monkeypatch):
+    """A manual face whose claim is removed first can be deleted as before."""
+    executed = []
+    state_rows = [
+        {
+            "id": 11,
+            "is_target": 1,
+            "sdc_written": 1,
+            "sdc_removal_pending": 0,
+            "commons_page_id": 555,
+            "wikidata_qid": "Q42",
+        }
+    ]
+    remove_mock = MagicMock(return_value=True)
+    monkeypatch.setattr(app_module, "_get_valid_token", lambda: "valid-token")
+    monkeypatch.setattr(app_module, "_remove_sdc_claim", remove_mock)
+    monkeypatch.setattr(app_module, "execute_transaction", _undo_tx(executed))
+
+    client, _ = _auth_client_chunk4(monkeypatch, _undo_state_eq(state_rows))
+    _set_csrf_chunk4(client)
+    _undo_session(client, action="manual_face", face_ids=[11], manual_face_ids=[11])
+
+    response = client.post("/api/undo-classify", data={"csrf_token": "testtoken"})
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["sdc_removed"] is True
+    remove_mock.assert_called_once_with(555, "Q42", "valid-token")
+    assert ("info", "SDC claim was removed.") in _get_flashes(client)
+    assert any(sql.startswith("DELETE FROM faces") for sql, _ in executed)
 
 
 def test_api_undo_classify_manual_face_review_action_decrements(monkeypatch):
@@ -5111,7 +5544,13 @@ def test_api_undo_classify_success_response_contains_ids(monkeypatch):
     response = client.post("/api/undo-classify", data={"csrf_token": "testtoken"})
     assert response.status_code == 200
     payload = response.get_json()
-    assert payload == {"status": "ok", "project_id": 9, "image_id": 77}
+    assert payload == {
+        "status": "ok",
+        "project_id": 9,
+        "image_id": 77,
+        "sdc_removed": False,
+        "sdc_removal_queued": False,
+    }
 
 
 # --- Undo-after-skip tests ---
@@ -6037,6 +6476,8 @@ def test_remove_sdc_claim_success_claim_found_and_removed(monkeypatch):
     post_mock = MagicMock(return_value=remove_resp)
     monkeypatch.setattr(app_module.requests, "get", get_mock)
     monkeypatch.setattr(app_module.requests, "post", post_mock)
+    eq_mock = MagicMock(return_value=1)
+    monkeypatch.setattr(app_module, "execute_query", eq_mock)
 
     ok = app_module._remove_sdc_claim(555, "Q42", "access-token")
 
@@ -6046,6 +6487,11 @@ def test_remove_sdc_claim_success_claim_found_and_removed(monkeypatch):
     post_data = post_mock.call_args.kwargs["data"]
     assert post_data["action"] == "wbremoveclaims"
     assert post_data["claim"] == "M555$ABC"
+    # The page/QID dedup row is dropped: a surviving written_at would make a
+    # later write mark the face written without restoring the claim.
+    eq_mock.assert_called_once()
+    assert "DELETE FROM sdc_claims" in eq_mock.call_args.args[0]
+    assert eq_mock.call_args.args[1] == (555, "Q42")
 
 
 def test_remove_sdc_claim_no_matching_claim_returns_true(monkeypatch):
@@ -6063,12 +6509,18 @@ def test_remove_sdc_claim_no_matching_claim_returns_true(monkeypatch):
     post_mock = MagicMock()
     monkeypatch.setattr(app_module.requests, "get", get_mock)
     monkeypatch.setattr(app_module.requests, "post", post_mock)
+    eq_mock = MagicMock(return_value=1)
+    monkeypatch.setattr(app_module, "execute_query", eq_mock)
 
     ok = app_module._remove_sdc_claim(555, "Q42", "access-token")
 
     assert ok is True
     assert get_mock.call_count == 1
     assert post_mock.call_count == 0
+    # Claim already gone from Commons — the dedup row must go with it.
+    eq_mock.assert_called_once()
+    assert "DELETE FROM sdc_claims" in eq_mock.call_args.args[0]
+    assert eq_mock.call_args.args[1] == (555, "Q42")
 
 
 def test_remove_sdc_claim_fetches_csrf_token(monkeypatch):
@@ -6093,10 +6545,14 @@ def test_remove_sdc_claim_fetches_csrf_token(monkeypatch):
     get_mock = MagicMock(side_effect=[claim_resp, token_resp])
     monkeypatch.setattr(app_module.requests, "get", get_mock)
     monkeypatch.setattr(app_module.requests, "post", MagicMock(return_value=remove_resp))
+    eq_mock = MagicMock(return_value=1)
+    monkeypatch.setattr(app_module, "execute_query", eq_mock)
 
     ok = app_module._remove_sdc_claim(555, "Q42", "access-token")
 
     assert ok is True
+    eq_mock.assert_called_once()
+    assert "DELETE FROM sdc_claims" in eq_mock.call_args.args[0]
     second_get_params = get_mock.call_args_list[1].kwargs["params"]
     assert second_get_params["action"] == "query"
     assert second_get_params["meta"] == "tokens"
@@ -6124,10 +6580,15 @@ def test_remove_sdc_claim_removal_api_returns_error(monkeypatch):
 
     monkeypatch.setattr(app_module.requests, "get", MagicMock(side_effect=[claim_resp, token_resp]))
     monkeypatch.setattr(app_module.requests, "post", MagicMock(return_value=remove_resp))
+    eq_mock = MagicMock(return_value=1)
+    monkeypatch.setattr(app_module, "execute_query", eq_mock)
 
     ok = app_module._remove_sdc_claim(555, "Q42", "access-token")
 
     assert ok is False
+    # The claim is still on Commons: the dedup row must stay so the removal
+    # is retried.
+    eq_mock.assert_not_called()
 
 
 def test_remove_sdc_claim_exception_during_api_calls(monkeypatch):
@@ -6135,6 +6596,46 @@ def test_remove_sdc_claim_exception_during_api_calls(monkeypatch):
         app_module.requests,
         "get",
         MagicMock(side_effect=requests.RequestException("network")),
+    )
+    eq_mock = MagicMock(return_value=1)
+    monkeypatch.setattr(app_module, "execute_query", eq_mock)
+
+    ok = app_module._remove_sdc_claim(555, "Q42", "access-token")
+
+    assert ok is False
+    eq_mock.assert_not_called()
+
+
+def test_remove_sdc_claim_returns_false_when_dedup_row_cannot_be_cleared(monkeypatch):
+    """A removal whose dedup row cannot be deleted is incomplete.
+
+    Returning True would let a later send trust the surviving written_at and
+    mark the face written without restoring the claim on Commons.
+    """
+    claim_resp = MagicMock()
+    claim_resp.raise_for_status.return_value = None
+    claim_resp.json.return_value = {
+        "claims": {
+            "P180": [
+                {"id": "M555$ABC", "mainsnak": {"datavalue": {"value": {"id": "Q42"}}}},
+            ]
+        }
+    }
+
+    token_resp = MagicMock()
+    token_resp.raise_for_status.return_value = None
+    token_resp.json.return_value = {"query": {"tokens": {"csrftoken": "csrf-token"}}}
+
+    remove_resp = MagicMock()
+    remove_resp.raise_for_status.return_value = None
+    remove_resp.json.return_value = {"success": 1}
+
+    monkeypatch.setattr(app_module.requests, "get", MagicMock(side_effect=[claim_resp, token_resp]))
+    monkeypatch.setattr(app_module.requests, "post", MagicMock(return_value=remove_resp))
+    monkeypatch.setattr(
+        app_module,
+        "execute_query",
+        MagicMock(side_effect=app_module.DatabaseError("pool down")),
     )
 
     ok = app_module._remove_sdc_claim(555, "Q42", "access-token")
@@ -6209,9 +6710,34 @@ def test_api_reclassify_approve_from_model_face(monkeypatch):
     assert payload["status"] == "ok"
     assert payload["is_target"] == 1
     assert payload["classified_by"] == "model"
+    assert payload["sdc_written"] == 0
     assert payload["sdc_removed"] is False
     assert payload["sdc_removal_queued"] is False
     assert payload["updated_faces"] == []
+
+
+def test_api_reclassify_approve_echoes_sdc_written_when_p180_exists(monkeypatch):
+    """Approve echoes the post-action ``sdc_written`` so the gallery card can refresh its badge."""
+    face_row = _default_reclassify_face_row(old_is_target=0, classified_by="model")
+    client, _ = _authed_client(monkeypatch, route_execute_query=_reclassify_query_router(face_row=face_row))
+
+    def _transaction(fn):
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_cursor.rowcount = 1
+        mock_cursor.fetchall.return_value = []
+        return fn(mock_conn, mock_cursor)
+
+    monkeypatch.setattr(app_module, "execute_transaction", _transaction)
+    monkeypatch.setattr(app_module, "_maybe_mark_sdc_written", MagicMock(return_value=True))
+    resp = client.post("/api/reclassify", data={"csrf_token": "testtoken", "face_id": "1", "is_target": "1"})
+
+    assert resp.status_code == 200
+    payload = resp.get_json()
+    assert payload["status"] == "ok"
+    assert payload["sdc_written"] == 1
+    assert payload["sdc_removed"] is False
+    assert payload["sdc_removal_queued"] is False
 
 
 def test_api_reclassify_reject_bootstrap_no_sibling_sdc_removal_queued(monkeypatch):
@@ -6234,6 +6760,7 @@ def test_api_reclassify_reject_bootstrap_no_sibling_sdc_removal_queued(monkeypat
     payload = resp.get_json()
     assert payload["sdc_removed"] is False
     assert payload["sdc_removal_queued"] is True
+    assert payload["sdc_written"] == 0
 
 
 def test_api_reclassify_reject_bootstrap_with_sibling_no_removal(monkeypatch):
@@ -6256,6 +6783,38 @@ def test_api_reclassify_reject_bootstrap_with_sibling_no_removal(monkeypatch):
     payload = resp.get_json()
     assert payload["sdc_removed"] is False
     assert payload["sdc_removal_queued"] is False
+
+
+def test_api_reclassify_reject_nonbootstrap_unwritten_no_sibling_queues_removal(monkeypatch):
+    """A rejection with sdc_written=0 queues removal: a write may still be in flight."""
+    executed = []
+    client, _ = _authed_client(
+        monkeypatch,
+        route_execute_query=_reclassify_query_router(face_row=_default_reclassify_face_row(), sibling_match=0),
+    )
+
+    remove_mock = MagicMock()
+    monkeypatch.setattr(app_module, "_remove_sdc_claim", remove_mock)
+
+    def _transaction(fn):
+        mock_conn = MagicMock()
+        cursor = MagicMock()
+        cursor.rowcount = 1
+        cursor.execute.side_effect = lambda sql, params=None: executed.append((sql, params))
+        return fn(mock_conn, cursor)
+
+    monkeypatch.setattr(app_module, "execute_transaction", _transaction)
+    resp = client.post("/api/reclassify", data={"csrf_token": "testtoken", "face_id": "1", "is_target": "0"})
+
+    assert resp.status_code == 200
+    payload = resp.get_json()
+    assert payload["sdc_removed"] is False
+    assert payload["sdc_removal_queued"] is True
+    assert payload["sdc_written"] == 0
+    remove_mock.assert_not_called()
+    update_params = [params for sql, params in executed if sql.startswith("UPDATE faces SET is_target")][0]
+    # (is_target, user_id, sdc_written, sdc_removal_pending, face_id, user_id)
+    assert update_params == (0, 1, 0, 1, 1, 1)
 
 
 def test_api_reclassify_reject_nonbootstrap_sdc_written_no_sibling_immediate_removal(monkeypatch):
@@ -6282,6 +6841,7 @@ def test_api_reclassify_reject_nonbootstrap_sdc_written_no_sibling_immediate_rem
     payload = resp.get_json()
     assert payload["sdc_removed"] is True
     assert payload["sdc_removal_queued"] is False
+    assert payload["sdc_written"] == 0
     remove_mock.assert_called_once_with(555, "Q42", "valid-token")
 
 
@@ -7321,6 +7881,8 @@ def test_api_progress_active_with_pending_and_stats(monkeypatch, fake_user):
                 }
             ]
         if "AND f.is_target IS NULL" in sql and "inference_eligible" not in sql:
+            # Faces with a queued P180 removal are not inference candidates.
+            assert "AND f.sdc_removal_pending = 0" in sql
             return [{"cnt": 4}]
         raise AssertionError(f"Unexpected SQL: {sql}")
 

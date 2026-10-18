@@ -388,7 +388,22 @@ class TestSDCMidBatchCancel:
 class TestRemoveSdcClaimIdempotent:
     """If the entity or claim is already absent on Commons (file deleted, peer
     removed it, etc.), the user's desired end-state is satisfied. Surfacing an
-    error would just confuse operators."""
+    error would just confuse operators. A successful removal also deletes the
+    page/QID deduplication row — a surviving ``written_at`` would make a later
+    send trust it and skip the actual Commons write."""
+
+    @pytest.fixture(autouse=True)
+    def _mock_execute_query(self, monkeypatch):
+        """Capture the dedup-row delete; these unit tests carry no database."""
+        mock = MagicMock(return_value=1)
+        monkeypatch.setattr(app_module, "execute_query", mock)
+        return mock
+
+    @staticmethod
+    def _assert_dedup_row_cleared(mock, page_id=1, qid="Q42"):
+        mock.assert_called_once()
+        assert "DELETE FROM sdc_claims" in mock.call_args.args[0]
+        assert mock.call_args.args[1] == (page_id, qid)
 
     @staticmethod
     def _fake_response(payload, status=200):
@@ -398,7 +413,7 @@ class TestRemoveSdcClaimIdempotent:
         r.status_code = status
         return r
 
-    def test_returns_true_when_entity_missing(self, monkeypatch):
+    def test_returns_true_when_entity_missing(self, monkeypatch, _mock_execute_query):
         """`wbgetclaims` returns {error: {code: 'no-such-entity'}} when the
         Commons file has no SDC entity at all. We treat this as success."""
         monkeypatch.setattr(
@@ -408,8 +423,9 @@ class TestRemoveSdcClaimIdempotent:
         )
         ok = app_module._remove_sdc_claim(commons_page_id=1, wikidata_qid="Q42", access_token="tok")
         assert ok is True
+        self._assert_dedup_row_cleared(_mock_execute_query)
 
-    def test_returns_true_when_p180_list_empty(self, monkeypatch):
+    def test_returns_true_when_p180_list_empty(self, monkeypatch, _mock_execute_query):
         """No P180 claims for this QID on the file → nothing to remove → success."""
         monkeypatch.setattr(
             app_module.requests,
@@ -418,8 +434,9 @@ class TestRemoveSdcClaimIdempotent:
         )
         ok = app_module._remove_sdc_claim(commons_page_id=1, wikidata_qid="Q42", access_token="tok")
         assert ok is True
+        self._assert_dedup_row_cleared(_mock_execute_query)
 
-    def test_returns_true_on_race_during_remove(self, monkeypatch):
+    def test_returns_true_on_race_during_remove(self, monkeypatch, _mock_execute_query):
         """A peer removed the claim between our wbgetclaims and wbremoveclaims.
         Wikibase returns `no-such-claim` / `no-such-statement`; treat as success."""
         get_calls = {"n": 0}
@@ -451,8 +468,9 @@ class TestRemoveSdcClaimIdempotent:
         monkeypatch.setattr(app_module.requests, "post", fake_post)
         ok = app_module._remove_sdc_claim(commons_page_id=1, wikidata_qid="Q42", access_token="tok")
         assert ok is True
+        self._assert_dedup_row_cleared(_mock_execute_query)
 
-    def test_returns_false_on_real_error(self, monkeypatch):
+    def test_returns_false_on_real_error(self, monkeypatch, _mock_execute_query):
         """A genuine error code (e.g. permissiondenied) must NOT be silently
         swallowed — operators need to know."""
         monkeypatch.setattr(
@@ -462,8 +480,9 @@ class TestRemoveSdcClaimIdempotent:
         )
         ok = app_module._remove_sdc_claim(commons_page_id=1, wikidata_qid="Q42", access_token="tok")
         assert ok is False
+        _mock_execute_query.assert_not_called()
 
-    def test_returns_false_on_network_exception(self, monkeypatch):
+    def test_returns_false_on_network_exception(self, monkeypatch, _mock_execute_query):
         """Unhandled exceptions (timeout, DNS failure) → False."""
 
         def boom(*_a, **_kw):
@@ -472,8 +491,9 @@ class TestRemoveSdcClaimIdempotent:
         monkeypatch.setattr(app_module.requests, "get", boom)
         ok = app_module._remove_sdc_claim(commons_page_id=1, wikidata_qid="Q42", access_token="tok")
         assert ok is False
+        _mock_execute_query.assert_not_called()
 
-    def test_happy_path_returns_true(self, monkeypatch):
+    def test_happy_path_returns_true(self, monkeypatch, _mock_execute_query):
         """Normal: claim exists, CSRF fetched, removal succeeds."""
         get_calls = {"n": 0}
 
@@ -498,3 +518,31 @@ class TestRemoveSdcClaimIdempotent:
         monkeypatch.setattr(app_module.requests, "post", lambda *a, **kw: self._fake_response({"success": 1}))
         ok = app_module._remove_sdc_claim(commons_page_id=1, wikidata_qid="Q42", access_token="tok")
         assert ok is True
+        self._assert_dedup_row_cleared(_mock_execute_query)
+
+    def test_returns_false_when_dedup_row_delete_fails(self, monkeypatch, _mock_execute_query):
+        """The removal is incomplete while the stale written_at row may survive."""
+        _mock_execute_query.side_effect = app_module.DatabaseError("pool down")
+        get_calls = {"n": 0}
+
+        def fake_get(*_a, **_kw):
+            get_calls["n"] += 1
+            if get_calls["n"] == 1:
+                return self._fake_response(
+                    {
+                        "claims": {
+                            "P180": [
+                                {
+                                    "id": "M1$abcd",
+                                    "mainsnak": {"datavalue": {"value": {"id": "Q42"}}},
+                                }
+                            ]
+                        }
+                    }
+                )
+            return self._fake_response({"query": {"tokens": {"csrftoken": "csrf-tok"}}})
+
+        monkeypatch.setattr(app_module.requests, "get", fake_get)
+        monkeypatch.setattr(app_module.requests, "post", lambda *a, **kw: self._fake_response({"success": 1}))
+        ok = app_module._remove_sdc_claim(commons_page_id=1, wikidata_qid="Q42", access_token="tok")
+        assert ok is False
