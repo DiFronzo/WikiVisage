@@ -1974,7 +1974,8 @@ def project_detail(project_id: int):
             "WHERE i.project_id = %s "
             "  AND f.is_target IS NULL "
             "  AND f.superseded_by IS NULL "
-            "  AND f.classified_by_user_id IS NULL",
+            "  AND f.classified_by_user_id IS NULL "
+            "  AND f.sdc_removal_pending = 0",
             (project_id,),
         )
         inference_eligible = eligible_row[0]["cnt"] if eligible_row else 0
@@ -2845,8 +2846,9 @@ def _remove_sdc_claim(commons_page_id: int, wikidata_qid: str, access_token: str
     exist") is satisfied either way, so surfacing an error to the UI just
     confuses operators.
 
-    Returns False only on errors we cannot interpret as "already in the desired
-    state": auth failures, network errors, maxlag, unexpected API responses.
+    Returns False on errors we cannot interpret as "already in the desired
+    state" (auth failures, network errors, maxlag, unexpected API responses)
+    and when the page/QID deduplication row cannot be cleared afterwards.
     """
     mid = f"M{commons_page_id}"
     headers = {
@@ -2861,6 +2863,26 @@ def _remove_sdc_claim(commons_page_id: int, wikidata_qid: str, access_token: str
         "no-such-statement",
         "notfound",
     }
+
+    def _clear_dedup_row() -> bool:
+        """Delete the page/QID deduplication row once the claim is off Commons.
+
+        Leaving the row behind makes a later ``write_sdc_claims`` run trust its
+        ``written_at`` and mark the face written without restoring the claim,
+        so a removal only counts as complete once the row is gone. Returns
+        False when the row may still exist; the callers then treat the removal
+        as incomplete and queue a worker removal instead of reporting success.
+        """
+        try:
+            execute_query(
+                "DELETE FROM sdc_claims WHERE commons_page_id = %s AND wikidata_qid = %s",
+                (commons_page_id, wikidata_qid),
+                fetch=False,
+            )
+            return True
+        except DatabaseError:
+            logger.exception(f"Failed to clear SDC dedup row for {mid}/{wikidata_qid}")
+            return False
 
     try:
         # 1. Find the specific claim GUID
@@ -2884,7 +2906,7 @@ def _remove_sdc_claim(commons_page_id: int, wikidata_qid: str, access_token: str
             err_code = claim_data["error"].get("code", "")
             if err_code in _ALREADY_GONE_CODES:
                 logger.info(f"SDC entity {mid} already gone ({err_code}); treating removal as success")
-                return True
+                return _clear_dedup_row()
             logger.error(f"SDC wbgetclaims error for {mid}: {claim_data['error']}")
             return False
 
@@ -2898,7 +2920,7 @@ def _remove_sdc_claim(commons_page_id: int, wikidata_qid: str, access_token: str
 
         if not target_guid:
             # Claim doesn't exist on Commons — nothing to remove
-            return True
+            return _clear_dedup_row()
 
         # 2. Get CSRF token
         token_resp = requests.get(
@@ -2942,11 +2964,11 @@ def _remove_sdc_claim(commons_page_id: int, wikidata_qid: str, access_token: str
                     f"SDC claim {target_guid} for {mid}/{wikidata_qid} already removed by peer "
                     f"({err_code}); treating as success"
                 )
-                return True
+                return _clear_dedup_row()
             logger.error(f"SDC removal error for {mid}/{wikidata_qid}: {result['error']}")
             return False
 
-        return True
+        return _clear_dedup_row()
 
     except Exception:
         logger.exception(f"Failed to remove SDC claim for {mid}/{wikidata_qid}")
@@ -3786,7 +3808,8 @@ def api_progress(project_id: int):
             "WHERE i.project_id = %s "
             "  AND f.is_target IS NULL "
             "  AND f.superseded_by IS NULL "
-            "  AND f.classified_by_user_id IS NULL",
+            "  AND f.classified_by_user_id IS NULL "
+            "  AND f.sdc_removal_pending = 0",
             (project_id,),
         )
         inference_eligible = eligible_row[0]["cnt"] if eligible_row else 0

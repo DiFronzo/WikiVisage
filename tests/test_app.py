@@ -3323,6 +3323,8 @@ def test_project_detail_full_success_with_lazy_p18_update(monkeypatch):
         if "status = 'pending'" in sql:
             return [{"cnt": 7}]
         if "f.is_target IS NULL" in sql and "classified_by_user_id IS NULL" in sql:
+            # Faces with a queued P180 removal are not inference candidates.
+            assert "AND f.sdc_removal_pending = 0" in sql
             return [{"cnt": 4}]
         return ()
 
@@ -6474,6 +6476,8 @@ def test_remove_sdc_claim_success_claim_found_and_removed(monkeypatch):
     post_mock = MagicMock(return_value=remove_resp)
     monkeypatch.setattr(app_module.requests, "get", get_mock)
     monkeypatch.setattr(app_module.requests, "post", post_mock)
+    eq_mock = MagicMock(return_value=1)
+    monkeypatch.setattr(app_module, "execute_query", eq_mock)
 
     ok = app_module._remove_sdc_claim(555, "Q42", "access-token")
 
@@ -6483,6 +6487,11 @@ def test_remove_sdc_claim_success_claim_found_and_removed(monkeypatch):
     post_data = post_mock.call_args.kwargs["data"]
     assert post_data["action"] == "wbremoveclaims"
     assert post_data["claim"] == "M555$ABC"
+    # The page/QID dedup row is dropped: a surviving written_at would make a
+    # later write mark the face written without restoring the claim.
+    eq_mock.assert_called_once()
+    assert "DELETE FROM sdc_claims" in eq_mock.call_args.args[0]
+    assert eq_mock.call_args.args[1] == (555, "Q42")
 
 
 def test_remove_sdc_claim_no_matching_claim_returns_true(monkeypatch):
@@ -6500,12 +6509,18 @@ def test_remove_sdc_claim_no_matching_claim_returns_true(monkeypatch):
     post_mock = MagicMock()
     monkeypatch.setattr(app_module.requests, "get", get_mock)
     monkeypatch.setattr(app_module.requests, "post", post_mock)
+    eq_mock = MagicMock(return_value=1)
+    monkeypatch.setattr(app_module, "execute_query", eq_mock)
 
     ok = app_module._remove_sdc_claim(555, "Q42", "access-token")
 
     assert ok is True
     assert get_mock.call_count == 1
     assert post_mock.call_count == 0
+    # Claim already gone from Commons — the dedup row must go with it.
+    eq_mock.assert_called_once()
+    assert "DELETE FROM sdc_claims" in eq_mock.call_args.args[0]
+    assert eq_mock.call_args.args[1] == (555, "Q42")
 
 
 def test_remove_sdc_claim_fetches_csrf_token(monkeypatch):
@@ -6530,10 +6545,14 @@ def test_remove_sdc_claim_fetches_csrf_token(monkeypatch):
     get_mock = MagicMock(side_effect=[claim_resp, token_resp])
     monkeypatch.setattr(app_module.requests, "get", get_mock)
     monkeypatch.setattr(app_module.requests, "post", MagicMock(return_value=remove_resp))
+    eq_mock = MagicMock(return_value=1)
+    monkeypatch.setattr(app_module, "execute_query", eq_mock)
 
     ok = app_module._remove_sdc_claim(555, "Q42", "access-token")
 
     assert ok is True
+    eq_mock.assert_called_once()
+    assert "DELETE FROM sdc_claims" in eq_mock.call_args.args[0]
     second_get_params = get_mock.call_args_list[1].kwargs["params"]
     assert second_get_params["action"] == "query"
     assert second_get_params["meta"] == "tokens"
@@ -6561,10 +6580,15 @@ def test_remove_sdc_claim_removal_api_returns_error(monkeypatch):
 
     monkeypatch.setattr(app_module.requests, "get", MagicMock(side_effect=[claim_resp, token_resp]))
     monkeypatch.setattr(app_module.requests, "post", MagicMock(return_value=remove_resp))
+    eq_mock = MagicMock(return_value=1)
+    monkeypatch.setattr(app_module, "execute_query", eq_mock)
 
     ok = app_module._remove_sdc_claim(555, "Q42", "access-token")
 
     assert ok is False
+    # The claim is still on Commons: the dedup row must stay so the removal
+    # is retried.
+    eq_mock.assert_not_called()
 
 
 def test_remove_sdc_claim_exception_during_api_calls(monkeypatch):
@@ -6572,6 +6596,46 @@ def test_remove_sdc_claim_exception_during_api_calls(monkeypatch):
         app_module.requests,
         "get",
         MagicMock(side_effect=requests.RequestException("network")),
+    )
+    eq_mock = MagicMock(return_value=1)
+    monkeypatch.setattr(app_module, "execute_query", eq_mock)
+
+    ok = app_module._remove_sdc_claim(555, "Q42", "access-token")
+
+    assert ok is False
+    eq_mock.assert_not_called()
+
+
+def test_remove_sdc_claim_returns_false_when_dedup_row_cannot_be_cleared(monkeypatch):
+    """A removal whose dedup row cannot be deleted is incomplete.
+
+    Returning True would let a later send trust the surviving written_at and
+    mark the face written without restoring the claim on Commons.
+    """
+    claim_resp = MagicMock()
+    claim_resp.raise_for_status.return_value = None
+    claim_resp.json.return_value = {
+        "claims": {
+            "P180": [
+                {"id": "M555$ABC", "mainsnak": {"datavalue": {"value": {"id": "Q42"}}}},
+            ]
+        }
+    }
+
+    token_resp = MagicMock()
+    token_resp.raise_for_status.return_value = None
+    token_resp.json.return_value = {"query": {"tokens": {"csrftoken": "csrf-token"}}}
+
+    remove_resp = MagicMock()
+    remove_resp.raise_for_status.return_value = None
+    remove_resp.json.return_value = {"success": 1}
+
+    monkeypatch.setattr(app_module.requests, "get", MagicMock(side_effect=[claim_resp, token_resp]))
+    monkeypatch.setattr(app_module.requests, "post", MagicMock(return_value=remove_resp))
+    monkeypatch.setattr(
+        app_module,
+        "execute_query",
+        MagicMock(side_effect=app_module.DatabaseError("pool down")),
     )
 
     ok = app_module._remove_sdc_claim(555, "Q42", "access-token")
@@ -7817,6 +7881,8 @@ def test_api_progress_active_with_pending_and_stats(monkeypatch, fake_user):
                 }
             ]
         if "AND f.is_target IS NULL" in sql and "inference_eligible" not in sql:
+            # Faces with a queued P180 removal are not inference candidates.
+            assert "AND f.sdc_removal_pending = 0" in sql
             return [{"cnt": 4}]
         raise AssertionError(f"Unexpected SQL: {sql}")
 

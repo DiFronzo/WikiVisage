@@ -1615,7 +1615,8 @@ def _claim_shadow_project() -> dict[str, Any] | None:
             "  )) "
             "  OR (p.status = 'completed' AND EXISTS ("
             "    SELECT 1 FROM faces f JOIN images i ON f.image_id = i.id "
-            "    WHERE i.project_id = p.id AND f.is_target IS NULL AND f.superseded_by IS NULL"
+            "    WHERE i.project_id = p.id AND f.is_target IS NULL AND f.superseded_by IS NULL "
+            "    AND f.sdc_removal_pending = 0"
             "  ) AND ("
             "    SELECT COUNT(*) FROM faces f JOIN images i ON f.image_id = i.id "
             "    WHERE i.project_id = p.id AND f.is_target = 1 AND f.superseded_by IS NULL "
@@ -1953,6 +1954,20 @@ def _sdc_error_message(error_code: str, error_info: str) -> str:
     return _SDC_ERROR_MESSAGES.get(error_code, f"{error_code}: {error_info}")
 
 
+def _clear_sdc_dedup_row(commons_page_id: int, qid: str) -> None:
+    """Delete the page/QID deduplication row once its P180 claim left Commons.
+
+    A surviving row with ``written_at`` set would make the next write run trust
+    it and mark the face written without restoring the claim, so every removal
+    path clears the row after the claim is gone.
+    """
+    execute_query(
+        "DELETE FROM sdc_claims WHERE commons_page_id = %s AND wikidata_qid = %s",
+        (commons_page_id, qid),
+        fetch=False,
+    )
+
+
 def _keepalive_sdc_write(project_id: int) -> None:
     """Refresh liveness signals during a long SDC write run.
 
@@ -2100,10 +2115,12 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
 
             # The batch was selected before the earlier faces were written; the
             # user can reject this face, undo its classification or edit its
-            # bbox while we work through it. Re-read the live state right before
-            # the write so no P180 claim is added for a face that no longer
-            # confirms the target. (The web-side reject/undo paths queue a
-            # removal as well; this narrows the race to a single face.)
+            # bbox while we work through it. Re-read the live state to skip the
+            # face before doing any reservation work, and again right before
+            # the edit (after the idempotency request) so no P180 claim is
+            # added for a face that no longer confirms the target. (The
+            # web-side reject/undo paths queue a removal as well; this narrows
+            # the race to a single face.)
             try:
                 live_rows = execute_query(
                     "SELECT is_target, superseded_by FROM faces WHERE id = %s",
@@ -2298,6 +2315,32 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
                     total_written += 1
                     continue
 
+                # wbgetclaims above is a network call (with retries), so the
+                # face can have been rejected, undone or deleted while it was
+                # in flight — an undone manual face even cascades its sdc_claims
+                # row away. Re-read the live state right before the edit so no
+                # claim is written for a face that no longer confirms the
+                # target, and release the unwritten reservation we still hold
+                # so a later write for a re-confirmed face starts clean.
+                try:
+                    live_rows = execute_query(
+                        "SELECT is_target, superseded_by FROM faces WHERE id = %s",
+                        (face_id,),
+                        fetch=True,
+                    )
+                except DatabaseError:
+                    recheck_failures += 1
+                    logger.warning(f"Could not re-check face {face_id} before SDC edit, skipping")
+                    continue
+                if not live_rows or live_rows[0]["is_target"] != 1 or live_rows[0]["superseded_by"] is not None:
+                    logger.info(f"SDC write skipped for face {face_id}: no longer an approved target")
+                    execute_query(
+                        "DELETE FROM sdc_claims WHERE face_id = %s AND written_at IS NULL",
+                        (face_id,),
+                        fetch=False,
+                    )
+                    continue
+
                 # Write claim
                 edit_data = {
                     "action": "wbeditentity",
@@ -2427,13 +2470,22 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
         if recheck_failures >= len(faces_to_write):
             # Every face failed its live-state re-check (e.g. the DB flapped on
             # those single-row SELECTs while the batch SELECTs still worked).
-            # Nothing in this batch can make progress, so stop instead of
-            # re-fetching the same faces in a tight loop.
+            # Nothing in this batch can make progress. Return through the error
+            # path: falling through to the normal cleanup would clear
+            # sdc_write_requested without recording why the faces stayed
+            # unwritten, leaving the user with no explanation and no retry.
+            msg = "Could not verify the faces before writing. Please try again."
             logger.warning(
                 f"SDC writes for project {project_id}: no face in the batch could be verified, "
-                f"stopping this run ({total_written} written)"
+                f"aborting this run ({total_written} written)"
             )
-            break
+            execute_query(
+                "UPDATE projects SET sdc_write_requested = 0, sdc_write_user_id = NULL, "
+                "sdc_write_error = %s WHERE id = %s",
+                (msg, project_id),
+                fetch=False,
+            )
+            return total_written
 
     # --- P180 Removal Phase ---
     # Process faces with sdc_removal_pending=1 (rejected bootstrap faces)
@@ -2560,6 +2612,7 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
                             (page_id, project_id),
                             fetch=False,
                         )
+                        _clear_sdc_dedup_row(page_id, qid)
                         total_removed += 1
                         continue
                     else:
@@ -2593,6 +2646,7 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
                         (page_id, project_id),
                         fetch=False,
                     )
+                    _clear_sdc_dedup_row(page_id, qid)
                     total_removed += 1
                     continue
 
@@ -2654,6 +2708,7 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
                             (page_id, project_id),
                             fetch=False,
                         )
+                        _clear_sdc_dedup_row(page_id, qid)
                         total_removed += 1
                         continue
                     else:
@@ -2679,6 +2734,7 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
                     (page_id, project_id),
                     fetch=False,
                 )
+                _clear_sdc_dedup_row(page_id, qid)
                 total_removed += 1
 
                 time.sleep(1)
@@ -2784,7 +2840,8 @@ def _claim_inference_projects(max_count: int) -> list[dict[str, Any]]:
     """Atomically claim inference-eligible projects not already claimed by any worker.
 
     An inference-eligible project is active or completed, has enough human-confirmed
-    target faces (>= min_confirmed), and still has unclassified faces remaining.
+    target faces (>= min_confirmed), and still has inferable unclassified faces
+    remaining (``run_autonomous_inference`` skips faces with a queued removal).
     The work predicate is mirrored (negated) by ``_claim_shadow_project``; keep
     them in sync.
     """
@@ -2804,7 +2861,8 @@ def _claim_inference_projects(max_count: int) -> list[dict[str, Any]]:
             "AND EXISTS ("
             "  SELECT 1 FROM faces f "
             "  JOIN images i ON f.image_id = i.id "
-            "  WHERE i.project_id = p.id AND f.is_target IS NULL AND f.superseded_by IS NULL"
+            "  WHERE i.project_id = p.id AND f.is_target IS NULL AND f.superseded_by IS NULL "
+            "  AND f.sdc_removal_pending = 0"
             ") "
             "ORDER BY COALESCE(p.worker_claimed_at, '1970-01-01') ASC, p.id ASC "
             "LIMIT %s "

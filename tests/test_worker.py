@@ -843,6 +843,45 @@ def test_claim_shadow_project_real_db_skips_inference_eligible_completed_project
 
 
 @pytest.mark.integration
+def test_claim_shadow_project_real_db_takes_project_whose_only_unclassified_faces_are_queued_removals(
+    db_pool, db_conn, seed_project, seed_images, seed_faces, seed_unclassified_faces
+):
+    """Queued removals make a face non-inferable, so the sweep may cover the project.
+
+    ``_claim_inference_projects`` excludes faces with ``sdc_removal_pending = 1``
+    because ``run_autonomous_inference`` skips them; with no inferable face left,
+    the completed project belongs to the shadow sweep instead of bouncing through
+    the inference queue every cycle.
+    """
+    with db_conn.cursor() as cur:
+        cur.execute(
+            "UPDATE projects SET status = 'completed', prefilter_mode = 'shadow' WHERE id = %s",
+            (seed_project["id"],),
+        )
+        placeholders = ",".join(["%s"] * len(seed_unclassified_faces))
+        cur.execute(
+            f"UPDATE faces SET sdc_removal_pending = 1 WHERE id IN ({placeholders})",
+            seed_unclassified_faces,
+        )
+        # An unchecked non-bootstrapped image so the sweep has pre-filter work.
+        cur.execute(
+            "INSERT INTO images (project_id, commons_page_id, file_title, status, bootstrapped, "
+            "face_count, detection_width, detection_height) "
+            "VALUES (%s, %s, %s, 'processed', 0, 0, 800, 600)",
+            (seed_project["id"], 900004, "File:Queued_Removal_1.jpg"),
+        )
+
+    with patch("worker._worker_id", "test-worker-1"):
+        # No inferable face left: the inference claim must not take the project …
+        assert _claim_inference_projects(1) == []
+        # … and the sweep claims it as otherwise unclaimed work.
+        project = _claim_shadow_project()
+
+    assert project is not None
+    assert project["id"] == seed_project["id"]
+
+
+@pytest.mark.integration
 def test_claim_shadow_project_real_db_respects_other_worker_claims(db_pool, db_conn, seed_project):
     """A fresh claim by the other worker defers the sweep; an expired one does not."""
     with db_conn.cursor() as cur:
@@ -1718,6 +1757,13 @@ def test_write_sdc_no_such_entity_on_removal_skips_and_clears_flag():
     removal_clears = [(sql, p) for sql, p in db_calls if "sdc_removal_pending = 0" in sql]
     assert len(removal_clears) == 1
     assert removal_clears[0][1] == (7777, 5)
+
+    # The stale page/QID deduplication row is dropped: keeping a written_at
+    # record would make the next send mark faces written without restoring
+    # the claim.
+    dedup_deletes = [(sql, p) for sql, p in db_calls if "DELETE FROM sdc_claims" in sql]
+    assert len(dedup_deletes) == 1
+    assert dedup_deletes[0][1] == (7777, "Q42")
     # The clearing statement also drops the stale sdc_written marker.
     assert "f.sdc_written = 0" in removal_clears[0][0]
 
@@ -3441,8 +3487,72 @@ def test_write_sdc_skips_face_that_vanished_before_write():
     assert not any("INSERT IGNORE INTO sdc_claims" in sql for sql, _ in db_calls)
 
 
+def test_write_sdc_rechecks_live_state_after_idempotency_check():
+    """A face undone while the idempotency request is in flight is not written.
+
+    The first live-state check runs before wbgetclaims; the second runs right
+    before wbeditentity, so an undo that deletes a manual face (cascading its
+    dedup row away) during that network call cannot strand an orphaned P180 claim.
+    """
+    project = {"id": 5, "user_id": 1, "wikidata_qid": "Q42"}
+    db_calls = []
+    batch_returned = [False]
+    state_calls = [0]
+
+    def mock_execute_query(sql, params=None, fetch=True):
+        db_calls.append((sql.strip(), params))
+        if "sdc_write_requested" in sql and "SELECT" in sql:
+            return [{"sdc_write_requested": 1}]
+        if "SELECT f.id as face_id" in sql:
+            if not batch_returned[0]:
+                batch_returned[0] = True
+                return [{"face_id": 100, "image_id": 200, "commons_page_id": 9999}]
+            return []
+        if "SELECT is_target, superseded_by FROM faces" in sql:
+            state_calls[0] += 1
+            if state_calls[0] == 1:
+                return [{"is_target": 1, "superseded_by": None}]
+            return []  # the face row vanished while wbgetclaims was in flight
+        if "INSERT IGNORE INTO sdc_claims" in sql:
+            return 1
+        if "DELETE FROM sdc_claims" in sql:
+            return 1
+        if "SELECT DISTINCT i.commons_page_id" in sql:
+            return []
+        return 0
+
+    api_calls = []
+
+    def mock_api(url, params=None, data=None, headers=None, method="get", **kwargs):
+        api_calls.append((params or {}).get("action") or (data or {}).get("action"))
+        resp = MagicMock()
+        resp.json.return_value = {"claims": {}}  # no P180 claim on Commons yet
+        return resp
+
+    with (
+        patch("worker.execute_query", side_effect=mock_execute_query),
+        patch("worker._refresh_worker_token", return_value="fake-token"),
+        patch("worker._get_csrf_token", return_value="fake-csrf"),
+        patch("worker._api_request", side_effect=mock_api),
+        patch("worker.shutdown_requested", False),
+        patch("worker.time.sleep"),
+    ):
+        result = write_sdc_claims(project)
+
+    assert result == 0
+    # Only the idempotency request went out — wbeditentity was never reached.
+    assert api_calls == ["wbgetclaims"]
+    # The unwritten reservation is released so a later send for a re-confirmed
+    # face starts clean.
+    releases = [(sql, p) for sql, p in db_calls if "DELETE FROM sdc_claims" in sql]
+    assert len(releases) == 1
+    assert releases[0][1] == (100,)
+    assert not any("UPDATE faces SET sdc_written" in sql for sql, _ in db_calls)
+
+
 def test_write_sdc_skips_face_when_state_recheck_fails():
-    """An unreadable per-face re-check skips the face instead of writing blind."""
+    """An unreadable per-face re-check skips the face and ends the run through the
+    error path, recording why the faces stayed unwritten."""
     project = {"id": 5, "user_id": 1, "wikidata_qid": "Q42"}
     mock_eq, db_calls = _mock_write_batch_query(
         [{"face_id": 100, "image_id": 200, "commons_page_id": 9999}],
@@ -3462,6 +3572,21 @@ def test_write_sdc_skips_face_when_state_recheck_fails():
     assert result == 0
     api_mock.assert_not_called()
     assert not any("INSERT IGNORE INTO sdc_claims" in sql for sql, _ in db_calls)
+
+    # The run must not fall through to the silent cleanup: the request flag is
+    # cleared together with an error message so the UI can explain the failure
+    # and the user can retry.
+    error_updates = [
+        (sql, p)
+        for sql, p in db_calls
+        if "sdc_write_error = %s" in sql and "UPDATE projects" in sql and p and p[0] is not None
+    ]
+    assert len(error_updates) == 1
+    assert "Could not verify the faces" in error_updates[0][1][0]
+    # … and the error survives: the normal cleanup (which nulls the message)
+    # never runs because the guard returns directly.
+    flag_updates = [(sql, p) for sql, p in db_calls if "UPDATE projects SET sdc_write_requested = 0" in sql]
+    assert flag_updates[-1][1][0] is not None
 
 
 def test_keepalive_sdc_write_refreshes_heartbeat_and_claim():
