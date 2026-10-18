@@ -881,7 +881,8 @@ def _persist_detection(
         # Multi-face bootstrapped images are left for manual classification.
         if bootstrapped and face_count == 1 and project_id is not None:
             auto_classified = execute_query(
-                "UPDATE faces SET is_target = 1, classified_by = 'bootstrap', classified_at = NOW() "
+                "UPDATE faces SET is_target = 1, classified_by = 'bootstrap', "
+                "sdc_removal_pending = 0, classified_at = NOW() "
                 "WHERE image_id = %s AND is_target IS NULL AND superseded_by IS NULL",
                 (img_id,),
                 fetch=False,
@@ -1267,7 +1268,8 @@ def bootstrap_from_sparql(project: dict[str, Any]) -> int:
                         # Perform this in a single conditional UPDATE to avoid a per-image COUNT query.
                         auto = execute_query(
                             "UPDATE faces "
-                            "SET is_target = 1, classified_by = 'bootstrap', classified_at = NOW() "
+                            "SET is_target = 1, classified_by = 'bootstrap', "
+                            "sdc_removal_pending = 0, classified_at = NOW() "
                             "WHERE image_id = %s "
                             "AND is_target IS NULL "
                             "AND superseded_by IS NULL "
@@ -1799,6 +1801,11 @@ def run_autonomous_inference(project: dict[str, Any]) -> int:
     # Select candidate faces for model classification. A face is eligible only if:
     #   (a) unclassified (is_target IS NULL) and not superseded
     #   (b) no human has interacted with it (classified_by_user_id IS NULL)
+    #   (c) no P180 removal is queued for it (sdc_removal_pending = 0). A model
+    #       guess must not re-target a face whose claim a human asked to remove:
+    #       the removal phase would then strip the claim of a fresh model match.
+    #       Excluded faces become eligible again once the worker resolves the
+    #       queue (or the user classifies them directly).
     # Bootstrapped images are included: bootstrap auto-classifies the single best face,
     # but multi-face images have additional unclassified faces that need inference.
     # The per-image dedup below ensures only the closest face per image is matched.
@@ -1810,6 +1817,7 @@ def run_autonomous_inference(project: dict[str, Any]) -> int:
           AND f.is_target IS NULL
           AND f.superseded_by IS NULL
           AND f.classified_by_user_id IS NULL
+          AND f.sdc_removal_pending = 0
           AND f.embedding_model = %s
         """,
         (project["id"], face_client.EXPECTED_MODEL_ID),
@@ -1945,6 +1953,34 @@ def _sdc_error_message(error_code: str, error_info: str) -> str:
     return _SDC_ERROR_MESSAGES.get(error_code, f"{error_code}: {error_info}")
 
 
+def _keepalive_sdc_write(project_id: int) -> None:
+    """Refresh liveness signals during a long SDC write run.
+
+    ``write_sdc_claims`` runs synchronously on the main thread, so the heartbeat
+    blocks in the main loop cannot run while it works. Without this, a run
+    longer than five minutes would let ``healthcheck.sh`` see a stale heartbeat
+    file (Toolforge restarts the pod mid-write), and a run longer than
+    ``CLAIM_EXPIRY_MINUTES`` would let the other worker claim the same project
+    and write the same queue concurrently. All three refreshes are best-effort.
+    """
+    try:
+        execute_query(
+            "REPLACE INTO worker_heartbeat (id, last_seen) VALUES (1, NOW())",
+            fetch=False,
+        )
+    except DatabaseError:
+        pass
+    _touch_heartbeat_file()
+    try:
+        execute_query(
+            "UPDATE projects SET worker_claimed_at = NOW() WHERE id = %s AND worker_claimed_by = %s",
+            (project_id, _worker_id),
+            fetch=False,
+        )
+    except DatabaseError:
+        pass
+
+
 def write_sdc_claims(project: dict[str, Any]) -> int:
     """Write SDC P180 claims for all faces marked as target.
 
@@ -2029,9 +2065,12 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
         # only fires every SDC_BATCH (50) faces — that's up to 50 unwanted Commons
         # writes between a user clicking "Stop" and us noticing. Re-check every
         # `_PER_FACE_CANCEL_CHECK_EVERY` faces (cheap one-row SELECT) so we abort
-        # promptly without spamming the DB.
+        # promptly without spamming the DB. The same cadence refreshes our
+        # heartbeat and project claim, because this function blocks the main
+        # loop for as long as the project has faces to write.
         _PER_FACE_CANCEL_CHECK_EVERY = 5
         faces_since_check = 0
+        recheck_failures = 0
 
         for row in faces_to_write:
             if shutdown_requested:
@@ -2040,6 +2079,7 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
             faces_since_check += 1
             if faces_since_check >= _PER_FACE_CANCEL_CHECK_EVERY:
                 faces_since_check = 0
+                _keepalive_sdc_write(project_id)
                 try:
                     inner_check = execute_query(
                         "SELECT sdc_write_requested FROM projects WHERE id = %s",
@@ -2057,6 +2097,29 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
 
             page_id = row["commons_page_id"]
             face_id = row["face_id"]
+
+            # The batch was selected before the earlier faces were written; the
+            # user can reject this face, undo its classification or edit its
+            # bbox while we work through it. Re-read the live state right before
+            # the write so no P180 claim is added for a face that no longer
+            # confirms the target. (The web-side reject/undo paths queue a
+            # removal as well; this narrows the race to a single face.)
+            try:
+                live_rows = execute_query(
+                    "SELECT is_target, superseded_by FROM faces WHERE id = %s",
+                    (face_id,),
+                    fetch=True,
+                )
+            except DatabaseError:
+                # Unverifiable — skip and retry on a later pass rather than
+                # risk writing a stale claim.
+                recheck_failures += 1
+                logger.warning(f"Could not re-check face {face_id} before SDC write, skipping")
+                continue
+            if not live_rows or live_rows[0]["is_target"] != 1 or live_rows[0]["superseded_by"] is not None:
+                logger.info(f"SDC write skipped for face {face_id}: no longer an approved target")
+                continue
+
             mid = f"M{page_id}"
 
             try:
@@ -2361,6 +2424,17 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
                 logger.info(f"SDC writes aborted for project {project_id}: {total_written} written before error")
                 return total_written
 
+        if recheck_failures >= len(faces_to_write):
+            # Every face failed its live-state re-check (e.g. the DB flapped on
+            # those single-row SELECTs while the batch SELECTs still worked).
+            # Nothing in this batch can make progress, so stop instead of
+            # re-fetching the same faces in a tight loop.
+            logger.warning(
+                f"SDC writes for project {project_id}: no face in the batch could be verified, "
+                f"stopping this run ({total_written} written)"
+            )
+            break
+
     # --- P180 Removal Phase ---
     # Process faces with sdc_removal_pending=1 (rejected bootstrap faces)
     total_removed = 0
@@ -2406,6 +2480,7 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
             if shutdown_requested:
                 break
 
+            _keepalive_sdc_write(project_id)
             page_id = row["commons_page_id"]
             mid = f"M{page_id}"
 
@@ -2479,7 +2554,7 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
                         logger.warning(f"Skipping removal for {mid}: {error_code} during idempotency check")
                         execute_query(
                             "UPDATE faces f JOIN images i ON f.image_id = i.id "
-                            "SET f.sdc_removal_pending = 0 "
+                            "SET f.sdc_removal_pending = 0, f.sdc_written = 0 "
                             "WHERE i.commons_page_id = %s AND i.project_id = %s "
                             "AND f.sdc_removal_pending = 1",
                             (page_id, project_id),
@@ -2512,7 +2587,7 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
                     logger.info(f"P180 claim for {qid} not found on {mid}, clearing removal flag")
                     execute_query(
                         "UPDATE faces f JOIN images i ON f.image_id = i.id "
-                        "SET f.sdc_removal_pending = 0 "
+                        "SET f.sdc_removal_pending = 0, f.sdc_written = 0 "
                         "WHERE i.commons_page_id = %s AND i.project_id = %s "
                         "AND f.sdc_removal_pending = 1",
                         (page_id, project_id),
@@ -2573,7 +2648,7 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
                         logger.warning(f"Skipping removal for {mid}: {error_code} during claim removal")
                         execute_query(
                             "UPDATE faces f JOIN images i ON f.image_id = i.id "
-                            "SET f.sdc_removal_pending = 0 "
+                            "SET f.sdc_removal_pending = 0, f.sdc_written = 0 "
                             "WHERE i.commons_page_id = %s AND i.project_id = %s "
                             "AND f.sdc_removal_pending = 1",
                             (page_id, project_id),
@@ -2598,7 +2673,7 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
 
                 execute_query(
                     "UPDATE faces f JOIN images i ON f.image_id = i.id "
-                    "SET f.sdc_removal_pending = 0 "
+                    "SET f.sdc_removal_pending = 0, f.sdc_written = 0 "
                     "WHERE i.commons_page_id = %s AND i.project_id = %s "
                     "AND f.sdc_removal_pending = 1",
                     (page_id, project_id),

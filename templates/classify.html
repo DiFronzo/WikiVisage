@@ -410,6 +410,19 @@
         .empty-card-text { font-size: 1rem; }
         .empty-card-subtext, .empty-card-skipped { font-size: 0.85rem; }
     }
+
+    /* Phones & tablets (touch input): the image spans the full content width.
+       Without this, the "desktop short screen" rule above collapses it on a
+       landscape phone (100vh - 16rem = ~184px cap) and the mobile rule caps
+       portrait photos at 45vh — the image never reaches the screen width.
+       "FACE N" labels and the keyboard hotkey hints are unreadable/unusable
+       on touch screens; desktop (hover + fine pointer) is unchanged. */
+    @media (hover: none) and (pointer: coarse) {
+        .image-wrapper { width: 100%; }
+        .image-wrapper img { max-height: none; margin: 0 auto; }
+        .face-label { display: none; }
+        .hotkey-hints { display: none; }
+    }
 </style>
 {% endblock %}
 

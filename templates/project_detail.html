@@ -729,7 +729,7 @@
     {% if is_owner %}
     <a href="{{ url_for('project_settings', project_id=project.id) }}" class="btn btn-lg">{{ _('Settings') }}</a>
     {% else %}
-    <form method="POST" action="{{ url_for('project_leave', project_id=project.id) }}" style="display:inline" onsubmit="return confirm({{ _('Are you sure you want to leave this project?')|tojson }})">
+    <form method="POST" action="{{ url_for('project_leave', project_id=project.id) }}" style="display:inline" onsubmit='return confirm({{ _('Are you sure you want to leave this project?')|tojson }})'>
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <button type="submit" class="btn btn-danger btn-lg">{{ _('Leave Project') }}</button>
     </form>
@@ -894,7 +894,6 @@
         var wasSdcPending = card.dataset.sdcPending === '1';
         var wasRemoval = card.dataset.sdcRemoval === '1';
         var isBootstrapped = card.dataset.bootstrapped === '1';
-        var sdcWritten = card.dataset.sdcWritten === '1';
 
         postForm(apiReclassifyUrl, csrfToken, {
             face_id: faceId,
@@ -905,6 +904,10 @@
                 card.dataset.reclassifyInFlight = '0';
                 card.dataset.result = isTarget === 1 ? 'match' : 'rejected';
                 card.dataset.source = 'human';
+                // Authoritative post-action state: the card must not keep a
+                // stale `sdcWritten` flag (a reject clears it server-side even
+                // when the claim was removed synchronously).
+                card.dataset.sdcWritten = data.sdc_written ? '1' : '0';
                 
                 var badge = card.querySelector('.badge');
                 badge.classList.remove('badge-active', 'badge-paused', 'badge-bootstrap');
@@ -914,7 +917,7 @@
                 var methodLabel = card.querySelector('.result-method');
                 if (methodLabel) methodLabel.textContent = i18nReclassify.human;
 
-                var nowIsSend = (isTarget === 1 && !sdcWritten && oldSource !== 'bootstrap' && !isBootstrapped);
+                var nowIsSend = (isTarget === 1 && !data.sdc_written && oldSource !== 'bootstrap' && !isBootstrapped);
                 var nowIsRemoval = !!data.sdc_removal_queued;
                 var nowSdcPending = nowIsSend || nowIsRemoval;
                 card.dataset.sdcPending = nowIsSend ? '1' : '0';
@@ -954,18 +957,12 @@
 
                 var sdcNote = card.querySelector('.sdc-note');
                 if (data.sdc_removed) {
-                    // The server removed the P180 claim synchronously, so the
-                    // removal is no longer "pending". We already incremented
-                    // removalEl above (for sdc_removal_queued), so decrement
-                    // it back — the net effect is no change to the removal count.
+                    // The claim was removed synchronously. The removal counter
+                    // was already reconciled above (decremented only when this
+                    // card actually carried a queued removal), so only the note
+                    // is shown here.
                     sdcNote.textContent = i18nReclassify.sdcRemoved;
                     sdcNote.style.display = 'block';
-                    if (removalEl) {
-                        var rc = Math.max(0, (parseInt(removalEl.textContent, 10) || 0) - 1);
-                        removalEl.textContent = rc;
-                        if (pendingEl) pendingEl.textContent = (parseInt(sendEl.textContent, 10) || 0) + rc;
-                        updateSdcStatusText();
-                    }
                 } else if (data.sdc_removal_queued) {
                     sdcNote.textContent = i18nReclassify.sdcRemovalQueued;
                     sdcNote.style.display = 'block';

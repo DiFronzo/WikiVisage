@@ -231,7 +231,7 @@
                 <td style="padding: 0.5rem 0.75rem; color: var(--text-muted); font-size: 0.875rem;">{{ member.joined_at.strftime('%Y-%m-%d') }}</td>
                 <td style="padding: 0.5rem 0.75rem; text-align: right;">
                     {% if is_owner and member.role != 'owner' %}
-                    <form method="POST" action="{{ url_for('project_remove_member', project_id=project.id) }}" style="display: inline;" onsubmit="return confirm(REMOVE_MEMBER_MSG.replace('{username}', {{ member.wiki_username|tojson }}));">
+                    <form method="POST" action="{{ url_for('project_remove_member', project_id=project.id) }}" style="display: inline;" onsubmit='return confirm(REMOVE_MEMBER_MSG.replace("{username}", {{ member.wiki_username|tojson }}));'>
                         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                         <input type="hidden" name="member_user_id" value="{{ member.user_id }}">
                         <button type="submit" class="btn btn-danger btn-sm" style="padding: 0.25rem 0.5rem; font-size: 0.75rem;">{{ _('Remove') }}</button>
@@ -257,7 +257,7 @@
                 <td style="padding: 0.5rem 0.75rem; color: var(--text-muted);">{{ member.wiki_username }}</td>
                 <td style="padding: 0.5rem 0.75rem; text-align: right;">
                     {% if is_owner %}
-                    <form method="POST" action="{{ url_for('project_unban_member', project_id=project.id) }}" style="display: inline;" onsubmit="return confirm(UNBAN_MEMBER_MSG.replace('{username}', {{ member.wiki_username|tojson }}));">
+                    <form method="POST" action="{{ url_for('project_unban_member', project_id=project.id) }}" style="display: inline;" onsubmit='return confirm(UNBAN_MEMBER_MSG.replace("{username}", {{ member.wiki_username|tojson }}));'>
                         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                         <input type="hidden" name="member_user_id" value="{{ member.user_id }}">
                         <button type="submit" class="btn btn-sm" style="border-color: var(--primary); color: var(--primary); padding: 0.25rem 0.5rem; font-size: 0.75rem;">{{ _('Unban') }}</button>

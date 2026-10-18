@@ -24,8 +24,11 @@ jobs:
         with:
           python-version: "3.11"
 
+      # Pinned deliberately: an unpinned Ruff could add rules or change
+      # formatting and turn this job red on unchanged code. Bump together
+      # with the local version used for `ruff format .`.
       - name: Install Ruff
-        run: pip install "ruff>=0.17"
+        run: pip install "ruff==0.17.1"
 
       - name: Ruff check
         run: ruff check .

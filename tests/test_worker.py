@@ -248,6 +248,35 @@ def test_inference_returns_classified_count():
     assert classified == 4
 
 
+def test_inference_candidates_exclude_faces_with_a_queued_removal():
+    """A face whose P180 removal is queued must not be model-classified.
+
+    A model re-target would let the removal phase strip the claim of a fresh
+    match; the face becomes eligible again once the queue is resolved.
+    """
+    project = {"id": 15, "min_confirmed": 5, "distance_threshold": 0.6}
+    candidate_sql: list[str] = []
+
+    def mock_execute_query(sql, params=None, fetch=True):
+        if "SELECT COUNT(*) AS cnt FROM faces f" in sql:
+            return [{"cnt": 5}]
+        if "SELECT f.id, f.encoding FROM faces f" in sql and "f.is_target = 1" in sql:
+            return [{"encoding": _make_embedding(i)} for i in range(5)]
+        if "SELECT f.id, f.image_id, f.encoding FROM faces f" in sql:
+            candidate_sql.append(sql)
+            return []
+        raise AssertionError(f"Unexpected query executed: {sql}")
+
+    with (
+        patch("worker.execute_query", side_effect=mock_execute_query),
+        patch("worker.shutdown_requested", False),
+    ):
+        classified = run_autonomous_inference(project)
+
+    assert classified == 0
+    assert candidate_sql and "f.sdc_removal_pending = 0" in candidate_sql[0]
+
+
 def test_process_image_wave_bootstrapped_single_face_auto_classifies():
     """Single-face bootstrapped image should auto-classify as target, set sdc_written=1, and increment faces_confirmed."""
     fake_location = (10, 110, 110, 10)
@@ -500,6 +529,42 @@ def test_inference_with_real_db_classifies_faces(
         assert row["is_target"] in (0, 1)
         assert row["classified_by"] == "model"
         assert row["confidence"] is not None
+
+
+@pytest.mark.integration
+def test_inference_with_real_db_skips_faces_with_a_queued_removal(
+    db_pool,
+    db_conn,
+    seed_project,
+    seed_images,
+    seed_faces,
+    seed_unclassified_faces,
+):
+    """A face with sdc_removal_pending=1 is not model-classified (claim rescue)."""
+    with db_conn.cursor() as cur:
+        cur.execute("UPDATE faces SET sdc_removal_pending = 1 WHERE id = %s", (seed_unclassified_faces[0],))
+
+    project = {
+        "id": seed_project["id"],
+        "min_confirmed": seed_project["min_confirmed"],
+        "distance_threshold": float(seed_project["distance_threshold"]),
+    }
+
+    with patch("worker.shutdown_requested", False):
+        classified = run_autonomous_inference(project)
+
+    assert classified == 4
+
+    with db_conn.cursor() as cur:
+        cur.execute(
+            "SELECT is_target, classified_by, sdc_removal_pending FROM faces WHERE id = %s",
+            (seed_unclassified_faces[0],),
+        )
+        row = cur.fetchone()
+
+    assert row["is_target"] is None
+    assert row["classified_by"] is None
+    assert row["sdc_removal_pending"] == 1
 
 
 @pytest.mark.integration
@@ -1162,6 +1227,8 @@ def test_write_sdc_marks_image_bootstrapped_on_idempotency_hit():
             if not any("UPDATE faces SET sdc_written" in c[0] for c in db_calls):
                 return [{"face_id": 100, "image_id": 200, "commons_page_id": 9999}]
             return []
+        if "SELECT is_target, superseded_by FROM faces" in sql:
+            return [{"is_target": 1, "superseded_by": None}]
         if "UPDATE faces SET sdc_written" in sql:
             return 1
         if "UPDATE images SET bootstrapped" in sql:
@@ -1210,6 +1277,8 @@ def test_write_sdc_insert_ignore_zero_written_at_not_null():
             if not any("UPDATE faces SET sdc_written" in c[0] for c in db_calls):
                 return [{"face_id": 100, "image_id": 200, "commons_page_id": 9999}]
             return []
+        if "SELECT is_target, superseded_by FROM faces" in sql:
+            return [{"is_target": 1, "superseded_by": None}]
         if "INSERT IGNORE INTO sdc_claims" in sql:
             return 0  # duplicate row
         if "SELECT project_id, written_at, claimed_at FROM sdc_claims" in sql:
@@ -1254,6 +1323,8 @@ def test_write_sdc_insert_ignore_zero_same_project_retries_write():
             if not any("UPDATE faces SET sdc_written" in c[0] for c in db_calls):
                 return [{"face_id": 100, "image_id": 200, "commons_page_id": 9999}]
             return []
+        if "SELECT is_target, superseded_by FROM faces" in sql:
+            return [{"is_target": 1, "superseded_by": None}]
         if "INSERT IGNORE INTO sdc_claims" in sql:
             return 0  # duplicate row
         if "SELECT project_id, written_at, claimed_at FROM sdc_claims" in sql:
@@ -1315,6 +1386,8 @@ def test_write_sdc_insert_ignore_zero_other_project_fresh_skips():
             if len(face_query_calls) == 1:
                 return [{"face_id": 100, "image_id": 200, "commons_page_id": 9999}]
             return []
+        if "SELECT is_target, superseded_by FROM faces" in sql:
+            return [{"is_target": 1, "superseded_by": None}]
         if "INSERT IGNORE INTO sdc_claims" in sql:
             return 0  # duplicate row
         if "SELECT project_id, written_at, claimed_at FROM sdc_claims" in sql:
@@ -1361,6 +1434,8 @@ def test_write_sdc_insert_ignore_zero_other_project_stale_reclaims():
             if not any("UPDATE faces SET sdc_written" in c[0] for c in db_calls):
                 return [{"face_id": 100, "image_id": 200, "commons_page_id": 9999}]
             return []
+        if "SELECT is_target, superseded_by FROM faces" in sql:
+            return [{"is_target": 1, "superseded_by": None}]
         if "INSERT IGNORE INTO sdc_claims" in sql:
             return 0  # duplicate row
         if "SELECT project_id, written_at, claimed_at FROM sdc_claims" in sql:
@@ -1491,6 +1566,8 @@ def test_write_sdc_no_such_entity_on_wbgetclaims_skips_face():
                     {"face_id": 101, "image_id": 201, "commons_page_id": 9999},
                 ]
             return []
+        if "SELECT is_target, superseded_by FROM faces" in sql:
+            return [{"is_target": 1, "superseded_by": None}]
         if "INSERT IGNORE INTO sdc_claims" in sql:
             return 1
         if "UPDATE faces SET sdc_written" in sql:
@@ -1553,6 +1630,8 @@ def test_write_sdc_no_such_entity_on_wbeditentity_skips_face():
                     {"face_id": 101, "image_id": 201, "commons_page_id": 9999},
                 ]
             return []
+        if "SELECT is_target, superseded_by FROM faces" in sql:
+            return [{"is_target": 1, "superseded_by": None}]
         if "INSERT IGNORE INTO sdc_claims" in sql:
             return 1
         if "UPDATE faces SET sdc_written" in sql:
@@ -1629,6 +1708,7 @@ def test_write_sdc_no_such_entity_on_removal_skips_and_clears_flag():
         patch("worker._refresh_worker_token", return_value="fake-token"),
         patch("worker._get_csrf_token", return_value="fake-csrf"),
         patch("worker._api_request", side_effect=mock_api_side_effect),
+        patch("worker._touch_heartbeat_file"),
         patch("worker.shutdown_requested", False),
     ):
         result = write_sdc_claims(project)
@@ -1638,6 +1718,14 @@ def test_write_sdc_no_such_entity_on_removal_skips_and_clears_flag():
     removal_clears = [(sql, p) for sql, p in db_calls if "sdc_removal_pending = 0" in sql]
     assert len(removal_clears) == 1
     assert removal_clears[0][1] == (7777, 5)
+    # The clearing statement also drops the stale sdc_written marker.
+    assert "f.sdc_written = 0" in removal_clears[0][0]
+
+    # The removal loop keeps liveness and the project claim fresh.
+    claim_refreshes = [
+        (sql, p) for sql, p in db_calls if "worker_claimed_at = NOW()" in sql and "worker_claimed_by" in sql
+    ]
+    assert claim_refreshes and claim_refreshes[0][1][0] == 5
 
     error_aborts = [
         (sql, p)
@@ -1710,6 +1798,12 @@ def test_bootstrap_flags_existing_images_at_cap():
 
     sdc_updates = [(sql, p) for sql, p in db_calls if "UPDATE faces SET sdc_written = 1" in sql]
     assert len(sdc_updates) == 2
+
+    # Auto-classified bootstrap targets drop any queued P180 removal — the
+    # pre-existing claim must stay.
+    auto_updates = [(sql, p) for sql, p in db_calls if "UPDATE faces" in sql and "classified_by = 'bootstrap'" in sql]
+    assert auto_updates
+    assert all("sdc_removal_pending = 0" in sql for sql, _ in auto_updates)
 
     inserts = [sql for sql, _ in db_calls if "INSERT IGNORE INTO images" in sql]
     assert len(inserts) == 0
@@ -3207,6 +3301,8 @@ def test_write_sdc_successful_write_increments_counter():
                 face_batch_returned[0] = True
                 return [{"face_id": 100, "image_id": 200, "commons_page_id": 9999}]
             return []
+        if "SELECT is_target, superseded_by FROM faces" in sql:
+            return [{"is_target": 1, "superseded_by": None}]
         if "sdc_removal_pending" in sql and "DISTINCT" in sql:
             return []
         if "INSERT IGNORE INTO sdc_claims" in sql:
@@ -3244,6 +3340,170 @@ def test_write_sdc_successful_write_increments_counter():
 
     face_sdc_updates = [(s, p) for s, p in db_calls if "UPDATE faces SET sdc_written" in s]
     assert len(face_sdc_updates) == 1
+
+
+def _mock_write_batch_query(face_rows, state_rows):
+    """Mock execute_query for one write batch: *face_rows* once, then empty.
+
+    ``state_rows`` is either a list returned for the per-face re-check or an
+    exception instance raised by it.
+    """
+    db_calls = []
+    batch_returned = [False]
+
+    def mock_execute_query(sql, params=None, fetch=True):
+        db_calls.append((sql.strip(), params))
+        if "sdc_write_requested" in sql and "SELECT" in sql:
+            return [{"sdc_write_requested": 1}]
+        if "SELECT f.id as face_id" in sql:
+            if not batch_returned[0]:
+                batch_returned[0] = True
+                return list(face_rows)
+            return []
+        if "SELECT is_target, superseded_by FROM faces" in sql:
+            if isinstance(state_rows, Exception):
+                raise state_rows
+            return list(state_rows)
+        if "SELECT DISTINCT i.commons_page_id" in sql:
+            return []
+        return 0
+
+    return mock_execute_query, db_calls
+
+
+def test_write_sdc_skips_face_rejected_before_write():
+    """A face rejected while its batch was queued is not written to Commons."""
+    project = {"id": 5, "user_id": 1, "wikidata_qid": "Q42"}
+    mock_eq, db_calls = _mock_write_batch_query(
+        [{"face_id": 100, "image_id": 200, "commons_page_id": 9999}],
+        [{"is_target": 0, "superseded_by": None}],
+    )
+    api_mock = MagicMock()
+
+    with (
+        patch("worker.execute_query", side_effect=mock_eq),
+        patch("worker._refresh_worker_token", return_value="fake-token"),
+        patch("worker._get_csrf_token", return_value="fake-csrf"),
+        patch("worker._api_request", api_mock),
+        patch("worker.shutdown_requested", False),
+    ):
+        result = write_sdc_claims(project)
+
+    assert result == 0
+    api_mock.assert_not_called()
+    assert not any("INSERT IGNORE INTO sdc_claims" in sql for sql, _ in db_calls)
+    assert not any("UPDATE faces SET sdc_written" in sql for sql, _ in db_calls)
+
+
+def test_write_sdc_skips_face_superseded_before_write():
+    """A face replaced by a bbox edit is not written to Commons."""
+    project = {"id": 5, "user_id": 1, "wikidata_qid": "Q42"}
+    mock_eq, db_calls = _mock_write_batch_query(
+        [{"face_id": 100, "image_id": 200, "commons_page_id": 9999}],
+        [{"is_target": 1, "superseded_by": 101}],
+    )
+    api_mock = MagicMock()
+
+    with (
+        patch("worker.execute_query", side_effect=mock_eq),
+        patch("worker._refresh_worker_token", return_value="fake-token"),
+        patch("worker._get_csrf_token", return_value="fake-csrf"),
+        patch("worker._api_request", api_mock),
+        patch("worker.shutdown_requested", False),
+    ):
+        result = write_sdc_claims(project)
+
+    assert result == 0
+    api_mock.assert_not_called()
+    assert not any("INSERT IGNORE INTO sdc_claims" in sql for sql, _ in db_calls)
+
+
+def test_write_sdc_skips_face_that_vanished_before_write():
+    """A face row deleted (manual draw undone) between batch and write is skipped."""
+    project = {"id": 5, "user_id": 1, "wikidata_qid": "Q42"}
+    mock_eq, db_calls = _mock_write_batch_query(
+        [{"face_id": 100, "image_id": 200, "commons_page_id": 9999}],
+        [],
+    )
+    api_mock = MagicMock()
+
+    with (
+        patch("worker.execute_query", side_effect=mock_eq),
+        patch("worker._refresh_worker_token", return_value="fake-token"),
+        patch("worker._get_csrf_token", return_value="fake-csrf"),
+        patch("worker._api_request", api_mock),
+        patch("worker.shutdown_requested", False),
+    ):
+        result = write_sdc_claims(project)
+
+    assert result == 0
+    api_mock.assert_not_called()
+    assert not any("INSERT IGNORE INTO sdc_claims" in sql for sql, _ in db_calls)
+
+
+def test_write_sdc_skips_face_when_state_recheck_fails():
+    """An unreadable per-face re-check skips the face instead of writing blind."""
+    project = {"id": 5, "user_id": 1, "wikidata_qid": "Q42"}
+    mock_eq, db_calls = _mock_write_batch_query(
+        [{"face_id": 100, "image_id": 200, "commons_page_id": 9999}],
+        _worker_module.DatabaseError("db down"),
+    )
+    api_mock = MagicMock()
+
+    with (
+        patch("worker.execute_query", side_effect=mock_eq),
+        patch("worker._refresh_worker_token", return_value="fake-token"),
+        patch("worker._get_csrf_token", return_value="fake-csrf"),
+        patch("worker._api_request", api_mock),
+        patch("worker.shutdown_requested", False),
+    ):
+        result = write_sdc_claims(project)
+
+    assert result == 0
+    api_mock.assert_not_called()
+    assert not any("INSERT IGNORE INTO sdc_claims" in sql for sql, _ in db_calls)
+
+
+def test_keepalive_sdc_write_refreshes_heartbeat_and_claim():
+    """The SDC-run keepalive touches the live signals the healthcheck and claim watch."""
+    db_calls = []
+
+    def mock_execute_query(sql, params=None, fetch=True):
+        db_calls.append((sql.strip(), params))
+        return 1
+
+    with (
+        patch("worker.execute_query", side_effect=mock_execute_query),
+        patch("worker._touch_heartbeat_file") as heartbeat,
+    ):
+        _worker_module._keepalive_sdc_write(7)
+
+    heartbeat.assert_called_once()
+    assert any("REPLACE INTO worker_heartbeat" in sql for sql, _ in db_calls)
+    claim_updates = [
+        (sql, p) for sql, p in db_calls if "worker_claimed_at = NOW()" in sql and "worker_claimed_by" in sql
+    ]
+    assert len(claim_updates) == 1
+    assert claim_updates[0][1][0] == 7
+
+
+def test_write_sdc_keepalive_runs_every_five_faces():
+    """A long write run refreshes its heartbeat and claim every 5 faces."""
+    project = {"id": 5, "user_id": 1, "wikidata_qid": "Q42"}
+    faces = [{"face_id": 100 + i, "image_id": 200, "commons_page_id": 9999} for i in range(5)]
+    mock_eq, _ = _mock_write_batch_query(faces, [{"is_target": 0, "superseded_by": None}])
+
+    with (
+        patch("worker.execute_query", side_effect=mock_eq),
+        patch("worker._refresh_worker_token", return_value="fake-token"),
+        patch("worker._get_csrf_token", return_value="fake-csrf"),
+        patch("worker._keepalive_sdc_write") as keepalive,
+        patch("worker.shutdown_requested", False),
+    ):
+        result = write_sdc_claims(project)
+
+    assert result == 0
+    keepalive.assert_called_once_with(5)
 
 
 # ---------------------------------------------------------------------------
@@ -3800,6 +4060,21 @@ def test_persist_detection_stores_embedding_model_and_detector_score():
     assert params[:4] == (8, _make_embedding(1), MODEL_ID, 0.93)
     assert params[8:12] == (8, _make_embedding(2), MODEL_ID, None)
     assert len(params) == 16
+
+
+def test_persist_detection_bootstrap_auto_classify_clears_queued_removal():
+    """Auto-classifying the single face of a bootstrapped image drops any queued
+    P180 removal — the pre-existing claim on Commons must stay."""
+    calls = []
+    faces = [face_client.DetectedFace(1, 50, 50, 1, encoding=_make_embedding(3), score=0.9)]
+
+    with patch(
+        "worker.execute_query", side_effect=lambda sql, params=None, fetch=True: calls.append((sql, params)) or 1
+    ):
+        assert _worker_module._persist_detection(8, _detection_result(100, 100, faces), bootstrapped=True, project_id=1)
+
+    auto = next(sql for sql, _ in calls if "classified_by = 'bootstrap'" in sql)
+    assert "sdc_removal_pending = 0" in auto
 
 
 def test_detection_url_uses_the_960_thumbnail():

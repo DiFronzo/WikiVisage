@@ -2344,7 +2344,7 @@ def api_classify():
                 if is_review_mode:
                     cursor.execute(
                         "UPDATE faces SET is_target = 1, classified_by = 'human', "
-                        "classified_by_user_id = %s, classified_at = NOW() "
+                        "classified_by_user_id = %s, sdc_removal_pending = 0, classified_at = NOW() "
                         "WHERE id = %s AND image_id = %s "
                         "AND is_target = 0 AND classified_by = 'model' "
                         "AND classified_by_user_id IS NULL AND superseded_by IS NULL",
@@ -2353,7 +2353,7 @@ def api_classify():
                 else:
                     cursor.execute(
                         "UPDATE faces SET is_target = 1, classified_by = 'human', "
-                        "classified_by_user_id = %s, classified_at = NOW() "
+                        "classified_by_user_id = %s, sdc_removal_pending = 0, classified_at = NOW() "
                         "WHERE id = %s AND image_id = %s AND is_target IS NULL",
                         (g.user["id"], selected_face_id, image_id),
                     )
@@ -2457,6 +2457,74 @@ def api_undo_classify():
     except DatabaseError:
         return jsonify({"error": _("Database error")}), 500
 
+    # Undoing a target classification must not strand a P180 claim on Commons.
+    # A claim on record (sdc_written=1) is removed now, or queued for the worker
+    # to verify when removal is not possible; a face with no claim on record is
+    # queued only while a write run is active, because only then can a write for
+    # it still be in flight. Undoing a rejection ("none") is the opposite case:
+    # it cancels the removal the rejection queued instead of confirming it — a
+    # revert must never delete a claim. Faces that get deleted (manual draws)
+    # cannot carry a queued removal, so their claim is removed synchronously
+    # before the delete.
+    undoing_rejection = last.get("action") == "none"
+    touched_ids = list(dict.fromkeys([*face_ids, *manual_face_ids]))
+    face_states: dict[int, dict[str, Any]] = {}
+    sibling_keeps_claim = False
+    sdc_removed = False
+    sdc_removal_queued = False
+    write_in_flight = False
+    if touched_ids:
+        placeholders = ",".join(["%s"] * len(touched_ids))
+        try:
+            state_rows = execute_query(
+                f"SELECT f.id, f.is_target, f.sdc_written, f.sdc_removal_pending, "
+                f"  i.commons_page_id, i.bootstrapped, p.wikidata_qid "
+                f"FROM faces f "
+                f"JOIN images i ON f.image_id = i.id "
+                f"JOIN projects p ON i.project_id = p.id "
+                f"WHERE f.image_id = %s AND f.id IN ({placeholders})",
+                (image_id, *touched_ids),
+            )
+            sibling_rows = execute_query(
+                f"SELECT EXISTS("
+                f"  SELECT 1 FROM faces f2 WHERE f2.image_id = %s "
+                f"  AND f2.is_target = 1 AND f2.superseded_by IS NULL "
+                f"  AND f2.id NOT IN ({placeholders})"
+                f") AS has_sibling",
+                (image_id, *touched_ids),
+            )
+            project_rows = execute_query(
+                "SELECT sdc_write_requested FROM projects WHERE id = %s",
+                (project_id,),
+            )
+        except DatabaseError:
+            return jsonify({"error": _("Database error")}), 500
+
+        face_states = {int(r["id"]): r for r in (state_rows or ())}
+        sibling_keeps_claim = bool(sibling_rows and sibling_rows[0]["has_sibling"])
+        write_in_flight = bool(project_rows and project_rows[0]["sdc_write_requested"])
+        claim_faces = [
+            fid
+            for fid, st in face_states.items()
+            if not undoing_rejection and (st["sdc_written"] == 1 or st["sdc_removal_pending"] == 1)
+        ]
+
+        if claim_faces and not sibling_keeps_claim:
+            claim_meta = face_states[claim_faces[0]]
+            access_token = _get_valid_token()
+            if access_token and claim_meta["commons_page_id"]:
+                sdc_removed = _remove_sdc_claim(claim_meta["commons_page_id"], claim_meta["wikidata_qid"], access_token)
+            if not sdc_removed and any(fid in manual_face_ids for fid in claim_faces):
+                # Refuse the undo rather than orphan a claim: the face row
+                # disappears and with it any queued removal.
+                if not access_token:
+                    return jsonify({"error": _("OAuth token expired. Please log in again.")}), 401
+                return jsonify(
+                    {"error": _("Failed to remove SDC claim from Commons. The classification was not undone.")}
+                ), 502
+            if not sdc_removed:
+                sdc_removal_queued = True
+
     try:
         was_review = last.get("was_review", False)
         decrement_counter = last.get("action") == "target" or (
@@ -2464,6 +2532,7 @@ def api_undo_classify():
         )
 
         def _undo(conn, cursor):
+            nonlocal sdc_removal_queued
             _assert_project_access_locked(cursor, project_id, g.user["id"])
             if manual_face_ids:
                 m_placeholders = ",".join(["%s"] * len(manual_face_ids))
@@ -2473,21 +2542,43 @@ def api_undo_classify():
                 )
 
             original_ids = [fid for fid in face_ids if fid not in manual_face_ids]
-            if original_ids:
-                placeholders = ",".join(["%s"] * len(original_ids))
+            for fid in original_ids:
+                st = face_states.get(int(fid))
+                if st is None or sibling_keeps_claim:
+                    # Sibling target keeps the claim; this face only reverts.
+                    pending, written = 0, 0
+                elif undoing_rejection:
+                    # Cancel the removal queue the rejection created. Only a
+                    # rejection on a bootstrapped image ever sets it; on other
+                    # images a queued flag predates the rejection (an earlier
+                    # undo racing a write run), so it is kept for the worker to
+                    # verify the possibly in-flight claim instead.
+                    queued = 0 if st.get("bootstrapped") else int(st["sdc_removal_pending"] or 0)
+                    pending, written = queued, int(st["sdc_written"] or 0)
+                elif st["sdc_written"] == 1 or st["sdc_removal_pending"] == 1:
+                    pending, written = (0, 0) if sdc_removed else (1, int(st["sdc_written"] or 0))
+                elif st["is_target"] == 1 and write_in_flight:
+                    pending, written = 1, 0
+                else:
+                    pending, written = 0, 0
+                if pending:
+                    sdc_removal_queued = True
+
                 if was_review:
                     cursor.execute(
-                        f"UPDATE faces SET is_target = 0, classified_by = 'model', "
-                        f"classified_by_user_id = NULL, sdc_removal_pending = 0, classified_at = NULL "
-                        f"WHERE id IN ({placeholders}) AND image_id = %s",
-                        (*original_ids, image_id),
+                        "UPDATE faces SET is_target = 0, classified_by = 'model', "
+                        "classified_by_user_id = NULL, sdc_written = %s, "
+                        "sdc_removal_pending = %s, classified_at = NULL "
+                        "WHERE id = %s AND image_id = %s",
+                        (written, pending, fid, image_id),
                     )
                 else:
                     cursor.execute(
-                        f"UPDATE faces SET is_target = NULL, classified_by = NULL, "
-                        f"classified_by_user_id = NULL, sdc_removal_pending = 0, classified_at = NULL "
-                        f"WHERE id IN ({placeholders}) AND image_id = %s",
-                        (*original_ids, image_id),
+                        "UPDATE faces SET is_target = NULL, classified_by = NULL, "
+                        "classified_by_user_id = NULL, sdc_written = %s, "
+                        "sdc_removal_pending = %s, classified_at = NULL "
+                        "WHERE id = %s AND image_id = %s",
+                        (written, pending, fid, image_id),
                     )
 
             if decrement_counter:
@@ -2503,7 +2594,22 @@ def api_undo_classify():
         logger.exception("Failed to undo classification")
         return jsonify({"error": _("Failed to undo classification")}), 500
 
-    return jsonify({"status": "ok", "project_id": project_id, "image_id": image_id})
+    # The classify page reloads right after an undo; surface the (otherwise
+    # invisible) effect the undo had on Commons so the user is not surprised.
+    if sdc_removed:
+        flash(_("SDC claim was removed."), "info")
+    elif sdc_removal_queued:
+        flash(_("SDC claim removal queued."), "info")
+
+    return jsonify(
+        {
+            "status": "ok",
+            "project_id": project_id,
+            "image_id": image_id,
+            "sdc_removed": sdc_removed,
+            "sdc_removal_queued": sdc_removal_queued,
+        }
+    )
 
 
 def _detection_space(width: Any, height: Any) -> tuple[int, int] | None:
@@ -2899,40 +3005,35 @@ def api_reclassify():
     wikidata_qid = face_row["wikidata_qid"]
     is_bootstrapped = face_row["bootstrapped"]
 
-    # If rejecting (is_target=0): for bootstrap images, queue removal via
-    # sdc_removal_pending (worker handles actual API call) — but ONLY if no
-    # other face on the same image confirms the target (sibling guard).
-    # For non-bootstrap faces with sdc_written=1, remove the claim immediately.
+    # If rejecting (is_target=0), any P180 claim must not survive the rejection
+    # unless another face on the same image still confirms the target (sibling
+    # guard). A claim on record for a non-bootstrap face is removed immediately
+    # with the caller's token; every other case — bootstrap faces, and faces
+    # whose claim may be written by a write run that is still in flight
+    # (sdc_written=0) — is queued for the worker, which re-verifies each face
+    # right before writing and removes what should not be there. Without the
+    # queue, a rejection racing an in-flight write left the claim on Commons.
     sdc_removed = False
     sdc_removal_queued = False
-    if is_target == 0 and is_bootstrapped:
-        # Check if another face on the same image is confirmed as target.
-        # If so, the P180 claim must stay — don't queue removal.
+    if is_target == 0:
         try:
             has_sibling = has_sibling_match(face_row["image_id"], face_id)
         except DatabaseError:
             return jsonify({"error": _("Database error")}), 500
 
         if not has_sibling:
-            sdc_removal_queued = True
-    elif is_target == 0 and sdc_written == 1:
-        # Check if another face on the same image is confirmed as target.
-        # If so, the P180 claim must stay — only clear sdc_written on this face.
-        try:
-            has_sibling = has_sibling_match(face_row["image_id"], face_id)
-        except DatabaseError:
-            return jsonify({"error": _("Database error")}), 500
+            if not is_bootstrapped and sdc_written == 1:
+                access_token = _get_valid_token()
+                if not access_token:
+                    return jsonify({"error": _("OAuth token expired. Please log in again.")}), 401
 
-        if not has_sibling:
-            access_token = _get_valid_token()
-            if not access_token:
-                return jsonify({"error": _("OAuth token expired. Please log in again.")}), 401
-
-            sdc_removed = _remove_sdc_claim(commons_page_id, wikidata_qid, access_token)
-            if not sdc_removed:
-                return jsonify(
-                    {"error": _("Failed to remove SDC claim from Commons. The face was not reclassified.")}
-                ), 502
+                sdc_removed = _remove_sdc_claim(commons_page_id, wikidata_qid, access_token)
+                if not sdc_removed:
+                    return jsonify(
+                        {"error": _("Failed to remove SDC claim from Commons. The face was not reclassified.")}
+                    ), 502
+            else:
+                sdc_removal_queued = True
 
     try:
         demoted_ids: list[int] = []
@@ -3054,6 +3155,10 @@ def api_reclassify():
             "face_id": face_id,
             "is_target": is_target,
             "classified_by": face_row["classified_by"],
+            # Post-action state, so the gallery card can refresh its SDC badge
+            # without a reload. Reject always clears the marker; approve may set
+            # it when the P180 check above found the claim already on Commons.
+            "sdc_written": 0 if is_target == 0 else (1 if sdc_written else 0),
             "sdc_removed": sdc_removed,
             "sdc_removal_queued": sdc_removal_queued,
             "updated_faces": [
