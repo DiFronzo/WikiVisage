@@ -1,0 +1,77 @@
+name: Dependency audit
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "requirements.txt"
+      - "model-server/requirements.in"
+      - "model-server/requirements.txt"
+      - ".github/workflows/audit.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "requirements.txt"
+      - "model-server/requirements.in"
+      - "model-server/requirements.txt"
+      - ".github/workflows/audit.yml"
+  schedule:
+    # Monday 06:17 UTC. A CVE disclosed against a pin nobody touched would
+    # otherwise wait for the next push to main.
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audit-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      # pip-audit resolves the lock at the interpreter's version, and the face
+      # service lock targets 3.11; auditing on 3.15 would fail to resolve
+      # kserve (Requires-Python <3.14).
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      # Pinned like Ruff: a new pip-audit release must not turn CI red on
+      # unchanged code.
+      - name: Install pip-audit
+        run: pip install "pip-audit==2.10.1"
+
+      # Two dependency sets: the web/worker stack and the face service, which
+      # parses untrusted images with Pillow/OpenCV/ONNX Runtime. A known CVE in
+      # either one fails the run (pip-audit exits non-zero).
+      - name: Audit dependencies
+        run: |
+          pip-audit -r requirements.txt --progress-spinner off
+          pip-audit -r model-server/requirements.txt --progress-spinner off
+
+      # The face service lock is generated, not hand-maintained. Pin uv to the
+      # version Dependabot ships (0.13.5): a different uv could change the
+      # output format and fail this check on unchanged dependencies. Bump both
+      # together.
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.3.2
+        with:
+          version: "0.13.5"
+          enable-cache: true
+
+      # Regenerate in place (the command in the file header must match) and
+      # fail if the result differs from what is committed. Catches a hand-edit,
+      # an unresolved merge, and a Dependabot PR that did not regenerate.
+      - name: Verify the face service lock is current
+        working-directory: model-server
+        run: |
+          uv pip compile --python-version 3.11 --python-platform x86_64-manylinux_2_28 \
+            requirements.in -o requirements.txt
+          git diff --exit-code -- requirements.txt

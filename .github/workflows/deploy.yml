@@ -170,6 +170,25 @@ jobs:
             toolforge build show
             return 1
           }
+
+          # Write to the Toolforge server admin log (SAL). Best-effort only:
+          # dologmsg depends on Toolforge-internal services and has been
+          # unavailable during outages (it can fail *or* hang), so a failure
+          # here must never fail a deploy that already succeeded.
+          log_to_sal() {
+            local msg="$1"
+            if ! command -v dologmsg >/dev/null 2>&1; then
+              echo "::warning::dologmsg is not available; skipping SAL entry: $msg"
+              return 0
+            fi
+            if command -v timeout >/dev/null 2>&1; then
+              timeout 20 dologmsg "$msg" && { echo "==> Logged to SAL: $msg"; return 0; }
+            else
+              dologmsg "$msg" && { echo "==> Logged to SAL: $msg"; return 0; }
+            fi
+            echo "::warning::dologmsg failed or timed out; continuing without a SAL entry: $msg"
+            return 0
+          }
           SCRIPT
 
           cat > /tmp/scripts/deploy-face.sh << 'SCRIPT'
@@ -201,7 +220,7 @@ jobs:
           for i in $(seq 1 60); do
             if curl -fsS --max-time 10 "$URL" 2>/dev/null | jq -e '.ready == true' >/dev/null 2>&1; then
               echo "Face service ready after $((i * 10))s"
-              dologmsg "deployed ${REF} (by ${ACTOR} on GitHub)"
+              log_to_sal "deployed ${REF} (by ${ACTOR} on GitHub)"
               exit 0
             fi
             sleep 10
@@ -295,8 +314,8 @@ jobs:
 
           LOG_MSG="deployed $TAG (by $ACTOR on GitHub)"
           [ "$DB_RESET" = "true" ] && LOG_MSG="deployed $TAG with database wipe (by $ACTOR on GitHub)"
-          dologmsg "$LOG_MSG"
-          echo "==> Deploy complete (logged to SAL)"
+          log_to_sal "$LOG_MSG"
+          echo "==> Deploy complete"
           SCRIPT
 
           ssh toolforge "mkdir -p '$REMOTE_DIR' && chmod 755 '$REMOTE_DIR'"
@@ -342,25 +361,44 @@ jobs:
           echo "ok: token is ${LEN} characters and identical on both tools"
 
       - name: Deploy face service
+        id: deploy_face
         timeout-minutes: 25
         run: |
           ssh toolforge "become '$FACE_TOOL' bash '$REMOTE_DIR/deploy-face.sh' '$FACE_REF' '$FACE_TOOL' '${{ github.actor }}'"
 
       - name: Deploy web app and workers
+        id: deploy_web
         timeout-minutes: 25
         run: |
           ssh toolforge "become wikivisage bash '$REMOTE_DIR/deploy.sh' '$TAG' '$DB_RESET' '${{ github.actor }}'"
 
       - name: Summary
         if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+          FACE_OUTCOME: ${{ steps.deploy_face.outcome || 'not run' }}
+          WEB_OUTCOME: ${{ steps.deploy_web.outcome || 'not run' }}
         run: |
+          case "$JOB_STATUS" in
+            success) RESULT="✅ success" ;;
+            failure) RESULT="❌ failed" ;;
+            cancelled) RESULT="⚠️ cancelled" ;;
+            *) RESULT="❔ ${JOB_STATUS:-unknown}" ;;
+          esac
+
           {
             echo "## 🚀 Deploy Summary"
+            echo
+            echo "**Result: ${RESULT}**"
+            echo
             echo "| | |"
             echo "|---|---|"
+            echo "| **Status** | ${RESULT} |"
             echo "| **Tag** | \`${TAG}\` |"
-            echo "| **DB Reset** | \`${DB_RESET}\` |"
+            echo "| **DB reset** | \`${DB_RESET}\` |"
             echo "| **Face service** | \`${FACE_TOOL}\` from \`${FACE_REF:-not published}\` |"
+            echo "| **Face service deploy** | ${FACE_OUTCOME} |"
+            echo "| **Web app + workers deploy** | ${WEB_OUTCOME} |"
             echo "| **Triggered by** | \`${{ github.actor }}\` |"
           } >> "$GITHUB_STEP_SUMMARY"
 

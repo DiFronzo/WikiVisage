@@ -92,6 +92,10 @@
     .face-box.label-inside .face-label {
         top: 0;
     }
+    /* Labels-off toggle: boxes stay, the text that hides small faces goes. */
+    .image-wrapper.hide-labels .face-label {
+        display: none;
+    }
     .face-box:hover .face-label {
         background: var(--success);
     }
@@ -420,7 +424,7 @@
     @media (hover: none) and (pointer: coarse) {
         .image-wrapper { width: 100%; }
         .image-wrapper img { max-height: none; margin: 0 auto; }
-        .face-label { display: none; }
+        .image-wrapper:not(.show-labels) .face-label { display: none; }
         .hotkey-hints { display: none; }
     }
 </style>
@@ -505,6 +509,9 @@
 
         <div class="manual-controls">
             <button class="btn btn-manual" id="btnDrawFace" onclick="toggleDrawMode()" title="{{ _('Draw a box around a missed face') }}">{{ _('+ Add Missing Face') }}</button>
+            {% if faces | length > 1 %}
+            <button class="btn btn-manual" id="btnToggleLabels" type="button" onclick="toggleLabels()" aria-pressed="true" title="{{ _('Show or hide the face labels') }}">{{ _('Hide labels') }}</button>
+            {% endif %}
             <span class="hint" id="drawHint" style="display: none;">{{ _('Click and drag on the image to draw a face box. Press Esc to cancel.') }}</span>
         </div>
 
@@ -519,7 +526,7 @@
                  data-bbox-bottom="{{ face.bbox_bottom }}"
                  data-bbox-left="{{ face.bbox_left }}"
                  role="button" tabindex="0" aria-label="{{ _('Face %(num)d', num=loop.index) }}">
-                {% if faces | length > 1 %}
+                {% if faces | length > 1 and loop.index <= 9 %}
                 <span class="face-label">{{ _('Face %(num)d', num=loop.index) }}</span>
                 {% endif %}
             </div>
@@ -551,6 +558,7 @@
                 </div>
                 <div class="hotkey-hints">
                     {% for face in faces %}{% if loop.index <= 9 %}<span><kbd>{{ loop.index }}</kbd> {{ _('Face %(num)d', num=loop.index) }}</span>{% endif %}{% endfor %}
+                    <span><kbd>H</kbd> {{ _('Labels') }}</span>
                     <span><kbd>N</kbd> {{ _('None') }}</span>
                     <span><kbd>S</kbd> {{ _('Skip') }}</span>
                     {% if has_undo %}<span><kbd>Z</kbd> {{ _('Undo') }}</span>{% endif %}
@@ -580,12 +588,65 @@
         errorManualFace: {{ _('Failed to add manual face. Please try again.')|tojson }},
         cancelDrawing: {{ _('Cancel Drawing')|tojson }},
         addMissingFace: {{ _('+ Add Missing Face')|tojson }},
+        hideLabels: {{ _('Hide labels')|tojson }},
+        showLabels: {{ _('Show labels')|tojson }},
         errorPrefix: {{ _('Error: {message}')|tojson }},
         unknownError: {{ _('Unknown error')|tojson }}
     };
 
     var img = document.getElementById('classifyImg');
     var boxes = document.querySelectorAll('.face-box');
+
+    /* --- Face labels on/off ---------------------------------------------
+       The "FACE N" tags sit above the boxes and can cover small neighbouring
+       faces. The preference is remembered between images; without one, touch
+       devices start with labels hidden (unreadable and covering the photo)
+       and desktop starts with them shown. */
+    var LABELS_PREF_KEY = 'wikivisage-face-labels';
+    var labelsWrapper = document.getElementById('imageWrapper');
+    var labelsBtn = document.getElementById('btnToggleLabels');
+    var labelsVisible = true;
+
+    function storedLabelsPref() {
+        try {
+            return window.localStorage.getItem(LABELS_PREF_KEY);
+        } catch (e) {
+            return null;  /* storage disabled (private mode) */
+        }
+    }
+
+    function touchPrefersLabelsHidden() {
+        return !!(window.matchMedia && window.matchMedia('(hover: none) and (pointer: coarse)').matches);
+    }
+
+    function applyLabels() {
+        if (!labelsWrapper) return;
+        labelsWrapper.classList.toggle('hide-labels', !labelsVisible);
+        labelsWrapper.classList.toggle('show-labels', labelsVisible);
+        if (!labelsBtn) return;  /* single face: no tags to toggle */
+        labelsBtn.textContent = labelsVisible ? i18n.hideLabels : i18n.showLabels;
+        labelsBtn.setAttribute('aria-pressed', labelsVisible ? 'true' : 'false');
+    }
+
+    function toggleLabels() {
+        labelsVisible = !labelsVisible;
+        try {
+            window.localStorage.setItem(LABELS_PREF_KEY, labelsVisible ? 'on' : 'off');
+        } catch (e) { /* storage disabled — keep the in-page state only */ }
+        applyLabels();
+    }
+
+    (function initLabels() {
+        var pref = storedLabelsPref();
+        if (pref === 'on') {
+            labelsVisible = true;
+        } else if (pref === 'off') {
+            labelsVisible = false;
+        } else {
+            labelsVisible = !touchPrefersLabelsHidden();
+        }
+        applyLabels();
+    })();
 
     /* Detection dimensions: the image resolution at which bboxes were computed.
        Falls back to the displayed thumbnail's natural size for legacy images
@@ -751,6 +812,8 @@
             skipImage();
         } else if ((e.key === 'z' || e.key === 'Z') && document.getElementById('undoBtn')) {
             undoClassify();
+        } else if ((e.key === 'h' || e.key === 'H') && !e.repeat) {
+            toggleLabels();
         }
         var idx = parseInt(e.key);
         if (idx >= 1 && idx <= 9 && idx <= {{ faces | length }}) {

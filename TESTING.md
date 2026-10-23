@@ -415,6 +415,25 @@ to top-level-only pins — that is how transitive versions drifted under a file
 labelled "pinned". Both the Docker image and the Toolforge buildpack install
 the generated lock with a plain `pip install -r requirements.txt`.
 
+For a targeted security bump, upgrade only the affected package:
+
+```bash
+uv pip compile --python-version 3.11 --python-platform x86_64-manylinux_2_28 \
+  requirements.in -o requirements.txt --upgrade-package certifi
+```
+
+`--upgrade-package` leaves every other pin where it is, which keeps a CVE fix
+from dragging in unrelated upgrades. Run `pip-audit -r requirements.txt`
+afterwards; `--upgrade` without a package refreshes everything and is a
+separate change for the face-service jobs to test.
+
+Dependabot's `uv` ecosystem updates `requirements.in` and regenerates
+`requirements.txt` in the same PR. If you resolve a conflict by hand, run the
+command above (without `--upgrade-package`) from `model-server/` and commit the
+result — the audit workflow's lock check fails if the committed file is not
+what uv produces. Use the uv version pinned in `.github/workflows/audit.yml`
+(0.13.5) so the output is byte-identical.
+
 ---
 
 ## 8. Building the production image locally (buildpacks)
@@ -438,6 +457,29 @@ docker run --rm -p 8082:8000 --entrypoint web \
 The service needs no system packages (there is no `project.toml`), so the
 deb-packages buildpack is not requested. The weights directory is part of the
 build context, so it ends up in the image.
+
+---
+
+## 9. Bbox editor browser regressions
+
+These tests render the real project page and exercise its mouse/touch handlers
+and layout in Chromium and WebKit. Flask queries and thumbnail/gallery responses
+are mocked; no database, face service or Commons connection is needed.
+
+```bash
+pip install -r requirements-browser.txt
+python -m playwright install chromium webkit
+WIKIVISAGE_BROWSER_TESTS=1 pytest tests/test_bbox_editor_browser.py -v
+```
+
+On Linux, use `python -m playwright install --with-deps chromium webkit` to
+install the browser system libraries too. The dedicated CI browser job uses
+that command. The plain Python suite skips browser tests unless explicitly
+enabled, and Playwright is not a production dependency.
+
+Coverage includes touch identity and multi-touch cancellation, `touchcancel`,
+rotation during a drag, detection-space coordinate conversion, completed-box
+placement after resize, mouse drawing, and landscape modal scrolling.
 
 ---
 

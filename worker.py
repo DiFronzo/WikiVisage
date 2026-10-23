@@ -1696,6 +1696,69 @@ def _shadow_prefilter_loop() -> None:
             time.sleep(1)
 
 
+def _persist_inference_batch(project_id: int, batch: list[tuple[int, int, float]]) -> tuple[int, int]:
+    """Apply a batch under the project lock shared with human classifications.
+
+    The candidate snapshot can predate an approval, undo or queued P180 removal.
+    Re-read eligibility and sibling targets before writing any model decisions.
+    """
+    if not batch:
+        return 0, 0
+
+    def _apply(conn, cursor):
+        cursor.execute(
+            "SELECT id FROM projects WHERE id = %s AND status IN ('active', 'completed') FOR UPDATE",
+            (project_id,),
+        )
+        if not cursor.fetchone():
+            return 0, 0
+
+        placeholders = ",".join(["%s"] * len(batch))
+        cursor.execute(
+            "SELECT f.id, f.image_id, EXISTS ("
+            "  SELECT 1 FROM faces t WHERE t.image_id = f.image_id "
+            "  AND t.is_target = 1 AND t.superseded_by IS NULL"
+            ") AS image_has_target "
+            "FROM faces f JOIN images i ON f.image_id = i.id "
+            f"WHERE f.id IN ({placeholders}) AND i.project_id = %s "
+            "AND f.is_target IS NULL AND f.classified_by_user_id IS NULL "
+            "AND f.superseded_by IS NULL AND f.sdc_removal_pending = 0 "
+            "AND f.embedding_model = %s FOR UPDATE",
+            (*[face_id for face_id, _, _ in batch], project_id, face_client.EXPECTED_MODEL_ID),
+        )
+        live = {row["id"]: row for row in cursor.fetchall()}
+        updates = [
+            (face_id, 0 if live[face_id]["image_has_target"] else is_target, distance)
+            for face_id, is_target, distance in batch
+            if face_id in live
+        ]
+        if not updates:
+            return 0, 0
+
+        target_cases = " ".join(["WHEN %s THEN %s" for _ in updates])
+        conf_cases = " ".join(["WHEN %s THEN %s" for _ in updates])
+        id_placeholders = ",".join(["%s"] * len(updates))
+        params: list = []
+        for face_id, is_target, _ in updates:
+            params.extend([face_id, is_target])
+        for face_id, _, distance in updates:
+            params.extend([face_id, distance])
+        params.extend(face_id for face_id, _, _ in updates)
+        cursor.execute(
+            "UPDATE faces SET "
+            f"is_target = CASE id {target_cases} END, "
+            f"confidence = CASE id {conf_cases} END, "
+            "classified_by = 'model', classified_at = NOW() "
+            f"WHERE id IN ({id_placeholders}) AND is_target IS NULL "
+            "AND classified_by_user_id IS NULL AND superseded_by IS NULL "
+            "AND sdc_removal_pending = 0",
+            tuple(params),
+        )
+        return cursor.rowcount, sum(is_target for _, is_target, _ in updates)
+
+    return execute_transaction(_apply)
+
+
 def run_autonomous_inference(project: dict[str, Any]) -> int:
     """
     Run model inference on unclassified faces based on confirmed faces.
@@ -1809,10 +1872,21 @@ def run_autonomous_inference(project: dict[str, Any]) -> int:
     #       queue (or the user classifies them directly).
     # Bootstrapped images are included: bootstrap auto-classifies the single best face,
     # but multi-face images have additional unclassified faces that need inference.
-    # The per-image dedup below ensures only the closest face per image is matched.
+    # ``image_has_target`` marks candidates on an image that already has a confirmed
+    # target outside this candidate set (human, bootstrap or written model match).
+    # Those candidates are always resolved as non-matches below: a person appears
+    # once per image, and a re-run must not promote a second face after the human
+    # approved one of several model faces on the same image.
     unclassified_rows = execute_query(
         """
-        SELECT f.id, f.image_id, f.encoding FROM faces f
+        SELECT f.id, f.image_id, f.encoding,
+               EXISTS (
+                   SELECT 1 FROM faces t
+                   WHERE t.image_id = f.image_id
+                     AND t.is_target = 1
+                     AND t.superseded_by IS NULL
+               ) AS image_has_target
+        FROM faces f
         JOIN images i ON f.image_id = i.id
         WHERE i.project_id = %s
           AND f.is_target IS NULL
@@ -1841,7 +1915,7 @@ def run_autonomous_inference(project: dict[str, Any]) -> int:
     t_distance_start = time.monotonic()
 
     # Phase 1: compute distances for all candidates
-    face_distances: list[tuple[int, int, float]] = []  # (face_id, image_id, distance)
+    face_distances: list[tuple[int, int, float, bool]] = []  # (face_id, image_id, distance, image_has_target)
     for row in unclassified_rows:
         if shutdown_requested:
             break
@@ -1850,19 +1924,23 @@ def run_autonomous_inference(project: dict[str, Any]) -> int:
         if embedding is None:
             continue
         distance = _face_distance(centroid, embedding)
-        face_distances.append((row["id"], row["image_id"], float(distance)))
+        face_distances.append((row["id"], row["image_id"], float(distance), bool(row.get("image_has_target"))))
 
     # Phase 2: per-image dedup — only the closest face below threshold is a match;
-    # all other faces on the same image are rejected (a person appears once per image)
+    # all other faces on the same image are rejected (a person appears once per image).
+    # Candidates on an image that already has a confirmed target are never matched:
+    # they are resolved as non-matches so they stop blocking the inference queue.
     best_per_image: dict[int, tuple[int, float]] = {}  # image_id -> (face_id, distance)
-    for face_id, image_id, distance in face_distances:
+    for face_id, image_id, distance, image_has_target in face_distances:
+        if image_has_target:
+            continue
         if distance < threshold:
             if image_id not in best_per_image or distance < best_per_image[image_id][1]:
                 best_per_image[image_id] = (face_id, distance)
 
     best_face_ids = {face_id for face_id, _ in best_per_image.values()}
 
-    for face_id, _image_id, distance in face_distances:
+    for face_id, _image_id, distance, _image_has_target in face_distances:
         if face_id in best_face_ids:
             pending_updates.append((face_id, 1, distance))
         else:
@@ -1870,8 +1948,9 @@ def run_autonomous_inference(project: dict[str, Any]) -> int:
 
     t_distance = time.monotonic()
 
-    # Flush batch UPDATEs using CASE/WHEN for single round-trip per batch
+    # Revalidate each batch under the same project lock as human edits.
     t_db_start = time.monotonic()
+    matches = 0
     for i in range(0, len(pending_updates), UPDATE_BATCH_SIZE):
         if shutdown_requested:
             break
@@ -1879,37 +1958,11 @@ def run_autonomous_inference(project: dict[str, Any]) -> int:
         if not batch:
             break
 
-        face_ids = [item[0] for item in batch]
-        id_placeholders = ",".join(["%s"] * len(face_ids))
-
-        # Build CASE expressions for is_target and confidence
-        target_cases = " ".join(["WHEN %s THEN %s" for _ in batch])
-        conf_cases = " ".join(["WHEN %s THEN %s" for _ in batch])
-
-        # Flatten params: target CASE pairs, confidence CASE pairs, then IN list
-        params: list = []
-        for face_id, is_target_val, _ in batch:
-            params.extend([face_id, is_target_val])
-        for face_id, _, dist in batch:
-            params.extend([face_id, dist])
-        params.extend(face_ids)
-
-        execute_query(
-            f"UPDATE faces SET "
-            f"is_target = CASE id {target_cases} END, "
-            f"confidence = CASE id {conf_cases} END, "
-            f"classified_by = 'model', "
-            f"classified_at = NOW() "
-            f"WHERE id IN ({id_placeholders}) "
-            f"AND classified_by_user_id IS NULL "
-            f"AND superseded_by IS NULL",
-            tuple(params),
-            fetch=False,
-        )
-        classified_count += len(batch)
+        applied, batch_matches = _persist_inference_batch(project["id"], batch)
+        classified_count += applied
+        matches += batch_matches
     t_db = time.monotonic()
 
-    matches = sum(1 for _, t, _ in pending_updates if t == 1)
     logger.info(
         f"Inference complete for project {project['id']}: "
         f"{classified_count} classified ({matches} matches, {classified_count - matches} non-matches) | "
@@ -1994,6 +2047,28 @@ def _keepalive_sdc_write(project_id: int) -> None:
         )
     except DatabaseError:
         pass
+
+
+def _has_pending_sdc_work(project_id: int) -> bool:
+    """Check the same actionable writes and removals as the two SDC phases."""
+    rows = execute_query(
+        "SELECT EXISTS ("
+        "  SELECT 1 FROM faces f JOIN images i ON f.image_id = i.id "
+        "  WHERE i.project_id = %s AND f.superseded_by IS NULL AND ("
+        "    (f.is_target = 1 AND f.sdc_written = 0 "
+        "      AND f.classified_by != 'bootstrap' AND i.bootstrapped = 0) "
+        "    OR (f.sdc_removal_pending = 1 AND NOT EXISTS ("
+        "      SELECT 1 FROM faces f2 WHERE f2.image_id = f.image_id "
+        "      AND f2.is_target = 1 AND f2.superseded_by IS NULL AND f2.id != f.id"
+        "    ))"
+        "  )"
+        ") AS pending",
+        (project_id,),
+        fetch=True,
+    )
+    if not rows:
+        raise DatabaseError("Could not read outstanding SDC work")
+    return bool(rows[0]["pending"])
 
 
 def write_sdc_claims(project: dict[str, Any]) -> int:
@@ -2294,12 +2369,25 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
                         break
 
                 if already_exists:
-                    logger.info(f"SDC P180 claim for {qid} already exists on {mid}, marking face {face_id} as written")
-                    execute_query(
-                        "UPDATE faces SET sdc_written = 1 WHERE id = %s",
+                    # Only mark a face that is still a target. The claim predates
+                    # this run, so a face reset while wbgetclaims was in flight
+                    # must not carry a written marker: a later rejection/undo
+                    # would remove a claim the worker did not add. No removal is
+                    # queued here for the same reason.
+                    marked_written = execute_query(
+                        "UPDATE faces SET sdc_written = 1 WHERE id = %s AND is_target = 1",
                         (face_id,),
                         fetch=False,
                     )
+                    if marked_written:
+                        logger.info(
+                            f"SDC P180 claim for {qid} already exists on {mid}, marked face {face_id} as written"
+                        )
+                    else:
+                        logger.warning(
+                            f"Face {face_id} is no longer a target; not marking the "
+                            f"pre-existing P180 claim on {mid} as written"
+                        )
                     execute_query(
                         "UPDATE sdc_claims SET written_at = NOW() "
                         "WHERE commons_page_id = %s AND wikidata_qid = %s AND written_at IS NULL",
@@ -2442,11 +2530,23 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
                     )
 
                 logger.info(f"SDC P180 claim for {qid} written to {mid} (face {face_id})")
-                execute_query(
-                    "UPDATE faces SET sdc_written = 1 WHERE id = %s",
+                # The face may have been reset or rejected between the live-state
+                # re-check above and the wbeditentity call. Only mark it written
+                # while it is still a target; otherwise the claim we just added is
+                # orphaned, so queue its removal in the same run.
+                written_now = execute_query(
+                    "UPDATE faces SET sdc_written = 1 WHERE id = %s AND is_target = 1",
                     (face_id,),
                     fetch=False,
                 )
+                if not written_now:
+                    logger.warning(f"Face {face_id} changed during the SDC write; queuing P180 removal for {mid}")
+                    execute_query(
+                        "UPDATE faces SET sdc_written = 1, sdc_removal_pending = 1 "
+                        "WHERE id = %s AND is_target IS NULL AND superseded_by IS NULL",
+                        (face_id,),
+                        fetch=False,
+                    )
                 execute_query(
                     "UPDATE sdc_claims SET written_at = NOW() WHERE commons_page_id = %s AND wikidata_qid = %s",
                     (page_id, qid),
@@ -2749,10 +2849,25 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
                 logger.info(f"SDC removals aborted for project {project_id}: {total_removed} removed before error")
                 return total_written
 
-    # Clear the flag — all done successfully (or shutdown requested)
+    # A shutdown can arrive after the last successful edit, including during
+    # its rate-limit sleep. The signal alone does not mean any work was lost.
     error_msg = None
     if shutdown_requested:
-        error_msg = "Worker shutdown interrupted SDC writes"
+        try:
+            if _has_pending_sdc_work(project_id):
+                error_msg = (
+                    "Worker shutdown left Commons edits pending. "
+                    "Edits already sent were kept. Send the remaining edits again."
+                )
+                logger.info("SDC for project %s stopped with edits still pending", project_id)
+            else:
+                logger.info("SDC for project %s finished before worker shutdown; no edits remain", project_id)
+        except DatabaseError:
+            logger.warning("Could not verify remaining SDC work on shutdown for project %s", project_id, exc_info=True)
+            error_msg = (
+                "Worker shut down before completion could be verified. "
+                "Edits may already be on Commons. Please check the results."
+            )
 
     execute_query(
         "UPDATE projects SET sdc_write_requested = 0, sdc_write_user_id = NULL, sdc_write_error = %s WHERE id = %s",
@@ -3076,6 +3191,32 @@ def _run_new_inference_projects(max_count: int = 1) -> int:
     return classified_projects
 
 
+def _has_inference_candidates(project_id: int) -> bool:
+    """Return True when the project has a face inference could classify.
+
+    Cheap pre-check for the early inference pass in :func:`process_project`.
+    Mirrors the candidate filter in :func:`run_autonomous_inference`.
+    """
+    try:
+        rows = execute_query(
+            "SELECT 1 AS found FROM faces f "
+            "JOIN images i ON f.image_id = i.id "
+            "WHERE i.project_id = %s "
+            "  AND f.is_target IS NULL "
+            "  AND f.superseded_by IS NULL "
+            "  AND f.classified_by_user_id IS NULL "
+            "  AND f.sdc_removal_pending = 0 "
+            "  AND f.embedding_model = %s "
+            "LIMIT 1",
+            (project_id, face_client.EXPECTED_MODEL_ID),
+            fetch=True,
+        )
+        return bool(rows)
+    except DatabaseError:
+        logger.warning("Could not check inference candidates for project %s", project_id, exc_info=True)
+        return False
+
+
 def process_project(project: dict[str, Any], *, skip_discovery: bool = False) -> None:
     """Orchestrate all phases for a single project.
 
@@ -3134,6 +3275,20 @@ def process_project(project: dict[str, Any], *, skip_discovery: bool = False) ->
         # bootstrap work for projects that are no longer active.
         if not _is_still_active():
             return
+
+        # Fast path: classify faces that are already waiting before the
+        # discovery stages. A re-run resets model faces on a project that is
+        # still active; without this the user waits through the category crawl
+        # and SPARQL bootstrap before the inference card resolves. The final
+        # pass below still handles faces from newly processed images.
+        if not shutdown_requested and _has_inference_candidates(project_id):
+            fresh_rows = execute_query(
+                "SELECT * FROM projects WHERE id = %s AND status != 'deleted'",
+                (project_id,),
+                fetch=True,
+            )
+            early_classified = run_autonomous_inference(fresh_rows[0] if fresh_rows else project)
+            logger.info(f"Project {project_id}: early inference classified {early_classified} face(s) before discovery")
 
         t_traversal = 0.0
         t_bootstrap = 0.0
