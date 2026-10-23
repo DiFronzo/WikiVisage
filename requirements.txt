@@ -34,7 +34,7 @@ Pillow>=12.2.0
 
 # Rate limiting
 Flask-Limiter==4.1.1
-redis>=7.4.0
+redis>=8.1.0
 
 # Internationalization
 Flask-Babel==4.0.0
