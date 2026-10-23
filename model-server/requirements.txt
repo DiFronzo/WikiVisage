@@ -160,7 +160,7 @@ requests==2.34.2
     #   requests-oauthlib
 requests-oauthlib==2.0.0
     # via kubernetes
-setuptools==84.0.0
+setuptools==84.2.1
     # via grpcio-tools
 six==1.17.0
     # via
