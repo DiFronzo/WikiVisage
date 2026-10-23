@@ -13059,7 +13059,7 @@ def test_inference_preserves_sibling_approved_after_candidate_selection(
         nonlocal approved
         rows = real_query(sql, params, fetch)
         if "SELECT f.id, f.image_id, f.encoding" in sql:
-            assert all(not row["image_has_target"] for row in rows)
+            assert {row["id"] for row in rows} == set(face_ids)
             response = client.post(
                 "/api/reclassify",
                 data={"face_id": face_ids[1], "is_target": "1", "csrf_token": "testtoken"},

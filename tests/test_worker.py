@@ -289,6 +289,52 @@ def test_inference_never_matches_second_face_on_image_with_existing_target(infer
     assert is_target_map[602] == 1
 
 
+def test_inference_ignores_snapshot_sibling_when_it_was_undone():
+    """A sibling target removed after candidate selection must not force a non-match.
+
+    The precomputed per-image flag is only a snapshot. The closest candidate is
+    computed from distance regardless of it, and the locked write decides the
+    final target value from live sibling state.
+    """
+    project = {"id": 17, "min_confirmed": 5, "distance_threshold": 0.6}
+
+    confirmed_rows = [{"encoding": _make_embedding(i)} for i in range(5)]
+    unclassified_rows = [
+        {"id": 701, "image_id": 1, "encoding": _make_embedding(701), "image_has_target": True},
+    ]
+
+    def mock_execute_query(sql, params=None, fetch=True):
+        if "SELECT COUNT(*) AS cnt FROM faces f" in sql:
+            return [{"cnt": 5}]
+        if "SELECT f.id, f.encoding FROM faces f" in sql and "f.is_target = 1" in sql:
+            return confirmed_rows
+        if "SELECT f.id, f.image_id, f.encoding" in sql:
+            return unclassified_rows
+        if "UPDATE projects SET last_inference" in sql:
+            return 1
+        raise AssertionError(f"Unexpected query executed: {sql}")
+
+    cursor = MagicMock()
+    cursor.fetchone.return_value = {"id": 17}
+    # The sibling target was undone after the candidate snapshot.
+    cursor.fetchall.return_value = [{"id": 701, "image_id": 1, "image_has_target": 0}]
+    cursor.rowcount = 1
+
+    with (
+        patch("worker.execute_query", side_effect=mock_execute_query),
+        patch("worker.execute_transaction", side_effect=lambda fn: fn(None, cursor)),
+        patch("worker._face_distance", return_value=0.1),
+        patch("worker.shutdown_requested", False),
+    ):
+        classified = run_autonomous_inference(project)
+
+    assert classified == 1
+    update_sql, update_params = cursor.execute.call_args_list[-1].args
+    assert update_sql.startswith("UPDATE faces SET")
+    is_target_map, _, _ = _extract_update_maps(update_params)
+    assert is_target_map == {701: 1}
+
+
 def test_inference_multi_face_all_above_threshold(inference_transaction):
     project = {"id": 13, "min_confirmed": 5, "distance_threshold": 0.6}
 
@@ -3727,12 +3773,19 @@ def test_pending_sdc_work_matches_actionable_queue(
     assert _worker_module._has_pending_sdc_work(seed_project["id"] + 1000) is False
 
 
-def test_write_sdc_queues_removal_when_face_reset_during_write():
-    """A face reset between the live-state re-check and the write must not
-    strand the P180 claim the worker just added."""
+@pytest.mark.parametrize("reset_is_target", [None, 0])
+def test_write_sdc_queues_removal_when_face_changes_during_write(reset_is_target):
+    """A face reset or undone between the live-state re-check and the write must
+    not strand the P180 claim the worker just added.
+
+    Classify undo restores ``is_target=NULL``; review undo restores 0. Both must
+    hit the recovery UPDATE, including the stop-then-undo interleaving where the
+    undo sees no in-flight write request and therefore queues nothing itself.
+    """
     project = {"id": 5, "user_id": 1, "wikidata_qid": "Q42"}
     db_calls = []
     face_batch_returned = [False]
+    recovered = [False]
 
     def mock_execute_query(sql, params=None, fetch=True):
         db_calls.append((sql.strip(), params))
@@ -3750,7 +3803,13 @@ def test_write_sdc_queues_removal_when_face_reset_during_write():
         if "INSERT IGNORE INTO sdc_claims" in sql:
             return 1
         if "UPDATE faces SET sdc_written = 1 WHERE id = %s AND is_target = 1" in sql:
-            return 0  # reset after the live-state re-check
+            return 0  # changed after the live-state re-check
+        if "UPDATE faces SET sdc_written = 1, sdc_removal_pending = 1" in sql:
+            if reset_is_target is None:
+                recovered[0] = "is_target IS NULL" in sql
+            else:
+                recovered[0] = "is_target = 0" in sql
+            return int(recovered[0])
         if "UPDATE faces SET sdc_written" in sql:
             return 1
         if "UPDATE sdc_claims SET written_at" in sql:
@@ -3781,9 +3840,72 @@ def test_write_sdc_queues_removal_when_face_reset_during_write():
         result = write_sdc_claims(project)
 
     assert result == 1
+    assert recovered[0]
     queued = [sql for sql, _ in db_calls if "UPDATE faces" in sql and "sdc_removal_pending = 1" in sql]
     assert queued
     assert "is_target IS NULL" in queued[0]
+    assert "is_target = 0" in queued[0]
+
+
+@pytest.mark.integration
+def test_write_sdc_recovers_claim_when_stop_and_review_undo_race_edit(
+    db_pool, db_conn, seed_project, seed_images, seed_faces, monkeypatch
+):
+    """Stopping first makes undo skip its own queue; the worker must recover.
+
+    Reproduces the real interleaving: the user stops the run (so the undo route
+    sees no in-flight write and clears both SDC flags), then undoes a reviewed
+    match while wbeditentity is still in flight. The post-write recovery must
+    recognize is_target=0, not only NULL, or the new P180 claim is stranded.
+    """
+    target = seed_faces["target"][0]
+    image_id = seed_images[0]["id"]
+    with db_conn.cursor() as cur:
+        cur.execute("UPDATE projects SET sdc_write_requested = 1 WHERE id = %s", (seed_project["id"],))
+        cur.execute("UPDATE faces SET sdc_written = 1")
+        cur.execute(
+            "UPDATE faces SET sdc_written = 0, sdc_removal_pending = 0 WHERE id = %s",
+            (target,),
+        )
+        cur.execute("UPDATE images SET bootstrapped = 0 WHERE id = %s", (image_id,))
+
+    actions = []
+
+    def api(_url, params=None, data=None, **_kwargs):
+        action = (params or data)["action"]
+        actions.append(action)
+        response = MagicMock()
+        if action == "wbgetclaims":
+            response.json.return_value = {"claims": {}}
+            return response
+        assert action == "wbeditentity"
+        with db_conn.cursor() as cur:
+            cur.execute("UPDATE projects SET sdc_write_requested = 0 WHERE id = %s", (seed_project["id"],))
+            cur.execute(
+                "UPDATE faces SET is_target = 0, classified_by = 'model', "
+                "classified_by_user_id = NULL, sdc_written = 0, "
+                "sdc_removal_pending = 0, classified_at = NULL WHERE id = %s",
+                (target,),
+            )
+        response.json.return_value = {"success": 1}
+        return response
+
+    monkeypatch.setattr(_worker_module, "_refresh_worker_token", lambda _user_id: "fake-token")
+    monkeypatch.setattr(_worker_module, "_get_csrf_token", lambda _token: "fake-csrf")
+    monkeypatch.setattr(_worker_module, "_api_request", api)
+    monkeypatch.setattr(_worker_module, "_keepalive_sdc_write", lambda _project_id: None)
+    monkeypatch.setattr(_worker_module, "shutdown_requested", False)
+    monkeypatch.setattr(_worker_module.time, "sleep", lambda _seconds: None)
+
+    assert write_sdc_claims(seed_project) == 1
+    assert actions == ["wbgetclaims", "wbeditentity"]
+    with db_conn.cursor() as cur:
+        cur.execute(
+            "SELECT is_target, sdc_written, sdc_removal_pending FROM faces WHERE id = %s",
+            (target,),
+        )
+        face = cur.fetchone()
+    assert face == {"is_target": 0, "sdc_written": 1, "sdc_removal_pending": 1}
 
 
 def _mock_write_batch_query(face_rows, state_rows):

@@ -1872,20 +1872,12 @@ def run_autonomous_inference(project: dict[str, Any]) -> int:
     #       queue (or the user classifies them directly).
     # Bootstrapped images are included: bootstrap auto-classifies the single best face,
     # but multi-face images have additional unclassified faces that need inference.
-    # ``image_has_target`` marks candidates on an image that already has a confirmed
-    # target outside this candidate set (human, bootstrap or written model match).
-    # Those candidates are always resolved as non-matches below: a person appears
-    # once per image, and a re-run must not promote a second face after the human
-    # approved one of several model faces on the same image.
+    # Sibling state is deliberately not snapshotted here: it can change between this
+    # query and the locked write (a human approval or undo), so _persist_inference_batch
+    # re-reads it and vetoes a match only when a live target still exists.
     unclassified_rows = execute_query(
         """
-        SELECT f.id, f.image_id, f.encoding,
-               EXISTS (
-                   SELECT 1 FROM faces t
-                   WHERE t.image_id = f.image_id
-                     AND t.is_target = 1
-                     AND t.superseded_by IS NULL
-               ) AS image_has_target
+        SELECT f.id, f.image_id, f.encoding
         FROM faces f
         JOIN images i ON f.image_id = i.id
         WHERE i.project_id = %s
@@ -1915,7 +1907,7 @@ def run_autonomous_inference(project: dict[str, Any]) -> int:
     t_distance_start = time.monotonic()
 
     # Phase 1: compute distances for all candidates
-    face_distances: list[tuple[int, int, float, bool]] = []  # (face_id, image_id, distance, image_has_target)
+    face_distances: list[tuple[int, int, float]] = []  # (face_id, image_id, distance)
     for row in unclassified_rows:
         if shutdown_requested:
             break
@@ -1924,23 +1916,22 @@ def run_autonomous_inference(project: dict[str, Any]) -> int:
         if embedding is None:
             continue
         distance = _face_distance(centroid, embedding)
-        face_distances.append((row["id"], row["image_id"], float(distance), bool(row.get("image_has_target"))))
+        face_distances.append((row["id"], row["image_id"], float(distance)))
 
     # Phase 2: per-image dedup — only the closest face below threshold is a match;
     # all other faces on the same image are rejected (a person appears once per image).
-    # Candidates on an image that already has a confirmed target are never matched:
-    # they are resolved as non-matches so they stop blocking the inference queue.
+    # Compute this from distance alone, even if the image had a sibling target when
+    # the candidates were selected. That target may have been undone since, and the
+    # locked write re-checks live sibling state before vetoing a match.
     best_per_image: dict[int, tuple[int, float]] = {}  # image_id -> (face_id, distance)
-    for face_id, image_id, distance, image_has_target in face_distances:
-        if image_has_target:
-            continue
+    for face_id, image_id, distance in face_distances:
         if distance < threshold:
             if image_id not in best_per_image or distance < best_per_image[image_id][1]:
                 best_per_image[image_id] = (face_id, distance)
 
     best_face_ids = {face_id for face_id, _ in best_per_image.values()}
 
-    for face_id, _image_id, distance, _image_has_target in face_distances:
+    for face_id, _image_id, distance in face_distances:
         if face_id in best_face_ids:
             pending_updates.append((face_id, 1, distance))
         else:
@@ -2530,10 +2521,12 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
                     )
 
                 logger.info(f"SDC P180 claim for {qid} written to {mid} (face {face_id})")
-                # The face may have been reset or rejected between the live-state
-                # re-check above and the wbeditentity call. Only mark it written
-                # while it is still a target; otherwise the claim we just added is
-                # orphaned, so queue its removal in the same run.
+                # The face may have been reset, rejected or undone between the
+                # live-state re-check above and the wbeditentity call. Only mark it
+                # written while it is still a target; otherwise the claim we just
+                # added is orphaned, so queue its removal in the same run. An undo
+                # can restore is_target=0 (review undo) as well as NULL (classify
+                # undo), so both non-target states need the recovery.
                 written_now = execute_query(
                     "UPDATE faces SET sdc_written = 1 WHERE id = %s AND is_target = 1",
                     (face_id,),
@@ -2543,7 +2536,8 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
                     logger.warning(f"Face {face_id} changed during the SDC write; queuing P180 removal for {mid}")
                     execute_query(
                         "UPDATE faces SET sdc_written = 1, sdc_removal_pending = 1 "
-                        "WHERE id = %s AND is_target IS NULL AND superseded_by IS NULL",
+                        "WHERE id = %s AND (is_target IS NULL OR is_target = 0) "
+                        "AND superseded_by IS NULL",
                         (face_id,),
                         fetch=False,
                     )
