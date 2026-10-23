@@ -1,6 +1,6 @@
 [project]
 name = "wikivisage"
-version = "0.11.4"
+version = "0.11.5"
 requires-python = ">=3.11"
 
 [tool.ruff]
@@ -49,4 +49,5 @@ pythonpath = ["."]
 markers = [
     "integration: tests requiring a local MariaDB (Docker)",
     "contract: tests requiring a running face service (Docker)",
+    "browser: tests requiring Playwright browsers (WIKIVISAGE_BROWSER_TESTS=1)",
 ]

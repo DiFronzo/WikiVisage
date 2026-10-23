@@ -405,8 +405,8 @@ def _get_face_stats(project_id: int) -> dict[str, Any]:
     """Return aggregate face statistics for a project.
 
     Columns returned: total_faces, confirmed_matches, confirmed_non_matches,
-    unclassified, human_confirmed, sdc_written, sdc_pending, sdc_removal_pending_faces,
-    sdc_removal_pending, by_human, by_model, by_bootstrap.
+    unclassified, human_confirmed, model_matches, sdc_written, sdc_pending,
+    sdc_removal_pending_faces, sdc_removal_pending, by_human, by_model, by_bootstrap.
     All values are coerced to ``int`` (NULL → 0).
     Returns an empty dict on database error.
     """
@@ -418,6 +418,7 @@ def _get_face_stats(project_id: int) -> dict[str, Any]:
             "  SUM(CASE WHEN f.is_target = 0 THEN 1 ELSE 0 END) AS confirmed_non_matches, "
             "  SUM(CASE WHEN f.is_target IS NULL THEN 1 ELSE 0 END) AS unclassified, "
             "  SUM(CASE WHEN f.is_target = 1 AND f.classified_by_user_id IS NOT NULL THEN 1 ELSE 0 END) AS human_confirmed, "
+            "  SUM(CASE WHEN f.is_target = 1 AND f.classified_by = 'model' AND f.classified_by_user_id IS NULL THEN 1 ELSE 0 END) AS model_matches, "
             "  SUM(CASE WHEN f.sdc_written = 1 AND sc.face_id IS NOT NULL THEN 1 ELSE 0 END) AS sdc_written, "
             "  SUM(CASE WHEN f.is_target = 1 AND f.sdc_written = 0 AND f.classified_by != 'bootstrap' AND i.bootstrapped = 0 THEN 1 ELSE 0 END) AS sdc_pending, "
             "  SUM(CASE WHEN f.sdc_removal_pending = 1 "
@@ -4248,22 +4249,60 @@ def project_rerun_inference(project_id: int):
     if not project:
         abort(404)
 
-    if (
-        project["last_inference_threshold"] is not None
-        and project["last_inference_min_confirmed"] is not None
-        and abs(float(project["distance_threshold"]) - float(project["last_inference_threshold"])) < 1e-6
-        and int(project["min_confirmed"]) == int(project["last_inference_min_confirmed"])
-    ):
-        flash(_("Settings have not changed since the last inference run. No re-run needed."), "info")
-        return redirect(url_for("project_settings", project_id=project_id))
-
-    affected = 0
-    inference_will_run = False
-
+    # All gate checks and the reset itself run in one transaction under the
+    # project-row lock, so a status change, a queued SDC write or a concurrent
+    # undo cannot land between the pre-check and the UPDATE.
     try:
 
         def _reset_inference(conn, cursor):
             _assert_project_access_locked(cursor, project_id, g.user["id"])
+            cursor.execute(
+                "SELECT status, sdc_write_requested, min_confirmed FROM projects WHERE id = %s FOR UPDATE",
+                (project_id,),
+            )
+            locked = cursor.fetchone()
+            if not locked:
+                return {"affected": 0, "blocked": "not_found"}
+
+            # Inference is only claimed for active and completed projects.
+            # Resetting a paused project would wipe its model results and leave
+            # nothing to recompute them.
+            if locked["status"] == "paused":
+                return {"affected": 0, "blocked": "paused"}
+
+            # A reset during a write run can land between the worker's live
+            # re-check and its wbeditentity call, leaving a P180 claim on
+            # Commons for a face that is no longer a target.
+            if locked["sdc_write_requested"]:
+                return {"affected": 0, "blocked": "sdc_in_progress"}
+
+            cursor.execute(
+                "SELECT "
+                "  SUM(CASE WHEN f.is_target = 1 AND f.classified_by_user_id IS NOT NULL "
+                "      THEN 1 ELSE 0 END) AS human_confirmed, "
+                "  SUM(CASE WHEN f.is_target = 1 AND f.classified_by = 'bootstrap' "
+                "      AND f.classified_by_user_id IS NULL THEN 1 ELSE 0 END) AS by_bootstrap "
+                "FROM faces f "
+                "JOIN images i ON f.image_id = i.id "
+                "WHERE i.project_id = %s AND f.superseded_by IS NULL",
+                (project_id,),
+            )
+            stats = cursor.fetchone() or {}
+            human_confirmed = int(stats.get("human_confirmed") or 0)
+            by_bootstrap = int(stats.get("by_bootstrap") or 0)
+            min_confirmed = int(locked["min_confirmed"])
+
+            # Below the gate the worker would not be allowed to reclassify the
+            # faces, so wiping the existing model results would be destructive.
+            if human_confirmed < min_confirmed:
+                return {
+                    "affected": 0,
+                    "blocked": "below_gate",
+                    "human_confirmed": human_confirmed,
+                    "by_bootstrap": by_bootstrap,
+                    "min_confirmed": min_confirmed,
+                }
+
             cursor.execute(
                 "UPDATE faces f "
                 "JOIN images i ON f.image_id = i.id "
@@ -4283,81 +4322,87 @@ def project_rerun_inference(project_id: int):
                     "WHERE id = %s",
                     (project_id,),
                 )
-            return rows_reset
+            return {
+                "affected": rows_reset,
+                "blocked": None,
+                "human_confirmed": human_confirmed,
+                "by_bootstrap": by_bootstrap,
+                "min_confirmed": min_confirmed,
+            }
 
-        affected = _run_authorized_transaction(_reset_inference)
-        if affected:
-            flash(
-                _(
-                    "Reset %(num)d model-classified faces. The worker will re-classify them on the next cycle.",
-                    num=affected,
-                ),
-                "success",
-            )
-            # Signal the worker to wake up and re-run inference immediately
-            try:
-                with open(WAKE_FILE_PATH, "w") as f:
-                    f.write("")
-            except OSError:
-                pass  # Non-critical — worker will pick it up on next poll
-        else:
-            flash(_("No model-classified faces to reset."), "info")
-
-        try:
-            stats = execute_query(
-                "SELECT "
-                "  SUM(CASE WHEN f.is_target = 1 AND f.classified_by_user_id IS NOT NULL "
-                "      THEN 1 ELSE 0 END) AS human_confirmed, "
-                "  SUM(CASE WHEN f.is_target = 1 AND f.classified_by = 'bootstrap' "
-                "      AND f.classified_by_user_id IS NULL THEN 1 ELSE 0 END) AS by_bootstrap "
-                "FROM faces f "
-                "JOIN images i ON f.image_id = i.id "
-                "WHERE i.project_id = %s AND f.superseded_by IS NULL",
-                (project_id,),
-            )
-            human_confirmed = (stats[0]["human_confirmed"] or 0) if stats else 0
-            by_bootstrap = (stats[0]["by_bootstrap"] or 0) if stats else 0
-            min_confirmed = int(project["min_confirmed"])
-            if human_confirmed >= min_confirmed:
-                inference_will_run = True
-                flash(
-                    _(
-                        "You have %(confirmed)d/%(min)d human-confirmed target faces — "
-                        "inference will run on the next worker cycle.",
-                        confirmed=human_confirmed,
-                        min=min_confirmed,
-                    ),
-                    "info",
-                )
-            else:
-                flash(
-                    _(
-                        "Warning: You currently have %(confirmed)d/%(min)d human-confirmed target faces. "
-                        "Autonomous inference will not run until this threshold is met.",
-                        confirmed=human_confirmed,
-                        min=min_confirmed,
-                    ),
-                    "warning",
-                )
-                if by_bootstrap > 0:
-                    flash(
-                        _(
-                            "Tip: You have %(count)d bootstrapped matches from existing Commons depicts claims. "
-                            "Approve them in Model Results to count them as human-confirmed.",
-                            count=by_bootstrap,
-                        ),
-                        "info",
-                    )
-        except DatabaseError:
-            logger.debug("Non-critical: failed to fetch stats after inference reset for project %s", project_id)
-
+        result = _run_authorized_transaction(_reset_inference)
     except DatabaseError:
         logger.exception("Failed to reset model-classified faces")
         flash(_("Failed to re-run inference."), "error")
+        return redirect(url_for("project_settings", project_id=project_id))
 
-    if affected and inference_will_run:
-        return redirect(url_for("project_detail", project_id=project_id, inference_triggered="1"))
-    return redirect(url_for("project_detail", project_id=project_id))
+    blocked = result.get("blocked")
+    if blocked == "not_found":
+        abort(404)
+    if blocked == "paused":
+        flash(
+            _("This project is paused. Set it to Active or Completed before re-running inference."),
+            "warning",
+        )
+        return redirect(url_for("project_settings", project_id=project_id))
+    if blocked == "sdc_in_progress":
+        flash(
+            _("A Commons edit run is in progress. Wait for it to finish (or stop it) before re-running inference."),
+            "warning",
+        )
+        return redirect(url_for("project_settings", project_id=project_id))
+    if blocked == "below_gate":
+        flash(
+            _(
+                "Warning: You currently have %(confirmed)d/%(min)d human-confirmed target faces. "
+                "Autonomous inference will not run until this threshold is met.",
+                confirmed=result["human_confirmed"],
+                min=result["min_confirmed"],
+            ),
+            "warning",
+        )
+        if result["by_bootstrap"] > 0:
+            flash(
+                _(
+                    "Tip: You have %(count)d bootstrapped matches from existing Commons depicts claims. "
+                    "Approve them in Model Results to count them as human-confirmed.",
+                    count=result["by_bootstrap"],
+                ),
+                "info",
+            )
+        flash(_("No faces were reset."), "info")
+        return redirect(url_for("project_settings", project_id=project_id))
+
+    affected = result["affected"]
+    if affected:
+        flash(
+            _(
+                "Reset %(num)d model-classified faces. The worker will re-classify them on the next cycle.",
+                num=affected,
+            ),
+            "success",
+        )
+    else:
+        flash(_("No model-classified faces to reset."), "info")
+
+    # Wake the worker even when no face needed a reset: unclassified faces
+    # may still be waiting, and the user explicitly asked for a run.
+    try:
+        with open(WAKE_FILE_PATH, "w") as f:
+            f.write("")
+    except OSError:
+        pass  # Non-critical — worker will pick it up on next poll
+
+    flash(
+        _(
+            "You have %(confirmed)d/%(min)d human-confirmed target faces — "
+            "inference will run on the next worker cycle.",
+            confirmed=result["human_confirmed"],
+            min=result["min_confirmed"],
+        ),
+        "info",
+    )
+    return redirect(url_for("project_detail", project_id=project_id, inference_triggered="1"))
 
 
 @app.route("/project/<int:project_id>/delete", methods=["POST"])

@@ -22,7 +22,7 @@ anyio==4.15.1
     #   watchfiles
 attrs==26.1.0
     # via aiohttp
-certifi==2026.7.22
+certifi==2026.10.23
     # via
     #   httpcore
     #   httpx
@@ -160,7 +160,7 @@ requests==2.34.2
     #   requests-oauthlib
 requests-oauthlib==2.0.0
     # via kubernetes
-setuptools==84.0.0
+setuptools==84.2.1
     # via grpcio-tools
 six==1.17.0
     # via

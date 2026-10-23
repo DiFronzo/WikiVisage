@@ -1,14 +1,24 @@
-# To get started with Dependabot version updates, you'll need to specify which
-# package ecosystems to update and where the package manifests are located.
-# Please see the documentation for all configuration options:
-# https://docs.github.com/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
-
 version: 2
 updates:
   - package-ecosystem: "pip"
     directory: "/"
     schedule:
       interval: "weekly"
+
+  # The face service has its own dependency set: Pillow, OpenCV and ONNX
+  # Runtime are the parsers that handle untrusted image bytes, so they need
+  # their own update stream. requirements.txt is a uv lock, not a pip-compile
+  # lock, so this must use the uv ecosystem: it reads requirements.in as the
+  # manifest and regenerates requirements.txt with uv. One grouped PR per week
+  # keeps the lock moving as a unit that CI can test end to end.
+  - package-ecosystem: "uv"
+    directory: "/model-server"
+    schedule:
+      interval: "weekly"
+    groups:
+      face-service:
+        patterns:
+          - "*"
 
   - package-ecosystem: "github-actions"
     directory: "/"

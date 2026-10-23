@@ -74,6 +74,73 @@ def _extract_update_maps(
     return is_target_map, confidence_map, in_ids
 
 
+def _fake_inference_transaction(fn):
+    """Reuse query mocks for the inference algorithm tests' batch transaction."""
+    cursor = MagicMock()
+
+    def execute(sql, params=None):
+        if sql.startswith("SELECT id FROM projects"):
+            rows = [{"id": params[0]}]
+        else:
+            result = _worker_module.execute_query(sql, params, fetch=sql.startswith("SELECT"))
+            rows = result if isinstance(result, (list, tuple)) else []
+            cursor.rowcount = result if isinstance(result, int) else 0
+        cursor.fetchone.return_value = rows[0] if rows else None
+        cursor.fetchall.return_value = [dict(row, image_has_target=row.get("image_has_target", False)) for row in rows]
+
+    cursor.execute.side_effect = execute
+    return fn(None, cursor)
+
+
+@pytest.fixture
+def inference_transaction(monkeypatch):
+    monkeypatch.setattr(_worker_module, "execute_transaction", _fake_inference_transaction)
+
+
+def test_persist_inference_batch_rechecks_sibling_targets_under_project_lock():
+    cursor = MagicMock()
+    cursor.fetchone.return_value = {"id": 16}
+    cursor.fetchall.return_value = [
+        {"id": 601, "image_id": 1, "image_has_target": 1},
+        {"id": 602, "image_id": 2, "image_has_target": 0},
+    ]
+    cursor.rowcount = 2
+
+    with patch("worker.execute_transaction", side_effect=lambda fn: fn(None, cursor)):
+        result = _worker_module._persist_inference_batch(16, [(601, 1, 0.1), (602, 1, 0.4), (603, 1, 0.2)])
+
+    assert result == (2, 1)
+    calls = cursor.execute.call_args_list
+    assert "FROM projects" in calls[0].args[0] and "FOR UPDATE" in calls[0].args[0]
+    live_sql = calls[1].args[0]
+    assert "t.is_target = 1" in live_sql and "FOR UPDATE" in live_sql
+    assert "f.is_target IS NULL" in live_sql
+    assert "f.classified_by_user_id IS NULL" in live_sql
+    assert "f.sdc_removal_pending = 0" in live_sql
+    assert "f.embedding_model = %s" in live_sql
+    targets, _, ids = _extract_update_maps(calls[2].args[1])
+    assert targets == {601: 0, 602: 1}
+    assert ids == [601, 602]  # 603 is no longer eligible.
+
+
+@pytest.mark.parametrize("project_exists,live_rows", [(False, []), (True, [])])
+def test_persist_inference_batch_does_not_write_without_live_candidates(project_exists, live_rows):
+    cursor = MagicMock()
+    cursor.fetchone.return_value = {"id": 1} if project_exists else None
+    cursor.fetchall.return_value = live_rows
+
+    with patch("worker.execute_transaction", side_effect=lambda fn: fn(None, cursor)):
+        assert _worker_module._persist_inference_batch(1, [(101, 1, 0.1)]) == (0, 0)
+
+    assert not any(call.args[0].startswith("UPDATE") for call in cursor.execute.call_args_list)
+
+
+def test_persist_inference_batch_empty_does_not_open_transaction():
+    with patch("worker.execute_transaction") as transaction:
+        assert _worker_module._persist_inference_batch(1, []) == (0, 0)
+    transaction.assert_not_called()
+
+
 def test_inference_skips_below_min_confirmed():
     project = {"id": 10, "min_confirmed": 5, "distance_threshold": 0.6}
 
@@ -93,7 +160,7 @@ def test_inference_skips_below_min_confirmed():
     assert all("UPDATE faces" not in c.args[0] for c in mock_db.call_args_list)
 
 
-def test_inference_single_face_per_image():
+def test_inference_single_face_per_image(inference_transaction):
     project = {"id": 11, "min_confirmed": 5, "distance_threshold": 0.6}
 
     confirmed_rows = [{"encoding": _make_embedding(i)} for i in range(5)]
@@ -109,7 +176,7 @@ def test_inference_single_face_per_image():
             return [{"cnt": 5}]
         if "SELECT f.id, f.encoding FROM faces f" in sql and "f.is_target = 1" in sql:
             return confirmed_rows
-        if "SELECT f.id, f.image_id, f.encoding FROM faces f" in sql:
+        if "SELECT f.id, f.image_id," in sql:
             return unclassified_rows
         if "UPDATE faces SET" in sql:
             assert params is not None
@@ -138,7 +205,7 @@ def test_inference_single_face_per_image():
     assert confidence_map[103] == 0.4
 
 
-def test_inference_multi_face_dedup():
+def test_inference_multi_face_dedup(inference_transaction):
     project = {"id": 12, "min_confirmed": 5, "distance_threshold": 0.6}
 
     confirmed_rows = [{"encoding": _make_embedding(i)} for i in range(5)]
@@ -154,7 +221,7 @@ def test_inference_multi_face_dedup():
             return [{"cnt": 5}]
         if "SELECT f.id, f.encoding FROM faces f" in sql and "f.is_target = 1" in sql:
             return confirmed_rows
-        if "SELECT f.id, f.image_id, f.encoding FROM faces f" in sql:
+        if "SELECT f.id, f.image_id," in sql:
             return unclassified_rows
         if "UPDATE faces SET" in sql:
             assert params is not None
@@ -179,7 +246,96 @@ def test_inference_multi_face_dedup():
     assert is_target_map[203] == 1
 
 
-def test_inference_multi_face_all_above_threshold():
+def test_inference_never_matches_second_face_on_image_with_existing_target(inference_transaction):
+    """A face on an image with a confirmed target is always a non-match.
+
+    A re-run resets model faces while preserving a human-approved target on the
+    same image. The reset face must not become a second match just because its
+    distance is below the threshold.
+    """
+    project = {"id": 16, "min_confirmed": 5, "distance_threshold": 0.6}
+
+    confirmed_rows = [{"encoding": _make_embedding(i)} for i in range(5)]
+    unclassified_rows = [
+        {"id": 601, "image_id": 1, "encoding": _make_embedding(601), "image_has_target": True},
+        {"id": 602, "image_id": 2, "encoding": _make_embedding(602), "image_has_target": False},
+    ]
+    update_params: list[tuple] = []
+
+    def mock_execute_query(sql, params=None, fetch=True):
+        if "SELECT COUNT(*) AS cnt FROM faces f" in sql:
+            return [{"cnt": 5}]
+        if "SELECT f.id, f.encoding FROM faces f" in sql and "f.is_target = 1" in sql:
+            return confirmed_rows
+        if "SELECT f.id, f.image_id," in sql:
+            return unclassified_rows
+        if "UPDATE faces SET" in sql:
+            assert params is not None
+            update_params.append(params)
+            return len(unclassified_rows)
+        raise AssertionError(f"Unexpected query executed: {sql}")
+
+    with (
+        patch("worker.execute_query", side_effect=mock_execute_query),
+        # 601 is the closer face, but its image already has a confirmed target.
+        patch("worker._face_distance", side_effect=[0.1, 0.4]),
+        patch("worker.shutdown_requested", False),
+    ):
+        classified = run_autonomous_inference(project)
+
+    assert classified == 2
+    is_target_map, _, _ = _extract_update_maps(update_params[0])
+    assert is_target_map[601] == 0
+    assert is_target_map[602] == 1
+
+
+def test_inference_ignores_snapshot_sibling_when_it_was_undone():
+    """A sibling target removed after candidate selection must not force a non-match.
+
+    The precomputed per-image flag is only a snapshot. The closest candidate is
+    computed from distance regardless of it, and the locked write decides the
+    final target value from live sibling state.
+    """
+    project = {"id": 17, "min_confirmed": 5, "distance_threshold": 0.6}
+
+    confirmed_rows = [{"encoding": _make_embedding(i)} for i in range(5)]
+    unclassified_rows = [
+        {"id": 701, "image_id": 1, "encoding": _make_embedding(701), "image_has_target": True},
+    ]
+
+    def mock_execute_query(sql, params=None, fetch=True):
+        if "SELECT COUNT(*) AS cnt FROM faces f" in sql:
+            return [{"cnt": 5}]
+        if "SELECT f.id, f.encoding FROM faces f" in sql and "f.is_target = 1" in sql:
+            return confirmed_rows
+        if "SELECT f.id, f.image_id, f.encoding" in sql:
+            return unclassified_rows
+        if "UPDATE projects SET last_inference" in sql:
+            return 1
+        raise AssertionError(f"Unexpected query executed: {sql}")
+
+    cursor = MagicMock()
+    cursor.fetchone.return_value = {"id": 17}
+    # The sibling target was undone after the candidate snapshot.
+    cursor.fetchall.return_value = [{"id": 701, "image_id": 1, "image_has_target": 0}]
+    cursor.rowcount = 1
+
+    with (
+        patch("worker.execute_query", side_effect=mock_execute_query),
+        patch("worker.execute_transaction", side_effect=lambda fn: fn(None, cursor)),
+        patch("worker._face_distance", return_value=0.1),
+        patch("worker.shutdown_requested", False),
+    ):
+        classified = run_autonomous_inference(project)
+
+    assert classified == 1
+    update_sql, update_params = cursor.execute.call_args_list[-1].args
+    assert update_sql.startswith("UPDATE faces SET")
+    is_target_map, _, _ = _extract_update_maps(update_params)
+    assert is_target_map == {701: 1}
+
+
+def test_inference_multi_face_all_above_threshold(inference_transaction):
     project = {"id": 13, "min_confirmed": 5, "distance_threshold": 0.6}
 
     confirmed_rows = [{"encoding": _make_embedding(i)} for i in range(5)]
@@ -194,7 +350,7 @@ def test_inference_multi_face_all_above_threshold():
             return [{"cnt": 5}]
         if "SELECT f.id, f.encoding FROM faces f" in sql and "f.is_target = 1" in sql:
             return confirmed_rows
-        if "SELECT f.id, f.image_id, f.encoding FROM faces f" in sql:
+        if "SELECT f.id, f.image_id," in sql:
             return unclassified_rows
         if "UPDATE faces SET" in sql:
             assert params is not None
@@ -216,7 +372,7 @@ def test_inference_multi_face_all_above_threshold():
     assert is_target_map[302] == 0
 
 
-def test_inference_returns_classified_count():
+def test_inference_returns_classified_count(inference_transaction):
     project = {"id": 14, "min_confirmed": 5, "distance_threshold": 0.6}
 
     confirmed_rows = [{"encoding": _make_embedding(i)} for i in range(5)]
@@ -232,7 +388,7 @@ def test_inference_returns_classified_count():
             return [{"cnt": 5}]
         if "SELECT f.id, f.encoding FROM faces f" in sql and "f.is_target = 1" in sql:
             return confirmed_rows
-        if "SELECT f.id, f.image_id, f.encoding FROM faces f" in sql:
+        if "SELECT f.id, f.image_id," in sql:
             return unclassified_rows
         if "UPDATE faces SET" in sql:
             return len(unclassified_rows)
@@ -262,7 +418,7 @@ def test_inference_candidates_exclude_faces_with_a_queued_removal():
             return [{"cnt": 5}]
         if "SELECT f.id, f.encoding FROM faces f" in sql and "f.is_target = 1" in sql:
             return [{"encoding": _make_embedding(i)} for i in range(5)]
-        if "SELECT f.id, f.image_id, f.encoding FROM faces f" in sql:
+        if "SELECT f.id, f.image_id, f.encoding" in sql:
             candidate_sql.append(sql)
             return []
         raise AssertionError(f"Unexpected query executed: {sql}")
@@ -568,6 +724,32 @@ def test_inference_with_real_db_skips_faces_with_a_queued_removal(
 
 
 @pytest.mark.integration
+def test_inference_rechecks_removal_queued_after_candidate_selection(
+    db_pool, db_conn, seed_project, seed_images, seed_faces, seed_unclassified_faces, monkeypatch
+):
+    real_query = _worker_module.execute_query
+
+    def queue_after_snapshot(sql, params=None, fetch=True):
+        rows = real_query(sql, params, fetch)
+        if "SELECT f.id, f.image_id, f.encoding" in sql:
+            with db_conn.cursor() as cur:
+                cur.execute("UPDATE faces SET sdc_removal_pending = 1 WHERE id = %s", (seed_unclassified_faces[0],))
+        return rows
+
+    monkeypatch.setattr(_worker_module, "execute_query", queue_after_snapshot)
+    monkeypatch.setattr(_worker_module, "shutdown_requested", False)
+    assert run_autonomous_inference(seed_project) == len(seed_unclassified_faces) - 1
+
+    with db_conn.cursor() as cur:
+        cur.execute(
+            "SELECT is_target, classified_by, sdc_removal_pending FROM faces WHERE id = %s",
+            (seed_unclassified_faces[0],),
+        )
+        face = cur.fetchone()
+    assert face == {"is_target": None, "classified_by": None, "sdc_removal_pending": 1}
+
+
+@pytest.mark.integration
 def test_inference_with_real_db_respects_threshold(db_pool, db_conn, seed_user, seed_project, seed_images):
     with db_conn.cursor() as cur:
         for img in seed_images:
@@ -577,17 +759,33 @@ def test_inference_with_real_db_respects_threshold(db_pool, db_conn, seed_user, 
                 (img["id"], _make_embedding(0), 50, 200, 200, 50, 1, "human", seed_user["id"]),
             )
 
+        # Two images without a confirmed target: a candidate on an image that
+        # already has one is always a non-match, which would mask the threshold
+        # outcome this test pins.
+        cur.execute(
+            "INSERT INTO images (project_id, commons_page_id, file_title, status, face_count, "
+            "detection_width, detection_height) VALUES (%s, %s, %s, 'processed', 1, 800, 600)",
+            (seed_project["id"], 100006, "File:Douglas_Adams_6.jpg"),
+        )
+        close_image_id = cur.lastrowid
+        cur.execute(
+            "INSERT INTO images (project_id, commons_page_id, file_title, status, face_count, "
+            "detection_width, detection_height) VALUES (%s, %s, %s, 'processed', 1, 800, 600)",
+            (seed_project["id"], 100007, "File:Douglas_Adams_7.jpg"),
+        )
+        far_image_id = cur.lastrowid
+
         cur.execute(
             "INSERT INTO faces (image_id, encoding, embedding_model, bbox_top, bbox_right, bbox_bottom, bbox_left) "
             "VALUES (%s, %s, 'scrfd500m+arcface_mbf', %s, %s, %s, %s)",
-            (seed_images[0]["id"], _make_embedding(0), 100, 300, 300, 100),
+            (close_image_id, _make_embedding(0), 100, 300, 300, 100),
         )
         close_face_id = cur.lastrowid
 
         cur.execute(
             "INSERT INTO faces (image_id, encoding, embedding_model, bbox_top, bbox_right, bbox_bottom, bbox_left) "
             "VALUES (%s, %s, 'scrfd500m+arcface_mbf', %s, %s, %s, %s)",
-            (seed_images[1]["id"], _make_embedding(9999), 120, 320, 320, 120),
+            (far_image_id, _make_embedding(9999), 120, 320, 320, 120),
         )
         far_face_id = cur.lastrowid
 
@@ -1290,10 +1488,14 @@ def test_write_sdc_marks_image_bootstrapped_on_idempotency_hit():
 
     assert result == 1
 
-    # Verify sdc_written=1 was set on the face
+    # Verify sdc_written=1 was set on the face, only while it is still a target.
+    # The claim predates this run, so a reset face must not be marked written
+    # and must not have a removal queued (that could delete someone else's claim).
     face_updates = [(sql, p) for sql, p in db_calls if "UPDATE faces SET sdc_written" in sql]
     assert len(face_updates) == 1
     assert face_updates[0][1] == (100,)
+    assert "is_target = 1" in face_updates[0][0]
+    assert not any("UPDATE faces" in sql and "sdc_removal_pending = 1" in sql for sql, _ in db_calls)
 
     # Verify bootstrapped=1 was set on the image
     img_updates = [(sql, p) for sql, p in db_calls if "UPDATE images SET bootstrapped" in sql]
@@ -2163,6 +2365,57 @@ def test_process_project_no_auto_complete_faces_at_min_confirmed():
     # faces >= min_confirmed → no auto-complete
     assert len(auto_complete_calls) == 0
     mock_inference.assert_called_once()
+
+
+def test_process_project_runs_inference_before_discovery():
+    """Faces reset by a re-run are classified before crawl/bootstrap.
+
+    A re-run on an active project otherwise waits for the full category
+    traversal and SPARQL bootstrap before the inference card can resolve.
+    """
+    project = {
+        "id": 103,
+        "user_id": 1,
+        "wikidata_qid": "Q42",
+        "commons_category": "Rerun_Category",
+        "status": "active",
+        "distance_threshold": 0.6,
+        "min_confirmed": 5,
+    }
+    events: list[str] = []
+
+    def mock_eq(sql, params=None, fetch=True):
+        sql_s = sql if isinstance(sql, str) else str(sql)
+        if "SELECT status, worker_claimed_by FROM projects" in sql_s:
+            return [{"status": "active", "worker_claimed_by": "test-worker"}]
+        if "UPDATE projects SET worker_claimed_at" in sql_s:
+            return 1
+        if "SELECT 1 AS found FROM faces f" in sql_s:
+            return [{"found": 1}]
+        if "SELECT * FROM projects WHERE id" in sql_s:
+            return [project.copy()]
+        if "COUNT(*) AS cnt FROM images WHERE project_id" in sql_s:
+            return [{"cnt": 0}]
+        if "COUNT(*) AS cnt FROM faces" in sql_s:
+            return [{"cnt": 10}]
+        if "SELECT min_confirmed FROM projects" in sql_s:
+            return [{"min_confirmed": 5}]
+        return ()
+
+    with (
+        patch("worker.execute_query", side_effect=mock_eq),
+        patch("worker.traverse_category", side_effect=lambda _p: events.append("traverse")),
+        patch("worker.bootstrap_from_sparql", side_effect=lambda _p: events.append("bootstrap")),
+        patch("worker.process_images", return_value=0),
+        patch("worker.prefilter_images", return_value=0),
+        patch("worker.run_autonomous_inference", side_effect=lambda _p: events.append("inference") or 1),
+        patch("worker.shutdown_requested", False),
+        patch("worker._worker_id", "test-worker"),
+    ):
+        process_project(project)
+
+    assert events[0] == "inference"
+    assert events.count("inference") == 2  # early pass + final catch-up pass
 
 
 # ---------------------------------------------------------------------------
@@ -3388,6 +3641,273 @@ def test_write_sdc_successful_write_increments_counter():
     assert len(face_sdc_updates) == 1
 
 
+@pytest.mark.parametrize("phase", ["write", "removal"])
+@pytest.mark.parametrize(
+    "remaining,expected_error",
+    [
+        (False, None),
+        (True, "Worker shutdown left Commons edits pending."),
+        ("db_error", "Worker shut down before completion could be verified."),
+        ("missing_result", "Worker shut down before completion could be verified."),
+    ],
+)
+def test_sdc_shutdown_after_success_checks_remaining_work(phase, remaining, expected_error, monkeypatch):
+    """SIGTERM after the last API success is not itself evidence of an incomplete run."""
+    project = {"id": 5, "user_id": 1, "wikidata_qid": "Q42"}
+    calls = []
+    batch_returned = False
+    actions = []
+
+    def query(sql, params=None, fetch=True):
+        nonlocal batch_returned
+        calls.append((sql.strip(), params))
+        if ") AS pending" in sql:
+            if remaining == "db_error":
+                raise _worker_module.DatabaseError("DB unavailable")
+            if remaining == "missing_result":
+                return ()
+            return [{"pending": int(remaining)}]
+        if "SELECT sdc_write_requested" in sql:
+            return [{"sdc_write_requested": 1}]
+        if "SELECT f.id as face_id" in sql:
+            if phase == "write" and not batch_returned:
+                batch_returned = True
+                return [{"face_id": 100, "image_id": 200, "commons_page_id": 9999}]
+            return []
+        if "SELECT DISTINCT i.commons_page_id" in sql:
+            if phase == "removal" and not batch_returned:
+                batch_returned = True
+                return [{"commons_page_id": 9999}]
+            return []
+        if "SELECT is_target, superseded_by" in sql:
+            return [{"is_target": 1, "superseded_by": None}]
+        if "SELECT 1 FROM faces f" in sql:
+            return [{"pending": 1}]
+        return 1
+
+    def api(url, params=None, data=None, **kwargs):
+        action = (params or data)["action"]
+        actions.append(action)
+        response = MagicMock()
+        if action == "wbgetclaims":
+            claims = []
+            if phase == "removal":
+                claims = [{"id": "M9999$test", "mainsnak": {"datavalue": {"value": {"id": "Q42"}}}}]
+            response.json.return_value = {"claims": {"P180": claims}}
+        else:
+            response.json.return_value = {"success": 1}
+        return response
+
+    def stop_after_edit(_seconds):
+        _worker_module.signal_handler(_worker_module.signal.SIGTERM, None)
+
+    monkeypatch.setattr(_worker_module, "execute_query", query)
+    monkeypatch.setattr(_worker_module, "_refresh_worker_token", lambda _user_id: "fake-token")
+    monkeypatch.setattr(_worker_module, "_get_csrf_token", lambda _token: "fake-csrf")
+    monkeypatch.setattr(_worker_module, "_api_request", api)
+    monkeypatch.setattr(_worker_module, "_keepalive_sdc_write", lambda _project_id: None)
+    monkeypatch.setattr(_worker_module, "shutdown_requested", False)
+    monkeypatch.setattr(_worker_module.time, "sleep", stop_after_edit)
+
+    assert write_sdc_claims(project) == (1 if phase == "write" else 0)
+    assert actions == ["wbgetclaims", "wbeditentity" if phase == "write" else "wbremoveclaims"]
+    assert _worker_module.shutdown_requested
+    finish = [(sql, params) for sql, params in calls if sql.startswith("UPDATE projects SET sdc_write_requested = 0")]
+    assert len(finish) == 1
+    error, project_id = finish[0][1]
+    assert project_id == 5
+    if expected_error is None:
+        assert error is None
+    else:
+        assert error.startswith(expected_error)
+    # Local bookkeeping was committed before the shutdown/completion check.
+    if phase == "write":
+        assert any("UPDATE faces SET sdc_written = 1" in sql for sql, _ in calls)
+        assert any("UPDATE sdc_claims SET written_at" in sql for sql, _ in calls)
+    else:
+        assert any("SET f.sdc_removal_pending = 0, f.sdc_written = 0" in sql for sql, _ in calls)
+        assert any("DELETE FROM sdc_claims" in sql for sql, _ in calls)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    "state,expected",
+    [
+        ("settled", False),
+        ("write", True),
+        ("bootstrap_image", False),
+        ("bootstrap_face", False),
+        ("unclassified", False),
+        ("superseded", False),
+        ("removal", True),
+        ("guarded_removal", False),
+        ("superseded_sibling", True),
+    ],
+)
+def test_pending_sdc_work_matches_actionable_queue(
+    db_pool, db_conn, seed_project, seed_images, seed_faces, state, expected
+):
+    target = seed_faces["target"][0]
+    sibling = seed_faces["non_target"][0]
+    image_id = seed_images[0]["id"]
+    with db_conn.cursor() as cur:
+        cur.execute("UPDATE faces SET sdc_written = 1")
+        if state in {"write", "bootstrap_image", "bootstrap_face", "superseded", "unclassified"}:
+            cur.execute("UPDATE faces SET sdc_written = 0 WHERE id = %s", (target,))
+        if state == "bootstrap_image":
+            cur.execute("UPDATE images SET bootstrapped = 1 WHERE id = %s", (image_id,))
+        elif state == "bootstrap_face":
+            cur.execute("UPDATE faces SET classified_by = 'bootstrap' WHERE id = %s", (target,))
+        elif state == "unclassified":
+            cur.execute("UPDATE faces SET is_target = NULL, classified_by = NULL WHERE id = %s", (target,))
+        elif state == "superseded":
+            cur.execute("UPDATE faces SET superseded_by = %s WHERE id = %s", (sibling, target))
+        elif state in {"removal", "guarded_removal", "superseded_sibling"}:
+            cur.execute("UPDATE faces SET is_target = 0, sdc_removal_pending = 1 WHERE id = %s", (target,))
+            if state != "removal":
+                cur.execute("UPDATE faces SET is_target = 1 WHERE id = %s", (sibling,))
+            if state == "superseded_sibling":
+                cur.execute("UPDATE faces SET superseded_by = %s WHERE id = %s", (target, sibling))
+
+    assert _worker_module._has_pending_sdc_work(seed_project["id"]) is expected
+    assert _worker_module._has_pending_sdc_work(seed_project["id"] + 1000) is False
+
+
+@pytest.mark.parametrize("reset_is_target", [None, 0])
+def test_write_sdc_queues_removal_when_face_changes_during_write(reset_is_target):
+    """A face reset or undone between the live-state re-check and the write must
+    not strand the P180 claim the worker just added.
+
+    Classify undo restores ``is_target=NULL``; review undo restores 0. Both must
+    hit the recovery UPDATE, including the stop-then-undo interleaving where the
+    undo sees no in-flight write request and therefore queues nothing itself.
+    """
+    project = {"id": 5, "user_id": 1, "wikidata_qid": "Q42"}
+    db_calls = []
+    face_batch_returned = [False]
+    recovered = [False]
+
+    def mock_execute_query(sql, params=None, fetch=True):
+        db_calls.append((sql.strip(), params))
+        if "sdc_write_requested" in sql and "SELECT" in sql:
+            return [{"sdc_write_requested": 1}]
+        if "SELECT f.id as face_id" in sql:
+            if not face_batch_returned[0]:
+                face_batch_returned[0] = True
+                return [{"face_id": 100, "image_id": 200, "commons_page_id": 9999}]
+            return []
+        if "SELECT is_target, superseded_by FROM faces" in sql:
+            return [{"is_target": 1, "superseded_by": None}]
+        if "sdc_removal_pending" in sql and "DISTINCT" in sql:
+            return []
+        if "INSERT IGNORE INTO sdc_claims" in sql:
+            return 1
+        if "UPDATE faces SET sdc_written = 1 WHERE id = %s AND is_target = 1" in sql:
+            return 0  # changed after the live-state re-check
+        if "UPDATE faces SET sdc_written = 1, sdc_removal_pending = 1" in sql:
+            if reset_is_target is None:
+                recovered[0] = "is_target IS NULL" in sql
+            else:
+                recovered[0] = "is_target = 0" in sql
+            return int(recovered[0])
+        if "UPDATE faces SET sdc_written" in sql:
+            return 1
+        if "UPDATE sdc_claims SET written_at" in sql:
+            return 1
+        if "UPDATE projects SET sdc_write_requested = 0" in sql:
+            return 1
+        return 0
+
+    api_call_count = [0]
+
+    def mock_api(url, params=None, data=None, headers=None, method="get", **kwargs):
+        resp = MagicMock()
+        api_call_count[0] += 1
+        if api_call_count[0] == 1:
+            resp.json.return_value = {"claims": {}}  # no existing claim
+        else:
+            resp.json.return_value = {"success": 1}
+        return resp
+
+    with (
+        patch("worker.execute_query", side_effect=mock_execute_query),
+        patch("worker._refresh_worker_token", return_value="fake-token"),
+        patch("worker._get_csrf_token", return_value="fake-csrf"),
+        patch("worker._api_request", side_effect=mock_api),
+        patch("worker.shutdown_requested", False),
+        patch("worker.time.sleep"),
+    ):
+        result = write_sdc_claims(project)
+
+    assert result == 1
+    assert recovered[0]
+    queued = [sql for sql, _ in db_calls if "UPDATE faces" in sql and "sdc_removal_pending = 1" in sql]
+    assert queued
+    assert "is_target IS NULL" in queued[0]
+    assert "is_target = 0" in queued[0]
+
+
+@pytest.mark.integration
+def test_write_sdc_recovers_claim_when_stop_and_review_undo_race_edit(
+    db_pool, db_conn, seed_project, seed_images, seed_faces, monkeypatch
+):
+    """Stopping first makes undo skip its own queue; the worker must recover.
+
+    Reproduces the real interleaving: the user stops the run (so the undo route
+    sees no in-flight write and clears both SDC flags), then undoes a reviewed
+    match while wbeditentity is still in flight. The post-write recovery must
+    recognize is_target=0, not only NULL, or the new P180 claim is stranded.
+    """
+    target = seed_faces["target"][0]
+    image_id = seed_images[0]["id"]
+    with db_conn.cursor() as cur:
+        cur.execute("UPDATE projects SET sdc_write_requested = 1 WHERE id = %s", (seed_project["id"],))
+        cur.execute("UPDATE faces SET sdc_written = 1")
+        cur.execute(
+            "UPDATE faces SET sdc_written = 0, sdc_removal_pending = 0 WHERE id = %s",
+            (target,),
+        )
+        cur.execute("UPDATE images SET bootstrapped = 0 WHERE id = %s", (image_id,))
+
+    actions = []
+
+    def api(_url, params=None, data=None, **_kwargs):
+        action = (params or data)["action"]
+        actions.append(action)
+        response = MagicMock()
+        if action == "wbgetclaims":
+            response.json.return_value = {"claims": {}}
+            return response
+        assert action == "wbeditentity"
+        with db_conn.cursor() as cur:
+            cur.execute("UPDATE projects SET sdc_write_requested = 0 WHERE id = %s", (seed_project["id"],))
+            cur.execute(
+                "UPDATE faces SET is_target = 0, classified_by = 'model', "
+                "classified_by_user_id = NULL, sdc_written = 0, "
+                "sdc_removal_pending = 0, classified_at = NULL WHERE id = %s",
+                (target,),
+            )
+        response.json.return_value = {"success": 1}
+        return response
+
+    monkeypatch.setattr(_worker_module, "_refresh_worker_token", lambda _user_id: "fake-token")
+    monkeypatch.setattr(_worker_module, "_get_csrf_token", lambda _token: "fake-csrf")
+    monkeypatch.setattr(_worker_module, "_api_request", api)
+    monkeypatch.setattr(_worker_module, "_keepalive_sdc_write", lambda _project_id: None)
+    monkeypatch.setattr(_worker_module, "shutdown_requested", False)
+    monkeypatch.setattr(_worker_module.time, "sleep", lambda _seconds: None)
+
+    assert write_sdc_claims(seed_project) == 1
+    assert actions == ["wbgetclaims", "wbeditentity"]
+    with db_conn.cursor() as cur:
+        cur.execute(
+            "SELECT is_target, sdc_written, sdc_removal_pending FROM faces WHERE id = %s",
+            (target,),
+        )
+        face = cur.fetchone()
+    assert face == {"is_target": 0, "sdc_written": 1, "sdc_removal_pending": 1}
+
+
 def _mock_write_batch_query(face_rows, state_rows):
     """Mock execute_query for one write batch: *face_rows* once, then empty.
 
@@ -3652,7 +4172,7 @@ def test_inference_skips_invalid_confirmed_encodings():
             return [{"cnt": 2}]
         if "SELECT f.id, f.encoding FROM faces f" in sql and "f.is_target = 1" in sql:
             return confirmed_rows
-        if "SELECT f.id, f.image_id, f.encoding FROM faces f" in sql:
+        if "SELECT f.id, f.image_id, f.encoding" in sql:
             return unclassified_rows
         if "UPDATE projects SET last_inference" in sql:
             return 1
@@ -3693,7 +4213,7 @@ def test_inference_all_confirmed_encodings_invalid_returns_zero():
     assert result == 0
 
 
-def test_inference_skips_invalid_candidate_encodings():
+def test_inference_skips_invalid_candidate_encodings(inference_transaction):
     """Candidate faces with invalid encoding lengths are skipped without crashing."""
     project = {"id": 22, "min_confirmed": 2, "distance_threshold": 0.6}
 
@@ -3709,7 +4229,7 @@ def test_inference_skips_invalid_candidate_encodings():
             return [{"cnt": 3}]
         if "SELECT f.id, f.encoding FROM faces f" in sql and "f.is_target = 1" in sql:
             return confirmed_rows
-        if "SELECT f.id, f.image_id, f.encoding FROM faces f" in sql:
+        if "SELECT f.id, f.image_id," in sql:
             return unclassified_rows
         if "UPDATE faces SET" in sql:
             update_calls.append(params)
@@ -3974,7 +4494,7 @@ def _run_inference_with(project, confirmed, candidates):
             return [{"cnt": len(confirmed)}]
         if "SELECT f.id, f.encoding FROM faces f" in sql and "f.is_target = 1" in sql:
             return [{"id": i, "encoding": blob} for i, blob in enumerate(confirmed)]
-        if "SELECT f.id, f.image_id, f.encoding FROM faces f" in sql:
+        if "SELECT f.id, f.image_id," in sql:
             return [{"id": fid, "image_id": img, "encoding": blob} for fid, img, blob in candidates]
         if "UPDATE faces SET" in sql:
             updates.append(params)
@@ -3983,6 +4503,7 @@ def _run_inference_with(project, confirmed, candidates):
 
     with (
         patch("worker.execute_query", side_effect=mock_execute_query),
+        patch("worker.execute_transaction", side_effect=_fake_inference_transaction),
         patch("worker.shutdown_requested", False),
     ):
         run_autonomous_inference(project)

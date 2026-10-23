@@ -3684,6 +3684,16 @@ def test_project_detail_inference_banner_renders_for_rerun_done_state(monkeypatc
     assert "Model inference complete." in body
 
 
+def test_project_detail_inference_completion_counts_only_model_matches(monkeypatch):
+    """The completion note counts new matches; ``by_model`` also counts non-matches."""
+    eq = _project_detail_banner_eq(stats_overrides={"model_matches": 3, "by_model": 4})
+    client, _ = _auth_client_chunk4(monkeypatch, eq)
+    body = client.get("/project/1?inference_triggered=1").get_data(as_text=True)
+
+    assert "var initialModelMatches = 3;" in body
+    assert "var newMatches = Math.max(0, (fs.model_matches || 0) - initialModelMatches);" in body
+
+
 def test_templates_never_put_tojson_in_a_double_quoted_attribute():
     """``|tojson`` emits raw double quotes, so inside a double-quoted attribute the
     rendered value closes the attribute and injects markup (owner-only forms) or
@@ -3942,6 +3952,125 @@ def test_classify_forced_image_normal_mode_with_unclassified(monkeypatch):
     assert response.status_code == 200
     assert captured["context"]["reviewing_model"] is False
     assert captured["context"]["faces"][0]["face_id"] == 101
+
+
+def test_classify_labels_only_number_first_nine_faces(monkeypatch):
+    """Faces 10+ have no keyboard shortcut, so their "FACE N" tags are not
+    rendered (they used to print "FACE 20" over the photo). The boxes stay
+    clickable and keep an aria-label, and the labels can be toggled off."""
+    faces = [
+        {
+            "face_id": 100 + i,
+            "bbox_left": 1,
+            "bbox_top": 2,
+            "bbox_right": 20,
+            "bbox_bottom": 40,
+            "confidence": None,
+        }
+        for i in range(1, 13)
+    ]
+
+    def eq(sql, params=None, fetch=True):
+        if "FROM users WHERE id = %s" in sql:
+            return [
+                {
+                    "id": 1,
+                    "wiki_username": "tester",
+                    "access_token": "token",
+                    "refresh_token": "refresh",
+                    "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
+                }
+            ]
+        if "FROM projects p LEFT JOIN project_members" in sql:
+            return [{"id": 1, "user_id": 1}]
+        if "WHERE i.project_id = %s AND i.id = %s" in sql:
+            return [
+                {
+                    "image_id": 45,
+                    "file_title": "File:D.jpg",
+                    "commons_page_id": 3,
+                    "detection_width": 100,
+                    "detection_height": 100,
+                }
+            ]
+        if "WHERE image_id = %s AND is_target IS NULL" in sql:
+            return [{"cnt": len(faces)}]
+        if "WHERE f.image_id = %s AND f.is_target IS NULL" in sql:
+            return faces
+        if "COUNT(DISTINCT i.id) AS cnt" in sql:
+            return [{"cnt": 1}]
+        return ()
+
+    client, _ = _auth_client_chunk4(monkeypatch, eq)
+    body = client.get("/project/1/classify?image_id=45").get_data(as_text=True)
+
+    assert body.count('<span class="face-label">') == 9
+    assert ">Face 9</span>" in body
+    assert ">Face 10</span>" not in body
+    # Still announced to screen readers even though the visual tag is gone.
+    assert 'aria-label="Face 12"' in body
+    # Labels-off toggle (persisted, and present for the no-label touch default).
+    assert 'id="btnToggleLabels"' in body
+    assert "function toggleLabels()" in body
+    assert "wikivisage-face-labels" in body
+    assert ".image-wrapper.hide-labels .face-label" in body
+    # "H" toggles them, and the hotkey row advertises it.
+    assert "e.key === 'h' || e.key === 'H'" in body
+    assert "<kbd>H</kbd> Labels" in body
+
+
+def test_classify_single_face_has_no_label_toggle(monkeypatch):
+    """A single face renders no "FACE N" tag, so there is nothing to toggle:
+    neither the button nor the "H" hint belongs on that page (the single-face
+    keydown branch has no H handler either)."""
+
+    def eq(sql, params=None, fetch=True):
+        if "FROM users WHERE id = %s" in sql:
+            return [
+                {
+                    "id": 1,
+                    "wiki_username": "tester",
+                    "access_token": "token",
+                    "refresh_token": "refresh",
+                    "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
+                }
+            ]
+        if "FROM projects p LEFT JOIN project_members" in sql:
+            return [{"id": 1, "user_id": 1}]
+        if "WHERE i.project_id = %s AND i.id = %s" in sql:
+            return [
+                {
+                    "image_id": 45,
+                    "file_title": "File:D.jpg",
+                    "commons_page_id": 3,
+                    "detection_width": 100,
+                    "detection_height": 100,
+                }
+            ]
+        if "WHERE image_id = %s AND is_target IS NULL" in sql:
+            return [{"cnt": 1}]
+        if "WHERE f.image_id = %s AND f.is_target IS NULL" in sql:
+            return [
+                {
+                    "face_id": 101,
+                    "bbox_left": 1,
+                    "bbox_top": 2,
+                    "bbox_right": 20,
+                    "bbox_bottom": 40,
+                    "confidence": None,
+                }
+            ]
+        if "COUNT(DISTINCT i.id) AS cnt" in sql:
+            return [{"cnt": 1}]
+        return ()
+
+    client, _ = _auth_client_chunk4(monkeypatch, eq)
+    body = client.get("/project/1/classify?image_id=45").get_data(as_text=True)
+
+    assert "<kbd>Y</kbd>" in body  # single-face branch rendered
+    assert 'id="btnToggleLabels"' not in body
+    assert "<kbd>H</kbd>" not in body
+    assert '<span class="face-label">' not in body
 
 
 def test_classify_skipped_ids_path_uses_not_in(monkeypatch):
@@ -8035,6 +8164,41 @@ def test_project_settings_get_renders_form(monkeypatch, fake_user):
     assert b"Project Settings" in response.data
 
 
+def _render_settings_with(monkeypatch, fake_user, **overrides):
+    project = _project_settings_base_row()
+    project.update(overrides)
+
+    def route_execute(sql, _params, _fetch):
+        if "SELECT * FROM projects" in sql:
+            return [project.copy()]
+        if "project_members" in sql:
+            return []
+        raise AssertionError(f"Unexpected SQL: {sql}")
+
+    client = _make_authed_client(monkeypatch, fake_user, route_execute)
+    return client.get("/project/1/settings").get_data(as_text=True)
+
+
+def test_project_settings_disables_rerun_while_paused(monkeypatch, fake_user):
+    body = _render_settings_with(monkeypatch, fake_user, status="paused")
+
+    assert "disabled>Re-run Inference</button>" in body
+    assert "This project is paused. Set it to Active or Completed before re-running inference." in body
+
+
+def test_project_settings_disables_rerun_during_sdc_write(monkeypatch, fake_user):
+    body = _render_settings_with(monkeypatch, fake_user, sdc_write_requested=1)
+
+    assert "disabled>Re-run Inference</button>" in body
+    assert "A Commons edit run is in progress. Wait for it to finish (or stop it) before re-running inference." in body
+
+
+def test_project_settings_keeps_rerun_enabled_when_runnable(monkeypatch, fake_user):
+    body = _render_settings_with(monkeypatch, fake_user, status="completed", sdc_write_requested=0)
+
+    assert "disabled>Re-run Inference</button>" not in body
+
+
 def test_project_settings_project_not_found(monkeypatch, fake_user):
     def route_execute(sql, _params, _fetch):
         if "SELECT * FROM projects" in sql:
@@ -8381,38 +8545,84 @@ def test_project_rerun_inference_project_not_found(monkeypatch, fake_user):
     assert response.status_code == 404
 
 
-def test_project_rerun_inference_settings_unchanged_noop(monkeypatch, fake_user):
-    calls = {"reset_sql_seen": False}
+def _fake_rerun_transaction(
+    fn,
+    *,
+    status="completed",
+    sdc_write_requested=0,
+    min_confirmed=5,
+    human_confirmed=10,
+    by_bootstrap=0,
+    rows_reset=2,
+    executed_sql=None,
+    stats_error=False,
+):
+    """Run a rerun transaction against a scripted cursor.
+
+    ``_assert_project_access_locked`` consumes the first ``fetchone``; the
+    project-row lock consumes the second and the gate stats the third.
+    """
+    cursor = MagicMock()
+    cursor.fetchone.side_effect = [
+        {"access": 1},
+        {
+            "status": status,
+            "sdc_write_requested": sdc_write_requested,
+            "min_confirmed": min_confirmed,
+        },
+        {"human_confirmed": human_confirmed, "by_bootstrap": by_bootstrap},
+    ]
+    cursor.rowcount = rows_reset
+
+    def _execute(sql, params=None):
+        if executed_sql is not None:
+            executed_sql.append(sql)
+        if stats_error and "AS human_confirmed" in sql:
+            raise DatabaseError("stats query failed")
+
+    cursor.execute = _execute
+    return fn(MagicMock(), cursor)
+
+
+def test_project_rerun_inference_runs_even_when_settings_match(monkeypatch, fake_user):
+    """The button must not no-op on an unreliable 'last settings' marker.
+
+    A background inference pass records the current threshold/min_confirmed even
+    when it only classified new faces, so the marker cannot prove that the
+    existing model results used those settings. Clicking the button is an
+    explicit request to reset and reclassify.
+    """
+    executed_sql = []
 
     def route_execute(sql, _params, _fetch):
         if "SELECT * FROM projects WHERE id = %s AND user_id = %s" in sql:
             return [
                 {
                     "id": 1,
+                    "status": "completed",
                     "distance_threshold": 0.6,
                     "min_confirmed": 5,
                     "last_inference_threshold": 0.6,
                     "last_inference_min_confirmed": 5,
                 }
             ]
-        if "UPDATE faces f" in sql:
-            calls["reset_sql_seen"] = True
-            return 4
         raise AssertionError(f"Unexpected SQL: {sql}")
 
     client = _make_authed_client(monkeypatch, fake_user, route_execute)
+    monkeypatch.setattr(
+        app_module,
+        "execute_transaction",
+        lambda fn: _fake_rerun_transaction(fn, rows_reset=2, executed_sql=executed_sql),
+    )
     _set_csrf_chunk6(client)
 
     response = client.post("/project/1/rerun-inference", data={"csrf_token": "testtoken"})
 
     assert response.status_code == 302
-    assert response.headers["Location"].endswith("/project/1/settings")
+    assert "inference_triggered=1" in response.headers["Location"]
+    assert any("UPDATE faces f" in sql for sql in executed_sql)
     flashes = _flashes_chunk6(client)
-    assert (
-        "info",
-        "Settings have not changed since the last inference run. No re-run needed.",
-    ) in flashes
-    assert calls["reset_sql_seen"] is False
+    assert any(cat == "success" and "Reset 2 model-classified faces." in msg for cat, msg in flashes)
 
 
 def test_project_rerun_inference_successful_reset_with_affected_faces(monkeypatch, fake_user):
@@ -8429,19 +8639,21 @@ def test_project_rerun_inference_successful_reset_with_affected_faces(monkeypatc
                     "last_inference_min_confirmed": 5,
                 }
             ]
-        if "AS human_confirmed" in sql:
-            return [{"human_confirmed": 10, "by_bootstrap": 3}]
         raise AssertionError(f"Unexpected SQL: {sql}")
 
-    def fake_transaction(fn):
-        mock_cursor = MagicMock()
-        mock_cursor.rowcount = 4
-        mock_cursor.execute = lambda sql, params=None: executed_sql.append(sql)
-        mock_conn = MagicMock()
-        return fn(mock_conn, mock_cursor)
-
     client = _make_authed_client(monkeypatch, fake_user, route_execute)
-    monkeypatch.setattr(app_module, "execute_transaction", fake_transaction)
+    monkeypatch.setattr(
+        app_module,
+        "execute_transaction",
+        lambda fn: _fake_rerun_transaction(
+            fn,
+            min_confirmed=7,
+            human_confirmed=10,
+            by_bootstrap=3,
+            rows_reset=4,
+            executed_sql=executed_sql,
+        ),
+    )
     _set_csrf_chunk6(client)
 
     response = client.post("/project/1/rerun-inference", data={"csrf_token": "testtoken"})
@@ -8454,7 +8666,9 @@ def test_project_rerun_inference_successful_reset_with_affected_faces(monkeypatc
     assert any(cat == "info" and "10/7 human-confirmed" in msg for cat, msg in flashes)
 
 
-def test_project_rerun_inference_null_last_inference_values_still_resets(monkeypatch, fake_user):
+def test_project_rerun_inference_below_threshold_does_not_reset(monkeypatch, fake_user):
+    """Below the human-confirmed gate, refuse instead of wiping model results
+    that the worker would not be allowed to recompute."""
     executed_sql = []
 
     def route_execute(sql, _params, _fetch):
@@ -8462,36 +8676,106 @@ def test_project_rerun_inference_null_last_inference_values_still_resets(monkeyp
             return [
                 {
                     "id": 1,
+                    "status": "completed",
                     "distance_threshold": 0.6,
                     "min_confirmed": 5,
                     "last_inference_threshold": None,
                     "last_inference_min_confirmed": None,
                 }
             ]
-        if "AS human_confirmed" in sql:
-            return [{"human_confirmed": 3, "by_bootstrap": 2}]
         raise AssertionError(f"Unexpected SQL: {sql}")
 
-    def fake_transaction(fn):
-        mock_cursor = MagicMock()
-        mock_cursor.rowcount = 2
-        mock_cursor.execute = lambda sql, params=None: executed_sql.append(sql)
-        mock_conn = MagicMock()
-        return fn(mock_conn, mock_cursor)
-
     client = _make_authed_client(monkeypatch, fake_user, route_execute)
-    monkeypatch.setattr(app_module, "execute_transaction", fake_transaction)
+    monkeypatch.setattr(
+        app_module,
+        "execute_transaction",
+        lambda fn: _fake_rerun_transaction(
+            fn,
+            human_confirmed=3,
+            by_bootstrap=2,
+            rows_reset=0,
+            executed_sql=executed_sql,
+        ),
+    )
     _set_csrf_chunk6(client)
 
     response = client.post("/project/1/rerun-inference", data={"csrf_token": "testtoken"})
 
     assert response.status_code == 302
-    assert any("UPDATE faces f" in sql for sql in executed_sql)
-    assert any("UPDATE projects SET last_inference_threshold = NULL" in sql for sql in executed_sql)
+    assert response.headers["Location"].endswith("/project/1/settings")
+    assert not any("UPDATE faces f" in sql for sql in executed_sql)
     flashes = _flashes_chunk6(client)
-    # Below threshold (3/5) + has bootstrap faces → warning + bootstrap tip
+    # Below threshold (3/5) + has bootstrap faces → warning + bootstrap tip,
+    # and explicitly no reset.
     assert any(cat == "warning" and "3/5 human-confirmed" in msg for cat, msg in flashes)
     assert any(cat == "info" and "2 bootstrapped" in msg for cat, msg in flashes)
+    assert ("info", "No faces were reset.") in flashes
+    assert not any(cat == "success" for cat, _msg in flashes)
+
+
+def test_project_rerun_inference_paused_project_does_not_reset(monkeypatch, fake_user):
+    """Inference never runs for paused projects, so the reset would be a dead end."""
+    executed_sql = []
+
+    def route_execute(sql, _params, _fetch):
+        if "SELECT * FROM projects WHERE id = %s AND user_id = %s" in sql:
+            return [
+                {
+                    "id": 1,
+                    "status": "paused",
+                    "distance_threshold": 0.55,
+                    "min_confirmed": 5,
+                    "last_inference_threshold": 0.6,
+                    "last_inference_min_confirmed": 5,
+                }
+            ]
+        raise AssertionError(f"Unexpected SQL: {sql}")
+
+    client = _make_authed_client(monkeypatch, fake_user, route_execute)
+    monkeypatch.setattr(
+        app_module,
+        "execute_transaction",
+        lambda fn: _fake_rerun_transaction(fn, status="paused", rows_reset=0, executed_sql=executed_sql),
+    )
+    _set_csrf_chunk6(client)
+
+    response = client.post("/project/1/rerun-inference", data={"csrf_token": "testtoken"})
+
+    assert response.status_code == 302
+    assert response.headers["Location"].endswith("/project/1/settings")
+    assert not any("UPDATE faces f" in sql for sql in executed_sql)
+    assert (
+        "warning",
+        "This project is paused. Set it to Active or Completed before re-running inference.",
+    ) in _flashes_chunk6(client)
+
+
+def test_project_rerun_inference_refuses_during_sdc_write(monkeypatch, fake_user):
+    """A reset during a Commons write can strand a P180 claim the worker adds."""
+    executed_sql = []
+
+    def route_execute(sql, _params, _fetch):
+        if "SELECT * FROM projects WHERE id = %s AND user_id = %s" in sql:
+            return [{"id": 1, "status": "completed", "distance_threshold": 0.6, "min_confirmed": 5}]
+        raise AssertionError(f"Unexpected SQL: {sql}")
+
+    client = _make_authed_client(monkeypatch, fake_user, route_execute)
+    monkeypatch.setattr(
+        app_module,
+        "execute_transaction",
+        lambda fn: _fake_rerun_transaction(fn, sdc_write_requested=1, rows_reset=0, executed_sql=executed_sql),
+    )
+    _set_csrf_chunk6(client)
+
+    response = client.post("/project/1/rerun-inference", data={"csrf_token": "testtoken"})
+
+    assert response.status_code == 302
+    assert response.headers["Location"].endswith("/project/1/settings")
+    assert not any("UPDATE faces f" in sql for sql in executed_sql)
+    assert (
+        "warning",
+        "A Commons edit run is in progress. Wait for it to finish (or stop it) before re-running inference.",
+    ) in _flashes_chunk6(client)
 
 
 def test_project_rerun_inference_no_faces_to_reset(monkeypatch, fake_user):
@@ -8506,26 +8790,24 @@ def test_project_rerun_inference_no_faces_to_reset(monkeypatch, fake_user):
                     "last_inference_min_confirmed": 5,
                 }
             ]
-        if "AS human_confirmed" in sql:
-            return [{"human_confirmed": 8, "by_bootstrap": 0}]
         raise AssertionError(f"Unexpected SQL: {sql}")
 
     executed_sql = []
 
-    def fake_transaction(fn):
-        mock_cursor = MagicMock()
-        mock_cursor.rowcount = 0
-        mock_cursor.execute = lambda sql, params=None: executed_sql.append(sql)
-        mock_conn = MagicMock()
-        return fn(mock_conn, mock_cursor)
-
     client = _make_authed_client(monkeypatch, fake_user, route_execute)
-    monkeypatch.setattr(app_module, "execute_transaction", fake_transaction)
+    monkeypatch.setattr(
+        app_module,
+        "execute_transaction",
+        lambda fn: _fake_rerun_transaction(
+            fn, min_confirmed=7, human_confirmed=8, rows_reset=0, executed_sql=executed_sql
+        ),
+    )
     _set_csrf_chunk6(client)
 
     response = client.post("/project/1/rerun-inference", data={"csrf_token": "testtoken"})
 
     assert response.status_code == 302
+    assert "inference_triggered=1" in response.headers["Location"]
     assert ("info", "No model-classified faces to reset.") in _flashes_chunk6(client)
     # Project update must not run when affected=0
     assert not any("UPDATE projects SET last_inference_threshold = NULL" in sql for sql in executed_sql)
@@ -8537,14 +8819,13 @@ def test_project_rerun_inference_db_error(monkeypatch, fake_user):
             return [
                 {
                     "id": 1,
+                    "status": "completed",
                     "distance_threshold": 0.55,
                     "min_confirmed": 7,
                     "last_inference_threshold": 0.6,
                     "last_inference_min_confirmed": 5,
                 }
             ]
-        if "AS human_confirmed" in sql:
-            return [{"human_confirmed": 0, "by_bootstrap": 0}]
         raise AssertionError(f"Unexpected SQL: {sql}")
 
     def fake_transaction(_fn):
@@ -9686,20 +9967,8 @@ def test_project_rerun_inference_db_error_loading_project_returns_500(monkeypatc
     assert response.status_code == 500
 
 
-def test_project_rerun_inference_ignores_wake_file_oserror(monkeypatch):
-    def _execute_query(sql, params=None, fetch=True):
-        del params, fetch
-        if "FROM users WHERE id = %s" in sql:
-            return [
-                {
-                    "id": 1,
-                    "wiki_user_id": 123,
-                    "wiki_username": "tester",
-                    "access_token": "token",
-                    "refresh_token": "refresh",
-                    "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
-                }
-            ]
+def test_project_rerun_inference_ignores_wake_file_oserror(monkeypatch, fake_user):
+    def route_execute(sql, _params, _fetch):
         if "SELECT * FROM projects WHERE id = %s AND user_id = %s" in sql:
             return [
                 {
@@ -9710,58 +9979,57 @@ def test_project_rerun_inference_ignores_wake_file_oserror(monkeypatch):
                     "last_inference_min_confirmed": 5,
                 }
             ]
-        if "AS human_confirmed" in sql:
-            return [{"human_confirmed": 8, "by_bootstrap": 0}]
         raise AssertionError(sql)
 
-    client, _ = _auth_client_chunk4(monkeypatch, _execute_query)
-    _set_csrf_chunk4(client)
-    monkeypatch.setattr(app_module, "execute_transaction", lambda _fn: 3)
+    client = _make_authed_client(monkeypatch, fake_user, route_execute)
+    _set_csrf_chunk6(client)
+    monkeypatch.setattr(
+        app_module,
+        "execute_transaction",
+        lambda fn: _fake_rerun_transaction(fn, min_confirmed=7, human_confirmed=8, rows_reset=3),
+    )
     monkeypatch.setattr("builtins.open", MagicMock(side_effect=OSError("disk error")))
 
     response = client.post("/project/1/rerun-inference", data={"csrf_token": "testtoken"})
 
     assert response.status_code == 302
-    assert any(cat == "success" and "Reset 3 model-classified faces." in msg for cat, msg in _flashes_tail(client))
+    assert any(cat == "success" and "Reset 3 model-classified faces." in msg for cat, msg in _flashes_chunk6(client))
 
 
-def test_project_rerun_inference_ignores_stats_query_db_error(monkeypatch):
-    def _execute_query(sql, params=None, fetch=True):
-        del params, fetch
-        if "FROM users WHERE id = %s" in sql:
-            return [
-                {
-                    "id": 1,
-                    "wiki_user_id": 123,
-                    "wiki_username": "tester",
-                    "access_token": "token",
-                    "refresh_token": "refresh",
-                    "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
-                }
-            ]
+def test_project_rerun_inference_stats_query_db_error_resets_nothing(monkeypatch, fake_user):
+    """If the gate cannot be checked, fail closed: do not wipe model results."""
+    executed_sql = []
+
+    def route_execute(sql, _params, _fetch):
         if "SELECT * FROM projects WHERE id = %s AND user_id = %s" in sql:
             return [
                 {
                     "id": 1,
+                    "status": "completed",
                     "distance_threshold": 0.55,
                     "min_confirmed": 7,
                     "last_inference_threshold": 0.6,
                     "last_inference_min_confirmed": 5,
                 }
             ]
-        if "AS human_confirmed" in sql:
-            raise DatabaseError("stats query failed")
         raise AssertionError(sql)
 
-    client, _ = _auth_client_chunk4(monkeypatch, _execute_query)
-    _set_csrf_chunk4(client)
-    monkeypatch.setattr(app_module, "execute_transaction", lambda _fn: 1)
+    client = _make_authed_client(monkeypatch, fake_user, route_execute)
+    _set_csrf_chunk6(client)
+    monkeypatch.setattr(
+        app_module,
+        "execute_transaction",
+        lambda fn: _fake_rerun_transaction(fn, stats_error=True, executed_sql=executed_sql),
+    )
     monkeypatch.setattr("builtins.open", mock_open())
 
     response = client.post("/project/1/rerun-inference", data={"csrf_token": "testtoken"})
 
     assert response.status_code == 302
-    assert any(cat == "success" and "Reset 1 model-classified faces." in msg for cat, msg in _flashes_tail(client))
+    assert response.headers["Location"].endswith("/project/1/settings")
+    assert not any("UPDATE faces f" in sql for sql in executed_sql)
+    assert ("error", "Failed to re-run inference.") in _flashes_chunk6(client)
+    assert not any(cat == "success" for cat, _msg in _flashes_chunk6(client))
 
 
 def test_account_settings_get_db_error_falls_back_to_opt_out_zero(monkeypatch):
@@ -12684,3 +12952,132 @@ def test_project_settings_prefilter_stats_from_db(integration_client, db_conn, s
     assert "Would skip 60.0%" in body
     assert 'stat-value">2</div>' in body  # confirmed matches it would drop
     assert "It would have dropped 2 of the 4 images you confirmed contain the target." in body
+
+
+@pytest.mark.integration
+def test_project_rerun_inference_resets_and_worker_reclassifies(
+    integration_client, db_conn, seed_project, seed_images, seed_faces
+):
+    """End-to-end: the route resets model faces and the worker resolves them.
+
+    Every image already has a human-confirmed target, so the worker must mark
+    the reset faces as non-matches instead of creating a second target.
+    """
+    client, _, _ = integration_client
+    model_face_ids = []
+
+    with db_conn.cursor() as cur:
+        for image in seed_images[:2]:
+            cur.execute(
+                "INSERT INTO faces (image_id, encoding, embedding_model, bbox_top, bbox_right, "
+                "bbox_bottom, bbox_left, is_target, classified_by, confidence, sdc_written) "
+                "VALUES (%s, %s, 'scrfd500m+arcface_mbf', 100, 300, 300, 100, 1, 'model', 0.2, 0)",
+                (image["id"], _make_embedding(300 + image["id"])),
+            )
+            model_face_ids.append(cur.lastrowid)
+        cur.execute(
+            "SELECT id, min_confirmed, distance_threshold FROM projects WHERE id = %s",
+            (seed_project["id"],),
+        )
+        project = cur.fetchone()
+
+    with client.session_transaction() as sess:
+        sess["csrf_token"] = "testtoken"
+
+    response = client.post(
+        f"/project/{seed_project['id']}/rerun-inference",
+        data={"csrf_token": "testtoken"},
+    )
+
+    assert response.status_code == 302
+    assert "inference_triggered=1" in response.headers["Location"]
+
+    with db_conn.cursor() as cur:
+        placeholders = ",".join(["%s"] * len(model_face_ids))
+        cur.execute(
+            "SELECT id, is_target, classified_by FROM faces WHERE id IN (" + placeholders + ") ORDER BY id",
+            tuple(model_face_ids),
+        )
+        rows = cur.fetchall()
+    assert len(rows) == 2
+    assert all(row["is_target"] is None and row["classified_by"] is None for row in rows)
+
+    import worker
+
+    with patch("worker.shutdown_requested", False):
+        classified = worker.run_autonomous_inference(
+            {
+                "id": project["id"],
+                "min_confirmed": project["min_confirmed"],
+                "distance_threshold": float(project["distance_threshold"]),
+            }
+        )
+
+    assert classified == 2
+    with db_conn.cursor() as cur:
+        placeholders = ",".join(["%s"] * len(model_face_ids))
+        cur.execute(
+            "SELECT id, is_target, classified_by FROM faces WHERE id IN (" + placeholders + ") ORDER BY id",
+            tuple(model_face_ids),
+        )
+        rows = cur.fetchall()
+    assert all(row["is_target"] == 0 for row in rows)
+    assert all(row["classified_by"] == "model" for row in rows)
+
+
+@pytest.mark.integration
+def test_inference_preserves_sibling_approved_after_candidate_selection(
+    integration_client, db_conn, seed_project, seed_images, seed_faces, monkeypatch
+):
+    """A gallery approval during inference must not leave two targets on an image."""
+    client, _, module = integration_client
+    with db_conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO images (project_id, commons_page_id, file_title, status, face_count, "
+            "detection_width, detection_height) VALUES (%s, 999001, 'File:Race.jpg', 'processed', 2, 800, 600)",
+            (seed_project["id"],),
+        )
+        image_id = cur.lastrowid
+        face_ids = []
+        for seed in (700, 701):
+            cur.execute(
+                "INSERT INTO faces (image_id, encoding, embedding_model, bbox_top, bbox_right, "
+                "bbox_bottom, bbox_left) VALUES (%s, %s, 'scrfd500m+arcface_mbf', 100, 300, 300, 100)",
+                (image_id, _make_embedding(seed)),
+            )
+            face_ids.append(cur.lastrowid)
+
+    with client.session_transaction() as sess:
+        sess["csrf_token"] = "testtoken"
+
+    import worker
+
+    real_query = worker.execute_query
+    approved = False
+
+    def approve_after_snapshot(sql, params=None, fetch=True):
+        nonlocal approved
+        rows = real_query(sql, params, fetch)
+        if "SELECT f.id, f.image_id, f.encoding" in sql:
+            assert {row["id"] for row in rows} == set(face_ids)
+            response = client.post(
+                "/api/reclassify",
+                data={"face_id": face_ids[1], "is_target": "1", "csrf_token": "testtoken"},
+            )
+            assert response.status_code == 200
+            approved = True
+            return sorted(rows, key=lambda row: row["id"])
+        return rows
+
+    monkeypatch.setattr(module, "_maybe_mark_sdc_written", lambda *args: False)
+    monkeypatch.setattr(worker, "execute_query", approve_after_snapshot)
+    monkeypatch.setattr(worker, "_face_distance", lambda *args: 0.1)
+    monkeypatch.setattr(worker, "shutdown_requested", False)
+    classified = worker.run_autonomous_inference(seed_project)
+
+    assert approved
+    assert classified == 1  # The newly human-approved face is no longer a candidate.
+    with db_conn.cursor() as cur:
+        cur.execute("SELECT id, is_target, classified_by FROM faces WHERE image_id = %s ORDER BY id", (image_id,))
+        rows = cur.fetchall()
+    assert [(row["is_target"], row["classified_by"]) for row in rows] == [(0, "model"), (1, "human")]

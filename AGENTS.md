@@ -43,6 +43,7 @@ WikiVisage/
 ├── pyproject.toml      # Project config: Ruff linter/formatter rules, pytest config, markers, version
 ├── requirements.txt    # Python 3.11+, NO ML dependencies (see model-server/ for those)
 ├── requirements-dev.txt # Dev/test deps: pytest, pytest-cov, ruff (includes requirements.txt)
+├── requirements-browser.txt # Optional Playwright browser tests (includes requirements-dev.txt); never installed in production
 ├── babel.cfg           # pybabel extraction config (explicit file list, excludes venv)
 ├── messages.pot        # Extracted translatable strings template
 ├── CONTRIBUTING.md     # Contributor guide: setup, conventions, i18n, schema changes
@@ -52,11 +53,13 @@ WikiVisage/
 │   ├── nb/LC_MESSAGES/ # Norwegian Bokmål
 │   ├── es/LC_MESSAGES/ # Spanish
 │   └── fr/LC_MESSAGES/ # French
+├── docs/plans/         # Design and migration plans (classify mobile, PTD adoption, face model upgrade)
 ├── tests/              # Hybrid test suite: unit + integration + contract tests
 │   ├── __init__.py
 │   ├── conftest.py     # Integration fixture infrastructure; `_make_embedding(seed, dim)` (unit-norm float32)
 │   ├── data/           # Public-domain portrait sample + provenance README used by the real-face tests
 │   ├── test_app.py     # Unit + integration tests
+│   ├── test_bbox_editor_browser.py # Chromium/WebKit tests of the rendered bbox editor (touch identity, cancel, resize, scrolling)
 │   ├── test_database.py # Unit + integration tests
 │   ├── test_face_client.py # Unit tests for the face service client (dim/model_id validation, box_space, startup probe)
 │   ├── test_face_service_backend.py # Unit tests for model-server/backend.py (fake ONNX sessions + real weights; needs onnxruntime/cv2)
@@ -76,7 +79,9 @@ WikiVisage/
 │   ├── wikivisage-common.js       # Shared JS helpers: snapThumbWidth(), commonsThumbUrl()
 │   └── view-it-tool.png           # View it! Tool icon (local copy)
 ├── .github/
+│   ├── dependabot.yml  # Weekly update PRs: root pip, model-server uv (grouped), github-actions
 │   └── workflows/
+│       ├── audit.yml   # Dependency audit: pip-audit + uv lock freshness (dependency changes, weekly, manual)
 │       ├── ci.yml      # CI: Ruff lint + no-LFS check, pytest on Python 3.11/3.15 (integration tests skipped), face-service unit/contract jobs
 │       └── deploy.yml  # CD: Release-triggered Toolforge deploy via SSH (2 workers + health checks)
 ├── Procfile            # web: gunicorn (2 workers, module-level app), worker: python -u worker.py
@@ -393,7 +398,7 @@ Flask app served by gunicorn (2 workers, `app:app`; the module-level app is buil
 | `/project/<id>/leave` | POST | Leave a project (non-owner members only, CSRF protected) |
 | `/project/<id>/invite-code` | POST | Generate or revoke invite code for the project (owner-only) |
 | `/join` | POST | Join a project via invite code |
-| `/project/<id>/rerun-inference` | POST | Reset model-classified faces to re-run inference with current settings (owner-only) |
+| `/project/<id>/rerun-inference` | POST | Reset model-classified faces to re-run inference with current settings (owner-only). The paused / active-SDC-write / `min_confirmed` checks and the reset run in one transaction under the project-row lock; refuses without resetting in those states, otherwise wakes the worker even if no model face needed a reset |
 | `/project/<id>/delete` | POST | Delete project |
 | `/account/settings` | GET/POST | User account settings (leaderboard opt-out) |
 | `/leaderboard` | GET | Top classifiers |
@@ -428,12 +433,16 @@ Long-running background process with concurrent execution. Polls DB every 60s (`
 **Liveness health check**: Each worker periodically touches `$HOME/.wikivisage-worker-alive-{worker_id}` (via `_touch_heartbeat_file()`). Toolforge runs `healthcheck.sh {worker_id}` every 10s; 3 consecutive failures (file missing or >5 min old) trigger automatic restart. The heartbeat directory is configured in `config.py` as `HEARTBEAT_FILE_DIR`.
 
 Two query paths:
-1. **Active projects** → full pipeline: `traverse_category` → `bootstrap_from_sparql` → `prefilter_images` (experimental, shadow) → `process_images` → `run_autonomous_inference`
+1. **Active projects** → full pipeline: early `run_autonomous_inference` when candidates already exist (so a re-run does not wait for discovery) → `traverse_category` → `bootstrap_from_sparql` → `prefilter_images` (experimental, shadow) → `process_images` → final `run_autonomous_inference`
 2. **Active or completed projects with unclassified faces and enough human-confirmed targets** → inference-only: `run_autonomous_inference`
 
 **Scheduling:** the inference-only queue is drained **before** the active batch each cycle (waves of `MAX_CONCURRENT_PROJECTS`), and the wake handler plus the 60 s heartbeat checks of the running loops call `_run_new_inference_projects()` so a project whose classifications just crossed `min_confirmed` is picked up mid-cycle (measured: 31 s from gate crossing to classification while the active batch was mid-run). Inference costs ~1 s per project while an active project can hold all slots for a long time looping its image backlog, so the original order (one inference batch *after* the active batch) left ready projects showing "Model inference in progress" at a standstill. `seen_ids` bounds the cycle-start drain: a project that stays eligible (e.g. faces with unusable encodings) is only attempted once per cycle there.
 
+**Inference writes:** `_persist_inference_batch` takes the project-row lock used by human classifications and re-reads candidate eligibility and sibling targets before each batch UPDATE. Per-image deduplication is computed from distance alone; the locked write, not the candidate snapshot, decides whether a live sibling target vetoes a match. A target approved after the snapshot forces its remaining siblings to non-matches, while a sibling undone after the snapshot lets the closest candidate become a match. Faces with a new human edit, queued P180 removal, or superseded box are left untouched. Paused/deleted projects receive no batch writes. Counts report rows actually updated.
+
 **Note:** SDC claim writing is user-triggered via the "Send Edits to Wikimedia Commons" button on the project detail page (calls `/api/write-sdc/<id>`). The worker no longer writes SDC claims automatically.
+
+**SDC shutdown reporting:** a shutdown signal can arrive after the final successful edit. Before recording an interruption, the worker checks both actionable writes and removals. With neither left it clears the request without an error; with work left it explains that completed edits were kept and the remaining edits need a new send request. A failed completion check reports an unverified outcome rather than claiming success. No automatic retry is added.
 
 **Pipeline stages:**
 | Function | What it does |
@@ -460,7 +469,8 @@ Two query paths:
 | `_load_embedding` | Validates a `faces.encoding` BLOB: exactly `dim * 4` bytes, little-endian float32, finite, L2 norm in `[0.9, 1.1]`; returns a renormalised unit vector or `None` (rejects stale 1024-byte dlib encodings) |
 | `_face_distance` | Cosine distance `1 - dot(centroid, embedding)`, clamped at 0; stored in `faces.confidence` |
 | `_convert_box_to_stored_space` | Re-expresses a box from one pixel space into the stored `detection_width/height` space (for re-detection on images whose boxes live in another size) |
-| `run_autonomous_inference` | Cosine-distance classification on unclassified faces against the renormalised mean centroid (needs >= `min_confirmed` target faces). Only reads faces whose `embedding_model` equals `face_client.EXPECTED_MODEL_ID`, and skips faces with `sdc_removal_pending = 1` so a model guess can never re-target a face whose claim a human asked to remove (the removal phase would then strip the claim of a fresh match) |
+| `_persist_inference_batch` | Takes the project-row lock, re-checks candidate eligibility and sibling targets, then applies model decisions in one transaction. Returns actual classified and match counts |
+| `run_autonomous_inference` | Cosine-distance classification on unclassified faces against the renormalised mean centroid (needs >= `min_confirmed` target faces). Only reads faces whose `embedding_model` equals `face_client.EXPECTED_MODEL_ID`, and skips faces with `sdc_removal_pending = 1` so a model guess can never re-target a face whose claim a human asked to remove (the removal phase would then strip the claim of a fresh match). A candidate on an image that already has a confirmed target (`image_has_target`) is always resolved as a non-match, so a re-run cannot promote a second face after the human approved one of several model faces on the same image |
 | `write_sdc_claims` | Writes P180 claims to Commons SDC via Wikibase API (idempotent). Triggered by `sdc_write_requested` flag set from web UI. Before every write it re-reads the face's live `is_target`/`superseded_by` and skips faces that were rejected, undone or replaced while the batch was in flight (the web side queues a removal for those too; a whole unverifiable batch stops the run instead of looping). Re-checks `sdc_write_requested` every 5 faces (`_PER_FACE_CANCEL_CHECK_EVERY`) so the user can stop a running batch quickly, and calls `_keepalive_sdc_write` on the same cadence. Treats `no-such-entity` / `no-such-claim` / `no-such-statement` / `notfound` as already-gone successes (`_ALREADY_GONE_CODES`). |
 | `_keepalive_sdc_write` | Refreshes the DB heartbeat row, the heartbeat file and `projects.worker_claimed_at` (only for this worker's claim) while a long SDC run blocks the main loop — otherwise a run over 5 minutes trips `healthcheck.sh` and a run over `CLAIM_EXPIRY_MINUTES` lets the other worker claim the same project. Best-effort: every statement is wrapped in its own `try/except DatabaseError`. Called every 5 written faces and once per removal page. |
 | `_api_request` | Wrapper for Commons/Wikidata API calls with maxlag, retry, and User-Agent |
@@ -753,7 +763,7 @@ Extracted common patterns to reduce duplication across routes, templates, and JS
 |--------|-----------|---------|------------|
 | `_wikimedia_api_get` | `(url, params, timeout=10) → dict` | Standardizes User-Agent header, `raise_for_status()`, `.json()` parsing for Wikimedia API GET requests | 10: `_is_human_entity`, `_commons_category_exists`, `_commons_category_has_files`, `_check_p180_exists`, `_fetch_p18_thumb_url`, `_fetch_wikidata_label`, + 4 calls in `api_category_info` |
 | `_validate_bbox` | `(top, right, bottom, left) → str \| None` | Validates bounding box coordinates against `MAX_BBOX_PX` and `MIN_BBOX_AREA`. Returns error message or `None` | 2: `api_manual_face`, `api_update_face_bbox` |
-| `_get_face_stats` | `(project_id) → dict[str, Any]` | Single SQL query returning 12-column face/image stats with NULL→0 coercion | 2: `project_detail`, `api_progress` |
+| `_get_face_stats` | `(project_id) → dict[str, Any]` | Single SQL query returning 13-column face/image stats (including `model_matches`) with NULL→0 coercion | 2: `project_detail`, `api_progress` |
 
 **CSS (base.html):**
 
@@ -850,8 +860,8 @@ The worker writes `REPLACE INTO worker_heartbeat (id, last_seen) VALUES (1, NOW(
 
 The LiftWing pre-filter has its own status path: the worker's probe writes `service_status`, and the web app's `inject_liftwing_status` context processor reads it (no network call). `base.html` shows a dismissible banner on the project detail/settings pages when the filter is down **and** the project uses it; the settings page also renders `reachable`/`unreachable`/`unknown` with the last check time. A row older than 3 probe intervals reads as `unknown`.
 
-### The inference-status card follows cycles by polling, not a page-load snapshot
-`project_detail.html`'s `#inferenceBanner` tracks the whole processing → inference lifecycle, not just the moment the page was opened. The card renders whenever inference can still happen — the viewer crossed `min_confirmed` and (eligible faces > 0 or the project is still processing images) — or the page came from a re-run (`?inference_triggered=1`); with nothing eligible at render time it starts hidden (`style="display:none"`) and the `/api/progress` poller is what makes it live: it reveals the card when a model cycle begins, hides it again between cycles, and shows "Model inference complete — N new matches found" only once `complete` **and** `pending_images == 0`, then stops; a quiescent page stops after the first poll. Do not re-gate the card or its poller on "running right now" — a page loaded while nothing was eligible used to show no live status at all, and once `images_processed == images_total` the progress poller is off too. The poller's live `SDC Pending` update must add `sdc_removal_pending_faces` to match the server-rendered combined figure. Two review-driven rules: the poller stops itself the moment the banner element is gone (a dismissed card must not leave a 5 s `/api/progress` loop), and the observed-work marker persists across the hidden gaps — eligible faces seen in any poll, or `by_model` growth since page load — so a cycle that finishes between two polls still finalizes the card instead of stopping silently.
+### The inference-status card follows cycles by polling
+`project_detail.html`'s `#inferenceBanner` tracks the whole processing → inference lifecycle. It used to be a page-load snapshot. The card renders whenever inference can still happen: the viewer crossed `min_confirmed` and (eligible faces > 0 or the project is still processing images), or the page came from a re-run (`?inference_triggered=1`). With nothing eligible at render time it starts hidden (`style="display:none"`), and the `/api/progress` poller is what makes it live: it reveals the card when a model cycle begins, hides it again between cycles, and shows "Model inference complete — N new matches found" only once `complete` **and** `pending_images == 0`, then stops. `N` is the growth of `model_matches` (target faces classified by the model); `by_model` also counts non-matches. A quiescent page stops after the first poll. Do not re-gate the card or its poller on "running right now". A page loaded while nothing was eligible used to show no live status at all, and once `images_processed == images_total` the progress poller is off too. The poller's live `SDC Pending` update must add `sdc_removal_pending_faces` to match the server-rendered combined figure. Two review-driven rules: the poller stops itself the moment the banner element is gone (a dismissed card must not leave a 5 s `/api/progress` loop), and the observed-work marker persists across the hidden gaps (eligible faces seen in any poll, or `by_model` growth since page load), so a cycle that finishes between two polls still finalizes the card instead of stopping silently.
 
 ### Toolforge health check (file-based liveness)
 Separate from the DB heartbeat above, each worker also writes a per-worker file at `$HOME/.wikivisage-worker-alive-{worker_id}` via `_touch_heartbeat_file()`. The `healthcheck.sh` script accepts a worker ID as `$1`, checks the file exists and was modified within 5 minutes (`find -mmin +5`). Toolforge's `--health-check-script` runs this every 10s; 3 consecutive failures trigger automatic pod restart. Per-worker files are critical because `$HOME` is shared NFS on Toolforge — a single file would be kept fresh by any surviving worker, hiding a dead one.
@@ -866,7 +876,7 @@ Both `app.py` and `worker.py` enforce a 50MB download size cap (`MAX_IMAGE_DOWNL
 The "Send Edits to Wikimedia Commons" button on the project detail page is the ONLY way SDC claims are written. The button sets `sdc_write_requested=1` on the project; the background worker picks this up on the next poll cycle and writes claims in batches. The web UI polls `/api/sdc-status/<id>` for progress. SDC writes run in the worker process, not the web process. Writes include `maxlag=5` for Wikimedia API compliance.
 
 Rejections and undos must never leave a stale P180 claim behind, including when they race a write run that already selected the face:
-- The worker re-reads each face's `is_target`/`superseded_by` right before the `wbeditentity` call and skips faces that changed; the same run's removal phase then clears `sdc_removal_pending` (and `sdc_written`) for those faces.
+- The worker re-reads each face's `is_target`/`superseded_by` right before the `wbeditentity` call and skips faces that changed; the same run's removal phase then clears `sdc_removal_pending` (and `sdc_written`) for those faces. After a successful write it sets `sdc_written=1` only `WHERE is_target = 1`; if the face was reset or undone in the sub-second window after the re-check, it queues `sdc_removal_pending=1` instead of leaving the freshly added claim orphaned. That recovery covers both non-target states: `is_target IS NULL` (classify undo) and `is_target = 0` (review undo), including a stop-then-undo interleaving where the undo route sees no in-flight write request and queues nothing itself. The idempotency-hit path (`already_exists`) marks `sdc_written=1` only for a still-target face and never queues a removal, because the claim predates this run and may not be ours to delete. The re-run route also refuses while `sdc_write_requested=1`.
 - The web side queues `sdc_removal_pending=1` for every rejection where no sibling target confirms the image (bootstrap faces and `sdc_written=0` faces included) and removes on-record claims for non-bootstrap written faces immediately (502 if that removal fails, so the rejection is not recorded).
 - Any transition back to `is_target = 1` (classify target, review approve, bbox redraw, worker bootstrap auto-classify and reconciliation) clears `sdc_removal_pending`, so a queued removal cannot strip the claim of a face that has become a target again. Model inference never creates such a transition: `run_autonomous_inference` skips faces with a queued removal, so a pending face stays unclassified until the queue is resolved and only then becomes eligible.
 - Undo removes the claim for faces with one on record (queueing on failure), queues unwritten targets only while a write run is active (`sdc_write_requested=1`, the only window where a claim can be in flight), and refuses to delete a manual face whose claim could not be removed first. Undoing a rejection ("none") is the opposite case and never deletes a claim: it cancels the removal the rejection queued (rejections only set the flag on bootstrapped images; on other images a queued flag predates the rejection — an earlier undo racing a write run — so it is kept for the worker to verify). Accepted residual: a manual face deleted in the same sub-second window between the worker's re-check and its `wbeditentity` call can still strand one claim; the re-check closes the realistic window.
@@ -876,7 +886,7 @@ Rejections and undos must never leave a stale P180 claim behind, including when 
 The project detail page includes approve/reject/edit-bbox controls on each Model Results gallery card. Key behaviors:
 - **Approve** (checkmark): Sets `is_target=1, classified_by='human'` via `/api/reclassify`. Updates card badge in-place.
 - **Reject** (X): Sets `is_target=0, classified_by='human'`. If the face had `sdc_written=1`, also removes the P180 depicts claim from Commons via `_remove_sdc_claim()` (uses `wbgetclaims` -> `wbremoveclaims`).
-- **Edit bbox** (pencil): Opens a modal with a 1280px image. User draws a new bounding box. Old face is kept; a new face row is inserted via `/api/update-face-bbox` (face encoding recomputed server-side; `faces.aligned` records whether the detector confirmed the box or the embedding fell back to an unaligned resize).
+- **Edit bbox** (pencil): Opens a modal with a 1280px image. User draws a new bounding box. Old face is kept; a new face row is inserted via `/api/update-face-bbox` (face encoding recomputed server-side; `faces.aligned` records whether the detector confirmed the box or the embedding fell back to an unaligned resize). Drawing works with mouse **and touch**: the drawing area listens to `touchstart`/`touchmove`/`touchend` on top of the mouse handlers and sets `touch-action: none`, so a finger drag draws instead of scrolling the page (it was desktop-only before); the geometry (scale + offsets) is measured from the live layout on every event and re-placed on `resize`/`orientationchange`, so rotating the phone mid-modal does not skew the box. `touchcancel` aborts the drag and restores the previous box instead of committing a partial one. The modal body scrolls and the image is capped at 50vh below 600px so the image, hint and Save button fit on a phone.
 - **Unreadable image**: if the face service rejects the image itself (`FaceServiceRejected` with `error_code: invalid_image`, which `encode_known_face` re-raises), both `/api/manual-face` and `/api/update-face-bbox` return **422** with "This image could not be read by the face detection service." (retryable service failures stay 503; box-level rejections still answer "draw a slightly larger box").
 - **Filter interaction**: After reclassification, `data-source` is NOT changed — the card remains visible under its original source filter (Model/Bootstrap). Only the visible method label updates to "human".
 - **State sync**: the reclassify success handler refreshes `data-sdc-written` from the response's `sdc_written` (the authoritative post-action value — reject always clears it, approve may set it when the P180 check finds the claim already on Commons) and computes the "send pending" badge from it, so a reject-then-approve cannot keep a stale written flag. The removal counter is decremented only when the card actually carried a queued removal; a synchronous removal (`sdc_removed`) shows the note without touching the counters, which keeps them consistent with the server stats between reloads.
@@ -972,17 +982,29 @@ test_db (session) → creates/drops wikiface_test DB
 
 ### CI (`.github/workflows/ci.yml`)
 
-Runs on push/PR to `main`. Five jobs:
+Runs on push/PR to `main`. Six jobs:
 
 1. **Lint**: Ruff check + format check (Python 3.11; Ruff is version-pinned in the workflow so a new Ruff release cannot turn the job red on unchanged code), then `scripts/check_no_lfs.sh` — fails if `.gitmodules` exists, a weight file is routed through the LFS filter, or a weight file is an LFS pointer.
 2. **Test**: `pytest --tb=short -q` on Python 3.11 and 3.15 matrix. Integration tests auto-skipped (no `WIKIVISAGE_TEST_DB` env var in CI); the face-service unit and contract files skip too (no ML stack here). No system deps needed — the ML stack lives in the face service, and the suite mocks `face_client` rather than reaching the network. Caches pip dependencies.
 3. **Face service (backend + model unit tests)** (`face-service-unit`): verifies `model-server/weights/SHA256SUMS`, installs `model-server/requirements.txt` + dev requirements on Python 3.11, and runs `test_face_service_backend.py` and `test_face_service_model.py` with `WIKIVISAGE_REQUIRE_SAMPLE=1`.
 4. **Face service** (`face-service`): verifies `SHA256SUMS`, builds `model-server/` with buildx (gha layer cache), starts the container **with a random token**, waits for readiness, runs the contract tests through the guard, and fails if the service log contains ONNX Runtime `VerifyOutputSizes` warnings. It builds the Dockerfile.
 5. **Face service (Toolforge buildpack)** (`face-service-buildpack`): verifies `SHA256SUMS`, builds `model-server/` with `pack` and Toolforge's own builder (`tools-harbor.wmcloud.org/toolforge/heroku-builder:24_0.21.8`, buildpacks `heroku/python` + `heroku/procfile` only — no deb packages are needed) — the production image — starts it via the `web` Procfile entry on port 8000 with `TOOL_TOOLFORGE_API_URL` set (so the fail-closed token check is live), and runs the same contract tests and log check. Catches `requirements.txt` / `Procfile` breakage that only affects the buildpack path.
+6. **Bbox editor** (`browser`): installs the optional `requirements-browser.txt` and Chromium/WebKit, then runs `test_bbox_editor_browser.py` with `WIKIVISAGE_BROWSER_TESTS=1`. It renders the real Flask page with mocked DB/gallery/thumbnail responses and exercises the DOM events and layout, including multi-touch cancellation, rotation and landscape scrolling. The plain suite skips these tests; production never installs Playwright.
 
-The contract tests need `tests/data/portrait_sample.jpg` (CI sets `WIKIVISAGE_REQUIRE_SAMPLE=1`). The sample is committed, so the three jobs run the real-face tests rather than failing by design.
+The contract tests need `tests/data/portrait_sample.jpg` (CI sets `WIKIVISAGE_REQUIRE_SAMPLE=1`). The sample is committed, so the three face-service jobs run the real-face tests rather than failing by design.
 
 Concurrency: `ci-${{ github.ref }}` with cancel-in-progress.
+
+### Dependency audit (`.github/workflows/audit.yml`)
+
+Runs on push/PR to `main` when a requirements file changes, every Monday at 06:17 UTC, and on `workflow_dispatch`. Python 3.11 (the face service lock cannot resolve on 3.15 — `kserve` requires `<3.14`).
+
+1. `pip-audit -r requirements.txt` and `pip-audit -r model-server/requirements.txt`; any known vulnerability fails the run. pip-audit is version-pinned like Ruff.
+2. `uv pip compile` (uv pinned to 0.13.5, the version Dependabot ships) regenerates `model-server/requirements.txt` in place and `git diff --exit-code` fails when the committed lock is not what `requirements.in` produces — a hand-edit, an unresolved merge, or a Dependabot PR that did not regenerate. The recipe is in `TESTING.md` §7.
+
+A CVE with no fixed release yet is suppressed with `--ignore-vuln <ID>` on the affected `pip-audit` line, with the ID and a review date in a comment; remove it when a fix lands.
+
+**Dependabot** (`.github/dependabot.yml`) watches root `pip`, `model-server` `uv` and `github-actions`, weekly. The face service entry is grouped into one PR because its transitive lock has to move as a unit, and the uv ecosystem reads `requirements.in` and regenerates `requirements.txt`. The Dockerfile is deliberately not watched: production builds from the Toolforge buildpack (which resolves the latest Python 3.11 patch on every build), so the Dockerfile only affects local development and the CI image job.
 
 ### CD (`.github/workflows/deploy.yml`)
 
@@ -999,7 +1021,8 @@ Steps (one job, `contents: write` for the tag push):
 3. Upload `lib.sh` (shared `build_and_wait`, prints `toolforge build quota` on failure), `deploy-face.sh`, `deploy.sh` to a per-run directory on the bastion.
 4. **Check configuration** — `toolforge envvars show` on both tools (face token; main URL + token) before either is touched.
 5. **`become $FACE_TOOL`** — builds `face-service-<tag>`, recreates the `face-service` job (`--command web --continuous --port 8000 --publish --mount=none --mem 3Gi --cpu 2 --health-check-http /v1/models/wikivisage`), waits up to 10 min for public readiness.
-6. **`become wikivisage`** — builds the release tag, deletes both workers, runs `migrate`, restarts the webservice, then the **preflight**: polls `/health` until `face_service: reachable` (URL + token checked). Only then starts `ml-worker` / `ml-worker-2` (`--mem 2Gi --cpu 2`, `healthcheck.sh`). `dologmsg` to SAL.
+6. **`become wikivisage`** — builds the release tag, deletes both workers, runs `migrate`, restarts the webservice, then the **preflight**: polls `/health` until `face_service: reachable` (URL + token checked). Only then starts `ml-worker` / `ml-worker-2` (`--mem 2Gi --cpu 2`, `healthcheck.sh`). `dologmsg` to SAL, best-effort: both deploy scripts call `log_to_sal()`, which warns and continues when `dologmsg` is missing, fails or hangs (20 s cap) — a SAL outage must not fail a deploy that already succeeded.
+7. **Summary** (`if: always()`) — writes the job result (`✅ success` / `❌ failed` / `⚠️ cancelled` from `job.status`), the per-step outcomes of `deploy_face` and `deploy_web` (`steps.<id>.outcome`; a step is `skipped` when an earlier step failed, `not run` when the job never reached it), plus tag, DB-reset flag, face tool/ref and actor to `$GITHUB_STEP_SUMMARY`.
 
 Concurrency: `deploy-production` with `cancel-in-progress: false`.
 

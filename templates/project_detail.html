@@ -189,7 +189,7 @@
     .modal-body {
         padding: 1rem;
         flex: 1;
-        overflow: hidden;
+        overflow-y: auto;
         display: flex;
         flex-direction: column;
         align-items: center;
@@ -197,10 +197,16 @@
     .drawing-area {
         position: relative;
         display: inline-block;
+        flex-shrink: 0;
         max-width: 100%;
         max-height: 100%;
         overflow: hidden;
         user-select: none;
+        -webkit-user-select: none;
+        -webkit-touch-callout: none;
+        /* Touch drawing: the browser must not pan/zoom the page while a
+           finger is dragging a box (the JS also preventDefaults). */
+        touch-action: none;
     }
     .drawing-area img {
         max-width: 100%;
@@ -495,6 +501,13 @@
         .sdc-title { font-size: 1rem; letter-spacing: 0.04em; }
         .progress-text { font-size: 0.75rem; letter-spacing: 0.05em; }
         .sdc-progress-text { font-size: 0.7rem; letter-spacing: 0.03em; }
+        /* Bounding-box editor: keep the image, hint and buttons inside the
+           viewport without the body clipping them. */
+        .modal-content { width: 96vw; max-height: 94vh; }
+        .modal-body { padding: 0.75rem; }
+        .modal-instructions { font-size: 0.8rem; margin-bottom: 0.75rem; }
+        .drawing-area img { max-height: 50vh; }
+        .modal-actions { margin-top: 0.75rem; }
     }
 </style>
 <script nonce="{{ csp_nonce }}" src="{{ url_for('static', filename='wikivisage-common.js') }}"></script>
@@ -826,7 +839,7 @@
         </div>
         <div class="modal-body">
             <p class="modal-instructions">
-                {{ _('Click and drag on the image to draw a new bounding box.') }}
+                {{ _('Drag on the image to draw a new bounding box.') }}
                 <a id="modalCommonsLink" href="" target="_blank" rel="noopener" class="modal-commons-link">{{ _('View on Commons') }} &rarr;</a>
             </p>
             <div class="drawing-area" id="drawingArea">
@@ -1019,11 +1032,10 @@
 
     var currentEditFaceId = null;
     var isDrawing = false;
+    var drawTouchId = null;
     var drawStartX = 0, drawStartY = 0;
     var currentBbox = null;
-    var imgScale = 1;
-    var imgOffsetX = 0;
-    var imgOffsetY = 0;
+    var currentOldBbox = null;
     var bboxTriggerElement = null;
 
     /**
@@ -1121,42 +1133,26 @@
         document.getElementById('modalCommonsLink').href = 'https://commons.wikimedia.org/wiki/File:' + encodeURIComponent(fileTitle);
         
         currentBbox = null;
+        currentOldBbox = null;
         document.getElementById('drawingBox').style.display = 'none';
         document.getElementById('saveBboxBtn').disabled = true;
         document.getElementById('oldBbox').style.display = 'none';
         
         img.onload = function() {
             img.style.opacity = '1';
-            var containerW = img.parentElement.clientWidth;
-            var containerH = img.parentElement.clientHeight;
-            /* Use detection dimensions for scaling — bbox coords are stored
+            /* Use detection dimensions for the math — bbox coords are stored
                at the resolution the worker used for face detection, not the
                thumbnail resolution loaded in this modal. */
-            var detW = parseInt(thumb.dataset.detectionWidth) || img.naturalWidth;
-            var detH = parseInt(thumb.dataset.detectionHeight) || img.naturalHeight;
-            imgScale = Math.min(containerW / detW, containerH / detH);
-            var renderedW = detW * imgScale;
-            var renderedH = detH * imgScale;
-            imgOffsetX = (containerW - renderedW) / 2;
-            imgOffsetY = (containerH - renderedH) / 2;
-            /* Store detection dims for mousedown/mousemove boundary checks */
-            img._detW = detW;
-            img._detH = detH;
-            
-            var oldBbox = {
+            img._detW = parseInt(thumb.dataset.detectionWidth) || img.naturalWidth;
+            img._detH = parseInt(thumb.dataset.detectionHeight) || img.naturalHeight;
+            currentOldBbox = {
                 top: parseInt(thumb.dataset.bboxTop),
                 right: parseInt(thumb.dataset.bboxRight),
                 bottom: parseInt(thumb.dataset.bboxBottom),
                 left: parseInt(thumb.dataset.bboxLeft)
             };
-            
-            var oldBox = document.getElementById('oldBbox');
-            var oldRect = bboxToDisplayRect(oldBbox, imgScale, imgScale, imgOffsetX, imgOffsetY);
-            oldBox.style.left = oldRect.left + 'px';
-            oldBox.style.top = oldRect.top + 'px';
-            oldBox.style.width = oldRect.width + 'px';
-            oldBox.style.height = oldRect.height + 'px';
-            oldBox.style.display = 'block';
+            positionOldBbox();
+            document.getElementById('oldBbox').style.display = 'block';
         };
         
         /* Set src AFTER onload handler is attached so the callback
@@ -1173,6 +1169,10 @@
         var img = document.getElementById('modalImg');
         img.onload = null;
         img.src = '';
+        isDrawing = false;
+        drawTouchId = null;
+        currentBbox = null;
+        currentOldBbox = null;
         currentEditFaceId = null;
         if (bboxTriggerElement) { bboxTriggerElement.focus(); bboxTriggerElement = null; }
     }
@@ -1186,75 +1186,187 @@
     var drawingArea = document.getElementById('drawingArea');
     var drawingBox = document.getElementById('drawingBox');
 
-    drawingArea.addEventListener('mousedown', function(e) {
-        if (e.button !== 0) return;
-        var rect = drawingArea.getBoundingClientRect();
-        var clickX = e.clientX - rect.left;
-        var clickY = e.clientY - rect.top;
-        
+    /* Mouse and touch both drive the drawing. Coordinates and scale come from
+       the live layout on every event (never cached at load): a rotation, a
+       window resize or a scrolled modal body changes the rendered image size,
+       and the overlay and drawing math must follow it. */
+    function bboxPoint(e) {
+        if (e.touches) {
+            var touches = e.type === 'touchend' ? e.changedTouches : e.touches;
+            for (var i = 0; i < touches.length; i++) {
+                if (drawTouchId === null || touches[i].identifier === drawTouchId) {
+                    return { x: touches[i].clientX, y: touches[i].clientY };
+                }
+            }
+            return null;
+        }
+        if (drawTouchId !== null) return null;
+        return { x: e.clientX, y: e.clientY };
+    }
+
+    /* Rendered image box inside the drawing area, in container coordinates.
+       Uses the detection size stored on the img so the scale is correct even
+       when the modal loads a larger thumbnail than the detection pass did. */
+    function bboxGeometry() {
         var img = document.getElementById('modalImg');
-        var detW = img._detW || img.naturalWidth;
-        var detH = img._detH || img.naturalHeight;
-        var renderedW = detW * imgScale;
-        var renderedH = detH * imgScale;
-        
-        if (clickX < imgOffsetX || clickX > imgOffsetX + renderedW ||
-            clickY < imgOffsetY || clickY > imgOffsetY + renderedH) {
+        var detW = img._detW || img.naturalWidth || 0;
+        var detH = img._detH || img.naturalHeight || 0;
+        var areaRect = drawingArea.getBoundingClientRect();
+        var imgRect = img.getBoundingClientRect();
+        if (detW === 0 || detH === 0 || imgRect.width === 0 || imgRect.height === 0) return null;
+        return {
+            scaleX: imgRect.width / detW,
+            scaleY: imgRect.height / detH,
+            left: imgRect.left - areaRect.left,
+            top: imgRect.top - areaRect.top,
+            width: imgRect.width,
+            height: imgRect.height
+        };
+    }
+
+    function positionOldBbox() {
+        var geom = bboxGeometry();
+        if (!currentOldBbox || !geom) return;
+        var rect = bboxToDisplayRect(currentOldBbox, geom.scaleX, geom.scaleY, geom.left, geom.top);
+        var oldBox = document.getElementById('oldBbox');
+        oldBox.style.left = rect.left + 'px';
+        oldBox.style.top = rect.top + 'px';
+        oldBox.style.width = rect.width + 'px';
+        oldBox.style.height = rect.height + 'px';
+    }
+
+    /* Re-place an already-drawn new box after the layout changed. The box is
+       stored in detection space, so it survives a resize/rotation even though
+       its on-screen pixels do not. */
+    function positionDrawnBbox() {
+        var geom = bboxGeometry();
+        if (!currentBbox || !geom) return false;
+        var rect = bboxToDisplayRect(currentBbox, geom.scaleX, geom.scaleY, geom.left, geom.top);
+        drawingBox.style.left = rect.left + 'px';
+        drawingBox.style.top = rect.top + 'px';
+        drawingBox.style.width = rect.width + 'px';
+        drawingBox.style.height = rect.height + 'px';
+        drawingBox.style.display = 'block';
+        return true;
+    }
+
+    function startBboxDraw(e) {
+        if (e.touches && e.touches.length > 1) {
+            abortBboxDraw();
             return;
         }
-        
+        if (isDrawing) return;
+        if (e.type === 'mousedown' && e.button !== 0) return;
+
+        var geom = bboxGeometry();
+        if (!geom) return;
+        var rect = drawingArea.getBoundingClientRect();
+        var point = bboxPoint(e);
+        if (!point) return;
+        var clickX = point.x - rect.left;
+        var clickY = point.y - rect.top;
+
+        if (clickX < geom.left || clickX > geom.left + geom.width ||
+            clickY < geom.top || clickY > geom.top + geom.height) {
+            return;
+        }
+
+        /* Stop the browser panning/zooming the page while a finger draws. */
+        if (e.cancelable) e.preventDefault();
+
         isDrawing = true;
+        drawTouchId = e.touches ? e.touches[0].identifier : null;
+        /* A new drag replaces whatever box was drawn before; Save must not
+           keep pointing at the old one. */
+        currentBbox = null;
+        document.getElementById('saveBboxBtn').disabled = true;
         drawStartX = clickX;
         drawStartY = clickY;
-        
+
         drawingBox.style.left = drawStartX + 'px';
         drawingBox.style.top = drawStartY + 'px';
         drawingBox.style.width = '0px';
         drawingBox.style.height = '0px';
         drawingBox.style.display = 'block';
         document.getElementById('oldBbox').style.display = 'none';
-    });
+    }
 
-    document.addEventListener('mousemove', function(e) {
+    function moveBboxDraw(e) {
         if (!isDrawing) return;
+        if (e.touches && e.touches.length > 1) {
+            abortBboxDraw();
+            return;
+        }
+        if (e.cancelable) e.preventDefault();
+
+        var geom = bboxGeometry();
+        if (!geom) return;
         var rect = drawingArea.getBoundingClientRect();
-        var currentX = e.clientX - rect.left;
-        var currentY = e.clientY - rect.top;
-        
-        var img = document.getElementById('modalImg');
-        var detW = img._detW || img.naturalWidth;
-        var detH = img._detH || img.naturalHeight;
-        var renderedW = detW * imgScale;
-        var renderedH = detH * imgScale;
-        
-        currentX = Math.max(imgOffsetX, Math.min(currentX, imgOffsetX + renderedW));
-        currentY = Math.max(imgOffsetY, Math.min(currentY, imgOffsetY + renderedH));
-        
+        var point = bboxPoint(e);
+        if (!point) return;
+        var currentX = point.x - rect.left;
+        var currentY = point.y - rect.top;
+
+        currentX = Math.max(geom.left, Math.min(currentX, geom.left + geom.width));
+        currentY = Math.max(geom.top, Math.min(currentY, geom.top + geom.height));
+
         var x = Math.min(drawStartX, currentX);
         var y = Math.min(drawStartY, currentY);
         var w = Math.abs(currentX - drawStartX);
         var h = Math.abs(currentY - drawStartY);
-        
+
         drawingBox.style.left = x + 'px';
         drawingBox.style.top = y + 'px';
         drawingBox.style.width = w + 'px';
         drawingBox.style.height = h + 'px';
-    });
+    }
 
-    document.addEventListener('mouseup', function(e) {
+    /* Abort an in-flight drag without committing a box (touch cancel, or a
+       viewport change that invalidates the start point). */
+    function abortBboxDraw() {
         if (!isDrawing) return;
         isDrawing = false;
-        
+        drawTouchId = null;
+        drawingBox.style.display = 'none';
+        currentBbox = null;
+        document.getElementById('saveBboxBtn').disabled = true;
+        if (currentOldBbox) {
+            positionOldBbox();
+            document.getElementById('oldBbox').style.display = 'block';
+        }
+    }
+
+    function endBboxDraw(e) {
+        if (!isDrawing) return;
+        if (!bboxPoint(e)) return;
+        if (e.touches && e.touches.length > 0) {
+            abortBboxDraw();
+            return;
+        }
+        moveBboxDraw(e);
+        isDrawing = false;
+        drawTouchId = null;
+
+        var geom = bboxGeometry();
+        if (!geom) {
+            /* The image is not laid out (yet); do not leave a box that no
+               longer maps to a detection-space rectangle. */
+            drawingBox.style.display = 'none';
+            currentBbox = null;
+            document.getElementById('saveBboxBtn').disabled = true;
+            return;
+        }
+
         var w = parseFloat(drawingBox.style.width);
         var h = parseFloat(drawingBox.style.height);
-        
+
         if (w > 10 && h > 10) {
             var boxLeft = parseFloat(drawingBox.style.left);
             var boxTop = parseFloat(drawingBox.style.top);
-            
+
             currentBbox = displayRectToDetectionBbox(
                 { left: boxLeft, top: boxTop, width: w, height: h },
-                imgScale, imgScale, imgOffsetX, imgOffsetY
+                geom.scaleX, geom.scaleY, geom.left, geom.top
             );
             document.getElementById('saveBboxBtn').disabled = false;
         } else {
@@ -1263,7 +1375,33 @@
             currentBbox = null;
             document.getElementById('saveBboxBtn').disabled = true;
         }
-    });
+    }
+
+    /* The modal can outlive a rotation or a window resize. Geometry is read
+       live, but a drag started against the old layout is cancelled and the
+       drawn box (or the previous one) re-placed. */
+    function onBboxViewportChange() {
+        if (!document.getElementById('bboxModal').classList.contains('active')) return;
+        if (isDrawing) {
+            abortBboxDraw();
+        } else if (currentBbox !== null) {
+            if (!positionDrawnBbox()) drawingBox.style.display = 'none';
+            document.getElementById('oldBbox').style.display = 'none';
+        } else if (currentOldBbox) {
+            positionOldBbox();
+            document.getElementById('oldBbox').style.display = 'block';
+        }
+    }
+    window.addEventListener('resize', onBboxViewportChange);
+    window.addEventListener('orientationchange', onBboxViewportChange);
+
+    drawingArea.addEventListener('mousedown', startBboxDraw);
+    drawingArea.addEventListener('touchstart', startBboxDraw, { passive: false });
+    document.addEventListener('mousemove', moveBboxDraw);
+    document.addEventListener('touchmove', moveBboxDraw, { passive: false });
+    document.addEventListener('mouseup', endBboxDraw);
+    document.addEventListener('touchend', endBboxDraw);
+    document.addEventListener('touchcancel', abortBboxDraw);
 
     function saveNewBbox() {
         if (!currentEditFaceId || !currentBbox) return;
@@ -2133,6 +2271,7 @@
             done: {{ _('Model inference complete — {matches} new matches found.')|tojson }}
         };
         var initialByModel = {{ (stats.by_model or 0)|tojson }};
+        var initialModelMatches = {{ (stats.model_matches or 0)|tojson }};
 
         function pollInference() {
             if (inferencePollInFlight) return;
@@ -2201,7 +2340,7 @@
                     // Everything finished after observed work — show the completion note
                     clearInterval(inferenceTimer);
                     inferenceTimer = null;
-                    var newMatches = Math.max(0, (fs.by_model || 0) - initialByModel);
+                    var newMatches = Math.max(0, (fs.model_matches || 0) - initialModelMatches);
                     banner.classList.add('inference-banner-done');
                     var spinner = document.getElementById('inferenceSpinner');
                     if (spinner) spinner.outerHTML = '<span class="inference-done-icon" aria-hidden="true">✓</span>';

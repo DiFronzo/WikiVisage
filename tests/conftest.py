@@ -45,11 +45,14 @@ def pytest_collection_modifyitems(config, items):
     skip_contract = pytest.mark.skip(
         reason="Set WIKIVISAGE_FACE_SERVICE_CONTRACT=1 to run contract tests (requires a running face service)"
     )
+    skip_browser = pytest.mark.skip(reason="Set WIKIVISAGE_BROWSER_TESTS=1 to run Playwright browser tests")
     for item in items:
         if "integration" in item.keywords and not os.environ.get("WIKIVISAGE_TEST_DB"):
             item.add_marker(skip_integration)
         if "contract" in item.keywords and not os.environ.get("WIKIVISAGE_FACE_SERVICE_CONTRACT"):
             item.add_marker(skip_contract)
+        if "browser" in item.keywords and os.environ.get("WIKIVISAGE_BROWSER_TESTS") != "1":
+            item.add_marker(skip_browser)
 
 
 def require_sample_env() -> bool:
