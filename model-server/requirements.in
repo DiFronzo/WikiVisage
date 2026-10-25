@@ -27,10 +27,12 @@
 # Python 3.12 (it requires >=3.10,<3.14). Do not downgrade to 0.8.x: it pins
 # numpy~=1.19 / ray 1.9 / protobuf 3.19, none of which build on Python 3.12.
 kserve==0.21.0
-# kserve >=0.21 requires protobuf >=6.33.5,<7; onnxruntime requires >=4.25.8.
-# Keep this pinned so the lock stays on the tested protobuf line instead of
-# drifting to a major that breaks one of them.
-protobuf==6.33.6
+# protobuf is deliberately not pinned here. kserve >=0.21 already requires
+# >=6.33.5,<7 (onnxruntime requires >=4.25.8), so the lock cannot leave the
+# 6.33.x line; an explicit `protobuf==` line only gave Dependabot a requirement
+# to rewrite to 7.x, which can never resolve and failed the weekly uv run with
+# an unsatisfiable kserve/protobuf conflict. The tested version stays pinned in
+# requirements.txt, and .github/dependabot.yml ignores 7.x as a second layer.
 
 # --- Face detection and embedding ----------------------------------------
 # SCRFD-500M + ArcFace MobileFaceNet run on ONNX Runtime (CPU). The weights are

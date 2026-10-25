@@ -119,7 +119,6 @@ propcache==0.5.4
     #   yarl
 protobuf==6.33.6
     # via
-    #   -r requirements.in
     #   grpcio-tools
     #   kserve
     #   onnxruntime
