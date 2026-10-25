@@ -5,7 +5,7 @@ import face_client
 import liftwing_client
 
 
-def test_every_outbound_client_sends_the_same_user_agent():
+def test_every_outbound_client_sends_the_same_user_agent(flask_app):
     app_module = importlib.import_module("app")
     worker_module = importlib.import_module("worker")
 
