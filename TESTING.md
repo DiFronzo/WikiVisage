@@ -427,6 +427,13 @@ from dragging in unrelated upgrades. Run `pip-audit -r requirements.txt`
 afterwards; `--upgrade` without a package refreshes everything and is a
 separate change for the face-service jobs to test.
 
+One rule that is easy to get wrong: do not add a direct `protobuf==` line to
+`requirements.in`. `kserve` already caps it at `>=6.33.5,<7`, so the lock
+cannot leave the 6.33.x line, and the explicit pin only gives Dependabot a
+requirement to rewrite to a 7.x release — which can never resolve and fails the
+weekly `uv` run with an unsatisfiable kserve/protobuf conflict. The tested
+version is still pinned in `requirements.txt`.
+
 Dependabot's `uv` ecosystem updates `requirements.in` and regenerates
 `requirements.txt` in the same PR. If you resolve a conflict by hand, run the
 command above (without `--upgrade-package`) from `model-server/` and commit the

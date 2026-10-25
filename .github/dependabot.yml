@@ -24,9 +24,11 @@ updates:
         patterns:
           - "*"
     ignore:
-      # kserve 0.21.0 requires protobuf>=6.33.5,<7.0.0, so every probe for a
-      # protobuf 7.x release fails to resolve and shows up as unknown_error in
-      # the weekly run. 6.33.x updates (including security patches) still flow;
+      # kserve 0.21.0 requires protobuf>=6.33.5,<7.0.0, so any update to a 7.x
+      # release is unsatisfiable and shows up as unknown_error in the weekly
+      # run. protobuf is no longer a direct requirement in requirements.in
+      # (that exact pin was what Dependabot rewrote to 7.36.2), so this rule is
+      # the second layer for the transitive pin. 6.33.x updates still flow;
       # remove this rule once a kserve release allows protobuf 7.
       - dependency-name: "protobuf"
         versions: [">=7.0.0"]

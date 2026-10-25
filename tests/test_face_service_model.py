@@ -135,6 +135,20 @@ def test_requirements_drop_dlib_and_pin_the_onnx_stack():
     assert "setuptools" not in (MODEL_SERVER / "requirements.in").read_text()
 
 
+def test_protobuf_is_a_transitive_pin_only():
+    """No ``protobuf==`` line in requirements.in.
+
+    kserve 0.21.0 already caps protobuf at >=6.33.5,<7, so a direct pin adds
+    nothing but gives Dependabot a requirement to rewrite to 7.36.2, which can
+    never resolve and failed the weekly uv run. The tested version stays pinned
+    in requirements.txt.
+    """
+    manifest = (MODEL_SERVER / "requirements.in").read_text()
+    direct = {line.split("#")[0].strip() for line in manifest.splitlines()} - {""}
+    assert not any(req.startswith("protobuf") for req in direct)
+    assert "\nprotobuf==" in (MODEL_SERVER / "requirements.txt").read_text()
+
+
 def test_no_deb_packages_are_needed():
     assert not (MODEL_SERVER / "project.toml").exists()
     dockerfile = (MODEL_SERVER / "Dockerfile").read_text()
