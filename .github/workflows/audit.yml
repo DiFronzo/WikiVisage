@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
     paths:
+      - "requirements.in"
       - "requirements.txt"
       - "model-server/requirements.in"
       - "model-server/requirements.txt"
@@ -11,6 +12,7 @@ on:
   pull_request:
     branches: [main]
     paths:
+      - "requirements.in"
       - "requirements.txt"
       - "model-server/requirements.in"
       - "model-server/requirements.txt"
@@ -37,18 +39,18 @@ jobs:
       - uses: actions/checkout@v7
 
       # pip-audit resolves the lock at the interpreter's version, and the face
-      # service lock targets 3.11; auditing on 3.15 would fail to resolve
+      # service lock targets 3.12; auditing on 3.15 would fail to resolve
       # kserve (Requires-Python <3.14).
       - uses: actions/setup-python@v7
         with:
-          python-version: "3.11"
+          python-version: "3.12"
 
       # Pinned like Ruff: a new pip-audit release must not turn CI red on
       # unchanged code.
       - name: Install pip-audit
         run: pip install "pip-audit==2.10.1"
 
-      # Two dependency sets: the web/worker stack and the face service, which
+      # Two dependency sets (both fully pinned locks): the web/worker stack and the face service, which
       # parses untrusted images with Pillow/OpenCV/ONNX Runtime. A known CVE in
       # either one fails the run (pip-audit exits non-zero).
       - name: Audit dependencies
@@ -72,6 +74,15 @@ jobs:
       - name: Verify the face service lock is current
         working-directory: model-server
         run: |
-          uv pip compile --python-version 3.11 --python-platform x86_64-manylinux_2_28 \
+          uv pip compile --python-version 3.12 --python-platform x86_64-manylinux_2_28 \
             requirements.in -o requirements.txt
+          git diff --exit-code -- requirements.txt
+
+      # The root lock is generated too. It is constrained by the face service
+      # lock (-c) so the packages both files pin cannot drift apart; that is why
+      # this step runs after the face service lock was verified above.
+      - name: Verify the root lock is current
+        run: |
+          uv pip compile --universal --python-version 3.12 \
+            -c model-server/requirements.txt requirements.in -o requirements.txt
           git diff --exit-code -- requirements.txt

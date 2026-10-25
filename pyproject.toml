@@ -1,10 +1,10 @@
 [project]
 name = "wikivisage"
-version = "0.11.5"
-requires-python = ">=3.11"
+version = "0.11.6"
+requires-python = ">=3.12"
 
 [tool.ruff]
-target-version = "py311"
+target-version = "py312"
 line-length = 120
 
 [tool.ruff.lint]
@@ -17,6 +17,7 @@ select = [
     "B",    # flake8-bugbear
     "SIM",  # flake8-simplify
     "S",    # flake8-bandit (security)
+    "C90",  # mccabe complexity, a ratchet: see max-complexity below
 ]
 ignore = [
     "E501",   # line too long (handled by formatter)
@@ -24,12 +25,8 @@ ignore = [
     "S101",   # assert used (needed in tests)
     "S105",   # possible hardcoded password — false positives on URL constants and test fixtures
     "S110",   # try-except-pass — intentional for connection cleanup and non-critical ops
-    "S112",   # try-except-continue — intentional in worker queue polling
-    "S201",   # debug=True in Flask — only in __main__ dev block
     "S311",   # random.choice — not crypto, just shuffling images for classification
     "S324",   # md5 — required by Commons thumbnail URL scheme
-    "S603",   # subprocess call without shell=True check — worker uses subprocess intentionally
-    "S607",   # starting process with partial path
     "S608",   # SQL injection — false positives, we build placeholder lists not values
     "S104",   # binding to all interfaces — only in __main__ dev block
     "B904",   # raise from — would be noisy to fix across pool/worker error handling
@@ -39,6 +36,13 @@ ignore = [
     "SIM108", # ternary operator — multi-line if/else is clearer in test fixtures
     "SIM117", # multiple with statements — nested with is clearer for our DB patterns
 ]
+
+[tool.ruff.lint.mccabe]
+# A ratchet, not a target: it is set to the worst function that exists today, so
+# it only stops NEW giants. Lower it each time a refactor lands (target: 15) and
+# never raise it. History: 70 (worker.write_sdc_claims was 68) -> 30 (the app.py
+# routes project_new and api_undo_classify) -> 20 (run_autonomous_inference).
+max-complexity = 20
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["S101", "S105", "S106", "S314"]
@@ -51,3 +55,31 @@ markers = [
     "contract: tests requiring a running face service (Docker)",
     "browser: tests requiring Playwright browsers (WIKIVISAGE_BROWSER_TESTS=1)",
 ]
+
+# Type checking covers the small, dependency-light modules first; app.py and
+# worker.py join once their large functions are split. CI pins the mypy version.
+[tool.mypy]
+python_version = "3.12"
+files = [
+    "config.py",
+    "token_crypto.py",
+    "redis_lock.py",
+    "database.py",
+    "face_client.py",
+    "liftwing_client.py",
+    "oauth_refresh.py",
+    "api_errors.py",
+]
+ignore_missing_imports = true
+follow_imports = "silent"
+warn_unused_ignores = true
+warn_redundant_casts = true
+
+[tool.coverage.run]
+source = ["."]
+omit = ["tests/*", "model-server/*", "scripts/*", "venv/*", ".venv/*"]
+
+[tool.coverage.report]
+# Whole-project gate; scripts/check_coverage_floors.py adds a floor per module.
+fail_under = 91
+exclude_also = ["if __name__ == .__main__.:", "pragma: no cover"]

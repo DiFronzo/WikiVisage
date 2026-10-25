@@ -1,6 +1,10 @@
 version: 2
 updates:
-  - package-ecosystem: "pip"
+  # The root requirements.txt is a uv lock generated from requirements.in (see
+  # its header), like the face service one, so it uses the uv ecosystem too. If a
+  # Dependabot PR does not regenerate it with the header command (which includes
+  # the face service lock as a constraint), audit.yml fails the PR.
+  - package-ecosystem: "uv"
     directory: "/"
     schedule:
       interval: "weekly"
@@ -19,6 +23,13 @@ updates:
       face-service:
         patterns:
           - "*"
+    ignore:
+      # kserve 0.21.0 requires protobuf>=6.33.5,<7.0.0, so every probe for a
+      # protobuf 7.x release fails to resolve and shows up as unknown_error in
+      # the weekly run. 6.33.x updates (including security patches) still flow;
+      # remove this rule once a kserve release allows protobuf 7.
+      - dependency-name: "protobuf"
+        versions: [">=7.0.0"]
 
   - package-ecosystem: "github-actions"
     directory: "/"

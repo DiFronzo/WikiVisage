@@ -4,7 +4,7 @@
 
 <p align="center">
         <a href="https://www.python.org/">
-                <img alt="Python" src="https://img.shields.io/badge/python-3.11%2B-blue?style=for-the-badge" />
+                <img alt="Python" src="https://img.shields.io/badge/python-3.12%2B-blue?style=for-the-badge" />
         </a>
         <a href="https://flask.palletsprojects.com/">
                 <img alt="Framework" src="https://img.shields.io/badge/flask-web-black?style=for-the-badge" />
@@ -107,7 +107,7 @@ Active learning facial recognition for Wikimedia Commons. Train an ML model to r
                         +------------+
 ```
 
-- 🧰 **Stack**: Python 3.11+, Flask, gunicorn, PyMySQL, requests-oauthlib — plus KServe + ONNX Runtime + OpenCV, isolated in the face service
+- 🧰 **Stack**: Python 3.12+ (tested on 3.12 and 3.15.1), Flask, gunicorn, PyMySQL, requests-oauthlib — plus KServe + ONNX Runtime + OpenCV in the face service
 - ☁️ **Hosted on**: [Wikimedia Toolforge](https://wikitech.wikimedia.org/wiki/Help:Toolforge) — `wikivisage` (web + workers) and `wikivisage-face` (face service)
 - 🔀 **Workers**: Multiple instances run concurrently — each claims projects via `SELECT … FOR UPDATE` with automatic stale-claim expiry (15 min)
 
@@ -128,15 +128,15 @@ WikiVisage/
 │   └── requirements.txt # kserve, onnxruntime, opencv-python-headless
 ├── token_crypto.py      # Fernet encrypt/decrypt helpers for OAuth tokens at rest
 ├── database.py          # MariaDB connection pool with retry logic
-├── schema.sql           # Database schema (10 tables + indices)
+├── schema.sql           # Database schema (9 tables + indices)
 ├── migrate.py           # Idempotent migration script with --reset flag
-├── jobs.yaml            # Toolforge jobs definition (2 worker instances)
 ├── templates/           # Jinja2 templates (10 files, all extend base.html)
-├── static/              # Logos + screenshots
+├── static/              # Logos, icons + service worker
 ├── translations/        # i18n: en, nb, es, fr
-├── requirements.txt     # Runtime dependencies (no ML libraries)
+├── requirements.in      # Top-level runtime dependencies
+├── requirements.txt     # Pinned lock generated from requirements.in (no ML libraries)
 ├── requirements-dev.txt # Dev/test deps (pytest, ruff)
-└── tests/               # Hybrid suite: 1059 tests (993 unit, 38 integration, 28 face-service/contract)
+└── tests/               # Hybrid suite: unit + integration + contract tests
 ```
 
 ## 🧑‍💻 Setup
@@ -198,8 +198,16 @@ toolforge build start https://github.com/DiFronzo/WikiVisage.git
 # Start web service
 toolforge webservice buildservice start
 
-# Start background workers (uses jobs.yaml — 2 worker instances)
-toolforge jobs load jobs.yaml
+# Start background workers (2 worker instances)
+toolforge jobs run ml-worker \
+  --command 'python -u worker.py --worker-id ml-worker-1' \
+  --image tool-wikivisage/tool-wikivisage:latest \
+  --continuous --mem 2Gi --cpu 2 --health-check-script './healthcheck.sh ml-worker-1'
+
+toolforge jobs run ml-worker-2 \
+  --command 'python -u worker.py --worker-id ml-worker-2' \
+  --image tool-wikivisage/tool-wikivisage:latest \
+  --continuous --mem 2Gi --cpu 2 --health-check-script './healthcheck.sh ml-worker-2'
 ```
 
 The app will be live at `https://<toolname>.toolforge.org`.

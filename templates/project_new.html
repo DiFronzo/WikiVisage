@@ -20,7 +20,7 @@
                 <label for="commons_category">{{ _('Commons Category') }}</label>
                 <div style="display: flex; gap: 0.5rem; align-items: start;">
                     <input type="text" id="commons_category" name="commons_category" value="{{ commons_category or '' }}" placeholder="Douglas Adams" required style="flex: 1;">
-                    <button type="button" id="check-category-btn" class="btn btn-sm" style="white-space: nowrap; margin-top: 2px;" onclick="checkCategory()">{{ _('Check') }}</button>
+                    <button type="button" id="check-category-btn" class="btn btn-sm" style="white-space: nowrap; margin-top: 2px;">{{ _('Check') }}</button>
                 </div>
                 <div class="help-text">{{ _('Category name without the "Category:" prefix') }}</div>
                 <div id="category-info" style="display: none; margin-top: 0.5rem; padding: 0.75rem 1rem; font-size: 0.875rem; border-left: 3px solid var(--primary); background: rgba(20, 184, 166, 0.05);"></div>
@@ -146,6 +146,8 @@ function checkCategory() {
         })
         .finally(function() { btn.disabled = false; });
 }
+
+document.getElementById('check-category-btn').addEventListener('click', checkCategory);
 
 document.getElementById('commons_category').addEventListener('input', function() {
     document.getElementById('submit-btn').disabled = false;

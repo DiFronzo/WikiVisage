@@ -6,7 +6,7 @@ Thanks for your interest in contributing to WikiVisage! This guide covers how to
 
 ### Prerequisites
 
-- Python 3.11+
+- Python 3.12+
 - Docker (for MariaDB and the face service)
 
 ### 1. Clone and install dependencies
@@ -86,17 +86,16 @@ The landing page and `/health` endpoint work without OAuth. See [test-local.md](
 | `scripts/` | `fetch_weights.sh` (re-create/verify the weights), `check_no_lfs.sh` (CI guard), `eval_prefilter.py` (pre-filter readout) |
 | `token_crypto.py` | Fernet encrypt/decrypt helpers for OAuth tokens at rest |
 | `database.py` | MariaDB connection pool with retry logic |
-| `schema.sql` | DDL for 10 tables + indexes |
+| `schema.sql` | DDL for 9 tables + indexes |
 | `migrate.py` | Idempotent schema migrations with `--reset` flag |
 | `templates/` | Jinja2 templates (10 files, all extend `base.html`) |
 | `translations/` | i18n files (en, nb, es, fr) |
 | `tests/` | Hybrid test suite: unit + integration + contract tests |
-| `jobs.yaml` | Toolforge jobs definition (2 worker instances) |
 | `Procfile` | Gunicorn web + worker process definitions |
 | `pyproject.toml` | Ruff config, pytest config, project metadata |
-| `requirements.txt` | Runtime dependencies |
+| `requirements.in` / `requirements.txt` | Runtime dependencies: edit the `.in`, then regenerate the lock (command in its header); never hand-edit the `.txt` |
 | `requirements-dev.txt` | Dev/test deps (pytest, pytest-cov, ruff) |
-| `.github/workflows/` | CI (lint, tests on Python 3.11/3.15, face-service Docker/buildpack jobs) and CD (release-triggered deploy of both Toolforge tools) |
+| `.github/workflows/` | CI (lint, tests on Python 3.12/3.15.1, face-service Docker/buildpack jobs) and CD (release-triggered deploy of both Toolforge tools) |
 | `SECURITY.md` | Vulnerability reporting policy |
 | `TESTING.md` | Face service: build, run, verify, troubleshoot |
 
@@ -107,13 +106,13 @@ The landing page and `/health` endpoint work without OAuth. See [test-local.md](
 - Use type hints and f-strings.
 - All database queries use `%s` parameterized placeholders (PyMySQL). Never interpolate **values** into SQL via f-strings. F-strings are acceptable for structural SQL (e.g., building `IN (%s, %s, %s)` placeholder lists from `",".join(["%s"] * len(ids))`).
 - Use `execute_query()` for reads and simple writes, `execute_insert()` for INSERTs needing `lastrowid`, and `execute_transaction()` for atomic multi-statement mutations.
-- Ruff is configured in `pyproject.toml` for linting and formatting (line-length 120, target py311). Run `ruff check .` and `ruff format --check .` before submitting.
+- Ruff is configured in `pyproject.toml` for linting and formatting (line-length 120, target py312). Run `ruff check .` and `ruff format --check .` before submitting.
 
 ### Templates
 
 - All templates extend `base.html` with three blocks: `title`, `extra_head`, `content`.
 - CSS is embedded in `<style>` tags (CSS custom properties in `base.html`, per-page styles in `extra_head`). No external CSS files.
-- JavaScript is inline in `<script>` tags. No build system.
+- JavaScript is inline in `<script nonce="{{ csp_nonce }}">` tags (the CSP only runs nonce'd scripts). No build system. Do **not** use inline event-handler attributes (`onclick=`, `onsubmit=`, …) or `javascript:` URLs: the CSP blocks them. Attach listeners with `addEventListener` using ids or `data-*` attributes. For confirmations use `<form data-confirm="{{ _('...') }}">`; show errors with `showInlineAlert(message)` instead of `alert()`. `tests/test_security_round2.py` checks the templates for all of this.
 
 ### Security
 
@@ -179,7 +178,7 @@ gated on `faces.embedding_model`. Never run `migrate.py` against a database you 
 about without a dump, and do not add further one-time destructive steps without a
 similar guard and tests for both the first run and a re-run.
 
-Currently 10 tables: `users`, `sessions`, `projects`, `images`, `faces`, `user_stats`, `sdc_claims`, `project_members`, `worker_heartbeat`, `service_status`.
+Currently 9 tables: `users`, `projects`, `images`, `faces`, `user_stats`, `sdc_claims`, `project_members`, `worker_heartbeat`, `service_status`.
 
 ## Testing
 
@@ -218,3 +217,15 @@ Face-service tests need extra dependencies or a live service: `tests/test_face_s
 ## License
 
 By contributing, you agree that your contributions will be licensed under the [MIT License](LICENSE).
+
+## Checks before you push
+
+```bash
+ruff check . && ruff format --check .      # lint (pinned in CI)
+mypy                                       # type check (scope in [tool.mypy])
+WIKIVISAGE_TEST_DB=1 pytest --cov          # needs the local MariaDB; fails below the coverage gates
+```
+
+Two ratchets protect the code base: Ruff's complexity limit (`max-complexity` in `pyproject.toml`) and the
+coverage floors (`fail_under` plus `scripts/check_coverage_floors.py`). Lower the first and raise the second
+when a change allows it; never loosen either to get a build through.

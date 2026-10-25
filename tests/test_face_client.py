@@ -219,11 +219,39 @@ def test_encode_known_face_treats_a_codeless_rejection_as_the_region():
     assert result is None
 
 
+def test_probe_session_never_retries_while_the_work_session_does():
+    face_client.reset_session()
+    try:
+        probe = face_client.get_probe_session().get_adapter("http://svc").max_retries
+        work = face_client.get_session().get_adapter("http://svc").max_retries
+    finally:
+        face_client.reset_session()
+
+    assert probe.total == 0
+    assert work.total == 3
+
+
+def test_is_healthy_fails_fast_when_nothing_listens():
+    """No retries means an unreachable service answers in well under a second."""
+    import time
+
+    face_client.reset_session()
+    try:
+        with patch.object(face_client, "FACE_SERVICE_URL", "http://127.0.0.1:9"):
+            started = time.monotonic()
+            assert face_client.is_healthy() is False
+            elapsed = time.monotonic() - started
+    finally:
+        face_client.reset_session()
+
+    assert elapsed < 2.0
+
+
 def test_is_healthy_false_on_exception():
     session = MagicMock()
     session.get.side_effect = requests.RequestException("boom")
 
-    with patch("face_client.get_session", return_value=session):
+    with patch("face_client.get_probe_session", return_value=session):
         assert face_client.is_healthy() is False
 
 
@@ -231,7 +259,7 @@ def test_is_healthy_false_on_ready_false():
     session = MagicMock()
     session.get.return_value = _response(json_body={"ready": False})
 
-    with patch("face_client.get_session", return_value=session):
+    with patch("face_client.get_probe_session", return_value=session):
         assert face_client.is_healthy() is False
 
 
@@ -239,7 +267,7 @@ def test_is_healthy_true_when_ready_and_token_accepted():
     session = MagicMock()
     session.get.side_effect = [_response(json_body={"ready": True}), _response(json_body={"models": []})]
 
-    with patch("face_client.get_session", return_value=session):
+    with patch("face_client.get_probe_session", return_value=session):
         assert face_client.is_healthy() is True
 
     probed = [call.args[0] for call in session.get.call_args_list]
@@ -251,7 +279,7 @@ def test_is_healthy_false_when_token_rejected_even_though_ready():
     session = MagicMock()
     session.get.side_effect = [_response(json_body={"ready": True}), _response(status_code=401)]
 
-    with patch("face_client.get_session", return_value=session):
+    with patch("face_client.get_probe_session", return_value=session):
         assert face_client.is_healthy() is False
 
 
@@ -259,7 +287,7 @@ def test_is_healthy_false_when_auth_probe_errors():
     session = MagicMock()
     session.get.side_effect = [_response(json_body={"ready": True}), _response(status_code=503)]
 
-    with patch("face_client.get_session", return_value=session):
+    with patch("face_client.get_probe_session", return_value=session):
         assert face_client.is_healthy() is False
 
 

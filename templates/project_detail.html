@@ -543,7 +543,7 @@
         <span>{{ _('View all related media on Commons with') }}</span>
         <a href="https://view-it.toolforge.org/?q={{ project.wikidata_qid }}&amp;utm_source=WikiVisage" target="_blank" rel="noopener">View it! &nearr;</a>
     </div>
-    <button class="viewit-strip-close" aria-label="{{ _('Close') }}" onclick="this.parentElement.remove();try{localStorage.setItem('viewit_dismissed','1')}catch(e){}">&times;</button>
+    <button class="viewit-strip-close" id="viewitStripClose" type="button" aria-label="{{ _('Close') }}">&times;</button>
 </div>
 <script nonce="{{ csp_nonce }}">try{if(localStorage.getItem('viewit_dismissed')==='1'){var s=document.getElementById('viewitStrip');if(s)s.remove()}}catch(e){}</script>
 
@@ -728,7 +728,7 @@
             {% endif %}
         </p>
     </div>
-    <button class="inference-banner-close" aria-label="{{ _('Close') }}" onclick="this.parentElement.remove();try{localStorage.setItem('inference_dismissed_{{ project.id }}','1')}catch(e){}">&times;</button>
+    <button class="inference-banner-close" id="inferenceBannerClose" type="button" aria-label="{{ _('Close') }}">&times;</button>
 </div>
 {% if inference_done %}
 <script nonce="{{ csp_nonce }}">try{if(localStorage.getItem('inference_dismissed_{{ project.id }}')==='1'){var ib=document.getElementById('inferenceBanner');if(ib)ib.remove()}}catch(e){}</script>
@@ -742,7 +742,7 @@
     {% if is_owner %}
     <a href="{{ url_for('project_settings', project_id=project.id) }}" class="btn btn-lg">{{ _('Settings') }}</a>
     {% else %}
-    <form method="POST" action="{{ url_for('project_leave', project_id=project.id) }}" style="display:inline" onsubmit='return confirm({{ _('Are you sure you want to leave this project?')|tojson }})'>
+    <form method="POST" action="{{ url_for('project_leave', project_id=project.id) }}" style="display:inline" data-confirm="{{ _('Are you sure you want to leave this project?') }}">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <button type="submit" class="btn btn-danger btn-lg">{{ _('Leave Project') }}</button>
     </form>
@@ -756,20 +756,20 @@
 </p>
 
 <div class="results-filters">
-    <select id="resultFilter" class="filter-select" onchange="onFilterChange()" aria-label="{{ _('Filter by result') }}">
+    <select id="resultFilter" class="filter-select" aria-label="{{ _('Filter by result') }}">
         <option value="all" selected>{{ _('All') }}</option>
         <option value="match">{{ _('Matches') }}</option>
         <option value="non-match">{{ _('Non-matches') }}</option>
         <option value="rejected">{{ _('Rejected') }}</option>
     </select>
-    <select id="sourceFilter" class="filter-select" onchange="onFilterChange()" aria-label="{{ _('Filter by source') }}">
+    <select id="sourceFilter" class="filter-select" aria-label="{{ _('Filter by source') }}">
         <option value="all" selected>{{ _('All sources') }}</option>
         <option value="model">{{ _('Model') }}</option>
         <option value="bootstrap">{{ _('Bootstrap') }}</option>
         <option value="human">{{ _('Human') }}</option>
     </select>
-    <button type="button" class="btn btn-sm results-filter" id="sdcToggle" onclick="toggleSdcFilter()" aria-pressed="false">{{ _('SDC Pending') }}</button>
-    <select id="sortSelect" class="filter-select" onchange="onSortChange()" aria-label="{{ _('Sort results') }}" style="display: none;">
+    <button type="button" class="btn btn-sm results-filter" id="sdcToggle" aria-pressed="false">{{ _('SDC Pending') }}</button>
+    <select id="sortSelect" class="filter-select" aria-label="{{ _('Sort results') }}" style="display: none;">
         <option value="threshold-asc" selected>{{ _('Threshold: Low → High') }}</option>
         <option value="threshold-desc">{{ _('Threshold: High → Low') }}</option>
     </select>
@@ -821,10 +821,10 @@
         {% endif %}
     </div>
     <div class="sdc-actions">
-        <button class="btn btn-primary" id="sdcWriteBtn" onclick="startSdcWrite()" {{ 'disabled' if (sdc_pending == 0 and sdc_removal == 0) or project.sdc_write_requested }}>
+        <button class="btn btn-primary" id="sdcWriteBtn" {{ 'disabled' if (sdc_pending == 0 and sdc_removal == 0) or project.sdc_write_requested }}>
             {{ _('Send Edits to Wikimedia Commons') }}
         </button>
-        <button class="btn btn-danger sdc-stop-btn" id="sdcStopBtn" onclick="stopSdcWrite()" style="display: none;">
+        <button class="btn btn-danger sdc-stop-btn" id="sdcStopBtn" style="display: none;">
             {{ _('Stop Upload') }}
         </button>
     </div>
@@ -835,7 +835,7 @@
     <div class="modal-content">
         <div class="modal-header">
             <h3 class="modal-title" id="bboxModalTitle" tabindex="-1">{{ _('Edit Bounding Box') }}</h3>
-            <button class="modal-close" aria-label="{{ _('Close') }}" onclick="closeBboxModal()">&times;</button>
+            <button class="modal-close" id="bboxModalClose" type="button" aria-label="{{ _('Close') }}">&times;</button>
         </div>
         <div class="modal-body">
             <p class="modal-instructions">
@@ -848,8 +848,8 @@
                 <div class="drawing-box" id="drawingBox"></div>
             </div>
             <div class="modal-actions">
-                <button class="btn" onclick="closeBboxModal()">{{ _('Cancel') }}</button>
-                <button class="btn btn-primary" id="saveBboxBtn" onclick="saveNewBbox()" disabled>{{ _('Save') }}</button>
+                <button class="btn" id="bboxModalCancel" type="button">{{ _('Cancel') }}</button>
+                <button class="btn btn-primary" id="saveBboxBtn" type="button" disabled>{{ _('Save') }}</button>
             </div>
             <div class="result-loading" id="modalLoading">{{ _('Saving...') }}</div>
         </div>
@@ -1015,7 +1015,7 @@
                     });
                 }
             } else {
-                alert(data.error || i18nReclassify.saveError);
+                showInlineAlert(data.error || i18nReclassify.saveError);
                 card.dataset.reclassifyInFlight = '0';
             }
         }).catch(function(e) {
@@ -1026,7 +1026,7 @@
             // message (e.g. "This face was already classified by X") instead
             // of the generic saveError fallback.
             var msg = (e && e.data && e.data.error) || (e && e.message) || i18nReclassify.saveError;
-            alert(msg);
+            showInlineAlert(msg);
         });
     }
 
@@ -1420,7 +1420,7 @@
                 closeBboxModal();
                 loadGalleryPage(currentPage);
             } else {
-                alert(data.error || i18nReclassify.bboxError);
+                showInlineAlert(data.error || i18nReclassify.bboxError);
                 loading.classList.remove('active');
             }
         }).catch(function(e) {
@@ -1429,7 +1429,7 @@
             // Surface the server's actual error message (postForm() throws
             // on non-2xx) instead of the generic bboxError fallback.
             var msg = (e && e.data && e.data.error) || (e && e.message) || i18nReclassify.bboxError;
-            alert(msg);
+            showInlineAlert(msg);
         });
     }
 
@@ -1478,7 +1478,8 @@
         
         var approveBtn = document.createElement('button');
         approveBtn.className = 'btn-icon success';
-        approveBtn.setAttribute('onclick', 'reclassifyFace(this, 1)');
+        approveBtn.type = 'button';
+        approveBtn.dataset.action = 'approve';
         approveBtn.setAttribute('aria-label', i18nGallery.approve);
         approveBtn.title = i18nGallery.approve;
         approveBtn.innerHTML = '&#10003;';
@@ -1486,7 +1487,8 @@
 
         var rejectBtn = document.createElement('button');
         rejectBtn.className = 'btn-icon danger';
-        rejectBtn.setAttribute('onclick', 'reclassifyFace(this, 0)');
+        rejectBtn.type = 'button';
+        rejectBtn.dataset.action = 'reject';
         rejectBtn.setAttribute('aria-label', i18nGallery.reject);
         rejectBtn.title = i18nGallery.reject;
         rejectBtn.innerHTML = '&#10007;';
@@ -1494,7 +1496,8 @@
 
         var editBtn = document.createElement('button');
         editBtn.className = 'btn-icon';
-        editBtn.setAttribute('onclick', 'openBboxModal(this)');
+        editBtn.type = 'button';
+        editBtn.dataset.action = 'edit-bbox';
         editBtn.setAttribute('aria-label', i18nGallery.editBbox);
         editBtn.title = i18nGallery.editBbox;
         editBtn.innerHTML = '&#9998;';
@@ -1659,38 +1662,48 @@
 
     function renderPagination(totalPages, totalItems) {
         var nav = document.getElementById('resultsPagination');
-        if (totalPages <= 1) {
-            nav.innerHTML = '';
-            return;
+        nav.textContent = '';
+        if (totalPages <= 1) return;
+
+        function pageButton(label, page, disabled) {
+            var b = document.createElement('button');
+            b.type = 'button';
+            b.textContent = label;
+            b.dataset.page = page;
+            if (disabled) b.disabled = true;
+            nav.appendChild(b);
+        }
+        function pageSpan(className, text) {
+            var sp = document.createElement('span');
+            sp.className = className;
+            sp.textContent = text;
+            nav.appendChild(sp);
         }
 
-        var html = '';
-        html += '<button type="button"' + (currentPage <= 1 ? ' disabled' : '') + ' onclick="goToPage(' + (currentPage - 1) + ')">' + i18nPagination.prev + '</button>';
+        pageButton(i18nPagination.prev, currentPage - 1, currentPage <= 1);
 
         var startPage = Math.max(1, currentPage - 2);
         var endPage = Math.min(totalPages, currentPage + 2);
 
         if (startPage > 1) {
-            html += '<button type="button" onclick="goToPage(1)">1</button>';
-            if (startPage > 2) html += '<span class="ellipsis">&hellip;</span>';
+            pageButton('1', 1, false);
+            if (startPage > 2) pageSpan('ellipsis', '\u2026');
         }
 
         for (var p = startPage; p <= endPage; p++) {
             if (p === currentPage) {
-                html += '<span class="active">' + p + '</span>';
+                pageSpan('active', String(p));
             } else {
-                html += '<button type="button" onclick="goToPage(' + p + ')">' + p + '</button>';
+                pageButton(String(p), p, false);
             }
         }
 
         if (endPage < totalPages) {
-            if (endPage < totalPages - 1) html += '<span class="ellipsis">&hellip;</span>';
-            html += '<button type="button" onclick="goToPage(' + totalPages + ')">' + totalPages + '</button>';
+            if (endPage < totalPages - 1) pageSpan('ellipsis', '\u2026');
+            pageButton(String(totalPages), totalPages, false);
         }
 
-        html += '<button type="button"' + (currentPage >= totalPages ? ' disabled' : '') + ' onclick="goToPage(' + (currentPage + 1) + ')">' + i18nPagination.next + '</button>';
-
-        nav.innerHTML = html;
+        pageButton(i18nPagination.next, currentPage + 1, currentPage >= totalPages);
     }
 
     function goToPage(page) {
@@ -1735,12 +1748,51 @@
         loadGalleryPage(1);
     }
 
+    // Event wiring (the CSP forbids inline on*= attributes)
+    document.getElementById('resultFilter').addEventListener('change', onFilterChange);
+    document.getElementById('sourceFilter').addEventListener('change', onFilterChange);
+    document.getElementById('sdcToggle').addEventListener('click', toggleSdcFilter);
+    document.getElementById('sortSelect').addEventListener('change', onSortChange);
+    document.getElementById('bboxModalClose').addEventListener('click', closeBboxModal);
+    document.getElementById('bboxModalCancel').addEventListener('click', closeBboxModal);
+    document.getElementById('saveBboxBtn').addEventListener('click', saveNewBbox);
+
+    // Gallery cards and pagination are rebuilt on every page load: delegate.
+    document.getElementById('resultsGallery').addEventListener('click', function(e) {
+        var btn = e.target.closest('button[data-action]');
+        if (!btn) return;
+        if (btn.dataset.action === 'approve') reclassifyFace(btn, 1);
+        else if (btn.dataset.action === 'reject') reclassifyFace(btn, 0);
+        else if (btn.dataset.action === 'edit-bbox') openBboxModal(btn);
+    });
+    document.getElementById('resultsPagination').addEventListener('click', function(e) {
+        var btn = e.target.closest('button[data-page]');
+        if (btn && !btn.disabled) goToPage(parseInt(btn.dataset.page, 10));
+    });
+
     // Initial load
     loadGalleryPage(1);
 </script>
 {% endif %}
 
 <script nonce="{{ csp_nonce }}">
+    (function() {
+        var viewitClose = document.getElementById('viewitStripClose');
+        if (viewitClose) {
+            viewitClose.addEventListener('click', function() {
+                viewitClose.parentElement.remove();
+                try { localStorage.setItem('viewit_dismissed', '1'); } catch (e) {}
+            });
+        }
+        var inferenceClose = document.getElementById('inferenceBannerClose');
+        if (inferenceClose) {
+            inferenceClose.addEventListener('click', function() {
+                inferenceClose.parentElement.remove();
+                try { localStorage.setItem('inference_dismissed_{{ project.id }}', '1'); } catch (e) {}
+            });
+        }
+    })();
+
     var sdcCsrfToken = {{ csrf_token()|tojson }};
     var apiWriteSdcUrl = {{ url_for('api_write_sdc', project_id=project.id)|tojson }};
     var apiStopSdcUrl = {{ url_for('api_stop_sdc', project_id=project.id)|tojson }};
@@ -2088,6 +2140,13 @@
             scheduleSdcPoll(backoff);
         });
     }
+
+    (function() {
+        var sdcWriteBtn = document.getElementById('sdcWriteBtn');
+        var sdcStopBtn = document.getElementById('sdcStopBtn');
+        if (sdcWriteBtn) sdcWriteBtn.addEventListener('click', startSdcWrite);
+        if (sdcStopBtn) sdcStopBtn.addEventListener('click', stopSdcWrite);
+    })();
 
     // On page load: if SDC write is already in progress, start polling
     {% if project.sdc_write_requested %}

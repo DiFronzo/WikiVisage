@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Fail if the face service's model weights could be delivered by anything other
-# than plain git blobs. Run in CI (lint job); see docs/plans/face-model-upgrade.md,
-# section 1c.
+# than plain git blobs. Run in CI (lint job); see scripts/fetch_weights.sh and
+# model-server/weights/LICENSE-NOTICE.
 #
 #   scripts/check_no_lfs.sh [repo-root]
 #

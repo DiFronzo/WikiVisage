@@ -2,7 +2,7 @@
 
 The face service is published on the internet, so these pin down exactly which
 requests reach the application. guard.py is stdlib-only and is loaded by path,
-so this runs in the normal suite without KServe or dlib installed.
+so this runs in the normal suite without KServe or the ML stack installed.
 """
 
 from __future__ import annotations

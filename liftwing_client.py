@@ -1,9 +1,8 @@
 """HTTP client for the experimental LiftWing Qwen metadata pre-filter.
 
-Phase 2 of ``docs/plans/face-model-upgrade.md``. Standalone by design: no ML
-dependencies, no database access, no imports from ``worker.py`` — just one
-OpenAI-compatible chat-completions endpoint. The worker owns the pipeline and
-the ``service_status`` table; this module only talks HTTP.
+Standalone by design: no ML dependencies, no database access, no imports from
+``worker.py`` — just one OpenAI-compatible chat-completions endpoint. The worker
+owns the pipeline and the ``service_status`` table; this module only talks HTTP.
 
 Every call **fails open**. ``filter_metadata`` returns ``None`` instead of
 raising when the service is slow, down, or unparseable, so the caller keeps
@@ -40,7 +39,7 @@ from typing import Any
 
 import requests
 
-from config import PROJECT_VERSION
+from config import USER_AGENT as DEFAULT_USER_AGENT
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +49,7 @@ DEFAULT_URL = "https://api.wikimedia.org/service/lw/inference/v1/models/llm-qwen
 # this in step with the worker's own UA (same string, same version).
 USER_AGENT = os.environ.get(
     "WIKIVISAGE_LIFTWING_USER_AGENT",
-    f"WikiVisage/{PROJECT_VERSION} (https://github.com/DiFronzo/WikiVisage)",
+    DEFAULT_USER_AGENT,
 )
 
 # A whole batch must finish inside this. Measured 2026-10-17: a 40-file batch

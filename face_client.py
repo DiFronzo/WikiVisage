@@ -24,6 +24,8 @@ import requests
 from requests.adapters import HTTPAdapter
 from requests.packages.urllib3.util.retry import Retry
 
+from config import USER_AGENT
+
 logger = logging.getLogger(__name__)
 
 FACE_SERVICE_URL = os.environ.get("WIKIVISAGE_FACE_SERVICE_URL", "http://localhost:8080").rstrip("/")
@@ -41,8 +43,6 @@ FACE_SERVICE_MAX_IMAGE_BYTES = int(os.environ.get("WIKIVISAGE_FACE_SERVICE_MAX_I
 FACE_SERVICE_TIMEOUT = float(os.environ.get("WIKIVISAGE_FACE_SERVICE_TIMEOUT", 30))
 FACE_SERVICE_TIMEOUT_PER_IMAGE = float(os.environ.get("WIKIVISAGE_FACE_SERVICE_TIMEOUT_PER_IMAGE", 15))
 FACE_SERVICE_CONNECT_TIMEOUT = 10.0
-
-USER_AGENT = "WikiVisage/1.0 (Wikimedia Toolforge; https://toolsadmin.wikimedia.org)"
 
 # The embedding the database holds and the inference math expects. Enforced on
 # receipt — dimension, byte width and model id — so a misconfigured or
@@ -148,10 +148,11 @@ class DetectionResult:
 
 
 _session: requests.Session | None = None
+_probe_session: requests.Session | None = None
 _session_lock = threading.Lock()
 
 
-def _build_session() -> requests.Session:
+def _build_session(*, retry: bool = True) -> requests.Session:
     session = requests.Session()
     headers = {"User-Agent": USER_AGENT, "Content-Type": "application/json"}
     if FACE_SERVICE_TOKEN:
@@ -162,7 +163,7 @@ def _build_session() -> requests.Session:
     # the caller has its own outer poll loop and would rather fail fast and
     # leave images pending than block a worker thread for minutes.
     retries = Retry(
-        total=3,
+        total=3 if retry else 0,
         backoff_factor=1,
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=["GET", "POST"],
@@ -184,13 +185,30 @@ def get_session() -> requests.Session:
     return _session
 
 
+def get_probe_session() -> requests.Session:
+    """Return the shared session for readiness probes: same headers, no retries.
+
+    A probe must answer "is it up right now" quickly. With the retrying session an
+    unreachable service made ``/health`` (and the deploy preflight polling it) take
+    about 12 s per call instead of failing at once.
+    """
+    global _probe_session
+    if _probe_session is None:
+        with _session_lock:
+            if _probe_session is None:
+                _probe_session = _build_session(retry=False)
+    return _probe_session
+
+
 def reset_session() -> None:
-    """Drop the cached session. Used by tests and after config changes."""
-    global _session
+    """Drop the cached sessions. Used by tests and after config changes."""
+    global _session, _probe_session
     with _session_lock:
-        if _session is not None:
-            _session.close()
+        for cached in (_session, _probe_session):
+            if cached is not None:
+                cached.close()
         _session = None
+        _probe_session = None
 
 
 def predict_url() -> str:
@@ -217,7 +235,7 @@ def is_healthy(timeout: float = 5.0) -> bool:
     hits a token-protected path to catch that before workers are started.
     """
     try:
-        session = get_session()
+        session = get_probe_session()
         resp = session.get(health_url(), timeout=timeout)
         if resp.status_code != 200 or not resp.json().get("ready", False):
             return False

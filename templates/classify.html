@@ -508,9 +508,9 @@
         {% endif %}
 
         <div class="manual-controls">
-            <button class="btn btn-manual" id="btnDrawFace" onclick="toggleDrawMode()" title="{{ _('Draw a box around a missed face') }}">{{ _('+ Add Missing Face') }}</button>
+            <button class="btn btn-manual" id="btnDrawFace" type="button" data-action="toggle-draw" title="{{ _('Draw a box around a missed face') }}">{{ _('+ Add Missing Face') }}</button>
             {% if faces | length > 1 %}
-            <button class="btn btn-manual" id="btnToggleLabels" type="button" onclick="toggleLabels()" aria-pressed="true" title="{{ _('Show or hide the face labels') }}">{{ _('Hide labels') }}</button>
+            <button class="btn btn-manual" id="btnToggleLabels" type="button" data-action="toggle-labels" aria-pressed="true" title="{{ _('Show or hide the face labels') }}">{{ _('Hide labels') }}</button>
             {% endif %}
             <span class="hint" id="drawHint" style="display: none;">{{ _('Click and drag on the image to draw a face box. Press Esc to cancel.') }}</span>
         </div>
@@ -537,13 +537,13 @@
             {% if faces | length == 1 %}
                 <div class="single-face-controls">
                     {% if reviewing_model %}
-                    <button class="btn btn-yes" onclick="selectFace({{ faces[0].face_id }})">{{ _('Yes') }} &mdash; {{ _('Override Model') }}</button>
-                    <button class="btn btn-no" onclick="selectFace('none')">{{ _('No') }} &mdash; {{ _('Confirm Rejection') }}</button>
+                    <button class="btn btn-yes" type="button" data-action="select-face" data-face-id="{{ faces[0].face_id }}">{{ _('Yes') }} &mdash; {{ _('Override Model') }}</button>
+                    <button class="btn btn-no" type="button" data-action="select-none">{{ _('No') }} &mdash; {{ _('Confirm Rejection') }}</button>
                     {% else %}
-                    <button class="btn btn-yes" onclick="selectFace({{ faces[0].face_id }})">{{ _('Yes') }} &mdash; {{ _('Target') }}</button>
-                    <button class="btn btn-no" onclick="selectFace('none')">{{ _('No') }} &mdash; {{ _('Not Target') }}</button>
+                    <button class="btn btn-yes" type="button" data-action="select-face" data-face-id="{{ faces[0].face_id }}">{{ _('Yes') }} &mdash; {{ _('Target') }}</button>
+                    <button class="btn btn-no" type="button" data-action="select-none">{{ _('No') }} &mdash; {{ _('Not Target') }}</button>
                     {% endif %}
-                    <button class="btn btn-skip" onclick="skipImage()">{{ _('Skip') }}</button>
+                    <button class="btn btn-skip" type="button" data-action="skip">{{ _('Skip') }}</button>
                 </div>
                 <div class="hotkey-hints">
                     <span><kbd>Y</kbd> {{ _('Yes') }}</span>
@@ -553,8 +553,8 @@
                 </div>
             {% else %}
                 <div class="single-face-controls">
-                    <button class="btn btn-none" onclick="selectFace('none')">{{ _('None of These') }}</button>
-                    <button class="btn btn-skip" onclick="skipImage()">{{ _('Skip') }}</button>
+                    <button class="btn btn-none" type="button" data-action="select-none">{{ _('None of These') }}</button>
+                    <button class="btn btn-skip" type="button" data-action="skip">{{ _('Skip') }}</button>
                 </div>
                 <div class="hotkey-hints">
                     {% for face in faces %}{% if loop.index <= 9 %}<span><kbd>{{ loop.index }}</kbd> {{ _('Face %(num)d', num=loop.index) }}</span>{% endif %}{% endfor %}
@@ -567,7 +567,7 @@
         </div>
         {% if has_undo %}
         <div class="undo-wrap">
-            <button class="btn btn-undo" id="undoBtn" onclick="undoClassify()">↩ {{ _('Undo Last') }}</button>
+            <button class="btn btn-undo" id="undoBtn" type="button" data-action="undo">↩ {{ _('Undo Last') }}</button>
         </div>
         {% endif %}
     {% endif %}
@@ -729,7 +729,7 @@
         postForm('{{ url_for("api_classify") }}', csrfToken, fields)
         .then(function(data) {
             if (data.error) {
-                alert(i18n.errorPrefix.replace('{message}', data.error));
+                showInlineAlert(i18n.errorPrefix.replace('{message}', data.error));
                 overlay.style.display = 'none';
                 inFlight = false;
             } else {
@@ -738,7 +738,7 @@
         })
         .catch(function(error) {
             console.error('Error:', error);
-            alert(i18n.errorSaving);
+            showInlineAlert(i18n.errorSaving);
             overlay.style.display = 'none';
             inFlight = false;
         });
@@ -762,7 +762,7 @@
         postForm('{{ url_for("api_undo_classify") }}', csrfToken, {})
         .then(function(data) {
             if (data.error) {
-                alert(data.error);
+                showInlineAlert(data.error);
                 overlay.style.display = 'none';
                 overlay.textContent = i18n.saving;
                 inFlight = false;
@@ -776,12 +776,27 @@
         })
         .catch(function(error) {
             console.error('Error:', error);
-            alert(i18n.errorUndo);
+            showInlineAlert(i18n.errorUndo);
             overlay.style.display = 'none';
             overlay.textContent = i18n.saving;
             inFlight = false;
         });
     }
+
+    /* Buttons carry data-action instead of inline onclick (the CSP forbids
+       inline handlers). Face boxes keep their own listeners above. */
+    document.addEventListener('click', function(e) {
+        var el = e.target.closest && e.target.closest('[data-action]');
+        if (!el) return;
+        switch (el.dataset.action) {
+            case 'select-face': selectFace(parseInt(el.dataset.faceId, 10)); break;
+            case 'select-none': selectFace('none'); break;
+            case 'skip': skipImage(); break;
+            case 'undo': undoClassify(); break;
+            case 'toggle-draw': toggleDrawMode(); break;
+            case 'toggle-labels': toggleLabels(); break;
+        }
+    });
 
     {% if faces | length == 1 %}
     document.addEventListener('keydown', function(e) {
@@ -984,7 +999,7 @@
         })
         .then(function(result) {
             if (!result.ok || result.data.error) {
-                alert(i18n.errorPrefix.replace('{message}', result.data.error || i18n.unknownError));
+                showInlineAlert(i18n.errorPrefix.replace('{message}', result.data.error || i18n.unknownError));
                 overlay.style.display = 'none';
                 removeDrawRect();
                 submittingManualFace = false;
@@ -994,7 +1009,7 @@
         })
         .catch(function(error) {
             console.error('Error:', error);
-            alert(i18n.errorManualFace);
+            showInlineAlert(i18n.errorManualFace);
             overlay.style.display = 'none';
             removeDrawRect();
             submittingManualFace = false;

@@ -9,7 +9,7 @@
 # without wheels; the runtime stage does not.
 
 # ---------- builder ----------
-FROM python:3.11-slim-bookworm AS builder
+FROM python:3.12-slim-bookworm AS builder
 
 ENV PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
@@ -31,7 +31,7 @@ RUN pip install --upgrade pip \
     && pip install -r /tmp/requirements.txt
 
 # ---------- runtime ----------
-FROM python:3.11-slim-bookworm AS production
+FROM python:3.12-slim-bookworm AS production
 
 # onnxruntime and opencv-python-headless ship self-contained wheels; curl is
 # only for the container health check.

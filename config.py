@@ -12,6 +12,10 @@ try:
 except (OSError, KeyError, tomllib.TOMLDecodeError):  # pragma: no cover - pyproject ships with the repo
     PROJECT_VERSION = "1.0"
 
+# The one User-Agent every outbound client sends (web app, worker, LiftWing and
+# face-service clients).
+USER_AGENT = f"WikiVisage/{PROJECT_VERSION} (https://github.com/DiFronzo/WikiVisage)"
+
 # Path to the file used to wake the background worker immediately.
 # Both the web process (writes it) and the worker (reads/deletes it) use
 # this path, so it must be defined in one place to stay consistent.
