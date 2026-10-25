@@ -336,12 +336,19 @@ def test_app_refresh_token_rowcount_zero_reads_fresh(monkeypatch):
 
     query_calls = [0]
 
+    # First SELECT: the credentials read again under the refresh lock (still the stale row).
+    # Second SELECT: the post-CAS re-read, after the peer's refresh landed.
+    select_results = [
+        [{"access_token": "old-token", "refresh_token": "old-refresh", "token_expires_at": past}],
+        [{"access_token": "fresh-token", "refresh_token": "fresh-refresh", "token_expires_at": None}],
+    ]
+
     def mock_execute_query(sql, params=None, fetch=True):
         query_calls[0] += 1
         if "UPDATE users SET access_token" in sql:
             return 0  # rowcount == 0 — another process refreshed first
         if "SELECT access_token, refresh_token, token_expires_at FROM users" in sql:
-            return [{"access_token": "fresh-token", "refresh_token": "fresh-refresh", "token_expires_at": None}]
+            return select_results.pop(0)
         return []
 
     new_token_data = {

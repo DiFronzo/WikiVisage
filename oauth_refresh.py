@@ -7,7 +7,9 @@ and used to carry their own copy of the protection against that. This module is 
 single copy. It has three layers, all best effort in that order:
 
 1. A Redis single-flight lock per user, so only one process in the cluster calls the
-   token endpoint with a given refresh token. Without Redis it is a no-op.
+   token endpoint with a given refresh token. Without Redis it is a no-op. Credentials
+   the caller already holds are re-read under that lock, because a peer may have rotated
+   the refresh token since the caller read its copy.
 2. An optimistic compare-and-swap on ``token_expires_at`` when storing the result:
    zero rows updated means another process won the race.
 3. A re-read of the winner's freshly stored tokens whenever a guard trips.
@@ -94,6 +96,16 @@ def read_user_tokens(query: Query, user_id: int, *, label: str) -> TokenSet | No
     return TokenSet(access_token, refresh_token, as_utc(row.get("token_expires_at")), source="reread")
 
 
+def _usable_credentials(credentials: TokenSet | None, *, label: str) -> TokenSet | None:
+    """Return credentials that can be exchanged, or None when there is nothing to refresh with."""
+    if credentials is None:
+        return None
+    if not credentials.refresh_token:
+        logger.error(f"No refresh token for {label}, cannot refresh")
+        return None
+    return credentials
+
+
 def store_tokens(query: Query, user_id: int, new: TokenSet, old_expires_at: datetime | None) -> int:
     """Save refreshed tokens if nobody else did first. Returns the number of rows updated.
 
@@ -133,7 +145,9 @@ def refresh_tokens(
     """Return valid credentials for the user, refreshing them first when they are about to expire.
 
     *current* are credentials the caller already holds; without them they are read from the
-    database. *exchange* trades a refresh token for the token endpoint's reply and raises on
+    database. Credentials the caller holds are read again once the refresh lock is held, because
+    a peer may have refreshed and rotated the refresh token since the caller read its copy.
+    *exchange* trades a refresh token for the token endpoint's reply and raises on
     failure. *get_redis* is only called when a refresh is actually needed, so a worker whose
     tokens are valid never opens a Redis connection. With *keep_on_store_failure* a refresh
     that succeeded at the provider but could not be saved is still returned (the caller can
@@ -142,24 +156,19 @@ def refresh_tokens(
     Returns None when the user cannot be refreshed (no row, no refresh token, endpoint error).
     """
     credentials = current if current is not None else read_user_tokens(query, user_id, label=label)
-    if credentials is None:
-        return None
-    if is_fresh(credentials.expires_at):
+    credentials = _usable_credentials(credentials, label=label)
+    if credentials is None or is_fresh(credentials.expires_at):
         return credentials
-    if not credentials.refresh_token:
-        logger.error(f"No refresh token for {label}, cannot refresh")
-        return None
 
     with single_flight(get_redis(), f"oauth-refresh:{user_id}", ttl_seconds=LOCK_TTL_SECONDS) as got_lock:
         if got_lock:
-            credentials = read_user_tokens(query, user_id, label=label)
-            if credentials is None:
-                return None
-            if is_fresh(credentials.expires_at):
-                return credentials
-            if not credentials.refresh_token:
-                logger.error(f"No refresh token for {label}, cannot refresh")
-                return None
+            if current is not None:
+                # The caller's copy may predate a peer's refresh, and that peer rotated the
+                # refresh token: exchanging the old one fails and logs the user out. Use the
+                # row that is current now.
+                credentials = _usable_credentials(read_user_tokens(query, user_id, label=label), label=label)
+                if credentials is None or is_fresh(credentials.expires_at):
+                    return credentials
             return _exchange_and_store(
                 user_id,
                 credentials,

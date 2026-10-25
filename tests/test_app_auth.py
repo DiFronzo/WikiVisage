@@ -246,6 +246,14 @@ def test_refresh_access_token_handles_string_naive_datetime(monkeypatch):
 
     def _execute(sql, params, fetch=False):
         db_calls.append((sql, params, fetch))
+        if fetch:
+            return [
+                {
+                    "access_token": "access-old",
+                    "refresh_token": "refresh-old",
+                    "token_expires_at": "2000-01-01 00:00:00",
+                }
+            ]
         return 1
 
     monkeypatch.setattr(app_module, "OAuth2Session", _FakeOAuth)
@@ -257,7 +265,8 @@ def test_refresh_access_token_handles_string_naive_datetime(monkeypatch):
     assert user["access_token"] == "access-new"
     assert user["refresh_token"] == "refresh-new"
     assert isinstance(user["token_expires_at"], datetime)
-    assert db_calls and db_calls[0][2] is False
+    assert db_calls[-1][0].startswith("UPDATE users SET access_token")
+    assert db_calls[-1][2] is False
     assert captured["refresh_token"] == "refresh-old"
 
 
@@ -278,7 +287,19 @@ def test_refresh_access_token_uses_old_refresh_token_if_not_returned(monkeypatch
             return {"access_token": "access-new", "expires_in": 1000}
 
     monkeypatch.setattr(app_module, "OAuth2Session", _FakeOAuth)
-    monkeypatch.setattr(app_module, "execute_query", lambda *_a, **_k: 1)
+
+    def _execute(sql, params, fetch=False):
+        if fetch:
+            return [
+                {
+                    "access_token": "access-old",
+                    "refresh_token": "refresh-old",
+                    "token_expires_at": "2000-01-01 00:00:00",
+                }
+            ]
+        return 1
+
+    monkeypatch.setattr(app_module, "execute_query", _execute)
 
     updated = app_module._refresh_access_token(user)
     assert updated is not None
@@ -302,6 +323,17 @@ def test_refresh_access_token_returns_none_on_failure(monkeypatch):
             raise RuntimeError("fail")
 
     monkeypatch.setattr(app_module, "OAuth2Session", _FakeOAuth)
+
+    def _execute(sql, params, fetch=False):
+        return [
+            {
+                "access_token": "access",
+                "refresh_token": "refresh",
+                "token_expires_at": "2000-01-01 00:00:00",
+            }
+        ]
+
+    monkeypatch.setattr(app_module, "execute_query", _execute)
     assert app_module._refresh_access_token(user) is None
 
 

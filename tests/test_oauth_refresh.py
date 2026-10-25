@@ -171,7 +171,7 @@ def test_without_a_refresh_token_there_is_nothing_to_exchange(caplog: pytest.Log
 
 
 def test_expiring_credentials_are_exchanged_and_stored_with_a_compare_and_swap() -> None:
-    db = FakeDb(updates=[1])
+    db = FakeDb(selects=[[row(SOON)]], updates=[1])
     exchange = exchange_ok()
 
     result = run(db, exchange, current=TokenSet("old-access", "old-refresh", SOON))
@@ -180,14 +180,45 @@ def test_expiring_credentials_are_exchanged_and_stored_with_a_compare_and_swap()
     assert result is not None
     assert (result.access_token, result.refresh_token, result.source) == ("new-access", "new-refresh", "refreshed")
     assert result.expires_at is not None and result.expires_at > datetime.now(UTC) + timedelta(hours=1)
-    sql, params = db.calls[0]
+    sql, params = db.calls[-1]
     assert "WHERE id = %s AND token_expires_at = %s" in sql
     assert params[3] == 1 and params[4] == SOON.strftime("%Y-%m-%d %H:%M:%S")
 
 
+def test_credentials_the_caller_holds_are_re_read_once_the_lock_is_held() -> None:
+    """A peer may have rotated the refresh token since the caller read its copy."""
+    db = FakeDb(selects=[[row(SOON, refresh="rotated-refresh")]], updates=[1])
+    exchange = exchange_ok()
+
+    run(db, exchange, current=TokenSet("old-access", "stale-refresh", SOON))
+
+    exchange.assert_called_once_with("rotated-refresh")
+    assert db.calls[0][0].startswith("SELECT")
+
+
+def test_a_peer_refresh_that_landed_before_the_lock_is_used_without_an_exchange() -> None:
+    db = FakeDb(selects=[[row(LATER, access="peer-access")]])
+    exchange = exchange_ok()
+
+    result = run(db, exchange, current=TokenSet("old-access", "stale-refresh", SOON))
+
+    exchange.assert_not_called()
+    assert result is not None and (result.access_token, result.source) == ("peer-access", "reread")
+
+
+def test_a_caller_token_without_a_refresh_token_never_reaches_the_database(caplog: pytest.LogCaptureFixture) -> None:
+    db = FakeDb()
+
+    with caplog.at_level(logging.ERROR, logger="oauth_refresh"):
+        assert run(db, exchange_ok(), current=TokenSet("a", "", SOON)) is None
+
+    assert db.calls == []
+    assert "No refresh token for user 1" in caplog.text
+
+
 def test_the_old_refresh_token_is_kept_when_the_endpoint_does_not_rotate_it() -> None:
     result = run(
-        FakeDb(updates=[1]),
+        FakeDb(selects=[[row(SOON)]], updates=[1]),
         exchange_ok({"access_token": "new-access"}),
         current=TokenSet("old-access", "old-refresh", SOON),
     )
@@ -199,28 +230,31 @@ def test_the_old_refresh_token_is_kept_when_the_endpoint_does_not_rotate_it() ->
 
 
 def test_a_reply_without_an_access_token_is_a_failure(caplog: pytest.LogCaptureFixture) -> None:
-    db = FakeDb()
+    db = FakeDb(selects=[[row(SOON)]])
 
     with caplog.at_level(logging.ERROR, logger="oauth_refresh"):
         assert run(db, exchange_ok({"error": "invalid_grant"}), current=TokenSet("a", "r", SOON)) is None
 
-    assert db.calls == []
+    assert not any(sql.startswith("UPDATE") for sql, _ in db.calls)
     assert "missing access_token" in caplog.text
 
 
 def test_an_endpoint_error_is_a_failure_and_nothing_is_stored(caplog: pytest.LogCaptureFixture) -> None:
-    db = FakeDb()
+    db = FakeDb(selects=[[row(SOON)]])
     exchange = MagicMock(side_effect=RuntimeError("HTTP 500"))
 
     with caplog.at_level(logging.ERROR, logger="oauth_refresh"):
         assert run(db, exchange, current=TokenSet("a", "r", SOON)) is None
 
-    assert db.calls == []
+    assert not any(sql.startswith("UPDATE") for sql, _ in db.calls)
     assert "Failed to refresh access token for user 1" in caplog.text
 
 
 def test_losing_the_compare_and_swap_returns_the_winners_tokens() -> None:
-    db = FakeDb(selects=[[row(LATER, access="winner-access", refresh="winner-refresh")]], updates=[0])
+    db = FakeDb(
+        selects=[[row(SOON)], [row(LATER, access="winner-access", refresh="winner-refresh")]],
+        updates=[0],
+    )
 
     result = run(db, exchange_ok(), current=TokenSet("old", "old", SOON))
 
@@ -230,7 +264,7 @@ def test_losing_the_compare_and_swap_returns_the_winners_tokens() -> None:
 
 def test_an_unconditional_update_never_triggers_the_lost_race_path() -> None:
     """Without an old expiry there is no compare, so 0 rows is not a lost race."""
-    db = FakeDb(updates=[0])
+    db = FakeDb(selects=[[row(None)]], updates=[0])
 
     result = run(db, exchange_ok(), current=TokenSet("old", "old", None))
 
@@ -238,13 +272,13 @@ def test_an_unconditional_update_never_triggers_the_lost_race_path() -> None:
 
 
 def test_a_store_failure_fails_the_refresh_by_default() -> None:
-    db = FakeDb(updates=[DatabaseError("deadlock")])
+    db = FakeDb(selects=[[row(SOON)]], updates=[DatabaseError("deadlock")])
 
     assert run(db, exchange_ok(), current=TokenSet("old", "old", SOON)) is None
 
 
 def test_a_store_failure_can_keep_the_new_token_for_the_work_in_hand(caplog: pytest.LogCaptureFixture) -> None:
-    db = FakeDb(updates=[DatabaseError("deadlock")])
+    db = FakeDb(selects=[[row(SOON)]], updates=[DatabaseError("deadlock")])
 
     with caplog.at_level(logging.ERROR, logger="oauth_refresh"):
         result = run(db, exchange_ok(), current=TokenSet("old", "old", SOON), keep_on_store_failure=True)
@@ -275,7 +309,13 @@ def test_a_peer_whose_row_disappeared_ends_the_refresh() -> None:
 
 def test_a_peer_that_did_not_finish_is_retried_once_the_lock_is_free(caplog: pytest.LogCaptureFixture) -> None:
     """First pass: lock held, peer's UPDATE never landed. Second pass: the lock is ours."""
-    db = FakeDb(selects=[[row(SOON, access="still-old", refresh="still-old-refresh")]], updates=[1])
+    db = FakeDb(
+        selects=[
+            [row(SOON, access="still-old", refresh="still-old-refresh")],
+            [row(SOON, access="still-old", refresh="still-old-refresh")],
+        ],
+        updates=[1],
+    )
     exchange = exchange_ok()
     passes = iter([False, True])
 
@@ -307,7 +347,7 @@ def test_the_lock_is_named_per_user() -> None:
         refresh_tokens(
             42,
             label="user 42",
-            query=FakeDb(updates=[1]),
+            query=FakeDb(selects=[[row(SOON)]], updates=[1]),
             get_redis=lambda: None,
             exchange=exchange_ok(),
             current=TokenSet("a", "r", SOON),
