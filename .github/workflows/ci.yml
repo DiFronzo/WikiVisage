@@ -22,19 +22,27 @@ jobs:
 
       - uses: actions/setup-python@v7
         with:
-          python-version: "3.11"
+          python-version: "3.12"
 
       # Pinned deliberately: an unpinned Ruff could add rules or change
       # formatting and turn this job red on unchanged code. Bump together
       # with the local version used for `ruff format .`.
       - name: Install Ruff
-        run: pip install "ruff==0.17.1"
+        run: pip install "ruff==0.17.2"
 
       - name: Ruff check
         run: ruff check .
 
       - name: Ruff format check
         run: ruff format --check .
+
+      # Pinned like Ruff. Installs the runtime requirements so mypy sees the real
+      # redis/cryptography types; the stub packages cover requests and PyMySQL.
+      # Scope (the small modules first) lives in [tool.mypy] in pyproject.toml.
+      - name: Type check (mypy)
+        run: |
+          pip install -r requirements.txt "mypy==2.4.0" types-requests types-PyMySQL
+          mypy
 
       # The Toolforge build service does a plain clone. The ONNX weights must be
       # ordinary git blobs: a Git LFS pointer file or a submodule would build
@@ -48,7 +56,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.15"]
+        # 3.15.1 is the latest stable patch and an expedited security release
+        # (2026-10-21); bump this pin when a newer 3.15.x lands.
+        python-version: ["3.12", "3.15.1"]
 
     steps:
       - uses: actions/checkout@v7
@@ -67,6 +77,51 @@ jobs:
       - name: Run tests
         run: pytest --tb=short -q
 
+  # The race-condition fixes (SDC writes, inference persistence, project claims,
+  # migrations) are guarded by tests that need a real MariaDB, so they must run
+  # here and not only on a developer's machine. The image matches local
+  # development (docker run mariadb:10.11); the test suite creates and drops its
+  # own wikiface_test database.
+  integration:
+    name: Integration tests (MariaDB) + coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      mariadb:
+        image: mariadb:10.11
+        env:
+          MARIADB_ROOT_PASSWORD: devpass
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="healthcheck.sh --connect --innodb_initialized"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install Python dependencies
+        run: pip install -r requirements-dev.txt
+
+      # fail_under in [tool.coverage.report] gates the whole project; the next
+      # step gates each module.
+      - name: Run unit + integration tests with coverage
+        env:
+          WIKIVISAGE_TEST_DB: "1"
+        run: pytest --tb=short -q --cov --cov-report=term --cov-report=json:coverage.json
+
+      - name: Coverage floors per module
+        run: python scripts/check_coverage_floors.py coverage.json
+
   browser:
     name: Bbox editor (Chromium + WebKit)
     runs-on: ubuntu-latest
@@ -76,7 +131,7 @@ jobs:
 
       - uses: actions/setup-python@v7
         with:
-          python-version: "3.11"
+          python-version: "3.12"
           cache: pip
           cache-dependency-path: |
             requirements.txt
@@ -107,7 +162,7 @@ jobs:
 
       - uses: actions/setup-python@v7
         with:
-          python-version: "3.11"
+          python-version: "3.12"
           cache: pip
           cache-dependency-path: |
             model-server/requirements.txt
@@ -180,7 +235,7 @@ jobs:
 
       - uses: actions/setup-python@v7
         with:
-          python-version: "3.11"
+          python-version: "3.12"
           cache: pip
           cache-dependency-path: requirements-dev.txt
 
@@ -232,8 +287,8 @@ jobs:
           docker run --rm -u root \
             -v /var/run/docker.sock:/var/run/docker.sock \
             -v "$PWD/model-server":/workspace -w /workspace \
-            buildpacksio/pack build wikivisage-face-bp:ci \
-            --builder tools-harbor.wmcloud.org/toolforge/heroku-builder:24_0.21.8 \
+            buildpacksio/pack:0.40.10 build wikivisage-face-bp:ci \
+            --builder tools-harbor.wmcloud.org/toolforge/heroku-builder:24_20261023 \
             --buildpack heroku/python --buildpack heroku/procfile
 
       # Same entrypoint, port and fail-closed check as the Toolforge job:
@@ -264,7 +319,7 @@ jobs:
 
       - uses: actions/setup-python@v7
         with:
-          python-version: "3.11"
+          python-version: "3.12"
           cache: pip
           cache-dependency-path: requirements-dev.txt
 

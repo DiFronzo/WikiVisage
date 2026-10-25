@@ -1,3 +1,4 @@
+import enum
 import html
 import io
 import json
@@ -10,9 +11,9 @@ import socket
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import UTC, datetime, timedelta
-from typing import Any
+from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from typing import Any, Self
 from urllib.parse import urlparse
 
 from dotenv import load_dotenv
@@ -36,11 +37,10 @@ from requests.packages.urllib3.util.retry import Retry
 
 import face_client
 import liftwing_client
-from config import DETECTION_WIDTH, HEARTBEAT_FILE_DIR, LIFTWING_PROBE_INTERVAL, PROJECT_VERSION, WAKE_FILE_PATH
+import oauth_refresh
+from config import DETECTION_WIDTH, HEARTBEAT_FILE_DIR, LIFTWING_PROBE_INTERVAL, USER_AGENT, WAKE_FILE_PATH
 from database import DatabaseError, close_pool, execute_query, execute_transaction, init_db
 from face_client import FaceServiceError, FaceServiceModelMismatch, FaceServiceRejected
-from redis_lock import single_flight
-from token_crypto import TokenDecryptionError, decrypt_token, encrypt_token
 
 # Configure Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
@@ -48,13 +48,8 @@ logger = logging.getLogger("worker")
 
 # Constants
 COMMONS_API_URL = "https://commons.wikimedia.org/w/api.php"
-SPARQL_URL = "https://commons-query.wikimedia.org/sparql"  # Requires OAuth; unused, kept for reference
 # Detection runs on this Commons thumbnail width (WIKIVISAGE_DETECTION_WIDTH, default 960).
 FILE_PATH_URL = f"https://commons.wikimedia.org/wiki/Special:FilePath/{{file_title}}?width={DETECTION_WIDTH}"
-
-# Wikimedia's User-Agent policy wants ``<client>/<version> (<contact>)``; the
-# LiftWing client uses the same string.
-USER_AGENT = f"WikiVisage/{PROJECT_VERSION} (https://github.com/DiFronzo/WikiVisage)"
 
 POLL_INTERVAL = int(os.environ.get("WIKIVISAGE_WORKER_POLL_INTERVAL", 60))
 BATCH_SIZE = int(os.environ.get("WIKIVISAGE_WORKER_BATCH_SIZE", 50))
@@ -68,7 +63,7 @@ IMAGE_THREADS = int(os.environ.get("WIKIVISAGE_WORKER_IMAGE_THREADS", 4))
 DETECTION_WAVE_SIZE = max(IMAGE_THREADS, face_client.FACE_SERVICE_BATCH_SIZE)
 
 # Cosine-distance threshold used when a project row carries none. Provisional
-# until Phase 0 calibration; keep in step with schema.sql / migrate.py.
+# until calibrated on real data; keep in step with schema.sql / migrate.py.
 DEFAULT_DISTANCE_THRESHOLD = 0.5
 
 # A stored embedding is L2-normalised, so its norm is 1. Anything this far off
@@ -83,7 +78,8 @@ CLAIM_EXPIRY_MINUTES = 15
 # Maximum image download size (50 MB) — prevents OOM on abnormally large files
 MAX_IMAGE_DOWNLOAD_BYTES = 50 * 1024 * 1024
 
-# Maximum image pixel area (100 megapixels) — prevents OOM in face detection subprocess
+# Maximum image pixel area (100 megapixels) — keeps a decompression bomb from
+# reaching the face service, which enforces its own independent ceiling.
 MAX_IMAGE_PIXELS = 100_000_000
 
 # Maximum images per project — stops category traversal once this limit is reached
@@ -122,7 +118,6 @@ MIN_BOOTSTRAP_IMAGES = 100  # Floor: always process at least 100 bootstrap image
 OAUTH_CLIENT_ID = os.environ.get("OAUTH_CLIENT_ID", "")
 OAUTH_CLIENT_SECRET = os.environ.get("OAUTH_CLIENT_SECRET", "")
 OAUTH_TOKEN_URL = "https://meta.wikimedia.org/w/rest.php/oauth2/access_token"
-TOKEN_REFRESH_BUFFER = 300
 
 # Maximum number of token refresh retries per SDC write session
 MAX_TOKEN_RETRIES = 2
@@ -240,24 +235,6 @@ def _convert_box_to_stored_space(
     bottom_s = min(max(top_s + 1, round(bottom * scale_y)), stored_h)
     return top_s, right_s, bottom_s, left_s
 
-
-def _build_skip_extensions_regex(extensions: set[str]) -> str:
-    """
-    Build a regex that matches file titles ending with any of the non-image extensions.
-
-    The generated pattern has the form: r"\\.(ext1|ext2|ext3)$"
-    where the extensions come from the `_SKIP_EXTENSIONS` set.
-    """
-    # Normalize by removing leading dots and escaping for regex safety
-    escaped_exts = [re.escape(ext.lstrip(".")) for ext in sorted(extensions)]
-    if not escaped_exts:
-        # Fallback that matches nothing if the set is ever empty
-        return r"(?!)"
-    return r"\.(" + "|".join(escaped_exts) + r")$"
-
-
-# Regex derived from `_SKIP_EXTENSIONS` for consistent non-image filtering (e.g. in SQL REGEXP)
-SKIP_EXTENSIONS_REGEX = _build_skip_extensions_regex(_SKIP_EXTENSIONS)
 
 # Global Shutdown Flag
 shutdown_requested = False
@@ -451,8 +428,8 @@ def _validate_image_dimensions(image_bytes: bytes) -> None:
     """Check image dimensions via PIL header-only read. Raises ValueError if too large.
 
     Catches PIL.Image.DecompressionBombError explicitly so callers see a uniform
-    ValueError instead of an unhandled exception (defense-in-depth — the worker
-    subprocess also caps PIL.Image.MAX_IMAGE_PIXELS).
+    ValueError instead of an unhandled exception (defense-in-depth — the face
+    service also caps its own decoded pixel area).
     """
     try:
         img = Image.open(io.BytesIO(image_bytes))
@@ -477,163 +454,42 @@ def _get_csrf_token(access_token: str) -> str:
         raise
 
 
-def _read_decrypted_user_tokens(user_id: int) -> tuple[str | None, str, Any]:
-    """Read and decrypt the user's access/refresh tokens + expiry from DB.
-
-    Returns (access_token, refresh_token, expires_at) or (None, "", None) on
-    decrypt/lookup failure (caller should treat as fatal — log already emitted).
-    """
-    user_row = execute_query(
-        "SELECT access_token, refresh_token, token_expires_at FROM users WHERE id = %s",
-        (user_id,),
-        fetch=True,
+def _oauth_exchange(refresh_token: str) -> dict[str, Any]:
+    """Trade a refresh token for new tokens at the Wikimedia OAuth endpoint."""
+    resp = _get_session().post(
+        OAUTH_TOKEN_URL,
+        data={
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": OAUTH_CLIENT_ID,
+            "client_secret": OAUTH_CLIENT_SECRET,
+        },
+        headers={"User-Agent": USER_AGENT},
+        timeout=10,  # Must complete well within the single-flight lock's TTL.
     )
-    if not user_row:
-        return None, "", None
-    user = user_row[0]
-    access_token = user["access_token"]
-    if isinstance(access_token, bytes):
-        access_token = access_token.decode("utf-8")
     try:
-        access_token = decrypt_token(access_token)
-    except TokenDecryptionError:
-        logger.error(
-            f"Cannot decrypt access token for user {user_id} — possible key rotation; skipping SDC writes for this user"
-        )
-        return None, "", None
-    refresh_token = user.get("refresh_token", "")
-    if isinstance(refresh_token, bytes):
-        refresh_token = refresh_token.decode("utf-8")
-    try:
-        refresh_token = decrypt_token(refresh_token)
-    except TokenDecryptionError:
-        logger.error(
-            f"Cannot decrypt refresh token for user {user_id} — possible key rotation; skipping SDC writes for this user"
-        )
-        return None, "", None
-    expires_at = user.get("token_expires_at")
-    if expires_at:
-        if isinstance(expires_at, str):
-            expires_at = datetime.fromisoformat(expires_at)
-        if expires_at.tzinfo is None:
-            expires_at = expires_at.replace(tzinfo=UTC)
-    return access_token, refresh_token, expires_at
+        resp.raise_for_status()
+        return resp.json()
+    finally:
+        resp.close()
 
 
 def _refresh_worker_token(user_id: int) -> str | None:
-    """Refresh an expired OAuth access token for SDC writes.
+    """Return a valid access token for SDC writes, refreshing it first if it is about to expire.
 
-    Reads refresh_token from DB, calls the OAuth token endpoint, and updates
-    the DB with the new credentials. Returns the new access_token or None if
-    refresh failed.
-
-    Concurrency model (mirrors app.py — see _refresh_access_token for full
-    rationale). Three layers of protection:
-      1. Redis single-flight lock per user_id — only one process per cluster
-         POSTs to the OAuth endpoint with a given refresh_token. Wikimedia
-         rotates refresh tokens on every exchange, so racing two refreshes
-         silently invalidates one of them.
-      2. DB optimistic concurrency (CAS on token_expires_at) — last-line
-         defense if Redis is down or the lock TTL expired mid-refresh.
-      3. Re-read from DB — used by both lost-race paths to recover the
-         winner's freshly-stored access_token.
+    The refresh protocol (Redis single-flight lock, DB compare-and-swap, re-read after a
+    lost race) lives in ``oauth_refresh`` and is shared with the web app. The worker
+    keeps a refreshed token it could not save: the batch in hand can still finish with it.
     """
-    access_token, refresh_token, expires_at = _read_decrypted_user_tokens(user_id)
-    if access_token is None:
-        return None
-
-    # Token still valid — no refresh needed, no lock needed.
-    if expires_at is not None:
-        now = datetime.now(UTC)
-        if (expires_at - now).total_seconds() > TOKEN_REFRESH_BUFFER:
-            return access_token
-
-    if not refresh_token:
-        logger.error(f"No refresh token for user {user_id}, cannot refresh")
-        return None
-
-    lock_name = f"oauth-refresh:{user_id}"
-    with single_flight(_get_redis_client(), lock_name, ttl_seconds=15) as got_lock:
-        if not got_lock:
-            # Another process is mid-refresh. Wait briefly, then re-read DB.
-            logger.info(f"Token refresh in flight for user {user_id} (worker) — waiting on peer")
-            time.sleep(1.0)
-            new_access, _, new_expires = _read_decrypted_user_tokens(user_id)
-            if new_access is None:
-                return None
-            if new_expires is not None and (new_expires - datetime.now(UTC)).total_seconds() > TOKEN_REFRESH_BUFFER:
-                return new_access
-            # Peer didn't actually commit — recurse once outside the lock window.
-            logger.warning(f"Peer refresh did not complete for user {user_id}; retrying")
-            return _refresh_worker_token(user_id)
-
-        logger.info(f"Refreshing access token for user {user_id} (worker)")
-        try:
-            resp = _get_session().post(
-                OAUTH_TOKEN_URL,
-                data={
-                    "grant_type": "refresh_token",
-                    "refresh_token": refresh_token,
-                    "client_id": OAUTH_CLIENT_ID,
-                    "client_secret": OAUTH_CLIENT_SECRET,
-                },
-                headers={"User-Agent": USER_AGENT},
-                timeout=10,  # Must complete well within the 15s single-flight lock TTL.
-            )
-            try:
-                resp.raise_for_status()
-                new_token = resp.json()
-            finally:
-                resp.close()
-        except Exception:
-            logger.exception(f"Failed to refresh access token for user {user_id}")
-            return None
-
-        new_access = new_token.get("access_token")
-        if not new_access:
-            logger.error(f"Token refresh response missing access_token for user {user_id}")
-            return None
-
-        new_refresh = new_token.get("refresh_token", refresh_token)
-        new_expires_at = datetime.now(UTC) + timedelta(seconds=new_token.get("expires_in", 14400))
-
-        # Optimistic concurrency: only update if no other process refreshed first.
-        old_expires_str = expires_at.strftime("%Y-%m-%d %H:%M:%S") if expires_at else None
-
-        try:
-            if old_expires_str:
-                rowcount = execute_query(
-                    "UPDATE users SET access_token = %s, refresh_token = %s, token_expires_at = %s "
-                    "WHERE id = %s AND token_expires_at = %s",
-                    (
-                        encrypt_token(new_access),
-                        encrypt_token(new_refresh),
-                        new_expires_at.strftime("%Y-%m-%d %H:%M:%S"),
-                        user_id,
-                        old_expires_str,
-                    ),
-                    fetch=False,
-                )
-            else:
-                rowcount = execute_query(
-                    "UPDATE users SET access_token = %s, refresh_token = %s, token_expires_at = %s WHERE id = %s",
-                    (
-                        encrypt_token(new_access),
-                        encrypt_token(new_refresh),
-                        new_expires_at.strftime("%Y-%m-%d %H:%M:%S"),
-                        user_id,
-                    ),
-                    fetch=False,
-                )
-
-            if rowcount == 0 and old_expires_str:
-                logger.info(f"Token already refreshed by another process for user {user_id}")
-                fresh_access, _, _ = _read_decrypted_user_tokens(user_id)
-                return fresh_access
-        except DatabaseError:
-            logger.exception(f"Failed to persist refreshed token for user {user_id}")
-
-        return new_access
+    tokens = oauth_refresh.refresh_tokens(
+        user_id,
+        label=f"user {user_id}",
+        query=execute_query,
+        get_redis=_get_redis_client,
+        exchange=_oauth_exchange,
+        keep_on_store_failure=True,
+    )
+    return tokens.access_token if tokens else None
 
 
 def traverse_category(project: dict[str, Any]) -> int:
@@ -2062,815 +1918,713 @@ def _has_pending_sdc_work(project_id: int) -> bool:
     return bool(rows[0]["pending"])
 
 
-def write_sdc_claims(project: dict[str, Any]) -> int:
-    """Write SDC P180 claims for all faces marked as target.
+# Faces fetched per write pass, and pages per removal pass.
+_SDC_WRITE_BATCH = 50
+_SDC_REMOVAL_BATCH = 50
 
-    Called when sdc_write_requested=1. Processes all pending faces in batches,
-    clears the flag when done (or sets sdc_write_error on failure).
+# While writing, the stop button is re-checked (and heartbeat, health-check file
+# and project claim refreshed) every this many faces. The check made once per
+# batch would otherwise allow up to _SDC_WRITE_BATCH unwanted Commons edits
+# between a click on "Stop" and the worker noticing.
+_PER_FACE_CANCEL_CHECK_EVERY = 5
+
+# A face whose page is claimed by another project that is still writing is not
+# written now, but the batch query selects it again at once. Without a pause the
+# loop would hammer the shared database until that claim is written or expires
+# (CLAIM_EXPIRY_MINUTES). After a pass in which EVERY face was held, wait, and
+# give up after this many such passes in a row, leaving those faces for the next
+# send and telling the user.
+_SDC_BLOCKED_BACKOFF_SECONDS = 20
+_SDC_BLOCKED_MAX_PASSES = 6
+
+# Commons answers with one of these when the token is unusable. Each is handled
+# the same way: refresh the token (bounded by MAX_TOKEN_RETRIES) and try again.
+_SDC_AUTH_ERRORS = frozenset({"badtoken", "permissiondenied", "notloggedin", "mwoauth-invalid-authorization"})
+
+_SDC_FACES_TO_WRITE_SQL = """
+    SELECT f.id as face_id, i.id as image_id, i.commons_page_id
+    FROM faces f
+    JOIN images i ON f.image_id = i.id
+    WHERE i.project_id = %s AND f.is_target = 1 AND f.sdc_written = 0
+    AND f.classified_by != 'bootstrap' AND i.bootstrapped = 0
+    AND f.superseded_by IS NULL
+    LIMIT %s
+"""
+
+_SDC_PAGES_TO_REMOVE_SQL = """
+    SELECT DISTINCT i.commons_page_id
+    FROM faces f
+    JOIN images i ON f.image_id = i.id
+    WHERE i.project_id = %s AND f.sdc_removal_pending = 1
+    AND f.superseded_by IS NULL
+    AND NOT EXISTS (
+        SELECT 1 FROM faces f2
+        WHERE f2.image_id = f.image_id AND f2.is_target = 1
+        AND f2.superseded_by IS NULL AND f2.id != f.id
+    )
+    LIMIT %s
+"""
+
+_SDC_REMOVAL_STILL_PENDING_SQL = """
+    SELECT 1 FROM faces f
+    JOIN images i ON f.image_id = i.id
+    WHERE i.commons_page_id = %s AND i.project_id = %s
+    AND f.sdc_removal_pending = 1 AND f.superseded_by IS NULL
+    AND NOT EXISTS (
+        SELECT 1 FROM faces f2
+        WHERE f2.image_id = f.image_id AND f2.is_target = 1
+        AND f2.superseded_by IS NULL AND f2.id != f.id
+    )
+    LIMIT 1
+"""
+
+
+class _Step(enum.Enum):
+    """What happened to one face (write phase) or one page (removal phase)."""
+
+    DONE = enum.auto()  # handled and counted in the run's totals
+    SKIPPED = enum.auto()  # nothing changed; the item stays pending for a later pass
+    BLOCKED = enum.auto()  # another project holds a fresh claim on the page; retry after a pause
+    UNVERIFIED = enum.auto()  # the face could not be re-read from the database
+    STOP = enum.auto()  # the run is over (aborted or cancelled): do no more work
+
+
+def _abort_sdc_run(project_id: int, message: str) -> None:
+    """End the run: clear the request flag and record why it stopped."""
+    execute_query(
+        "UPDATE projects SET sdc_write_requested = 0, sdc_write_user_id = NULL, sdc_write_error = %s WHERE id = %s",
+        (message, project_id),
+        fetch=False,
+    )
+
+
+def _find_p180_claim(claim_data: dict[str, Any], qid: str) -> dict[str, Any] | None:
+    """Return the first P180 claim in a ``wbgetclaims`` reply whose value is *qid*."""
+    for claim in claim_data.get("claims", {}).get("P180", []):
+        if claim.get("mainsnak", {}).get("datavalue", {}).get("value", {}).get("id") == qid:
+            return claim
+    return None
+
+
+class _SdcRun:
+    """One ``write_sdc_claims`` call: write approved faces, then remove rejected claims.
+
+    The two phases share the credentials and the retry budget for refreshed
+    tokens. Every step returns a :class:`_Step`; ``STOP`` means the run already
+    recorded its outcome on the project (or the user cancelled) and the caller
+    must return immediately.
     """
-    project_id = project["id"]
-    user_id = project.get("sdc_write_user_id") or project["user_id"]
-    logger.info(f"Starting SDC writes for project {project_id}")
 
-    access_token = _refresh_worker_token(user_id)
-    if not access_token:
-        logger.error(f"Cannot obtain valid token for user {user_id}, aborting SDC writes")
-        execute_query(
-            "UPDATE projects SET sdc_write_requested = 0, sdc_write_user_id = NULL, "
-            "sdc_write_error = 'Token expired or user not found. Please log in again.' WHERE id = %s",
-            (project_id,),
-            fetch=False,
-        )
-        return 0
+    def __init__(self, project: dict[str, Any], user_id: int, access_token: str, csrf_token: str, numeric_id: int):
+        self.project_id: int = project["id"]
+        self.qid: str = project["wikidata_qid"]
+        self.user_id = user_id
+        self.access_token = access_token
+        self.csrf_token = csrf_token
+        self.numeric_id = numeric_id
+        self.total_written = 0
+        self.total_removed = 0
+        self.token_retries = 0
+        self.notice: str | None = None  # shown to the user when the run ends without an abort
 
-    try:
-        csrf_token = _get_csrf_token(access_token)
-    except Exception as e:
-        logger.error(f"Failed to get CSRF token for project {project_id}: {e}")
-        execute_query(
-            "UPDATE projects SET sdc_write_requested = 0, sdc_write_user_id = NULL, sdc_write_error = 'Failed to get CSRF token' WHERE id = %s",
-            (project_id,),
-            fetch=False,
-        )
-        return 0
+    @classmethod
+    def begin(cls, project: dict[str, Any]) -> Self | None:
+        """Obtain credentials and validate the project, or record the failure and return None."""
+        project_id = project["id"]
+        user_id = project.get("sdc_write_user_id") or project["user_id"]
+        logger.info(f"Starting SDC writes for project {project_id}")
 
-    qid = project["wikidata_qid"]
-    try:
-        numeric_id = int(qid[1:])
-    except ValueError:
-        logger.error(f"Invalid QID format: {qid}")
-        execute_query(
-            "UPDATE projects SET sdc_write_requested = 0, sdc_write_user_id = NULL, sdc_write_error = 'Invalid QID format' WHERE id = %s",
-            (project_id,),
-            fetch=False,
-        )
-        return 0
+        access_token = _refresh_worker_token(user_id)
+        if not access_token:
+            logger.error(f"Cannot obtain valid token for user {user_id}, aborting SDC writes")
+            _abort_sdc_run(project_id, "Token expired or user not found. Please log in again.")
+            return None
 
-    total_written = 0
-    token_retries = 0
-    SDC_BATCH = 50  # Faces per DB fetch batch
-
-    while not shutdown_requested:
-        # Check if user cancelled the write via the stop button
         try:
-            cancel_check = execute_query(
+            csrf_token = _get_csrf_token(access_token)
+        except Exception as e:
+            logger.error(f"Failed to get CSRF token for project {project_id}: {e}")
+            _abort_sdc_run(project_id, "Failed to get CSRF token")
+            return None
+
+        qid = project["wikidata_qid"]
+        try:
+            numeric_id = int(qid[1:])
+        except ValueError:
+            logger.error(f"Invalid QID format: {qid}")
+            _abort_sdc_run(project_id, "Invalid QID format")
+            return None
+
+        return cls(project, user_id, access_token, csrf_token, numeric_id)
+
+    # -- shared helpers -----------------------------------------------------
+
+    @property
+    def _headers(self) -> dict[str, str]:
+        return {"Authorization": f"Bearer {self.access_token}"}
+
+    def abort(self, message: str) -> None:
+        _abort_sdc_run(self.project_id, message)
+
+    def _user_cancelled(self) -> bool:
+        """True when the user pressed Stop. A failed check never cancels: keep writing."""
+        try:
+            rows = execute_query(
                 "SELECT sdc_write_requested FROM projects WHERE id = %s",
-                (project_id,),
+                (self.project_id,),
                 fetch=True,
             )
-            if not cancel_check or cancel_check[0]["sdc_write_requested"] == 0:
-                logger.info(f"SDC write cancelled by user for project {project_id} ({total_written} written so far)")
-                return total_written
         except DatabaseError:
-            pass  # Non-fatal: continue writing if we can't check
+            return False
+        return not rows or rows[0]["sdc_write_requested"] == 0
 
-        # Fetch next batch of unwritten faces
-        faces_to_write = execute_query(
-            """
-            SELECT f.id as face_id, i.id as image_id, i.commons_page_id
-            FROM faces f
-            JOIN images i ON f.image_id = i.id
-            WHERE i.project_id = %s AND f.is_target = 1 AND f.sdc_written = 0
-            AND f.classified_by != 'bootstrap' AND i.bootstrapped = 0
-            AND f.superseded_by IS NULL
-            LIMIT %s
-            """,
-            (project_id, SDC_BATCH),
-            fetch=True,
+    def _lookup_claims(self, mid: str) -> dict[str, Any]:
+        response = _api_request(
+            COMMONS_API_URL,
+            params={"action": "wbgetclaims", "entity": mid, "property": "P180", "format": "json"},
+            headers=self._headers,
         )
+        return response.json()
 
-        if not faces_to_write:
-            break
+    def _refresh_credentials(self, error_code: str, error_info: str, step: str, mid: str) -> bool:
+        """Refresh the token after an auth error. False means the run was aborted."""
+        self.token_retries += 1
+        if self.token_retries > MAX_TOKEN_RETRIES:
+            logger.error(f"SDC token retry limit reached during {step} for project {self.project_id}: {error_code}")
+            self.abort(_sdc_error_message(error_code, error_info))
+            return False
+        logger.warning(f"Auth error during {step} for {mid}: {error_code}, refreshing token")
+        refreshed = _refresh_worker_token(self.user_id)
+        if refreshed:
+            self.access_token = refreshed
+        try:
+            self.csrf_token = _get_csrf_token(self.access_token)
+        except Exception:
+            logger.error(f"Failed to refresh tokens during {step} for project {self.project_id}")
+            self.abort(_sdc_error_message(error_code, error_info))
+            return False
+        return True
 
-        # Cooperative cancellation inside the per-face loop. The outer-loop check
-        # only fires every SDC_BATCH (50) faces — that's up to 50 unwanted Commons
-        # writes between a user clicking "Stop" and us noticing. Re-check every
-        # `_PER_FACE_CANCEL_CHECK_EVERY` faces (cheap one-row SELECT) so we abort
-        # promptly without spamming the DB. The same cadence refreshes our
-        # heartbeat and project claim, because this function blocks the main
-        # loop for as long as the project has faces to write.
-        _PER_FACE_CANCEL_CHECK_EVERY = 5
+    def _api_failure(
+        self,
+        reply: dict[str, Any],
+        *,
+        mid: str,
+        step: str,
+        on_skippable: Callable[[str], _Step],
+    ) -> _Step | None:
+        """Classify an error reply from Commons; None when the reply holds no error."""
+        error = reply.get("error")
+        if not error:
+            return None
+        code = error.get("code", "unknown")
+        info = error.get("info", "Unknown error")
+        if code in _SDC_AUTH_ERRORS:
+            return _Step.SKIPPED if self._refresh_credentials(code, info, step, mid) else _Step.STOP
+        if code in _SDC_PER_FACE_SKIP_ERRORS:
+            return on_skippable(code)
+        logger.error(f"SDC {step} error for {mid}: {error}")
+        self.abort(_sdc_error_message(code, info))
+        logger.info(
+            f"SDC run aborted for project {self.project_id}: {self.total_written} written, "
+            f"{self.total_removed} removed before the error"
+        )
+        return _Step.STOP
+
+    # -- write phase --------------------------------------------------------
+
+    def write_phase(self) -> bool:
+        """Write every approved face. False means the run ended (aborted or cancelled)."""
+        self.token_retries = 0
+        blocked_passes = 0
+        while not shutdown_requested:
+            if self._user_cancelled():
+                logger.info(
+                    f"SDC write cancelled by user for project {self.project_id} ({self.total_written} written so far)"
+                )
+                return False
+            faces = execute_query(_SDC_FACES_TO_WRITE_SQL, (self.project_id, _SDC_WRITE_BATCH), fetch=True)
+            if not faces:
+                break
+            step = self._write_batch(faces)
+            if step is _Step.STOP:
+                return False
+            if step is not _Step.BLOCKED:
+                blocked_passes = 0
+                continue
+            blocked_passes += 1
+            if blocked_passes >= _SDC_BLOCKED_MAX_PASSES:
+                logger.warning(
+                    f"SDC writes for project {self.project_id}: pages still held by another project after "
+                    f"{blocked_passes} passes, leaving them for the next send"
+                )
+                self.notice = (
+                    "Some files are being edited by another project and were skipped. Send the edits again later."
+                )
+                break
+            if not self._wait_while_blocked():
+                break
+        return True
+
+    def _wait_while_blocked(self) -> bool:
+        """Pause between fully blocked passes, staying alive. False: a shutdown was requested."""
+        for second in range(1, _SDC_BLOCKED_BACKOFF_SECONDS + 1):
+            if shutdown_requested:
+                return False
+            time.sleep(1)
+            if second % _PER_FACE_CANCEL_CHECK_EVERY == 0:
+                _keepalive_sdc_write(self.project_id)
+        return True
+
+    def _write_batch(self, faces: list[dict[str, Any]]) -> _Step:
         faces_since_check = 0
-        recheck_failures = 0
-
-        for row in faces_to_write:
+        unverified = 0
+        blocked = 0
+        for row in faces:
             if shutdown_requested:
                 break
 
             faces_since_check += 1
             if faces_since_check >= _PER_FACE_CANCEL_CHECK_EVERY:
                 faces_since_check = 0
-                _keepalive_sdc_write(project_id)
-                try:
-                    inner_check = execute_query(
-                        "SELECT sdc_write_requested FROM projects WHERE id = %s",
-                        (project_id,),
-                        fetch=True,
+                _keepalive_sdc_write(self.project_id)
+                if self._user_cancelled():
+                    logger.info(
+                        f"SDC write cancelled mid-batch by user for project {self.project_id} "
+                        f"({self.total_written} written so far)"
                     )
-                    if not inner_check or inner_check[0]["sdc_write_requested"] == 0:
-                        logger.info(
-                            f"SDC write cancelled mid-batch by user for project {project_id} "
-                            f"({total_written} written so far)"
-                        )
-                        return total_written
-                except DatabaseError:
-                    pass  # Non-fatal: keep writing if the check fails
+                    return _Step.STOP
 
-            page_id = row["commons_page_id"]
-            face_id = row["face_id"]
+            step = self._write_face(row)
+            if step is _Step.STOP:
+                return _Step.STOP
+            if step is _Step.DONE:
+                self.total_written += 1
+            elif step is _Step.UNVERIFIED:
+                unverified += 1
+            elif step is _Step.BLOCKED:
+                blocked += 1
 
-            # The batch was selected before the earlier faces were written; the
-            # user can reject this face, undo its classification or edit its
-            # bbox while we work through it. Re-read the live state to skip the
-            # face before doing any reservation work, and again right before
-            # the edit (after the idempotency request) so no P180 claim is
-            # added for a face that no longer confirms the target. (The
-            # web-side reject/undo paths queue a removal as well; this narrows
-            # the race to a single face.)
-            try:
-                live_rows = execute_query(
-                    "SELECT is_target, superseded_by FROM faces WHERE id = %s",
-                    (face_id,),
-                    fetch=True,
-                )
-            except DatabaseError:
-                # Unverifiable — skip and retry on a later pass rather than
-                # risk writing a stale claim.
-                recheck_failures += 1
-                logger.warning(f"Could not re-check face {face_id} before SDC write, skipping")
-                continue
-            if not live_rows or live_rows[0]["is_target"] != 1 or live_rows[0]["superseded_by"] is not None:
-                logger.info(f"SDC write skipped for face {face_id}: no longer an approved target")
-                continue
-
-            mid = f"M{page_id}"
-
-            try:
-                # Cross-project dedup: claim this page+qid pair before making the API call.
-                # INSERT IGNORE returns rowcount=0 when a row already exists.
-                claim_rows = execute_query(
-                    "INSERT IGNORE INTO sdc_claims (commons_page_id, wikidata_qid, project_id, face_id) "
-                    "VALUES (%s, %s, %s, %s)",
-                    (page_id, qid, project_id, face_id),
-                    fetch=False,
-                )
-                if claim_rows == 0:
-                    # INSERT was a no-op: a row already exists for this page+qid.
-                    # Inspect it before deciding whether to skip, retry, or reclaim.
-                    existing_claim = execute_query(
-                        "SELECT project_id, written_at, claimed_at FROM sdc_claims "
-                        "WHERE commons_page_id = %s AND wikidata_qid = %s",
-                        (page_id, qid),
-                        fetch=True,
-                    )
-                    if not existing_claim:
-                        # Row vanished between INSERT and SELECT (e.g. cascade delete).
-                        # Skip this face; it will be retried next write cycle.
-                        logger.warning(
-                            f"SDC claim row missing for {qid} on M{page_id} after INSERT IGNORE, "
-                            f"skipping face {face_id}"
-                        )
-                        continue
-
-                    existing = existing_claim[0]
-
-                    if existing["written_at"] is not None:
-                        # The claim was already successfully written to Commons.
-                        # Safe to mark this face as done.
-                        logger.info(
-                            f"SDC claim for {qid} on M{page_id} already written "
-                            f"(written_at={existing['written_at']}), marking face {face_id} as written"
-                        )
-                        execute_query(
-                            "UPDATE faces SET sdc_written = 1 WHERE id = %s",
-                            (face_id,),
-                            fetch=False,
-                        )
-                        total_written += 1
-                        continue
-
-                    if int(existing["project_id"]) == int(project_id):
-                        # Same project owns this claim but hasn't written it yet
-                        # (e.g. a previous write attempt failed mid-way).
-                        # Fall through to the write logic below.
-                        logger.info(
-                            f"SDC claim for {qid} on M{page_id} previously claimed by this project, "
-                            f"retrying write for face {face_id}"
-                        )
-                    else:
-                        # A different project holds the claim with written_at IS NULL.
-                        # Try to reclaim if the claim is stale (crashed/abandoned worker).
-                        reclaimed = execute_query(
-                            "UPDATE sdc_claims SET project_id = %s, face_id = %s, claimed_at = NOW() "
-                            "WHERE commons_page_id = %s AND wikidata_qid = %s "
-                            "AND written_at IS NULL "
-                            "AND claimed_at < NOW() - INTERVAL %s MINUTE",
-                            (project_id, face_id, page_id, qid, CLAIM_EXPIRY_MINUTES),
-                            fetch=False,
-                        )
-                        if reclaimed == 0:
-                            # Another project holds a fresh, non-stale claim — skip for now.
-                            logger.info(
-                                f"SDC claim for {qid} on M{page_id} held by project "
-                                f"{existing['project_id']} (claimed_at={existing['claimed_at']}), "
-                                f"skipping face {face_id} this cycle"
-                            )
-                            continue
-                        logger.info(
-                            f"Reclaimed stale SDC claim for {qid} on M{page_id} "
-                            f"from project {existing['project_id']} for face {face_id}"
-                        )
-
-                # Idempotency check
-                claim_params = {
-                    "action": "wbgetclaims",
-                    "entity": mid,
-                    "property": "P180",
-                    "format": "json",
-                }
-                claim_headers = {"Authorization": f"Bearer {access_token}"}
-
-                claim_resp = _api_request(COMMONS_API_URL, params=claim_params, headers=claim_headers)
-                claim_data = claim_resp.json()
-
-                if "error" in claim_data:
-                    error_code = claim_data["error"].get("code", "unknown")
-                    error_info = claim_data["error"].get("info", "Unknown error")
-                    if error_code in ("badtoken", "permissiondenied", "notloggedin", "mwoauth-invalid-authorization"):
-                        token_retries += 1
-                        if token_retries > MAX_TOKEN_RETRIES:
-                            msg = _sdc_error_message(error_code, error_info)
-                            logger.error(
-                                f"SDC token retry limit reached during idempotency check for project {project_id}: "
-                                f"{error_code}"
-                            )
-                            execute_query(
-                                "UPDATE projects SET sdc_write_requested = 0, sdc_write_user_id = NULL, sdc_write_error = %s WHERE id = %s",
-                                (msg, project_id),
-                                fetch=False,
-                            )
-                            return total_written
-                        logger.warning(f"Auth error on wbgetclaims for {mid}: {error_code}, refreshing token")
-                        refreshed = _refresh_worker_token(user_id)
-                        if refreshed:
-                            access_token = refreshed
-                            claim_headers = {"Authorization": f"Bearer {access_token}"}
-                        try:
-                            csrf_token = _get_csrf_token(access_token)
-                        except Exception:
-                            msg = _sdc_error_message(error_code, error_info)
-                            logger.error(f"Failed to refresh tokens for project {project_id}")
-                            execute_query(
-                                "UPDATE projects SET sdc_write_requested = 0, sdc_write_user_id = NULL, sdc_write_error = %s WHERE id = %s",
-                                (msg, project_id),
-                                fetch=False,
-                            )
-                            return total_written
-                        continue
-                    elif error_code in _SDC_PER_FACE_SKIP_ERRORS:
-                        logger.warning(f"Skipping face {face_id} on {mid}: {error_code} during idempotency check")
-                        # Mark this face as completed for SDC writes and release its claim so it is not retried indefinitely.
-                        execute_query(
-                            "UPDATE faces SET sdc_written = 1 WHERE id = %s",
-                            (face_id,),
-                            fetch=False,
-                        )
-                        execute_query(
-                            "DELETE FROM sdc_claims WHERE face_id = %s",
-                            (face_id,),
-                            fetch=False,
-                        )
-                        continue
-                    else:
-                        msg = _sdc_error_message(error_code, error_info)
-                        logger.error(f"SDC idempotency check error for {mid}: {claim_data['error']}")
-                        execute_query(
-                            "UPDATE projects SET sdc_write_requested = 0, sdc_write_user_id = NULL, sdc_write_error = %s WHERE id = %s",
-                            (msg, project_id),
-                            fetch=False,
-                        )
-                        return total_written
-
-                already_exists = False
-                claims = claim_data.get("claims", {}).get("P180", [])
-                for claim in claims:
-                    snak = claim.get("mainsnak", {})
-                    if snak.get("datavalue", {}).get("value", {}).get("id") == qid:
-                        already_exists = True
-                        break
-
-                if already_exists:
-                    # Only mark a face that is still a target. The claim predates
-                    # this run, so a face reset while wbgetclaims was in flight
-                    # must not carry a written marker: a later rejection/undo
-                    # would remove a claim the worker did not add. No removal is
-                    # queued here for the same reason.
-                    marked_written = execute_query(
-                        "UPDATE faces SET sdc_written = 1 WHERE id = %s AND is_target = 1",
-                        (face_id,),
-                        fetch=False,
-                    )
-                    if marked_written:
-                        logger.info(
-                            f"SDC P180 claim for {qid} already exists on {mid}, marked face {face_id} as written"
-                        )
-                    else:
-                        logger.warning(
-                            f"Face {face_id} is no longer a target; not marking the "
-                            f"pre-existing P180 claim on {mid} as written"
-                        )
-                    execute_query(
-                        "UPDATE sdc_claims SET written_at = NOW() "
-                        "WHERE commons_page_id = %s AND wikidata_qid = %s AND written_at IS NULL",
-                        (page_id, qid),
-                        fetch=False,
-                    )
-                    image_id = row["image_id"]
-                    execute_query(
-                        "UPDATE images SET bootstrapped = 1 WHERE id = %s AND bootstrapped = 0",
-                        (image_id,),
-                        fetch=False,
-                    )
-                    total_written += 1
-                    continue
-
-                # wbgetclaims above is a network call (with retries), so the
-                # face can have been rejected, undone or deleted while it was
-                # in flight — an undone manual face even cascades its sdc_claims
-                # row away. Re-read the live state right before the edit so no
-                # claim is written for a face that no longer confirms the
-                # target, and release the unwritten reservation we still hold
-                # so a later write for a re-confirmed face starts clean.
-                try:
-                    live_rows = execute_query(
-                        "SELECT is_target, superseded_by FROM faces WHERE id = %s",
-                        (face_id,),
-                        fetch=True,
-                    )
-                except DatabaseError:
-                    recheck_failures += 1
-                    logger.warning(f"Could not re-check face {face_id} before SDC edit, skipping")
-                    continue
-                if not live_rows or live_rows[0]["is_target"] != 1 or live_rows[0]["superseded_by"] is not None:
-                    logger.info(f"SDC write skipped for face {face_id}: no longer an approved target")
-                    execute_query(
-                        "DELETE FROM sdc_claims WHERE face_id = %s AND written_at IS NULL",
-                        (face_id,),
-                        fetch=False,
-                    )
-                    continue
-
-                # Write claim
-                edit_data = {
-                    "action": "wbeditentity",
-                    "id": mid,
-                    "data": json.dumps(
-                        {
-                            "claims": [
-                                {
-                                    "mainsnak": {
-                                        "snaktype": "value",
-                                        "property": "P180",
-                                        "datavalue": {
-                                            "type": "wikibase-entityid",
-                                            "value": {
-                                                "numeric-id": numeric_id,
-                                                "id": qid,
-                                            },
-                                        },
-                                    },
-                                    "type": "statement",
-                                    "rank": "normal",
-                                }
-                            ]
-                        }
-                    ),
-                    "token": csrf_token,
-                    "summary": f"WikiVisage: Adding depicts (P180) claim for {qid}",
-                    "format": "json",
-                    "bot": "1",
-                    "maxlag": "5",
-                }
-
-                edit_resp = _api_request(
-                    COMMONS_API_URL,
-                    data=edit_data,
-                    headers=claim_headers,
-                    method="post",
-                )
-                edit_json = edit_resp.json()
-
-                if "error" in edit_json:
-                    error_code = edit_json["error"].get("code")
-                    error_info = edit_json["error"].get("info", "Unknown error")
-                    if error_code in ("badtoken", "permissiondenied", "notloggedin"):
-                        token_retries += 1
-                        if token_retries > MAX_TOKEN_RETRIES:
-                            msg = _sdc_error_message(error_code, error_info)
-                            logger.error(f"SDC token retry limit reached for project {project_id}: {error_code}")
-                            execute_query(
-                                "UPDATE projects SET sdc_write_requested = 0, sdc_write_user_id = NULL, sdc_write_error = %s WHERE id = %s",
-                                (msg, project_id),
-                                fetch=False,
-                            )
-                            return total_written
-                        # Try refreshing the access token first
-                        refreshed = _refresh_worker_token(user_id)
-                        if refreshed:
-                            access_token = refreshed
-                            claim_headers = {"Authorization": f"Bearer {access_token}"}
-                        try:
-                            csrf_token = _get_csrf_token(access_token)
-                        except Exception:
-                            msg = _sdc_error_message(error_code, error_info)
-                            logger.error(f"Failed to refresh tokens for project {project_id}")
-                            execute_query(
-                                "UPDATE projects SET sdc_write_requested = 0, sdc_write_user_id = NULL, sdc_write_error = %s WHERE id = %s",
-                                (msg, project_id),
-                                fetch=False,
-                            )
-                            return total_written
-                        continue
-                    elif error_code in _SDC_PER_FACE_SKIP_ERRORS:
-                        logger.warning(f"Skipping face {face_id} on {mid}: {error_code} during write")
-                        # Mark this face as terminal so it is not retried indefinitely
-                        execute_query(
-                            "UPDATE faces SET sdc_written = 1 WHERE id = %s",
-                            (face_id,),
-                            fetch=False,
-                        )
-                        continue
-                    else:
-                        # Any other API error — abort entire write
-                        msg = _sdc_error_message(error_code, error_info)
-                        logger.error(f"SDC Write error for {mid}: {edit_json['error']}")
-                        execute_query(
-                            "UPDATE projects SET sdc_write_requested = 0, sdc_write_user_id = NULL, sdc_write_error = %s WHERE id = %s",
-                            (msg, project_id),
-                            fetch=False,
-                        )
-                        logger.info(
-                            f"SDC writes aborted for project {project_id}: {total_written} written before error"
-                        )
-                        return total_written
-
-                if not edit_json.get("success"):
-                    logger.warning(
-                        f"SDC write for face {face_id} on {mid} returned unexpected response "
-                        f"(no 'success' key): {json.dumps(edit_json)[:500]}"
-                    )
-
-                logger.info(f"SDC P180 claim for {qid} written to {mid} (face {face_id})")
-                # The face may have been reset, rejected or undone between the
-                # live-state re-check above and the wbeditentity call. Only mark it
-                # written while it is still a target; otherwise the claim we just
-                # added is orphaned, so queue its removal in the same run. An undo
-                # can restore is_target=0 (review undo) as well as NULL (classify
-                # undo), so both non-target states need the recovery.
-                written_now = execute_query(
-                    "UPDATE faces SET sdc_written = 1 WHERE id = %s AND is_target = 1",
-                    (face_id,),
-                    fetch=False,
-                )
-                if not written_now:
-                    logger.warning(f"Face {face_id} changed during the SDC write; queuing P180 removal for {mid}")
-                    execute_query(
-                        "UPDATE faces SET sdc_written = 1, sdc_removal_pending = 1 "
-                        "WHERE id = %s AND (is_target IS NULL OR is_target = 0) "
-                        "AND superseded_by IS NULL",
-                        (face_id,),
-                        fetch=False,
-                    )
-                execute_query(
-                    "UPDATE sdc_claims SET written_at = NOW() WHERE commons_page_id = %s AND wikidata_qid = %s",
-                    (page_id, qid),
-                    fetch=False,
-                )
-                total_written += 1
-
-                # Rate limiting for MediaWiki API
-                time.sleep(1)
-
-            except Exception as e:
-                logger.error(f"Error writing SDC for face {face_id} on {mid}: {e}")
-                execute_query(
-                    "UPDATE projects SET sdc_write_requested = 0, sdc_write_user_id = NULL, sdc_write_error = %s WHERE id = %s",
-                    (str(e)[:1024], project_id),
-                    fetch=False,
-                )
-                logger.info(f"SDC writes aborted for project {project_id}: {total_written} written before error")
-                return total_written
-
-        if recheck_failures >= len(faces_to_write):
+        if unverified >= len(faces):
             # Every face failed its live-state re-check (e.g. the DB flapped on
-            # those single-row SELECTs while the batch SELECTs still worked).
-            # Nothing in this batch can make progress. Return through the error
-            # path: falling through to the normal cleanup would clear
-            # sdc_write_requested without recording why the faces stayed
-            # unwritten, leaving the user with no explanation and no retry.
-            msg = "Could not verify the faces before writing. Please try again."
+            # those single-row SELECTs while the batch SELECT still worked).
+            # Nothing in this batch can make progress. Ending through the abort
+            # path records why the faces stayed unwritten; falling through to the
+            # normal cleanup would clear sdc_write_requested with no explanation
+            # and no retry for the user.
             logger.warning(
-                f"SDC writes for project {project_id}: no face in the batch could be verified, "
-                f"aborting this run ({total_written} written)"
+                f"SDC writes for project {self.project_id}: no face in the batch could be verified, "
+                f"aborting this run ({self.total_written} written)"
             )
-            execute_query(
-                "UPDATE projects SET sdc_write_requested = 0, sdc_write_user_id = NULL, "
-                "sdc_write_error = %s WHERE id = %s",
-                (msg, project_id),
-                fetch=False,
-            )
-            return total_written
+            self.abort("Could not verify the faces before writing. Please try again.")
+            return _Step.STOP
+        return _Step.BLOCKED if blocked >= len(faces) else _Step.DONE
 
-    # --- P180 Removal Phase ---
-    # Process faces with sdc_removal_pending=1 (rejected bootstrap faces)
-    total_removed = 0
-    token_retries = 0
-    REMOVAL_BATCH = 50
+    def _face_state(self, face_id: int) -> bool | None:
+        """Re-read a face. True: still an approved target. False: changed. None: unreadable.
 
-    while not shutdown_requested:
-        # Check if user cancelled the write via the stop button
+        The batch was selected before earlier faces were written; the user can
+        reject the face, undo its classification or edit its box while we work.
+        """
         try:
-            cancel_check = execute_query(
-                "SELECT sdc_write_requested FROM projects WHERE id = %s",
-                (project_id,),
+            rows = execute_query(
+                "SELECT is_target, superseded_by FROM faces WHERE id = %s",
+                (face_id,),
                 fetch=True,
             )
-            if not cancel_check or cancel_check[0]["sdc_write_requested"] == 0:
-                logger.info(f"SDC removal cancelled by user for project {project_id}")
-                break
         except DatabaseError:
-            pass
+            return None
+        return bool(rows) and rows[0]["is_target"] == 1 and rows[0]["superseded_by"] is None
 
-        faces_to_remove = execute_query(
-            """
-            SELECT DISTINCT i.commons_page_id
-            FROM faces f
-            JOIN images i ON f.image_id = i.id
-            WHERE i.project_id = %s AND f.sdc_removal_pending = 1
-            AND f.superseded_by IS NULL
-            AND NOT EXISTS (
-                SELECT 1 FROM faces f2
-                WHERE f2.image_id = f.image_id AND f2.is_target = 1
-                AND f2.superseded_by IS NULL AND f2.id != f.id
+    def _write_face(self, row: dict[str, Any]) -> _Step:
+        face_id = row["face_id"]
+        state = self._face_state(face_id)
+        if state is None:
+            # Unverifiable: skip and retry on a later pass rather than risk a stale claim.
+            logger.warning(f"Could not re-check face {face_id} before SDC write, skipping")
+            return _Step.UNVERIFIED
+        if not state:
+            logger.info(f"SDC write skipped for face {face_id}: no longer an approved target")
+            return _Step.SKIPPED
+
+        mid = f"M{row['commons_page_id']}"
+        try:
+            return self._write_verified_face(row, mid)
+        except Exception as e:
+            logger.error(f"Error writing SDC for face {face_id} on {mid}: {e}")
+            self.abort(str(e)[:1024])
+            logger.info(f"SDC writes aborted for project {self.project_id}: {self.total_written} written before error")
+            return _Step.STOP
+
+    def _write_verified_face(self, row: dict[str, Any], mid: str) -> _Step:
+        page_id = row["commons_page_id"]
+        face_id = row["face_id"]
+
+        reserved = self._reserve_claim(page_id, face_id)
+        if reserved is not None:
+            return reserved
+
+        reply = self._lookup_claims(mid)
+        failure = self._api_failure(
+            reply,
+            mid=mid,
+            step="idempotency check",
+            on_skippable=lambda code: self._finish_face_without_edit(face_id, mid, code),
+        )
+        if failure is not None:
+            return failure
+
+        if _find_p180_claim(reply, self.qid):
+            return self._adopt_existing_claim(row, mid)
+
+        # The lookup was a network call (with retries): the face can have been
+        # rejected, undone or deleted meanwhile (an undone manual face even
+        # cascades its sdc_claims row away). Re-read it right before the edit
+        # and release the reservation we still hold, so a later write for a
+        # re-confirmed face starts clean.
+        state = self._face_state(face_id)
+        if state is None:
+            logger.warning(f"Could not re-check face {face_id} before SDC edit, skipping")
+            return _Step.UNVERIFIED
+        if not state:
+            logger.info(f"SDC write skipped for face {face_id}: no longer an approved target")
+            execute_query(
+                "DELETE FROM sdc_claims WHERE face_id = %s AND written_at IS NULL",
+                (face_id,),
+                fetch=False,
             )
-            LIMIT %s
-            """,
-            (project_id, REMOVAL_BATCH),
+            return _Step.SKIPPED
+
+        reply = self._send_edit(mid)
+        failure = self._api_failure(
+            reply,
+            mid=mid,
+            step="write",
+            on_skippable=lambda code: self._finish_face_without_edit(face_id, mid, code, release_claim=False),
+        )
+        if failure is not None:
+            return failure
+
+        if not reply.get("success"):
+            logger.warning(
+                f"SDC write for face {face_id} on {mid} returned unexpected response "
+                f"(no 'success' key): {json.dumps(reply)[:500]}"
+            )
+        logger.info(f"SDC P180 claim for {self.qid} written to {mid} (face {face_id})")
+        self._record_written(face_id, page_id, mid)
+        time.sleep(1)  # Rate limiting for the MediaWiki API
+        return _Step.DONE
+
+    def _reserve_claim(self, page_id: int, face_id: int) -> _Step | None:
+        """Claim this page+QID pair across projects. None: go on and write; else the step's result."""
+        inserted = execute_query(
+            "INSERT IGNORE INTO sdc_claims (commons_page_id, wikidata_qid, project_id, face_id) VALUES (%s, %s, %s, %s)",
+            (page_id, self.qid, self.project_id, face_id),
+            fetch=False,
+        )
+        if inserted != 0:
+            return None
+
+        # A row already exists for this page+qid: decide whether to skip, retry or reclaim.
+        existing_rows = execute_query(
+            "SELECT project_id, written_at, claimed_at FROM sdc_claims WHERE commons_page_id = %s AND wikidata_qid = %s",
+            (page_id, self.qid),
             fetch=True,
         )
+        if not existing_rows:
+            # The row vanished between INSERT and SELECT (e.g. a cascade delete); retry next pass.
+            logger.warning(
+                f"SDC claim row missing for {self.qid} on M{page_id} after INSERT IGNORE, skipping face {face_id}"
+            )
+            return _Step.SKIPPED
 
-        if not faces_to_remove:
-            break
+        existing = existing_rows[0]
+        if existing["written_at"] is not None:
+            logger.info(
+                f"SDC claim for {self.qid} on M{page_id} already written "
+                f"(written_at={existing['written_at']}), marking face {face_id} as written"
+            )
+            execute_query("UPDATE faces SET sdc_written = 1 WHERE id = %s", (face_id,), fetch=False)
+            return _Step.DONE
 
-        for row in faces_to_remove:
-            if shutdown_requested:
+        if int(existing["project_id"]) == int(self.project_id):
+            # This project reserved it but never finished (e.g. an earlier attempt failed midway).
+            logger.info(
+                f"SDC claim for {self.qid} on M{page_id} previously claimed by this project, "
+                f"retrying write for face {face_id}"
+            )
+            return None
+
+        # Another project holds an unwritten claim: take it over only if it went stale.
+        reclaimed = execute_query(
+            "UPDATE sdc_claims SET project_id = %s, face_id = %s, claimed_at = NOW() "
+            "WHERE commons_page_id = %s AND wikidata_qid = %s "
+            "AND written_at IS NULL "
+            "AND claimed_at < NOW() - INTERVAL %s MINUTE",
+            (self.project_id, face_id, page_id, self.qid, CLAIM_EXPIRY_MINUTES),
+            fetch=False,
+        )
+        if reclaimed == 0:
+            logger.info(
+                f"SDC claim for {self.qid} on M{page_id} held by project {existing['project_id']} "
+                f"(claimed_at={existing['claimed_at']}), skipping face {face_id} this cycle"
+            )
+            return _Step.BLOCKED
+        logger.info(
+            f"Reclaimed stale SDC claim for {self.qid} on M{page_id} from project {existing['project_id']} "
+            f"for face {face_id}"
+        )
+        return None
+
+    def _finish_face_without_edit(self, face_id: int, mid: str, code: str, *, release_claim: bool = True) -> _Step:
+        """Commons says the entity is gone: mark the face terminal so it is not retried forever."""
+        logger.warning(f"Skipping face {face_id} on {mid}: {code}")
+        execute_query("UPDATE faces SET sdc_written = 1 WHERE id = %s", (face_id,), fetch=False)
+        if release_claim:
+            execute_query("DELETE FROM sdc_claims WHERE face_id = %s", (face_id,), fetch=False)
+        return _Step.SKIPPED
+
+    def _adopt_existing_claim(self, row: dict[str, Any], mid: str) -> _Step:
+        """The P180 claim is already on Commons: record it instead of writing it again."""
+        face_id = row["face_id"]
+        # Only mark a face that is still a target. The claim predates this run, so a
+        # face reset while wbgetclaims was in flight must not carry a written
+        # marker: a later rejection/undo would remove a claim the worker did not
+        # add. No removal is queued here for the same reason.
+        marked = execute_query(
+            "UPDATE faces SET sdc_written = 1 WHERE id = %s AND is_target = 1",
+            (face_id,),
+            fetch=False,
+        )
+        if marked:
+            logger.info(f"SDC P180 claim for {self.qid} already exists on {mid}, marked face {face_id} as written")
+        else:
+            logger.warning(
+                f"Face {face_id} is no longer a target; not marking the pre-existing P180 claim on {mid} as written"
+            )
+        execute_query(
+            "UPDATE sdc_claims SET written_at = NOW() "
+            "WHERE commons_page_id = %s AND wikidata_qid = %s AND written_at IS NULL",
+            (row["commons_page_id"], self.qid),
+            fetch=False,
+        )
+        execute_query(
+            "UPDATE images SET bootstrapped = 1 WHERE id = %s AND bootstrapped = 0",
+            (row["image_id"],),
+            fetch=False,
+        )
+        return _Step.DONE
+
+    def _send_edit(self, mid: str) -> dict[str, Any]:
+        claim = {
+            "mainsnak": {
+                "snaktype": "value",
+                "property": "P180",
+                "datavalue": {
+                    "type": "wikibase-entityid",
+                    "value": {"numeric-id": self.numeric_id, "id": self.qid},
+                },
+            },
+            "type": "statement",
+            "rank": "normal",
+        }
+        response = _api_request(
+            COMMONS_API_URL,
+            data={
+                "action": "wbeditentity",
+                "id": mid,
+                "data": json.dumps({"claims": [claim]}),
+                "token": self.csrf_token,
+                "summary": f"WikiVisage: Adding depicts (P180) claim for {self.qid}",
+                "format": "json",
+                "bot": "1",
+                "maxlag": "5",
+            },
+            headers=self._headers,
+            method="post",
+        )
+        return response.json()
+
+    def _record_written(self, face_id: int, page_id: int, mid: str) -> None:
+        # The face may have been reset, rejected or undone between the live-state
+        # re-check and the wbeditentity call. Only mark it written while it is
+        # still a target; otherwise the claim we just added is orphaned, so queue
+        # its removal in the same run. An undo can restore is_target=0 (review
+        # undo) as well as NULL (classify undo), so both need the recovery.
+        written_now = execute_query(
+            "UPDATE faces SET sdc_written = 1 WHERE id = %s AND is_target = 1",
+            (face_id,),
+            fetch=False,
+        )
+        if not written_now:
+            logger.warning(f"Face {face_id} changed during the SDC write; queuing P180 removal for {mid}")
+            execute_query(
+                "UPDATE faces SET sdc_written = 1, sdc_removal_pending = 1 "
+                "WHERE id = %s AND (is_target IS NULL OR is_target = 0) "
+                "AND superseded_by IS NULL",
+                (face_id,),
+                fetch=False,
+            )
+        execute_query(
+            "UPDATE sdc_claims SET written_at = NOW() WHERE commons_page_id = %s AND wikidata_qid = %s",
+            (page_id, self.qid),
+            fetch=False,
+        )
+
+    # -- removal phase ------------------------------------------------------
+
+    def removal_phase(self) -> bool:
+        """Remove P180 claims for rejected faces. False means the run ended (aborted)."""
+        self.token_retries = 0
+        while not shutdown_requested:
+            if self._user_cancelled():
+                logger.info(f"SDC removal cancelled by user for project {self.project_id}")
                 break
 
-            _keepalive_sdc_write(project_id)
-            page_id = row["commons_page_id"]
-            mid = f"M{page_id}"
+            pages = execute_query(_SDC_PAGES_TO_REMOVE_SQL, (self.project_id, _SDC_REMOVAL_BATCH), fetch=True)
+            if not pages:
+                break
 
-            try:
-                still_pending = execute_query(
-                    """
-                    SELECT 1 FROM faces f
-                    JOIN images i ON f.image_id = i.id
-                    WHERE i.commons_page_id = %s AND i.project_id = %s
-                    AND f.sdc_removal_pending = 1 AND f.superseded_by IS NULL
-                    AND NOT EXISTS (
-                        SELECT 1 FROM faces f2
-                        WHERE f2.image_id = f.image_id AND f2.is_target = 1
-                        AND f2.superseded_by IS NULL AND f2.id != f.id
-                    )
-                    LIMIT 1
-                    """,
-                    (page_id, project_id),
-                    fetch=True,
-                )
-                if not still_pending:
-                    logger.info(f"Skipping removal for M{page_id}: sibling approved since selection")
-                    continue
+            for row in pages:
+                if shutdown_requested:
+                    break
+                _keepalive_sdc_write(self.project_id)
+                step = self._remove_page(row["commons_page_id"])
+                if step is _Step.STOP:
+                    return False
+                if step is _Step.DONE:
+                    self.total_removed += 1
+        return True
 
-                claim_params = {
-                    "action": "wbgetclaims",
-                    "entity": mid,
-                    "property": "P180",
-                    "format": "json",
-                }
-                claim_headers = {"Authorization": f"Bearer {access_token}"}
-
-                claim_resp = _api_request(COMMONS_API_URL, params=claim_params, headers=claim_headers)
-                claim_data = claim_resp.json()
-
-                if "error" in claim_data:
-                    error_code = claim_data["error"].get("code", "unknown")
-                    error_info = claim_data["error"].get("info", "Unknown error")
-                    if error_code in ("badtoken", "permissiondenied", "notloggedin", "mwoauth-invalid-authorization"):
-                        token_retries += 1
-                        if token_retries > MAX_TOKEN_RETRIES:
-                            msg = _sdc_error_message(error_code, error_info)
-                            logger.error(
-                                f"SDC token retry limit reached during removal idempotency check "
-                                f"for project {project_id}: {error_code}"
-                            )
-                            execute_query(
-                                "UPDATE projects SET sdc_write_requested = 0, sdc_write_user_id = NULL, sdc_write_error = %s WHERE id = %s",
-                                (msg, project_id),
-                                fetch=False,
-                            )
-                            return total_written
-                        logger.warning(f"Auth error on wbgetclaims (removal) for {mid}: {error_code}, refreshing token")
-                        refreshed = _refresh_worker_token(user_id)
-                        if refreshed:
-                            access_token = refreshed
-                            claim_headers = {"Authorization": f"Bearer {access_token}"}
-                        try:
-                            csrf_token = _get_csrf_token(access_token)
-                        except Exception:
-                            msg = _sdc_error_message(error_code, error_info)
-                            logger.error(f"Failed to refresh tokens during removal for project {project_id}")
-                            execute_query(
-                                "UPDATE projects SET sdc_write_requested = 0, sdc_write_user_id = NULL, sdc_write_error = %s WHERE id = %s",
-                                (msg, project_id),
-                                fetch=False,
-                            )
-                            return total_written
-                        continue
-                    elif error_code in _SDC_PER_FACE_SKIP_ERRORS:
-                        logger.warning(f"Skipping removal for {mid}: {error_code} during idempotency check")
-                        execute_query(
-                            "UPDATE faces f JOIN images i ON f.image_id = i.id "
-                            "SET f.sdc_removal_pending = 0, f.sdc_written = 0 "
-                            "WHERE i.commons_page_id = %s AND i.project_id = %s "
-                            "AND f.sdc_removal_pending = 1",
-                            (page_id, project_id),
-                            fetch=False,
-                        )
-                        _clear_sdc_dedup_row(page_id, qid)
-                        total_removed += 1
-                        continue
-                    else:
-                        msg = _sdc_error_message(error_code, error_info)
-                        logger.error(f"SDC removal idempotency check error for {mid}: {claim_data['error']}")
-                        execute_query(
-                            "UPDATE projects SET sdc_write_requested = 0, sdc_write_user_id = NULL, sdc_write_error = %s WHERE id = %s",
-                            (msg, project_id),
-                            fetch=False,
-                        )
-                        logger.info(
-                            f"SDC removals aborted for project {project_id}: {total_removed} removed before error"
-                        )
-                        return total_written
-
-                claims = claim_data.get("claims", {}).get("P180", [])
-                target_guid = None
-                for claim in claims:
-                    snak = claim.get("mainsnak", {})
-                    if snak.get("datavalue", {}).get("value", {}).get("id") == qid:
-                        target_guid = claim.get("id")
-                        break
-
-                if not target_guid:
-                    logger.info(f"P180 claim for {qid} not found on {mid}, clearing removal flag")
-                    execute_query(
-                        "UPDATE faces f JOIN images i ON f.image_id = i.id "
-                        "SET f.sdc_removal_pending = 0, f.sdc_written = 0 "
-                        "WHERE i.commons_page_id = %s AND i.project_id = %s "
-                        "AND f.sdc_removal_pending = 1",
-                        (page_id, project_id),
-                        fetch=False,
-                    )
-                    _clear_sdc_dedup_row(page_id, qid)
-                    total_removed += 1
-                    continue
-
-                remove_data = {
-                    "action": "wbremoveclaims",
-                    "claim": target_guid,
-                    "token": csrf_token,
-                    "summary": f"WikiVisage: Removing depicts (P180) claim for {qid} (human review)",
-                    "format": "json",
-                    "bot": "1",
-                    "maxlag": "5",
-                }
-
-                remove_resp = _api_request(
-                    COMMONS_API_URL,
-                    data=remove_data,
-                    headers=claim_headers,
-                    method="post",
-                )
-                remove_json = remove_resp.json()
-
-                if "error" in remove_json:
-                    error_code = remove_json["error"].get("code")
-                    error_info = remove_json["error"].get("info", "Unknown error")
-                    if error_code in ("badtoken", "permissiondenied", "notloggedin"):
-                        token_retries += 1
-                        if token_retries > MAX_TOKEN_RETRIES:
-                            msg = _sdc_error_message(error_code, error_info)
-                            logger.error(f"SDC token retry limit reached during removal for project {project_id}")
-                            execute_query(
-                                "UPDATE projects SET sdc_write_requested = 0, sdc_write_user_id = NULL, sdc_write_error = %s WHERE id = %s",
-                                (msg, project_id),
-                                fetch=False,
-                            )
-                            return total_written
-                        refreshed = _refresh_worker_token(user_id)
-                        if refreshed:
-                            access_token = refreshed
-                            claim_headers = {"Authorization": f"Bearer {access_token}"}
-                        try:
-                            csrf_token = _get_csrf_token(access_token)
-                        except Exception:
-                            msg = _sdc_error_message(error_code, error_info)
-                            logger.error(f"Failed to refresh tokens during removal for project {project_id}")
-                            execute_query(
-                                "UPDATE projects SET sdc_write_requested = 0, sdc_write_user_id = NULL, sdc_write_error = %s WHERE id = %s",
-                                (msg, project_id),
-                                fetch=False,
-                            )
-                            return total_written
-                        continue
-                    elif error_code in _SDC_PER_FACE_SKIP_ERRORS:
-                        logger.warning(f"Skipping removal for {mid}: {error_code} during claim removal")
-                        execute_query(
-                            "UPDATE faces f JOIN images i ON f.image_id = i.id "
-                            "SET f.sdc_removal_pending = 0, f.sdc_written = 0 "
-                            "WHERE i.commons_page_id = %s AND i.project_id = %s "
-                            "AND f.sdc_removal_pending = 1",
-                            (page_id, project_id),
-                            fetch=False,
-                        )
-                        _clear_sdc_dedup_row(page_id, qid)
-                        total_removed += 1
-                        continue
-                    else:
-                        msg = _sdc_error_message(error_code, error_info)
-                        logger.error(f"SDC removal error for {mid}: {remove_json['error']}")
-                        execute_query(
-                            "UPDATE projects SET sdc_write_requested = 0, sdc_write_user_id = NULL, sdc_write_error = %s WHERE id = %s",
-                            (msg, project_id),
-                            fetch=False,
-                        )
-                        logger.info(
-                            f"SDC removals aborted for project {project_id}: {total_removed} removed before error"
-                        )
-                        return total_written
-
-                logger.info(f"SDC removal succeeded for {mid} (project {project_id}): removed claim {target_guid}")
-
-                execute_query(
-                    "UPDATE faces f JOIN images i ON f.image_id = i.id "
-                    "SET f.sdc_removal_pending = 0, f.sdc_written = 0 "
-                    "WHERE i.commons_page_id = %s AND i.project_id = %s "
-                    "AND f.sdc_removal_pending = 1",
-                    (page_id, project_id),
-                    fetch=False,
-                )
-                _clear_sdc_dedup_row(page_id, qid)
-                total_removed += 1
-
-                time.sleep(1)
-
-            except Exception as e:
-                logger.error(f"Error removing SDC for {mid}: {e}")
-                execute_query(
-                    "UPDATE projects SET sdc_write_requested = 0, sdc_write_user_id = NULL, sdc_write_error = %s WHERE id = %s",
-                    (str(e)[:1024], project_id),
-                    fetch=False,
-                )
-                logger.info(f"SDC removals aborted for project {project_id}: {total_removed} removed before error")
-                return total_written
-
-    # A shutdown can arrive after the last successful edit, including during
-    # its rate-limit sleep. The signal alone does not mean any work was lost.
-    error_msg = None
-    if shutdown_requested:
+    def _remove_page(self, page_id: int) -> _Step:
+        mid = f"M{page_id}"
         try:
-            if _has_pending_sdc_work(project_id):
-                error_msg = (
-                    "Worker shutdown left Commons edits pending. "
-                    "Edits already sent were kept. Send the remaining edits again."
-                )
-                logger.info("SDC for project %s stopped with edits still pending", project_id)
-            else:
-                logger.info("SDC for project %s finished before worker shutdown; no edits remain", project_id)
-        except DatabaseError:
-            logger.warning("Could not verify remaining SDC work on shutdown for project %s", project_id, exc_info=True)
-            error_msg = (
-                "Worker shut down before completion could be verified. "
-                "Edits may already be on Commons. Please check the results."
+            still_pending = execute_query(
+                _SDC_REMOVAL_STILL_PENDING_SQL,
+                (page_id, self.project_id),
+                fetch=True,
             )
+            if not still_pending:
+                logger.info(f"Skipping removal for M{page_id}: sibling approved since selection")
+                return _Step.SKIPPED
 
-    execute_query(
-        "UPDATE projects SET sdc_write_requested = 0, sdc_write_user_id = NULL, sdc_write_error = %s WHERE id = %s",
-        (error_msg, project_id),
-        fetch=False,
-    )
+            reply = self._lookup_claims(mid)
+            failure = self._api_failure(
+                reply,
+                mid=mid,
+                step="removal idempotency check",
+                on_skippable=lambda code: self._settle_removal(page_id, f"{code} during idempotency check"),
+            )
+            if failure is not None:
+                return failure
 
-    logger.info(f"SDC for project {project_id}: {total_written} written, {total_removed} removed")
-    return total_written
+            claim = _find_p180_claim(reply, self.qid)
+            guid = claim.get("id") if claim else None
+            if not guid:
+                logger.info(f"P180 claim for {self.qid} not found on {mid}, clearing removal flag")
+                return self._settle_removal(page_id)
+
+            reply = self._send_removal(guid)
+            failure = self._api_failure(
+                reply,
+                mid=mid,
+                step="removal",
+                on_skippable=lambda code: self._settle_removal(page_id, f"{code} during claim removal"),
+            )
+            if failure is not None:
+                return failure
+
+            logger.info(f"SDC removal succeeded for {mid} (project {self.project_id}): removed claim {guid}")
+            self._settle_removal(page_id)
+            time.sleep(1)
+            return _Step.DONE
+        except Exception as e:
+            logger.error(f"Error removing SDC for {mid}: {e}")
+            self.abort(str(e)[:1024])
+            logger.info(
+                f"SDC removals aborted for project {self.project_id}: {self.total_removed} removed before error"
+            )
+            return _Step.STOP
+
+    def _send_removal(self, guid: str) -> dict[str, Any]:
+        response = _api_request(
+            COMMONS_API_URL,
+            data={
+                "action": "wbremoveclaims",
+                "claim": guid,
+                "token": self.csrf_token,
+                "summary": f"WikiVisage: Removing depicts (P180) claim for {self.qid} (human review)",
+                "format": "json",
+                "bot": "1",
+                "maxlag": "5",
+            },
+            headers=self._headers,
+            method="post",
+        )
+        return response.json()
+
+    def _settle_removal(self, page_id: int, skipped_because: str | None = None) -> _Step:
+        """The claim is gone from Commons (removed, or never there): clear every flag that said otherwise."""
+        if skipped_because:
+            logger.warning(f"Skipping removal for M{page_id}: {skipped_because}")
+        execute_query(
+            "UPDATE faces f JOIN images i ON f.image_id = i.id "
+            "SET f.sdc_removal_pending = 0, f.sdc_written = 0 "
+            "WHERE i.commons_page_id = %s AND i.project_id = %s "
+            "AND f.sdc_removal_pending = 1",
+            (page_id, self.project_id),
+            fetch=False,
+        )
+        _clear_sdc_dedup_row(page_id, self.qid)
+        return _Step.DONE
+
+    # -- end of run ---------------------------------------------------------
+
+    def finish(self) -> None:
+        """Clear the request flag, reporting an unfinished run if a shutdown cut it short."""
+        # A shutdown can arrive after the last successful edit, including during
+        # its rate-limit sleep. The signal alone does not mean any work was lost.
+        error_msg = self.notice
+        if shutdown_requested:
+            try:
+                if _has_pending_sdc_work(self.project_id):
+                    error_msg = (
+                        "Worker shutdown left Commons edits pending. "
+                        "Edits already sent were kept. Send the remaining edits again."
+                    )
+                    logger.info("SDC for project %s stopped with edits still pending", self.project_id)
+                else:
+                    logger.info("SDC for project %s finished before worker shutdown; no edits remain", self.project_id)
+            except DatabaseError:
+                logger.warning(
+                    "Could not verify remaining SDC work on shutdown for project %s", self.project_id, exc_info=True
+                )
+                error_msg = (
+                    "Worker shut down before completion could be verified. "
+                    "Edits may already be on Commons. Please check the results."
+                )
+
+        execute_query(
+            "UPDATE projects SET sdc_write_requested = 0, sdc_write_user_id = NULL, sdc_write_error = %s WHERE id = %s",
+            (error_msg, self.project_id),
+            fetch=False,
+        )
+        logger.info(f"SDC for project {self.project_id}: {self.total_written} written, {self.total_removed} removed")
+
+
+def write_sdc_claims(project: dict[str, Any]) -> int:
+    """Write SDC P180 claims for all faces marked as target, then remove rejected ones.
+
+    Called when ``sdc_write_requested=1``. Processes faces in batches and clears the
+    flag when done (or sets ``sdc_write_error`` on failure). Returns the number of
+    claims written (or recorded as already present).
+    """
+    run = _SdcRun.begin(project)
+    if run is None:
+        return 0
+    if run.write_phase() and run.removal_phase():
+        run.finish()
+    return run.total_written
 
 
 # ---------------------------------------------------------------------------
@@ -3211,6 +2965,184 @@ def _has_inference_candidates(project_id: int) -> bool:
         return False
 
 
+def _project_still_active(project_id: int) -> bool:
+    """Re-check project status and claim ownership from the database.
+
+    False if the project is no longer active, or another worker has reclaimed it (for example
+    because our claim expired). Refreshes the claim timestamp on success so the claim does not
+    expire while we work. A database error counts as still active: keep going rather than
+    silently drop work.
+    """
+    try:
+        row = execute_query(
+            "SELECT status, worker_claimed_by FROM projects WHERE id = %s",
+            (project_id,),
+            fetch=True,
+        )
+        if not row:
+            logger.info(f"Project {project_id} not found, stopping processing")
+            return False
+        status = row[0]["status"]
+        claimed_by = row[0].get("worker_claimed_by")
+        if status != "active":
+            logger.info(f"Project {project_id} is no longer active (status={status}), stopping processing")
+            return False
+        if claimed_by != _worker_id:
+            logger.info(f"Project {project_id} not claimed by us (claimed_by={claimed_by}), stopping processing")
+            return False
+        execute_query(
+            "UPDATE projects SET worker_claimed_at = NOW() WHERE id = %s AND worker_claimed_by = %s",
+            (project_id, _worker_id),
+            fetch=False,
+        )
+        return True
+    except DatabaseError as exc:
+        logger.warning(
+            "DatabaseError while checking if project %s is still active; "
+            "assuming it is still active to avoid dropping work: %s",
+            project_id,
+            exc,
+        )
+        return True
+
+
+def _run_early_inference(project: dict[str, Any]) -> None:
+    """Classify faces that are already waiting, before the (slow) discovery stages.
+
+    A re-run resets model faces on a project that is still active; without this the user waits
+    through the category crawl and SPARQL bootstrap before the inference card resolves. The
+    final pass in ``process_project`` still handles faces from newly processed images.
+    """
+    project_id = project["id"]
+    if shutdown_requested or not _has_inference_candidates(project_id):
+        return
+    fresh_rows = execute_query(
+        "SELECT * FROM projects WHERE id = %s AND status != 'deleted'",
+        (project_id,),
+        fetch=True,
+    )
+    early_classified = run_autonomous_inference(fresh_rows[0] if fresh_rows else project)
+    logger.info(f"Project {project_id}: early inference classified {early_classified} face(s) before discovery")
+
+
+def _process_pending_images(project: dict[str, Any]) -> tuple[float, int]:
+    """Download and detect every pending image. Returns (seconds spent, images processed)."""
+    t0 = time.monotonic()
+    total_processed = 0
+    while not shutdown_requested:
+        batch_count = process_images(project)
+        if batch_count == 0:
+            break
+        total_processed += batch_count
+        logger.info(f"Processed batch of {batch_count} images ({total_processed} total so far)")
+
+        # Check if project was paused/completed between batches
+        if not _project_still_active(project["id"]):
+            break
+    return time.monotonic() - t0, total_processed
+
+
+_AUTO_COMPLETE_SQL = {
+    "no_faces": (
+        "UPDATE projects SET status = 'completed', completion_reason = 'no_faces' WHERE id = %s AND status = 'active'"
+    ),
+    "insufficient_faces": (
+        "UPDATE projects SET status = 'completed', completion_reason = 'insufficient_faces' "
+        "WHERE id = %s AND status = 'active'"
+    ),
+}
+
+
+def _auto_complete_unusable_project(project: dict[str, Any]) -> bool:
+    """Mark a project completed when it has no faces, or too few to train on. True if it did.
+
+    Never auto-completes while images are still unprocessed. The image loop exits as soon as a
+    batch yields zero successes, which also happens when every download fails (for example when
+    Commons moves its CDN to a host the allowlist rejects). Without this guard a transient outage
+    is recorded as a permanent "no faces in this category" verdict, and ``_claim_active_projects``
+    only picks up status='active', so the remaining images would never be retried. Mirrors the
+    guard in app.py.
+    """
+    project_id = project["id"]
+    pending_row = execute_query(
+        "SELECT COUNT(*) AS cnt FROM images WHERE project_id = %s AND status = 'pending'",
+        (project_id,),
+        fetch=True,
+    )
+    pending_images = pending_row[0]["cnt"] if pending_row else 0
+
+    face_count_row = execute_query(
+        "SELECT COUNT(*) AS cnt FROM faces f "
+        "JOIN images i ON f.image_id = i.id "
+        "WHERE i.project_id = %s AND f.superseded_by IS NULL",
+        (project_id,),
+        fetch=True,
+    )
+    total_faces = face_count_row[0]["cnt"] if face_count_row else 0
+
+    # Fetch the latest min_confirmed from the database to avoid using a stale in-memory value.
+    min_conf_row = execute_query(
+        "SELECT min_confirmed FROM projects WHERE id = %s",
+        (project_id,),
+        fetch=True,
+    )
+    if min_conf_row and min_conf_row[0].get("min_confirmed") is not None:
+        min_confirmed = min_conf_row[0]["min_confirmed"]
+    else:
+        # Fall back to the original project dict or default to preserve existing behavior.
+        min_confirmed = project.get("min_confirmed", 5)
+
+    if pending_images > 0:
+        logger.warning(
+            f"Project {project_id}: image processing stopped early with {pending_images} image(s) "
+            f"still pending ({total_faces} faces so far). NOT auto-completing — the project stays "
+            f"active and will retry next cycle. Check images.error_message for the cause."
+        )
+        return False
+
+    if total_faces == 0:
+        reason = "no_faces"
+        outcome = f"0 faces detected, auto-completed ({reason})"
+    elif total_faces <= 5 and total_faces < min_confirmed:
+        reason = "insufficient_faces"
+        outcome = f"only {total_faces} faces detected (need {min_confirmed}), auto-completed ({reason})"
+    else:
+        return False
+
+    execute_query(_AUTO_COMPLETE_SQL[reason], (project_id,), fetch=False)
+    logger.info(f"Project {project_id}: {outcome}")
+    return True
+
+
+def _run_final_inference(project: dict[str, Any]) -> float:
+    """Classify whatever is still unclassified. Returns the seconds spent."""
+    t0 = time.monotonic()
+    if not shutdown_requested and _project_still_active(project["id"]):
+        fresh = execute_query(
+            "SELECT * FROM projects WHERE id = %s AND status != 'deleted'", (project["id"],), fetch=True
+        )
+        run_autonomous_inference(fresh[0] if fresh else project)
+    return time.monotonic() - t0
+
+
+def _log_project_summary(
+    project_id: int,
+    t_start: float,
+    *,
+    traversal: float,
+    bootstrap: float,
+    images: float,
+    processed: int,
+    inference: str,
+) -> None:
+    logger.info(
+        f"--- Project {project_id} complete: "
+        f"traversal={traversal:.1f}s, bootstrap={bootstrap:.1f}s, "
+        f"images={images:.1f}s ({processed} processed), "
+        f"inference={inference}, total={time.monotonic() - t_start:.1f}s ---"
+    )
+
+
 def process_project(project: dict[str, Any], *, skip_discovery: bool = False) -> None:
     """Orchestrate all phases for a single project.
 
@@ -3222,67 +3154,14 @@ def process_project(project: dict[str, Any], *, skip_discovery: bool = False) ->
     project_id = project["id"]
     logger.info(f"--- Processing project {project_id} ({project['wikidata_qid']}) ---")
 
-    def _is_still_active() -> bool:
-        """Re-check project status and claim ownership from DB.
-
-        Returns False if the project is no longer active or if another worker
-        has reclaimed it (e.g. because our claim expired).  Also refreshes the
-        claim timestamp on success so the claim does not expire while we work.
-        """
-        try:
-            row = execute_query(
-                "SELECT status, worker_claimed_by FROM projects WHERE id = %s",
-                (project_id,),
-                fetch=True,
-            )
-            if not row:
-                logger.info(f"Project {project_id} not found, stopping processing")
-                return False
-            status = row[0]["status"]
-            claimed_by = row[0].get("worker_claimed_by")
-            if status != "active":
-                logger.info(f"Project {project_id} is no longer active (status={status}), stopping processing")
-                return False
-            if claimed_by != _worker_id:
-                logger.info(f"Project {project_id} not claimed by us (claimed_by={claimed_by}), stopping processing")
-                return False
-            # Refresh claim timestamp so it doesn't expire while we work
-            execute_query(
-                "UPDATE projects SET worker_claimed_at = NOW() WHERE id = %s AND worker_claimed_by = %s",
-                (project_id, _worker_id),
-                fetch=False,
-            )
-            return True
-        except DatabaseError as exc:
-            logger.warning(
-                "DatabaseError while checking if project %s is still active; "
-                "assuming it is still active to avoid dropping work: %s",
-                project_id,
-                exc,
-            )
-            return True  # On DB error, keep going rather than silently dropping work
-
     try:
-        # Early bail-out: the project may have been deleted / paused between the
-        # moment it was queued in the thread-pool and the moment this thread
-        # actually starts running.  Checking here avoids wasted traversal and
-        # bootstrap work for projects that are no longer active.
-        if not _is_still_active():
+        # Early bail-out: the project may have been deleted / paused between the moment it was
+        # queued in the thread pool and the moment this thread starts running. Checking here
+        # avoids wasted traversal and bootstrap work for projects that are no longer active.
+        if not _project_still_active(project_id):
             return
 
-        # Fast path: classify faces that are already waiting before the
-        # discovery stages. A re-run resets model faces on a project that is
-        # still active; without this the user waits through the category crawl
-        # and SPARQL bootstrap before the inference card resolves. The final
-        # pass below still handles faces from newly processed images.
-        if not shutdown_requested and _has_inference_candidates(project_id):
-            fresh_rows = execute_query(
-                "SELECT * FROM projects WHERE id = %s AND status != 'deleted'",
-                (project_id,),
-                fetch=True,
-            )
-            early_classified = run_autonomous_inference(fresh_rows[0] if fresh_rows else project)
-            logger.info(f"Project {project_id}: early inference classified {early_classified} face(s) before discovery")
+        _run_early_inference(project)
 
         t_traversal = 0.0
         t_bootstrap = 0.0
@@ -3295,7 +3174,7 @@ def process_project(project: dict[str, Any], *, skip_discovery: bool = False) ->
             traverse_category(project)
             t_traversal = time.monotonic() - t0
 
-            if shutdown_requested or not _is_still_active():
+            if shutdown_requested or not _project_still_active(project_id):
                 return
 
             # 2. Bootstrap (if needed)
@@ -3303,135 +3182,47 @@ def process_project(project: dict[str, Any], *, skip_discovery: bool = False) ->
             bootstrap_from_sparql(project)
             t_bootstrap = time.monotonic() - t0
 
-            if shutdown_requested or not _is_still_active():
+            if shutdown_requested or not _project_still_active(project_id):
                 return
 
-        # 3. Image Download & Face Detection — process all pending images
-        #    Interleave inference every 5 batches so results appear progressively
-        t0 = time.monotonic()
-        total_processed = 0
-        while not shutdown_requested:
-            batch_count = process_images(project)
-            if batch_count == 0:
-                break
-            total_processed += batch_count
-            logger.info(f"Processed batch of {batch_count} images ({total_processed} total so far)")
+        # 3. Image download and face detection: process all pending images
+        t_images, total_processed = _process_pending_images(project)
 
-            # Check if project was paused/completed between batches
-            if not _is_still_active():
-                break
-        t_images = time.monotonic() - t0
-
-        # 3a. Experimental LiftWing metadata pre-filter (shadow mode: verdicts are
-        #     recorded for an offline readout and change no behaviour). Runs after
-        #     detection on purpose: verdicts are metadata-only, and selecting
-        #     already-processed images too means a backlog larger than one
-        #     cycle's cap is fully covered over time. (An eventual `enforce`
-        #     mode must instead select pending images and run *before* this
-        #     loop, so drops happen before any download.)
-        if not shutdown_requested and _is_still_active():
+        # 3a. Experimental LiftWing metadata pre-filter (shadow mode: verdicts are recorded for an
+        #     offline readout and change no behaviour). Runs after detection on purpose: verdicts
+        #     are metadata-only, and selecting already-processed images too means a backlog larger
+        #     than one cycle's cap is fully covered over time. (An eventual `enforce` mode must
+        #     instead select pending images and run *before* the image loop, so drops happen
+        #     before any download.)
+        if not shutdown_requested and _project_still_active(project_id):
             prefilter_images(project)
 
-        # 3b. Auto-complete if no faces or insufficient faces detected
-        if not shutdown_requested and _is_still_active():
-            # Never auto-complete while images are still unprocessed. The loop
-            # above exits as soon as a batch yields zero successes, which also
-            # happens when every download fails (e.g. Commons moves its CDN to a
-            # host the allowlist rejects). Without this guard a transient outage
-            # is recorded as a permanent "no faces in this category" verdict,
-            # and _claim_active_projects only picks up status='active', so the
-            # remaining images are never retried. Mirrors app.py's guard.
-            pending_row = execute_query(
-                "SELECT COUNT(*) AS cnt FROM images WHERE project_id = %s AND status = 'pending'",
-                (project_id,),
-                fetch=True,
+        # 3b. Auto-complete if no faces or insufficient faces were detected
+        if not shutdown_requested and _project_still_active(project_id) and _auto_complete_unusable_project(project):
+            _log_project_summary(
+                project_id,
+                t_project_start,
+                traversal=t_traversal,
+                bootstrap=t_bootstrap,
+                images=t_images,
+                processed=total_processed,
+                inference="skipped",
             )
-            pending_images = pending_row[0]["cnt"] if pending_row else 0
+            return
 
-            face_count_row = execute_query(
-                "SELECT COUNT(*) AS cnt FROM faces f "
-                "JOIN images i ON f.image_id = i.id "
-                "WHERE i.project_id = %s AND f.superseded_by IS NULL",
-                (project_id,),
-                fetch=True,
-            )
-            total_faces = face_count_row[0]["cnt"] if face_count_row else 0
+        # 4. Final autonomous inference (catch any remaining unclassified faces)
+        t_inference = _run_final_inference(project)
 
-            # Fetch the latest min_confirmed from the database to avoid using a stale in-memory value.
-            min_conf_row = execute_query(
-                "SELECT min_confirmed FROM projects WHERE id = %s",
-                (project_id,),
-                fetch=True,
-            )
-            if min_conf_row and min_conf_row[0].get("min_confirmed") is not None:
-                min_confirmed = min_conf_row[0]["min_confirmed"]
-            else:
-                # Fall back to the original project dict or default to preserve existing behavior.
-                min_confirmed = project.get("min_confirmed", 5)
-
-            if pending_images > 0:
-                logger.warning(
-                    f"Project {project_id}: image processing stopped early with {pending_images} image(s) "
-                    f"still pending ({total_faces} faces so far). NOT auto-completing — the project stays "
-                    f"active and will retry next cycle. Check images.error_message for the cause."
-                )
-            elif total_faces == 0:
-                execute_query(
-                    "UPDATE projects SET status = 'completed', completion_reason = 'no_faces' "
-                    "WHERE id = %s AND status = 'active'",
-                    (project_id,),
-                    fetch=False,
-                )
-                logger.info(f"Project {project_id}: 0 faces detected, auto-completed (no_faces)")
-                t_total = time.monotonic() - t_project_start
-                logger.info(
-                    f"--- Project {project['id']} complete: "
-                    f"traversal={t_traversal:.1f}s, bootstrap={t_bootstrap:.1f}s, "
-                    f"images={t_images:.1f}s ({total_processed} processed), "
-                    f"inference=skipped, total={t_total:.1f}s ---"
-                )
-                return
-            elif total_faces <= 5 and total_faces < min_confirmed:
-                execute_query(
-                    "UPDATE projects SET status = 'completed', completion_reason = 'insufficient_faces' "
-                    "WHERE id = %s AND status = 'active'",
-                    (project_id,),
-                    fetch=False,
-                )
-                logger.info(
-                    f"Project {project_id}: only {total_faces} faces detected "
-                    f"(need {min_confirmed}), auto-completed (insufficient_faces)"
-                )
-                t_total = time.monotonic() - t_project_start
-                logger.info(
-                    f"--- Project {project['id']} complete: "
-                    f"traversal={t_traversal:.1f}s, bootstrap={t_bootstrap:.1f}s, "
-                    f"images={t_images:.1f}s ({total_processed} processed), "
-                    f"inference=skipped, total={t_total:.1f}s ---"
-                )
-                return
-
-        # 4. Final Autonomous Inference (catch any remaining unclassified faces)
-        t0 = time.monotonic()
-        if not shutdown_requested and _is_still_active():
-            fresh = execute_query(
-                "SELECT * FROM projects WHERE id = %s AND status != 'deleted'", (project_id,), fetch=True
-            )
-            if fresh:
-                run_autonomous_inference(fresh[0])
-            else:
-                run_autonomous_inference(project)
-        t_inference = time.monotonic() - t0
-
-        # 6. SDC writes are handled separately — triggered via web UI,
-        #    processed in the main loop when sdc_write_requested=1.
-
-        t_total = time.monotonic() - t_project_start
-        logger.info(
-            f"--- Project {project['id']} complete: "
-            f"traversal={t_traversal:.1f}s, bootstrap={t_bootstrap:.1f}s, "
-            f"images={t_images:.1f}s ({total_processed} processed), "
-            f"inference={t_inference:.1f}s, total={t_total:.1f}s ---"
+        # SDC writes are handled separately: triggered via the web UI, processed in the main
+        # loop when sdc_write_requested=1.
+        _log_project_summary(
+            project_id,
+            t_project_start,
+            traversal=t_traversal,
+            bootstrap=t_bootstrap,
+            images=t_images,
+            processed=total_processed,
+            inference=f"{t_inference:.1f}s",
         )
 
     except Exception as e:
@@ -3549,52 +3340,46 @@ def _probe_liftwing_if_due() -> None:
         logger.exception("LiftWing probe failed unexpectedly")
 
 
-def main():
-    """Main worker loop with distributed locking for concurrent multi-instance processing."""
-    global _worker_id, shutdown_requested
-    # Accept --worker-id from command line (used in jobs.yaml), fall back to hostname-pid.
+def _parse_worker_id(argv: list[str]) -> str:
+    """Worker id from ``--worker-id`` (used by deploy.yml), else ``<hostname>-<pid>``."""
     wid = None
-    if "--worker-id" in sys.argv:
-        idx = sys.argv.index("--worker-id")
-        if idx + 1 < len(sys.argv):
-            wid = sys.argv[idx + 1]
-    _worker_id = wid or f"{socket.gethostname()}-{os.getpid()}"
-    # Sanitize worker ID to prevent path traversal in heartbeat file path
-    if not re.fullmatch(r"[a-zA-Z0-9._-]+", _worker_id):
-        raise SystemExit(f"Invalid worker ID (must be alphanumeric/dot/hyphen/underscore): {_worker_id!r}")
-    logger.info(
-        f"Starting WikiVisage Worker {_worker_id} "
-        f"(max_projects={MAX_CONCURRENT_PROJECTS}, image_threads={IMAGE_THREADS})"
-    )
+    if "--worker-id" in argv:
+        idx = argv.index("--worker-id")
+        if idx + 1 < len(argv):
+            wid = argv[idx + 1]
+    worker_id = wid or f"{socket.gethostname()}-{os.getpid()}"
+    # The id becomes part of the heartbeat file path: refuse anything that could traverse.
+    if not re.fullmatch(r"[a-zA-Z0-9._-]+", worker_id):
+        raise SystemExit(f"Invalid worker ID (must be alphanumeric/dot/hyphen/underscore): {worker_id!r}")
+    return worker_id
 
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
 
-    try:
-        # Respect WIKIVISAGE_DB_POOL_SIZE env var if set; otherwise compute from concurrency settings.
-        # Toolforge ToolsDB enforces max_user_connections=20 across ALL processes sharing the same
-        # DB user account (gunicorn + all worker instances). Default gunicorn uses pool_size=2 per
-        # worker (2 workers = 4 conns). Cap each worker at 6 so 2 workers + web stays <= 20.
-        db_pool_env = os.environ.get("WIKIVISAGE_DB_POOL_SIZE")
-        if db_pool_env:
-            worker_pool_size = int(db_pool_env)
-        else:
-            worker_pool_size = min(MAX_CONCURRENT_PROJECTS * IMAGE_THREADS + 3, 6)
-        if worker_pool_size > 6:
-            logger.warning(
-                "DB pool size %d may exceed Toolforge max_user_connections (20 shared across all processes). "
-                "With 2 workers + gunicorn, keep each worker's pool <= 6.",
-                worker_pool_size,
-            )
-        init_db(pool_size=worker_pool_size)
-    except Exception as e:
-        logger.error(f"Database initialization failed: {e}")
-        sys.exit(1)
+def _db_pool_size() -> int:
+    """Pool size for this worker: ``WIKIVISAGE_DB_POOL_SIZE``, else derived from the concurrency settings.
 
-    # Probe the face service once at startup so a misconfigured endpoint shows
-    # up in the logs immediately rather than as a wave of per-image failures.
-    # Non-fatal: the service may still be starting, and detection retries on
-    # every poll cycle anyway.
+    Toolforge ToolsDB enforces max_user_connections=20 across ALL processes sharing the DB user
+    (gunicorn + every worker instance). The web app uses 2 workers x 3 connections, so each of
+    the two background workers is capped at 6 to stay at or below 20.
+    """
+    db_pool_env = os.environ.get("WIKIVISAGE_DB_POOL_SIZE")
+    if db_pool_env:
+        pool_size = int(db_pool_env)
+    else:
+        pool_size = min(MAX_CONCURRENT_PROJECTS * IMAGE_THREADS + 3, 6)
+    if pool_size > 6:
+        logger.warning(
+            "DB pool size %d may exceed Toolforge max_user_connections (20 shared across all processes). "
+            "With 2 workers + gunicorn, keep each worker's pool <= 6.",
+            pool_size,
+        )
+    return pool_size
+
+
+def _check_face_service_at_startup() -> None:
+    """Probe the face service once so a misconfigured endpoint shows up in the logs at once.
+
+    Non-fatal: the service may still be starting, and detection retries on every poll cycle.
+    """
     if face_client.is_healthy():
         logger.info("Face service ready at %s (model=%s)", face_client.FACE_SERVICE_URL, face_client.FACE_SERVICE_MODEL)
         _check_face_service_model()
@@ -3606,6 +3391,9 @@ def main():
             face_client.FACE_SERVICE_MODEL,
         )
 
+
+def _log_project_diagnostics() -> None:
+    """Log one line per project so a support session starts with the real counts."""
     try:
         diag = execute_query(
             "SELECT p.id, p.wikidata_qid, p.status, p.min_confirmed, p.faces_confirmed, "
@@ -3618,293 +3406,302 @@ def main():
             "FROM projects p",
             fetch=True,
         )
-        if diag:
-            for row in diag:
-                logger.info(
-                    f"Project {row['id']} ({row['wikidata_qid']}): "
-                    f"status={row['status']}, min_confirmed={row['min_confirmed']}, "
-                    f"faces_confirmed_counter={row['faces_confirmed']}, "
-                    f"actual_target={row['actual_target_faces']}, "
-                    f"actual_non_target={row['actual_non_target']}, "
-                    f"unclassified={row['unclassified_faces']}"
-                )
+        for row in diag or []:
+            logger.info(
+                f"Project {row['id']} ({row['wikidata_qid']}): "
+                f"status={row['status']}, min_confirmed={row['min_confirmed']}, "
+                f"faces_confirmed_counter={row['faces_confirmed']}, "
+                f"actual_target={row['actual_target_faces']}, "
+                f"actual_non_target={row['actual_non_target']}, "
+                f"unclassified={row['unclassified_faces']}"
+            )
     except Exception as e:
         logger.warning(f"Diagnostic query failed: {e}")
 
-    # Background shadow sweep: records LiftWing verdicts for projects the
-    # processing pipelines never claim (completed, paused or fully processed).
-    # Own daemon thread — one pass can take minutes, and an inline call would
-    # stall the heartbeat refreshes the Toolforge health check watches. The
-    # handle is kept so shutdown can join it before its resources go away.
+
+def _archive_and_purge(conn: Any, cursor: Any) -> int:
+    """Move deleted projects' classification counts into user_stats, then delete them."""
+    cursor.execute(
+        "INSERT INTO user_stats (user_id, classifications, sdc_tags) "
+        "SELECT f.classified_by_user_id, "
+        "  COUNT(*), "
+        "  COUNT(CASE WHEN f.sdc_written = 1 THEN 1 END) "
+        "FROM faces f "
+        "INNER JOIN images i ON i.id = f.image_id "
+        "INNER JOIN projects p ON p.id = i.project_id "
+        "WHERE p.status = 'deleted' "
+        "  AND f.classified_by_user_id IS NOT NULL "
+        "  AND f.superseded_by IS NULL "
+        "GROUP BY f.classified_by_user_id "
+        "ON DUPLICATE KEY UPDATE "
+        "  classifications = classifications + VALUES(classifications), "
+        "  sdc_tags = sdc_tags + VALUES(sdc_tags)",
+    )
+    cursor.execute("DELETE FROM projects WHERE status = 'deleted'")
+    return cursor.rowcount
+
+
+def _purge_deleted_projects() -> None:
+    """Purge soft-deleted projects first: it is quick and unblocks re-creating the same project."""
+    try:
+        deleted = execute_transaction(_archive_and_purge)
+        if deleted:
+            logger.info(f"Purged {deleted} soft-deleted project(s)")
+    except DatabaseError as exc:
+        logger.warning("Failed to purge soft-deleted projects: %s", exc)
+
+
+def _consume_wake_signal() -> bool:
+    """True once per wake-up request. The web app creates the file to ask for an immediate cycle."""
+    if not os.path.exists(WAKE_FILE_PATH):
+        return False
+    try:
+        os.remove(WAKE_FILE_PATH)
+    except OSError:
+        pass
+    return True
+
+
+def _keep_alive_during_cycle() -> None:
+    """Once a minute while projects run: heartbeat, claims, LiftWing probe, newly inference-ready projects."""
+    try:
+        execute_query("REPLACE INTO worker_heartbeat (id, last_seen) VALUES (1, NOW())", fetch=False)
+        _touch_heartbeat_file()
+    except Exception:
+        pass
+    _refresh_claims()
+    _probe_liftwing_if_due()
+    _run_new_inference_projects(1)
+
+
+def _supervise(
+    futures: dict[Future[Any], int],
+    *,
+    on_wake: Callable[[dict[Future[Any], int]], None],
+    on_done: Callable[[Future[Any], int], None],
+) -> None:
+    """Wait for *futures* while keeping this worker alive and responsive.
+
+    The project threads can run for a long time. Meanwhile this loop refreshes the
+    heartbeat and claims every minute, services SDC write requests (on a wake-up
+    signal, and every 10 s because the wake file does not cross pods), and hands each
+    finished future to *on_done*. *on_wake* runs when the web app asked for an
+    immediate check; it may add futures to the dict.
+    """
+    last_heartbeat = last_sdc_check = time.time()
+    while futures:
+        if shutdown_requested:
+            break
+
+        if time.time() - last_heartbeat >= 60:
+            _keep_alive_during_cycle()
+            last_heartbeat = time.time()
+
+        if _consume_wake_signal():
+            on_wake(futures)
+            last_sdc_check = time.time()
+
+        if time.time() - last_sdc_check >= 10:
+            _process_sdc_writes()
+            last_sdc_check = time.time()
+
+        done = {f for f in futures if f.done()}
+        if not done:
+            time.sleep(1)
+            continue
+        for future in done:
+            on_done(future, futures.pop(future))
+
+
+def _drain_inference_queue(active_ids: set[int], seen_ids: set[int]) -> None:
+    """Run inference for every claimable project before the (slow) active projects start.
+
+    Inference is a few seconds of numpy plus one batched UPDATE per project, whereas an
+    active project can hold all slots for a long time looping through its image backlog.
+    With the old order a project whose classifications had just crossed min_confirmed sat
+    behind that backlog while its page said "Model inference in progress". Keep claiming
+    until no unseen eligible project remains; ``seen_ids`` guarantees termination when a
+    project stays eligible because some of its faces have unusable encodings.
+    """
+
+    def on_wake(_futures: dict[Future[Any], int]) -> None:
+        _process_sdc_writes()
+        # Pick up any project that just became inference-ready.
+        _run_new_inference_projects(1)
+
+    def on_done(future: Future[Any], project_id: int) -> None:
+        try:
+            logger.info(f"Inference classified {future.result()} faces for project {project_id}")
+        except Exception as e:
+            logger.error(f"Inference failed for project {project_id}: {e}")
+
+    while not shutdown_requested:
+        claimed = _claim_inference_projects(MAX_CONCURRENT_PROJECTS)
+        inference_only = [p for p in claimed if p["id"] not in active_ids and p["id"] not in seen_ids]
+        run_ids = {p["id"] for p in inference_only}
+        # Release claims we will not run (already processed this cycle, or covered by the
+        # active pipeline) instead of holding them until the claim expiry.
+        for project in claimed:
+            if project["id"] not in run_ids and project["id"] not in active_ids:
+                _release_project(project["id"])
+        if not inference_only:
+            break
+
+        with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_PROJECTS) as executor:
+            futures: dict[Future[Any], int] = {}
+            for project in inference_only:
+                if shutdown_requested:
+                    break
+                seen_ids.add(project["id"])
+                logger.info(f"Running inference-only for project {project['id']} (status={project.get('status')})")
+                futures[executor.submit(_infer_and_release, project)] = project["id"]
+            _supervise(futures, on_wake=on_wake, on_done=on_done)
+
+
+def _process_active_projects(active_projects: list[dict[str, Any]], seen_ids: set[int]) -> None:
+    """Process the claimed projects concurrently (claims are released in the wrapper).
+
+    Each thread handles its own discovery (traverse_category + bootstrap), so all claimed
+    projects start working at once with no serial bottleneck.
+    """
+    if not active_projects:
+        return
+
+    with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_PROJECTS) as executor:
+        futures: dict[Future[Any], int] = {}
+
+        def submit(project: dict[str, Any]) -> None:
+            seen_ids.add(project["id"])
+            futures[executor.submit(_process_and_release, project)] = project["id"]
+
+        def on_wake(current: dict[Future[Any], int]) -> None:
+            logger.info("Wake-up signal received mid-cycle, checking for new work")
+            _process_sdc_writes()
+
+            free_slots = MAX_CONCURRENT_PROJECTS - len([f for f in current if not f.done()])
+            if free_slots <= 0:
+                logger.debug("All %d worker slots occupied, skipping mid-cycle claim", MAX_CONCURRENT_PROJECTS)
+            else:
+                for project in _claim_active_projects(free_slots):
+                    if project["id"] not in seen_ids:
+                        logger.info(f"Adding new project {project['id']} to current cycle")
+                        submit(project)
+
+            # A classification can make a project inference-ready even when all slots are
+            # busy; inference is cheap, so run it inline instead of waiting for the next cycle.
+            _run_new_inference_projects(1)
+
+        def on_done(future: Future[Any], project_id: int) -> None:
+            try:
+                future.result()
+            except Exception as e:
+                logger.error(f"Project {project_id} processing failed: {e}")
+
+        for project in active_projects:
+            if shutdown_requested:
+                break
+            submit(project)
+        _supervise(futures, on_wake=on_wake, on_done=on_done)
+
+
+def _run_cycle() -> None:
+    """One poll cycle: heartbeat, purge, SDC writes, inference, active projects."""
+    execute_query("REPLACE INTO worker_heartbeat (id, last_seen) VALUES (1, NOW())", fetch=False)
+    _touch_heartbeat_file()
+    _probe_liftwing_if_due()
+
+    _purge_deleted_projects()
+
+    # User-triggered SDC writes come before the active pipeline, so users do not wait
+    # minutes through crawl/detect/infer before "Send Edits to Wikimedia Commons" is serviced.
+    _process_sdc_writes()
+
+    active_projects = _claim_active_projects(MAX_CONCURRENT_PROJECTS)
+    logger.info(f"Poll: claimed {len(active_projects)} active project(s)")
+
+    seen_ids: set[int] = set()
+    _drain_inference_queue({p["id"] for p in active_projects}, seen_ids)
+    _process_active_projects(active_projects, seen_ids)
+
+
+def _sleep_until_next_cycle() -> None:
+    """Sleep one poll interval, waking early for a wake-up signal or finished SDC work.
+
+    Random jitter (0-15 s) desynchronizes multiple workers so they do not all race to
+    claim the same projects every cycle.
+    """
+    last_sdc_check = time.time()
+    for _ in range(POLL_INTERVAL + random.randint(0, 15)):
+        if shutdown_requested:
+            break
+        if _consume_wake_signal():
+            logger.info("Wake-up signal received, starting next cycle")
+            break
+        if time.time() - last_sdc_check >= 10:
+            written = _process_sdc_writes()
+            last_sdc_check = time.time()
+            if written:
+                break
+        time.sleep(1)
+
+
+def _release_resources(sweep_thread: threading.Thread) -> None:
+    """Shutdown: stop the sweep, give back claims, close pools. Order matters."""
+    global shutdown_requested
+    logger.info("Worker %s shutting down, releasing claims and closing resources.", _worker_id)
+    # Signal the sweep and let it leave its batch before the claims and the DB/HTTP resources
+    # go away: it checks shutdown_requested between batches, but an in-flight LiftWing request
+    # can still outlive the bounded join. After that the daemon thread dies with the process.
+    shutdown_requested = True
+    sweep_thread.join(timeout=SWEEP_JOIN_TIMEOUT)
+    if sweep_thread.is_alive():
+        logger.warning(f"Shadow pre-filter sweep still running after {SWEEP_JOIN_TIMEOUT}s; closing resources anyway")
+    _release_all_claims()
+    face_client.reset_session()
+    liftwing_client.reset_client()
+    close_pool()
+
+
+def main():
+    """Main worker loop with distributed locking for concurrent multi-instance processing."""
+    global _worker_id
+    _worker_id = _parse_worker_id(sys.argv)
+    logger.info(
+        f"Starting WikiVisage Worker {_worker_id} (max_projects={MAX_CONCURRENT_PROJECTS}, image_threads={IMAGE_THREADS})"
+    )
+
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
+    try:
+        init_db(pool_size=_db_pool_size())
+    except Exception as e:
+        logger.error(f"Database initialization failed: {e}")
+        sys.exit(1)
+
+    _check_face_service_at_startup()
+    _log_project_diagnostics()
+
+    # Background shadow sweep: records LiftWing verdicts for projects the processing pipelines
+    # never claim (completed, paused or fully processed). Own daemon thread: one pass can take
+    # minutes, and an inline call would stall the heartbeat refreshes the Toolforge health check
+    # watches. The handle is kept so shutdown can join it before its resources go away.
     sweep_thread = threading.Thread(target=_shadow_prefilter_loop, name="shadow-prefilter-sweep", daemon=True)
     sweep_thread.start()
 
     try:
         while not shutdown_requested:
             try:
-                execute_query(
-                    "REPLACE INTO worker_heartbeat (id, last_seen) VALUES (1, NOW())",
-                    fetch=False,
-                )
-                _touch_heartbeat_file()
-                _probe_liftwing_if_due()
-
-                # ---- Purge soft-deleted projects FIRST (quick, unblocks re-creation) ----
-                try:
-
-                    def _archive_and_purge(conn: Any, cursor: Any) -> int:
-                        cursor.execute(
-                            "INSERT INTO user_stats (user_id, classifications, sdc_tags) "
-                            "SELECT f.classified_by_user_id, "
-                            "  COUNT(*), "
-                            "  COUNT(CASE WHEN f.sdc_written = 1 THEN 1 END) "
-                            "FROM faces f "
-                            "INNER JOIN images i ON i.id = f.image_id "
-                            "INNER JOIN projects p ON p.id = i.project_id "
-                            "WHERE p.status = 'deleted' "
-                            "  AND f.classified_by_user_id IS NOT NULL "
-                            "  AND f.superseded_by IS NULL "
-                            "GROUP BY f.classified_by_user_id "
-                            "ON DUPLICATE KEY UPDATE "
-                            "  classifications = classifications + VALUES(classifications), "
-                            "  sdc_tags = sdc_tags + VALUES(sdc_tags)",
-                        )
-                        cursor.execute("DELETE FROM projects WHERE status = 'deleted'")
-                        return cursor.rowcount
-
-                    deleted = execute_transaction(_archive_and_purge)
-                    if deleted:
-                        logger.info(f"Purged {deleted} soft-deleted project(s)")
-                except DatabaseError as exc:
-                    logger.warning("Failed to purge soft-deleted projects: %s", exc)
-
-                # ---- SDC writes (user-triggered, latency-sensitive) ----
-                # Process SDC write requests before the active pipeline so users
-                # don't wait minutes through crawl/detect/infer before their
-                # "Send Edits to Wikimedia Commons" request is serviced.
-                _process_sdc_writes()
-
-                # ---- Claim active projects (atomic, distributed-safe) ----
-                active_projects = _claim_active_projects(MAX_CONCURRENT_PROJECTS)
-
-                # ---- Inference-eligible projects are claimed in the drain loop below ----
-                active_ids = {p["id"] for p in active_projects}
-
-                logger.info(f"Poll: claimed {len(active_projects)} active project(s)")
-
-                seen_ids = set()
-
-                # Drain the inference queue FIRST. Inference is a few seconds of numpy
-                # plus one batched UPDATE per project, whereas an active project can hold
-                # all slots for a long time looping through its image backlog. With the
-                # old order (a single inference batch per cycle, run after the active
-                # batch) a project whose classifications had just crossed min_confirmed
-                # sat behind that backlog while its page said "Model inference in
-                # progress" the whole time. Keep claiming until no unseen eligible
-                # project remains; `seen_ids` guarantees termination when a project stays
-                # eligible because some of its faces have unusable encodings.
-                while not shutdown_requested:
-                    claimed = _claim_inference_projects(MAX_CONCURRENT_PROJECTS)
-                    inference_only = [p for p in claimed if p["id"] not in active_ids and p["id"] not in seen_ids]
-                    run_ids = {p["id"] for p in inference_only}
-                    # Release claims we will not run (already processed this cycle, or
-                    # covered by the active pipeline) instead of holding them until the
-                    # claim expiry.
-                    for project in claimed:
-                        if project["id"] not in run_ids and project["id"] not in active_ids:
-                            _release_project(project["id"])
-                    if not inference_only:
-                        break
-
-                    with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_PROJECTS) as executor:
-                        futures = {}
-                        for project in inference_only:
-                            if shutdown_requested:
-                                break
-                            seen_ids.add(project["id"])
-                            logger.info(
-                                f"Running inference-only for project {project['id']} (status={project.get('status')})"
-                            )
-                            future = executor.submit(_infer_and_release, project)
-                            futures[future] = project["id"]
-
-                        last_heartbeat_inf = time.time()
-                        last_sdc_check_inf = time.time()
-                        while futures:
-                            if shutdown_requested:
-                                break
-
-                            # Refresh heartbeat + claims during inference
-                            if time.time() - last_heartbeat_inf >= 60:
-                                try:
-                                    execute_query(
-                                        "REPLACE INTO worker_heartbeat (id, last_seen) VALUES (1, NOW())",
-                                        fetch=False,
-                                    )
-                                    _touch_heartbeat_file()
-                                except Exception:
-                                    pass
-                                _refresh_claims()
-                                _probe_liftwing_if_due()
-                                _run_new_inference_projects(1)
-                                last_heartbeat_inf = time.time()
-
-                            # Check for wake-up signal during inference
-                            if os.path.exists(WAKE_FILE_PATH):
-                                try:
-                                    os.remove(WAKE_FILE_PATH)
-                                except OSError:
-                                    pass
-                                _process_sdc_writes()
-                                last_sdc_check_inf = time.time()
-                                # Pick up any project that just became inference-ready.
-                                _run_new_inference_projects(1)
-
-                            # Periodic SDC check (works across pods where wake file doesn't)
-                            if time.time() - last_sdc_check_inf >= 10:
-                                _process_sdc_writes()
-                                last_sdc_check_inf = time.time()
-
-                            done = {f for f in futures if f.done()}
-                            if not done:
-                                time.sleep(1)
-                                continue
-
-                            for future in done:
-                                project_id = futures.pop(future)
-                                try:
-                                    classified = future.result()
-                                    logger.info(f"Inference classified {classified} faces for project {project_id}")
-                                except Exception as e:
-                                    logger.error(f"Inference failed for project {project_id}: {e}")
-
-                # Process active projects concurrently (claims released in wrapper).
-                # Each thread handles its own discovery (traverse_category + bootstrap)
-                # so all claimed projects start working immediately — no serial bottleneck.
-                if active_projects:
-                    with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_PROJECTS) as executor:
-                        futures = {}
-                        for project in active_projects:
-                            if shutdown_requested:
-                                break
-                            seen_ids.add(project["id"])
-                            future = executor.submit(_process_and_release, project)
-                            futures[future] = project["id"]
-
-                        last_heartbeat = time.time()
-                        last_sdc_check = time.time()
-                        while futures:
-                            if shutdown_requested:
-                                break
-
-                            # Refresh heartbeat + claim timestamps during long processing cycles
-                            if time.time() - last_heartbeat >= 60:
-                                try:
-                                    execute_query(
-                                        "REPLACE INTO worker_heartbeat (id, last_seen) VALUES (1, NOW())",
-                                        fetch=False,
-                                    )
-                                    _touch_heartbeat_file()
-                                except Exception:
-                                    pass
-                                _refresh_claims()
-                                _probe_liftwing_if_due()
-                                _run_new_inference_projects(1)
-                                last_heartbeat = time.time()
-
-                            # Check for wake-up signal every iteration (even if no futures done)
-                            if os.path.exists(WAKE_FILE_PATH):
-                                try:
-                                    os.remove(WAKE_FILE_PATH)
-                                except OSError:
-                                    pass
-                                logger.info("Wake-up signal received mid-cycle, checking for new work")
-
-                                _process_sdc_writes()
-                                last_sdc_check = time.time()
-
-                                unfinished_futures = [f for f in futures if not f.done()]
-                                free_slots = MAX_CONCURRENT_PROJECTS - len(unfinished_futures)
-                                if free_slots <= 0:
-                                    logger.debug(
-                                        "All %d worker slots occupied, skipping mid-cycle claim",
-                                        MAX_CONCURRENT_PROJECTS,
-                                    )
-                                else:
-                                    new_projects = _claim_active_projects(free_slots)
-                                    for project in new_projects:
-                                        if project["id"] not in seen_ids:
-                                            seen_ids.add(project["id"])
-                                            logger.info(f"Adding new project {project['id']} to current cycle")
-                                            future = executor.submit(_process_and_release, project)
-                                            futures[future] = project["id"]
-
-                                # A classification can make a project inference-ready
-                                # even when all slots are busy; inference is cheap, so
-                                # run it inline instead of waiting for the next cycle.
-                                _run_new_inference_projects(1)
-
-                            # Periodic SDC check (works across pods where wake file doesn't)
-                            if time.time() - last_sdc_check >= 10:
-                                _process_sdc_writes()
-                                last_sdc_check = time.time()
-
-                            done = {f for f in futures if f.done()}
-                            if not done:
-                                time.sleep(1)
-                                continue
-
-                            for future in done:
-                                project_id = futures.pop(future)
-                                try:
-                                    future.result()
-                                except Exception as e:
-                                    logger.error(f"Project {project_id} processing failed: {e}")
-
-                # Add random jitter (0–15s) so multiple workers desynchronize
-                # and don't all race to claim the same projects every cycle.
-                jitter = random.randint(0, 15)
-                last_sdc_check_sleep = time.time()
-                for _ in range(POLL_INTERVAL + jitter):
-                    if shutdown_requested:
-                        break
-                    if os.path.exists(WAKE_FILE_PATH):
-                        try:
-                            os.remove(WAKE_FILE_PATH)
-                        except OSError:
-                            pass
-                        logger.info("Wake-up signal received, starting next cycle")
-                        break
-                    if time.time() - last_sdc_check_sleep >= 10:
-                        written = _process_sdc_writes()
-                        last_sdc_check_sleep = time.time()
-                        if written:
-                            break
-                    time.sleep(1)
-
+                _run_cycle()
+                _sleep_until_next_cycle()
             except DatabaseError as e:
                 logger.error(f"Database error in main loop: {e}")
                 time.sleep(10)
             except Exception as e:
                 logger.error(f"Unexpected error in main loop: {e}")
                 time.sleep(10)
-
     finally:
-        logger.info("Worker %s shutting down, releasing claims and closing resources.", _worker_id)
-        # Signal the sweep and let it leave its batch before the claims and the
-        # DB/HTTP resources go away: it checks shutdown_requested between
-        # batches, but an in-flight LiftWing request can still outlive the
-        # bounded join. After that the daemon thread dies with the process.
-        shutdown_requested = True
-        sweep_thread.join(timeout=SWEEP_JOIN_TIMEOUT)
-        if sweep_thread.is_alive():
-            logger.warning(
-                f"Shadow pre-filter sweep still running after {SWEEP_JOIN_TIMEOUT}s; closing resources anyway"
-            )
-        _release_all_claims()
-        face_client.reset_session()
-        liftwing_client.reset_client()
-        close_pool()
+        _release_resources(sweep_thread)
 
 
 if __name__ == "__main__":

@@ -27,7 +27,9 @@ logger = logging.getLogger(__name__)
 
 SCHEMA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "schema.sql")
 
-# Drop order respects foreign key dependencies (children first).
+# Drop order respects foreign key dependencies (children first). "sessions" is a
+# legacy table (server-side sessions were never used; the app signs its session
+# cookie), kept here only so --reset also removes it from older databases.
 _ALL_TABLES = [
     "sdc_claims",
     "project_members",
@@ -165,8 +167,8 @@ _IDEMPOTENT_ERROR_CODES = {
 }
 
 # Default projects.distance_threshold since the switch to cosine distance on
-# ArcFace embeddings. Provisional until Phase 0 calibration (see
-# docs/plans/face-model-upgrade.md); keep in step with schema.sql.
+# ArcFace embeddings. Provisional until calibrated on real data; keep in step
+# with schema.sql.
 DEFAULT_DISTANCE_THRESHOLD = 0.5
 
 # Incremental migrations: each entry is (description, SQL).
@@ -456,6 +458,20 @@ _ALTER_MIGRATIONS = [
         "Seed the liftwing row in service_status",
         "INSERT IGNORE INTO service_status (name) VALUES ('liftwing')",
     ),
+    (
+        # Server-side sessions were reserved but never used (the app signs its
+        # session cookie); dropping the table also removes its FK to users.
+        "Drop the unused sessions table",
+        "DROP TABLE IF EXISTS sessions",
+    ),
+    (
+        # The comment is also set by apply_embedding_model_upgrade(), but that
+        # runs once. Without this entry a database migrated before the text
+        # changed keeps the old comment forever, diverging from schema.sql.
+        "Refresh the projects.distance_threshold comment",
+        f"ALTER TABLE projects MODIFY COLUMN distance_threshold FLOAT NOT NULL DEFAULT {DEFAULT_DISTANCE_THRESHOLD} "
+        "COMMENT 'Cosine distance threshold for autonomous inference (provisional default)'",
+    ),
 ]
 
 
@@ -503,7 +519,7 @@ _EMBEDDING_MODEL_SCHEMA = [
         "Set the cosine-distance default on projects.distance_threshold",
         f"ALTER TABLE projects MODIFY COLUMN distance_threshold FLOAT NOT NULL DEFAULT {DEFAULT_DISTANCE_THRESHOLD} "
         "COMMENT 'Cosine distance threshold for autonomous inference "
-        "(provisional default, see docs/plans/face-model-upgrade.md)'",
+        "(provisional default)'",
     ),
 ]
 
@@ -531,7 +547,7 @@ def _column_exists(cursor: Any, table: str, column: str) -> bool:
 def _wipe_derived_data(conn: Any, cursor: Any) -> None:
     """Delete every image, face and SDC claim, and reset per-project progress.
 
-    Keeps users, sessions, projects, project_members, user_stats and
+    Keeps users, projects, project_members, user_stats and
     worker_heartbeat. ``DELETE`` rather than ``TRUNCATE``: InnoDB refuses
     TRUNCATE on a table a foreign key references. Deleting images cascades to
     faces and from there to sdc_claims; the explicit sdc_claims delete is a
@@ -616,7 +632,6 @@ def verify_tables() -> None:
     """
     expected_tables = [
         "users",
-        "sessions",
         "projects",
         "images",
         "faces",

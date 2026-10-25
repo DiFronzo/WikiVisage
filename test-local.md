@@ -65,7 +65,7 @@ export OAUTHLIB_INSECURE_TRANSPORT=1
 python migrate.py
 ```
 
-This creates all 10 tables (`users`, `sessions`, `projects`, `images`, `faces`, `user_stats`, `sdc_claims`, `project_members`, `worker_heartbeat`, `service_status`) and their indexes. Safe to re-run.
+This creates all 9 tables (`users`, `projects`, `images`, `faces`, `user_stats`, `sdc_claims`, `project_members`, `worker_heartbeat`, `service_status`) and their indexes. Safe to re-run.
 
 ## 5. Run the Web App
 

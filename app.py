@@ -23,6 +23,7 @@ import re
 import secrets
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from functools import wraps
 from typing import Any
@@ -54,7 +55,9 @@ from flask_limiter.util import get_remote_address
 from requests_oauthlib import OAuth2Session
 
 import face_client
-from config import COMMONS_THUMB_STEPS, DETECTION_WIDTH, LIFTWING_PROBE_INTERVAL, WAKE_FILE_PATH
+import oauth_refresh
+from api_errors import ApiError
+from config import COMMONS_THUMB_STEPS, DETECTION_WIDTH, LIFTWING_PROBE_INTERVAL, USER_AGENT, WAKE_FILE_PATH
 from database import (
     DatabaseError,
     execute_query,
@@ -62,7 +65,6 @@ from database import (
     init_db,
 )
 from face_client import FaceServiceError, FaceServiceRejected
-from redis_lock import single_flight
 from token_crypto import TokenDecryptionError, decrypt_token, encrypt_token
 
 # ---------------------------------------------------------------------------
@@ -214,18 +216,22 @@ def inject_i18n_helpers() -> dict[str, Any]:
     }
 
 
-# Token expiry buffer (refresh 5 minutes before actual expiry)
-TOKEN_REFRESH_BUFFER = 300  # seconds
-
 # Wikimedia Commons file URL pattern (used for manual face detection). Same width
 # as the worker's detection (WIKIVISAGE_DETECTION_WIDTH), so a drawn box and the
 # stored detection space differ by a scale factor of about 1.
 FILE_PATH_URL = f"https://commons.wikimedia.org/wiki/Special:FilePath/{{file_title}}?width={DETECTION_WIDTH}"
 
-# Default cosine-distance threshold for new projects. Provisional until Phase 0
-# calibration (docs/plans/face-model-upgrade.md); keep in step with schema.sql.
+# Default cosine-distance threshold for new projects. Provisional until calibrated
+# on real data; keep in step with schema.sql.
 DEFAULT_DISTANCE_THRESHOLD = 0.5
-USER_AGENT = "WikiVisage/1.0 (https://github.com/DiFronzo/WikiVisage)"
+# Files that cannot show a face. The crawler no longer inserts them, but rows
+# from older crawls may exist, so the gallery still excludes them. Comparing the
+# last dot-separated segment is equivalent to the former `REGEXP '\\.(ext)$'`
+# without running a regex over every row of every page.
+_NON_VISUAL_EXTENSIONS = ("webm", "ogv", "ogg", "mp3", "wav", "flac", "opus", "mid", "oga")
+_EXCLUDE_NON_VISUAL_SQL = "SUBSTRING_INDEX(LOWER(i.file_title), '.', -1) NOT IN ({})".format(
+    ", ".join(f"'{ext}'" for ext in _NON_VISUAL_EXTENSIONS)
+)
 COMMONS_API_URL = "https://commons.wikimedia.org/w/api.php"
 WIKIDATA_API_URL = "https://www.wikidata.org/w/api.php"
 
@@ -264,12 +270,6 @@ def before_request() -> None:
         except DatabaseError:
             logger.exception("Failed to load user from session")
             session.clear()
-
-
-@app.teardown_appcontext
-def teardown_appcontext(exception: BaseException | None = None) -> None:
-    """Clean up per-request resources."""
-    pass  # Connection pool handles cleanup via context managers
 
 
 def _is_safe_url(target: str) -> bool:
@@ -401,6 +401,105 @@ def _validate_bbox(bbox_top: int, bbox_right: int, bbox_bottom: int, bbox_left: 
     return None
 
 
+def _read_box_request(*id_fields: str) -> tuple[tuple[int, ...], tuple[int, int, int, int]]:
+    """Read the integer id fields and a drawn box (top, right, bottom, left) from the POST form.
+
+    Raises ``ApiError`` (400) for a missing field, a non-integer value or an invalid box.
+    """
+    names = (*id_fields, "bbox_top", "bbox_right", "bbox_bottom", "bbox_left")
+    raw = [request.form.get(name) for name in names]
+    if not all(raw):
+        raise ApiError(_("Missing required fields"))
+    try:
+        values = [int(value) for value in raw]  # type: ignore[arg-type]
+    except (ValueError, TypeError):
+        raise ApiError(_("Invalid field values")) from None
+    ids, box = tuple(values[: len(id_fields)]), (values[-4], values[-3], values[-2], values[-1])
+    bbox_error = _validate_bbox(*box)
+    if bbox_error:
+        raise ApiError(bbox_error)
+    return ids, box
+
+
+def _read_dismiss_ids() -> list[int]:
+    """Face ids the classify page asks to dismiss as non-target (``dismiss_face_ids``, a JSON list).
+
+    Anything that is not a well-formed list is ignored; a list over MAX_DISMISS_FACE_IDS is refused.
+    """
+    raw = request.form.get("dismiss_face_ids", "")
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+        if not isinstance(parsed, list):
+            return []
+        if len(parsed) > MAX_DISMISS_FACE_IDS:
+            raise ApiError(_("Too many face IDs in dismiss list"))
+        return [int(face_id) for face_id in parsed]
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return []
+
+
+def _commons_file_url(file_title: str) -> str:
+    """Detection-width thumbnail URL for a ``File:`` title."""
+    clean_title = file_title[5:] if file_title.startswith("File:") else file_title
+    return FILE_PATH_URL.format(file_title=clean_title)
+
+
+def _encode_drawn_box(image_row: dict[str, Any], box: tuple[int, int, int, int], *, purpose: str):
+    """Download the image and embed a drawn box with the face service.
+
+    *purpose* completes the log lines ("encoding manual face", "re-encoding face bbox").
+    Raises ``ApiError``: 422 when the service cannot read the image or the box yields no
+    usable embedding, 503 when the service is unavailable. A failed download raises
+    ``requests.RequestException`` for the route to turn into a 502.
+    """
+    image_bytes = _download_image(_commons_file_url(image_row["file_title"]))
+    try:
+        encoded = face_client.encode_known_face(
+            image_bytes,
+            box,
+            box_space=_detection_space(image_row.get("detection_width"), image_row.get("detection_height")),
+        )
+    except FaceServiceRejected:
+        logger.warning("Face service rejected the image while %s", purpose)
+        raise ApiError(_("This image could not be read by the face detection service."), 422) from None
+    except FaceServiceError:
+        logger.exception("Face service unavailable while %s", purpose)
+        raise ApiError(_("Face detection service is unavailable. Please try again in a moment."), 503) from None
+    if not encoded:
+        raise ApiError(
+            _("Could not compute face encoding for the selected region. Try drawing a slightly larger box."), 422
+        )
+    return encoded
+
+
+def _already_reviewed_error(other_username: str) -> ApiError:
+    """409 for a face another contributor classified; only they may change their own classification."""
+    if other_username:
+        message = _(
+            "This face was already classified by %(user)s. Only they can change their own classification.",
+            user=other_username,
+        )
+    else:
+        message = _("This face has already been classified by another contributor.")
+    return ApiError(message, 409, reason="already_reviewed")
+
+
+def _insert_human_target_face(
+    cursor: Any, image_id: int, encoded: Any, box: tuple[int, int, int, int], user_id: int
+) -> int:
+    """Insert a manually drawn face as a human-confirmed target and return its id."""
+    cursor.execute(
+        "INSERT INTO faces "
+        "(image_id, encoding, embedding_model, aligned, bbox_top, bbox_right, bbox_bottom, bbox_left, "
+        "is_target, classified_by, classified_by_user_id, classified_at) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 1, 'human', %s, NOW())",
+        (image_id, encoded.encoding, encoded.model_id, 1 if encoded.aligned else 0, *box, user_id),
+    )
+    return cursor.lastrowid
+
+
 def _get_face_stats(project_id: int) -> dict[str, Any]:
     """Return aggregate face statistics for a project.
 
@@ -521,141 +620,52 @@ def _make_oauth_session(state: str | None = None) -> OAuth2Session:
         redirect_uri=OAUTH_REDIRECT_URI,
         state=state,
     )
-    sess.headers["User-Agent"] = "WikiVisage/1.0 (https://github.com/DiFronzo/WikiVisage)"
+    sess.headers["User-Agent"] = USER_AGENT
     return sess
 
 
-def _reread_user_credentials(user: dict[str, Any]) -> dict[str, Any] | None:
-    """Re-read access/refresh/expiry from DB and update `user` in place.
-
-    Used after losing a single-flight race (another process refreshed first) or
-    when the optimistic CAS reports 0 rows updated. Returns the updated `user`
-    dict or None if the row vanished.
-    """
-    fresh = execute_query(
-        "SELECT access_token, refresh_token, token_expires_at FROM users WHERE id = %s",
-        (user["id"],),
-        fetch=True,
+def _oauth_exchange(refresh_token: str) -> dict[str, Any]:
+    """Trade a refresh token for new tokens at the Wikimedia OAuth endpoint."""
+    oauth = OAuth2Session(client_id=OAUTH_CLIENT_ID)
+    return oauth.refresh_token(
+        OAUTH_TOKEN_URL,
+        refresh_token=refresh_token,
+        client_id=OAUTH_CLIENT_ID,
+        client_secret=OAUTH_CLIENT_SECRET,
+        timeout=10,  # Must complete well within the single-flight lock's TTL.
     )
-    if not fresh:
-        return None
-    row = fresh[0]
-    at = row["access_token"]
-    if isinstance(at, bytes):
-        at = at.decode("utf-8")
-    rt = row["refresh_token"]
-    if isinstance(rt, bytes):
-        rt = rt.decode("utf-8")
-    try:
-        user["access_token"] = decrypt_token(at)
-        user["refresh_token"] = decrypt_token(rt)
-    except TokenDecryptionError:
-        logger.error("Cannot decrypt re-read tokens for user %s", user.get("wiki_username"))
-        return None
-    user["token_expires_at"] = row["token_expires_at"]
-    return user
 
 
 def _refresh_access_token(user: dict[str, Any]) -> dict[str, Any] | None:
+    """Refresh the user's access token if it is expired or about to expire.
+
+    The protocol (Redis single-flight lock, DB compare-and-swap, re-read after a lost
+    race) lives in ``oauth_refresh``, shared with the worker. This only supplies the
+    web side: the credentials already loaded for the request, the OAuth2 exchange, and
+    carrying the result back onto the caller's ``user`` dict.
+
+    Returns the updated user dict, or None if the refresh failed.
     """
-    Refresh the user's access token if it is expired or about to expire.
-
-    Concurrency model (defense in depth, all three layers):
-      1. Redis single-flight lock keyed on user_id — ensures only one process
-         POSTs to the OAuth `/token` endpoint with a given refresh_token.
-         Wikimedia rotates the refresh_token on every exchange; without this
-         lock, two concurrent calls would race and the second one's success
-         would invalidate the first's freshly issued tokens, silently logging
-         the user out and breaking SDC writes mid-batch.
-      2. Optimistic concurrency at the DB layer — UPDATE compares the old
-         token_expires_at; 0 rows updated means another process won the race.
-      3. Fallback re-read from DB — if either guard trips, we read the
-         freshly-stored tokens and continue with them.
-
-    The single-flight lock is best-effort: if Redis is down, we proceed without
-    it and rely on layers 2 and 3. This preserves liveness during a Redis outage
-    at the cost of occasional silent logouts (the pre-fix behavior).
-
-    Returns updated user dict or None if refresh failed.
-    """
-    expires_at = user["token_expires_at"]
-    if isinstance(expires_at, str):
-        expires_at = datetime.fromisoformat(expires_at)
-    if expires_at.tzinfo is None:
-        expires_at = expires_at.replace(tzinfo=UTC)
-
-    now = datetime.now(UTC)
-    if (expires_at - now).total_seconds() > TOKEN_REFRESH_BUFFER:
-        return user  # Still valid
-
-    # Single-flight: only one process per (user_id) calls the OAuth provider.
-    # TTL of 15s comfortably exceeds a normal token-exchange round-trip but
-    # guarantees a crashed holder cannot wedge other refreshes for long.
-    lock_name = f"oauth-refresh:{user['id']}"
-    with single_flight(redis_client, lock_name, ttl_seconds=15) as got_lock:
-        if not got_lock:
-            # Another process is mid-refresh. Wait briefly for it to commit
-            # to the DB, then re-read the new credentials.
-            logger.info("Token refresh in flight for user %s — waiting on peer", user["wiki_username"])
-            time.sleep(1.0)
-            updated = _reread_user_credentials(user)
-            if updated is None:
-                return None
-            # Verify the peer actually refreshed (their UPDATE may have failed).
-            new_expires = updated["token_expires_at"]
-            if isinstance(new_expires, str):
-                new_expires = datetime.fromisoformat(new_expires)
-            if new_expires.tzinfo is None:
-                new_expires = new_expires.replace(tzinfo=UTC)
-            if (new_expires - datetime.now(UTC)).total_seconds() > TOKEN_REFRESH_BUFFER:
-                return updated
-            # Peer didn't refresh in time — fall through and try ourselves.
-            # (Lock has been released because we exited the `with` block.)
-            logger.warning("Peer refresh did not complete for user %s; retrying ourselves", user["wiki_username"])
-            return _refresh_access_token(updated)
-
-        old_expires_str = expires_at.strftime("%Y-%m-%d %H:%M:%S")
-        logger.info(f"Refreshing access token for user {user['wiki_username']}")
-
-        try:
-            oauth = OAuth2Session(client_id=OAUTH_CLIENT_ID)
-            new_token = oauth.refresh_token(
-                OAUTH_TOKEN_URL,
-                refresh_token=user["refresh_token"],
-                client_id=OAUTH_CLIENT_ID,
-                client_secret=OAUTH_CLIENT_SECRET,
-                timeout=10,  # Must complete well within the 15s single-flight lock TTL.
-            )
-
-            new_expires_at = datetime.now(UTC) + timedelta(seconds=new_token.get("expires_in", 14400))
-
-            # DB-layer CAS is still useful as a last-line guard against a Redis outage
-            # that let two refreshes through.
-            rowcount = execute_query(
-                "UPDATE users SET access_token = %s, refresh_token = %s, token_expires_at = %s "
-                "WHERE id = %s AND token_expires_at = %s",
-                (
-                    encrypt_token(new_token["access_token"]),
-                    encrypt_token(new_token.get("refresh_token", user["refresh_token"])),
-                    new_expires_at.strftime("%Y-%m-%d %H:%M:%S"),
-                    user["id"],
-                    old_expires_str,
-                ),
-                fetch=False,
-            )
-
-            if rowcount == 0:
-                logger.info(f"Token already refreshed by another process for user {user['wiki_username']}")
-                return _reread_user_credentials(user)
-
-            user["access_token"] = new_token["access_token"]
-            user["refresh_token"] = new_token.get("refresh_token", user["refresh_token"])
-            user["token_expires_at"] = new_expires_at
-            return user
-
-        except Exception:
-            logger.exception("Failed to refresh access token")
-            return None
+    current = oauth_refresh.TokenSet(
+        user["access_token"],
+        user["refresh_token"],
+        oauth_refresh.as_utc(user["token_expires_at"]),
+    )
+    tokens = oauth_refresh.refresh_tokens(
+        user["id"],
+        label=f"user {user['wiki_username']}",
+        query=execute_query,
+        get_redis=lambda: redis_client,
+        exchange=_oauth_exchange,
+        current=current,
+    )
+    if tokens is None:
+        return None
+    if tokens is not current:  # refreshed here, or taken over from a peer's refresh
+        user["access_token"] = tokens.access_token
+        user["refresh_token"] = tokens.refresh_token
+        user["token_expires_at"] = tokens.expires_at
+    return user
 
 
 def _get_valid_token() -> str | None:
@@ -700,12 +710,11 @@ def _generate_csp_nonce() -> None:
 
     Must run as a before_request so that g.csp_nonce is available to
     set_security_headers() (after_request) and to templates via the
-    inject_csp_nonce context processor. Note: the nonce is NOT currently
-    emitted in the Content-Security-Policy header because 'unsafe-inline' is
-    still required by several inline handlers across the templates; adding a
-    nonce alongside 'unsafe-inline' would have no effect per CSP Level 3
-    (browsers ignore 'unsafe-inline' when a nonce/hash is present). The nonce
-    is preserved here to support a future incremental migration to nonce-only.
+    inject_csp_nonce context processor. The same value is emitted as
+    'nonce-<value>' in the script-src directive and must be placed on every
+    inline <script> via {{ csp_nonce }}; inline event-handler attributes are
+    forbidden (script-src-attr 'none'), so page behaviour is wired with
+    addEventListener from those nonce'd scripts.
     """
     g.csp_nonce = secrets.token_urlsafe(32)
 
@@ -809,27 +818,26 @@ def set_security_headers(response):
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
     response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
     # CSP notes:
-    # - 'unsafe-inline' is retained because templates still contain inline onclick/onsubmit
-    #   handlers and style="" attributes (refactor is tracked separately). Adding the
-    #   per-request nonce alongside lets us migrate scripts/styles incrementally; modern
-    #   browsers honour the nonce when both are present.
+    # - script-src allows only same-origin files and inline <script> tags carrying this
+    #   request's nonce (g.csp_nonce, the same value templates render as {{ csp_nonce }}).
+    #   There is no 'unsafe-inline' for scripts: a nonce makes browsers ignore it anyway.
+    # - script-src-attr 'none' forbids inline event-handler attributes (onclick=...) and
+    #   javascript: URLs outright; templates use addEventListener instead.
+    # - style-src keeps 'unsafe-inline' because many style="" attributes remain.
     # - object-src 'none' blocks <object>/<embed>/<applet> plugin loads.
     # - base-uri 'none' prevents an injected <base> tag from rewriting all relative URLs
     #   on the page, which is a known XSS escalation vector.
     # - frame-ancestors 'none' makes X-Frame-Options redundant but both are kept for
     #   older browsers.
-    # NOTE: We intentionally do NOT include a 'nonce-...' source alongside
-    # 'unsafe-inline'. Per CSP Level 3, browsers ignore 'unsafe-inline' when a
-    # nonce or hash source is present, which would silently break ~106 inline
-    # style="" attributes and ~41 inline event handlers across our templates
-    # (logout button, mobile nav toggle, language selector, PWA install banner,
-    # etc.). The genuine H1 hardening wins -- object-src/base-uri/frame-ancestors
-    # 'none' -- are retained and are independent of the nonce mechanism.
-    # Tightening to nonce-only would require a full template refactor (tracked
-    # separately).
+    nonce = getattr(g, "csp_nonce", None)
+    if not nonce:
+        # Responses built before _generate_csp_nonce ran (e.g. an early abort) render no
+        # nonce'd script, so a fresh value is fine; keep it on g for any later reader.
+        nonce = g.csp_nonce = secrets.token_urlsafe(32)
     response.headers["Content-Security-Policy"] = (
         "default-src 'self'; "
-        "script-src 'self' 'unsafe-inline'; "
+        f"script-src 'self' 'nonce-{nonce}'; "
+        "script-src-attr 'none'; "
         "style-src 'self' 'unsafe-inline'; "
         "img-src 'self' https://*.wikimedia.org data:; "
         "connect-src 'self'; "
@@ -1535,6 +1543,96 @@ def dashboard():
     )
 
 
+def _fetch_subcategories(category_title: str) -> tuple[list[str], bool]:
+    """A category's direct subcategories, and whether Commons truncated the list (more pages exist)."""
+    data = _wikimedia_api_get(
+        COMMONS_API_URL,
+        {
+            "action": "query",
+            "list": "categorymembers",
+            "cmtitle": category_title,
+            "cmtype": "subcat",
+            "cmlimit": COMMONS_API_LIMIT,
+            "format": "json",
+        },
+        timeout=3,
+    )
+    titles = [m["title"] for m in data.get("query", {}).get("categorymembers", [])]
+    return titles, "continue" in data
+
+
+def _category_info_pages(titles: list[str]) -> dict[str, Any]:
+    """The ``categoryinfo`` (file and subcategory counts) of up to 50 categories."""
+    return (
+        _wikimedia_api_get(
+            COMMONS_API_URL,
+            {"action": "query", "titles": "|".join(titles), "prop": "categoryinfo", "format": "json"},
+            timeout=3,
+        )
+        .get("query", {})
+        .get("pages", {})
+    )
+
+
+def _count_category_tree(root_title: str, deadline: float) -> dict[str, Any] | None:
+    """Breadth-first count of the files under a Commons category and its subcategories.
+
+    Bounded by MAX_CATEGORY_TRAVERSAL categories and the *deadline* (``time.monotonic()``), so the
+    result may be approximate. Returns None when the root category does not exist.
+    """
+    pages = _category_info_pages([root_title])
+    if "-1" in pages:
+        return None
+
+    root_info = next(iter(pages.values())).get("categoryinfo", {})
+    total_files = root_info.get("files", 0)
+    total_subcats = root_info.get("subcats", 0)
+
+    visited = {root_title}
+    queue: list[str] = []
+    approximate = False
+
+    if total_subcats > 0:
+        titles, truncated = _fetch_subcategories(root_title)
+        queue.extend(title for title in titles if title not in visited)
+        approximate = truncated
+
+    while queue and len(visited) < MAX_CATEGORY_TRAVERSAL and time.monotonic() < deadline:
+        batch: list[str] = []
+        while queue and len(batch) < 50 and len(visited) + len(batch) < MAX_CATEGORY_TRAVERSAL:
+            title = queue.pop(0)
+            if title not in visited:
+                batch.append(title)
+        if not batch:
+            break
+        visited.update(batch)
+
+        subcats_to_fetch = []
+        for info_page in _category_info_pages(batch).values():
+            counts = info_page.get("categoryinfo", {})
+            total_files += counts.get("files", 0)
+            total_subcats += counts.get("subcats", 0)
+            if counts.get("subcats", 0) > 0:
+                subcats_to_fetch.append(info_page["title"])
+
+        for sub_title in subcats_to_fetch:
+            if time.monotonic() >= deadline or len(visited) >= MAX_CATEGORY_TRAVERSAL:
+                break
+            titles, truncated = _fetch_subcategories(sub_title)
+            queue.extend(title for title in titles if title not in visited)
+            approximate = approximate or truncated
+
+    # A strict bool: the page reads it as `data.approximate ? ... : ...`, where an empty
+    # list (what `queue and ...` used to leave behind) is truthy.
+    approximate = approximate or len(visited) >= MAX_CATEGORY_TRAVERSAL or bool(queue and time.monotonic() >= deadline)
+    return {
+        "files": total_files,
+        "subcats": total_subcats,
+        "categories_visited": len(visited),
+        "approximate": approximate,
+    }
+
+
 @app.route("/api/category-info")
 @login_required
 @limiter.limit("5 per minute")
@@ -1552,224 +1650,112 @@ def api_category_info():
     if len(category) > 200 or any(c in category for c in "|\n\r\x00"):
         return jsonify({"error": "invalid category name"}), 400
 
-    deadline = time.monotonic() + CATEGORY_API_TIMEOUT
-
-    root_title = f"Category:{category}"
-
     try:
-        # 1. Check root category exists
-        pages = (
-            _wikimedia_api_get(
-                COMMONS_API_URL,
-                {"action": "query", "titles": root_title, "prop": "categoryinfo", "format": "json"},
-                timeout=3,
-            )
-            .get("query", {})
-            .get("pages", {})
-        )
-        if "-1" in pages:
-            return jsonify({"error": "not_found"}), 404
-
-        page = next(iter(pages.values()))
-        root_info = page.get("categoryinfo", {})
-        total_files = root_info.get("files", 0)
-        total_subcats = root_info.get("subcats", 0)
-
-        # 2. BFS subcategory traversal to sum file counts
-        cat_queue = []
-        visited = {root_title}
-        approximate = False
-
-        # Seed queue with subcategories of root
-        if total_subcats > 0:
-            sub_data = _wikimedia_api_get(
-                COMMONS_API_URL,
-                {
-                    "action": "query",
-                    "list": "categorymembers",
-                    "cmtitle": root_title,
-                    "cmtype": "subcat",
-                    "cmlimit": COMMONS_API_LIMIT,
-                    "format": "json",
-                },
-                timeout=3,
-            )
-            for m in sub_data.get("query", {}).get("categorymembers", []):
-                if m["title"] not in visited:
-                    cat_queue.append(m["title"])
-            if "continue" in sub_data:
-                approximate = True
-
-        while cat_queue and len(visited) < MAX_CATEGORY_TRAVERSAL and time.monotonic() < deadline:
-            # Batch up to 50 titles for categoryinfo
-            batch = []
-            while cat_queue and len(batch) < 50 and len(visited) + len(batch) < MAX_CATEGORY_TRAVERSAL:
-                title = cat_queue.pop(0)
-                if title not in visited:
-                    batch.append(title)
-
-            if not batch:
-                break
-
-            for title in batch:
-                visited.add(title)
-
-            info_pages = (
-                _wikimedia_api_get(
-                    COMMONS_API_URL,
-                    {"action": "query", "titles": "|".join(batch), "prop": "categoryinfo", "format": "json"},
-                    timeout=3,
-                )
-                .get("query", {})
-                .get("pages", {})
-            )
-
-            subcats_to_fetch = []
-            for p in info_pages.values():
-                ci = p.get("categoryinfo", {})
-                total_files += ci.get("files", 0)
-                total_subcats += ci.get("subcats", 0)
-                if ci.get("subcats", 0) > 0:
-                    subcats_to_fetch.append(p["title"])
-
-            for sub_title in subcats_to_fetch:
-                if time.monotonic() >= deadline or len(visited) >= MAX_CATEGORY_TRAVERSAL:
-                    break
-                sub_data = _wikimedia_api_get(
-                    COMMONS_API_URL,
-                    {
-                        "action": "query",
-                        "list": "categorymembers",
-                        "cmtitle": sub_title,
-                        "cmtype": "subcat",
-                        "cmlimit": COMMONS_API_LIMIT,
-                        "format": "json",
-                    },
-                    timeout=3,
-                )
-                for m in sub_data.get("query", {}).get("categorymembers", []):
-                    if m["title"] not in visited:
-                        cat_queue.append(m["title"])
-                if "continue" in sub_data:
-                    approximate = True
-
-        approximate = (
-            approximate or len(visited) >= MAX_CATEGORY_TRAVERSAL or (cat_queue and time.monotonic() >= deadline)
-        )
-
-        return jsonify(
-            {
-                "files": total_files,
-                "subcats": total_subcats,
-                "categories_visited": len(visited),
-                "approximate": approximate,
-            }
-        )
+        counts = _count_category_tree(f"Category:{category}", time.monotonic() + CATEGORY_API_TIMEOUT)
     except Exception:
         logger.debug(f"Failed to fetch category info: {category}", exc_info=True)
         return jsonify({"error": "api_error"}), 502
+    if counts is None:
+        return jsonify({"error": "not_found"}), 404
+    return jsonify(counts)
 
 
-@app.route("/project/new", methods=["GET", "POST"])
-@login_required
-@limiter.limit("20 per hour")
-def project_new():
-    """Create a new project."""
-    if request.method == "GET":
-        return render_template("project_new.html")
+@dataclass
+class _NewProjectForm:
+    """The "new project" form after parsing and validation. ``errors`` is empty when it is usable."""
 
-    if not _validate_csrf():
-        abort(400, _("Invalid CSRF token"))
+    wikidata_qid: str
+    commons_category: str
+    label: str
+    distance_threshold: float
+    min_confirmed: int
+    errors: list[str]
 
+    def template_context(self) -> dict[str, Any]:
+        return {
+            "wikidata_qid": self.wikidata_qid,
+            "commons_category": self.commons_category,
+            "label": self.label,
+            "distance_threshold": self.distance_threshold,
+            "min_confirmed": self.min_confirmed,
+        }
+
+    def render(self, **extra: Any):
+        return render_template("project_new.html", **self.template_context(), **extra)
+
+
+def _read_new_project_form() -> _NewProjectForm:
+    """Parse the form and validate it, including the Wikidata and Commons lookups."""
     wikidata_qid = request.form.get("wikidata_qid", "").strip().upper()
     commons_category = request.form.get("commons_category", "").strip()
     label = request.form.get("label", "").strip()
-    distance_threshold = request.form.get("distance_threshold", str(DEFAULT_DISTANCE_THRESHOLD))
-    min_confirmed = request.form.get("min_confirmed", "5")
+    raw_threshold = request.form.get("distance_threshold", str(DEFAULT_DISTANCE_THRESHOLD))
+    raw_min_confirmed = request.form.get("min_confirmed", "5")
 
-    # Validation
-    errors = []
+    errors: list[str] = []
     if not wikidata_qid or not wikidata_qid.startswith("Q"):
         errors.append(_("Wikidata Q-ID must start with 'Q' (e.g., Q42)."))
     if not commons_category:
         errors.append(_("Commons category is required."))
 
+    distance_threshold: float
     try:
-        distance_threshold = float(distance_threshold)
+        distance_threshold = float(raw_threshold)
         if not 0.1 <= distance_threshold <= 1.0:
             errors.append(_("Distance threshold must be between 0.1 and 1.0."))
     except ValueError:
         errors.append(_("Distance threshold must be a number."))
         distance_threshold = DEFAULT_DISTANCE_THRESHOLD
 
+    min_confirmed: int
     try:
-        min_confirmed = int(min_confirmed)
+        min_confirmed = int(raw_min_confirmed)
         if min_confirmed < 1:
             errors.append(_("Minimum confirmed must be at least 1."))
     except ValueError:
         errors.append(_("Minimum confirmed must be a whole number."))
         min_confirmed = 5
 
-    # Validate Q-ID refers to a human (P31 = Q5) on Wikidata
-    if not errors and wikidata_qid:
-        if not _is_human_entity(wikidata_qid):
-            errors.append(
-                _(
-                    "The Wikidata entity %(qid)s is not an instance of human (Q5). Only human entities are supported.",
-                    qid=wikidata_qid,
-                )
+    # The network checks only run once the cheap ones passed.
+    if not errors and wikidata_qid and not _is_human_entity(wikidata_qid):
+        errors.append(
+            _(
+                "The Wikidata entity %(qid)s is not an instance of human (Q5). Only human entities are supported.",
+                qid=wikidata_qid,
             )
-
-    # Validate Commons category exists and has files
+        )
     if not errors and commons_category:
         if not _commons_category_exists(commons_category):
-            errors.append(
-                _(
-                    'The Commons category "%(category)s" does not exist.',
-                    category=commons_category,
-                )
-            )
+            errors.append(_('The Commons category "%(category)s" does not exist.', category=commons_category))
         elif not _commons_category_has_files(commons_category):
             errors.append(
-                _(
-                    'The Commons category "%(category)s" exists but contains no files.',
-                    category=commons_category,
-                )
+                _('The Commons category "%(category)s" exists but contains no files.', category=commons_category)
             )
 
-    if errors:
-        for err in errors:
-            flash(err, "error")
-        return render_template(
-            "project_new.html",
-            wikidata_qid=wikidata_qid,
-            commons_category=commons_category,
-            label=label,
-            distance_threshold=distance_threshold,
-            min_confirmed=min_confirmed,
-        )
+    return _NewProjectForm(wikidata_qid, commons_category, label, distance_threshold, min_confirmed, errors)
 
-    # Check for duplicate
+
+def _user_already_has_project(form: _NewProjectForm) -> bool:
+    """True if this user has a live project with the same Q-ID and category. A failed lookup reads as False."""
     try:
-        existing = execute_query(
-            "SELECT id FROM projects WHERE user_id = %s AND wikidata_qid = %s AND commons_category = %s "
-            "AND status != 'deleted'",
-            (g.user["id"], wikidata_qid, commons_category),
-        )
-        if existing:
-            flash(_("A project with this Q-ID and category already exists."), "error")
-            return render_template(
-                "project_new.html",
-                wikidata_qid=wikidata_qid,
-                commons_category=commons_category,
-                label=label,
-                distance_threshold=distance_threshold,
-                min_confirmed=min_confirmed,
+        return bool(
+            execute_query(
+                "SELECT id FROM projects WHERE user_id = %s AND wikidata_qid = %s AND commons_category = %s "
+                "AND status != 'deleted'",
+                (g.user["id"], form.wikidata_qid, form.commons_category),
             )
+        )
     except DatabaseError:
         logger.exception("Failed to check for duplicate project")
+        return False
 
-    # Cross-user duplicate: inform user if another project exists for same QID + category
+
+def _respond_to_other_users_project(form: _NewProjectForm):
+    """If another user already has this Q-ID + category, redirect a member to it or offer to join.
+
+    Returns a response, or None to go on creating the project: no such project, the user was
+    banned from it, or they chose "create anyway". A failed lookup also reads as None.
+    """
     action = request.form.get("action", "create")
     try:
         other_project = execute_query(
@@ -1777,72 +1763,72 @@ def project_new():
             "JOIN users u ON p.user_id = u.id "
             "WHERE p.wikidata_qid = %s AND p.commons_category = %s "
             "AND p.status != 'deleted' AND p.user_id != %s LIMIT 1",
-            (wikidata_qid, commons_category, g.user["id"]),
+            (form.wikidata_qid, form.commons_category, g.user["id"]),
         )
-        if other_project:
-            op = other_project[0]
-            existing_membership = execute_query(
-                "SELECT status FROM project_members WHERE project_id = %s AND user_id = %s",
-                (op["id"], g.user["id"]),
+        if not other_project:
+            return None
+        other = other_project[0]
+        membership = execute_query(
+            "SELECT status FROM project_members WHERE project_id = %s AND user_id = %s",
+            (other["id"], g.user["id"]),
+        )
+        is_banned = bool(membership) and membership[0]["status"] == "banned"
+        if membership and not is_banned:
+            flash(_("You are already a member of this project."), "info")
+            return redirect(url_for("project_detail", project_id=other["id"]))
+        if not is_banned and action != "create_anyway":
+            flash(
+                _(
+                    "%(username)s already has a project for this Q-ID and category. "
+                    "You can ask them for an invite code to join, or create your own.",
+                    username=other["wiki_username"],
+                ),
+                "info",
             )
-            is_banned = existing_membership and existing_membership[0]["status"] == "banned"
-            if existing_membership and not is_banned:
-                flash(_("You are already a member of this project."), "info")
-                return redirect(url_for("project_detail", project_id=op["id"]))
-            if not is_banned and action != "create_anyway":
-                flash(
-                    _(
-                        "%(username)s already has a project for this Q-ID and category. "
-                        "You can ask them for an invite code to join, or create your own.",
-                        username=op["wiki_username"],
-                    ),
-                    "info",
-                )
-                return render_template(
-                    "project_new.html",
-                    wikidata_qid=wikidata_qid,
-                    commons_category=commons_category,
-                    label=label,
-                    distance_threshold=distance_threshold,
-                    min_confirmed=min_confirmed,
-                    existing_project=op,
-                )
+            return form.render(existing_project=other)
     except DatabaseError:
         logger.exception("Failed to check for joinable projects")
+    return None
 
-    # Create project
+
+def _insert_project(form: _NewProjectForm, p18_thumb_url: str | None) -> None:
+    """Insert the project with a fresh invite code, retrying on a code collision. Raises ``DatabaseError``."""
+    invite_code = _generate_invite_code()
+    for attempt in range(_MAX_INVITE_CODE_RETRIES):
+        try:
+            execute_query(
+                "INSERT INTO projects (user_id, wikidata_qid, commons_category, label, "
+                "distance_threshold, min_confirmed, p18_thumb_url, invite_code, invite_code_created_at) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())",
+                (
+                    g.user["id"],
+                    form.wikidata_qid,
+                    form.commons_category,
+                    form.label,
+                    form.distance_threshold,
+                    form.min_confirmed,
+                    p18_thumb_url,
+                    invite_code,
+                ),
+                fetch=False,
+            )
+            return
+        except DatabaseError as exc:
+            if _is_invite_code_collision(exc) and attempt < _MAX_INVITE_CODE_RETRIES - 1:
+                logger.debug("invite_code collision on attempt %d, retrying", attempt + 1)
+                invite_code = _generate_invite_code()
+            else:
+                raise
+
+
+def _create_project(form: _NewProjectForm):
+    """Create the project and wake the worker; on failure flash why and show the form again."""
     try:
-        p18_thumb_url = _fetch_p18_thumb_url(wikidata_qid)
+        p18_thumb_url = _fetch_p18_thumb_url(form.wikidata_qid)
+        if not form.label:
+            form.label = _fetch_wikidata_label(form.wikidata_qid) or ""
 
-        if not label:
-            label = _fetch_wikidata_label(wikidata_qid) or ""
-
-        invite_code = _generate_invite_code()
-        for _attempt in range(_MAX_INVITE_CODE_RETRIES):
-            try:
-                execute_query(
-                    "INSERT INTO projects (user_id, wikidata_qid, commons_category, label, "
-                    "distance_threshold, min_confirmed, p18_thumb_url, invite_code, invite_code_created_at) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())",
-                    (
-                        g.user["id"],
-                        wikidata_qid,
-                        commons_category,
-                        label,
-                        distance_threshold,
-                        min_confirmed,
-                        p18_thumb_url,
-                        invite_code,
-                    ),
-                    fetch=False,
-                )
-                break
-            except DatabaseError as _exc:
-                if _is_invite_code_collision(_exc) and _attempt < _MAX_INVITE_CODE_RETRIES - 1:
-                    logger.debug("invite_code collision on attempt %d, retrying", _attempt + 1)
-                    invite_code = _generate_invite_code()
-                else:
-                    raise
+        _insert_project(form, p18_thumb_url)
         flash(_("Project created successfully!"), "success")
 
         # Signal the worker to wake up and process the new project immediately
@@ -1858,9 +1844,8 @@ def project_new():
         # user_id + wikidata_qid + commons_category still exists.  The background
         # worker will hard-delete it on the next poll cycle (≤60 s).
         if _is_invite_code_collision(exc):
-            # The retry loop exhausted all _MAX_INVITE_CODE_RETRIES attempts to find
-            # a unique invite code and re-raised the last collision — treat as a
-            # generic creation failure (extremely unlikely in practice).
+            # The retry loop exhausted all attempts to find a unique invite code and
+            # re-raised the last collision — treat it as a generic creation failure.
             logger.exception("Failed to create project: invite_code collision after all retries")
             flash(_("Failed to create project. Please try again."), "error")
         elif _is_mysql_1062(exc):
@@ -1875,14 +1860,35 @@ def project_new():
         else:
             logger.exception("Failed to create project")
             flash(_("Failed to create project. Please try again."), "error")
-        return render_template(
-            "project_new.html",
-            wikidata_qid=wikidata_qid,
-            commons_category=commons_category,
-            label=label,
-            distance_threshold=distance_threshold,
-            min_confirmed=min_confirmed,
-        )
+        return form.render()
+
+
+@app.route("/project/new", methods=["GET", "POST"])
+@login_required
+@limiter.limit("20 per hour")
+def project_new():
+    """Create a new project."""
+    if request.method == "GET":
+        return render_template("project_new.html")
+
+    if not _validate_csrf():
+        abort(400, _("Invalid CSRF token"))
+
+    form = _read_new_project_form()
+    if form.errors:
+        for err in form.errors:
+            flash(err, "error")
+        return form.render()
+
+    if _user_already_has_project(form):
+        flash(_("A project with this Q-ID and category already exists."), "error")
+        return form.render()
+
+    response = _respond_to_other_users_project(form)
+    if response is not None:
+        return response
+
+    return _create_project(form)
 
 
 @app.route("/project/<int:project_id>")
@@ -1925,7 +1931,7 @@ def project_detail(project_id: int):
             "  AND f.superseded_by IS NULL "
             "  AND (f.classified_by IN ('model', 'bootstrap') "
             "       OR (f.classified_by = 'human' AND f.classified_by_user_id IS NOT NULL)) "
-            "  AND LOWER(i.file_title) NOT REGEXP '\\\\.(webm|ogv|ogg|mp3|wav|flac|opus|mid|oga)$'",
+            f"  AND {_EXCLUDE_NON_VISUAL_SQL}",
             (project_id,),
         )
         gallery_total = rows[0]["cnt"] if rows else 0
@@ -2011,6 +2017,128 @@ def project_detail(project_id: int):
     )
 
 
+_CLASSIFY_IMAGE_SELECT = (
+    "SELECT DISTINCT i.id AS image_id, i.file_title, i.commons_page_id, i.detection_width, i.detection_height "
+    "FROM images i JOIN faces f ON f.image_id = i.id WHERE "
+)
+_UNCLASSIFIED_FACE_CONDITIONS = "i.project_id = %s AND f.is_target IS NULL AND f.superseded_by IS NULL"
+_MODEL_REJECTED_FACE_CONDITIONS = (
+    "i.project_id = %s AND f.is_target = 0 AND f.classified_by = 'model' "
+    "AND f.classified_by_user_id IS NULL AND f.superseded_by IS NULL"
+)
+
+
+def _record_skip_request(project_id: int) -> None:
+    """Remember ``?skip_image_id=`` in the session so the image is not offered again, and make it undoable."""
+    if not request.args.get("skip_image_id"):
+        return
+    is_skip_review = request.args.get("skip_reviewing") == "1"
+    try:
+        skip_id = int(request.args["skip_image_id"])
+    except (ValueError, TypeError):
+        return
+    key = f"skipped_images_review_{project_id}" if is_skip_review else f"skipped_images_{project_id}"
+    skipped = session.get(key, [])
+    if skip_id not in skipped:
+        skipped.append(skip_id)
+    session[key] = skipped
+    session["last_classify"] = {
+        "action": "skip",
+        "project_id": project_id,
+        "image_id": skip_id,
+        "was_review": is_skip_review,
+        "face_ids": [],
+        "manual_face_ids": [],
+    }
+
+
+def _random_candidate_image(conditions: str, params: tuple, excluded: list[int]) -> list[dict[str, Any]]:
+    """One random image matching *conditions* (out of at most 200), skipping the *excluded* image ids."""
+    sql = _CLASSIFY_IMAGE_SELECT + conditions
+    if excluded:
+        sql += f" AND i.id NOT IN ({','.join(['%s'] * len(excluded))})"
+        params = (*params, *excluded)
+    rows = execute_query(sql + " LIMIT 200", params)
+    return [random.choice(rows)] if rows else rows
+
+
+def _forced_candidate_image(project_id: int, image_id: int) -> tuple[list[dict[str, Any]], bool]:
+    """Load one specific image (used after an undo). Returns (rows, reviewing_model).
+
+    Reviewing mode applies when the image has no unclassified face left, only model rejections.
+    """
+    rows = execute_query(
+        _CLASSIFY_IMAGE_SELECT + "i.project_id = %s AND i.id = %s "
+        "AND f.superseded_by IS NULL "
+        "AND (f.is_target IS NULL OR (f.is_target = 0 AND f.classified_by = 'model')) "
+        "LIMIT 1",
+        (project_id, image_id),
+    )
+    if not rows:
+        return rows, False
+    unclassified = execute_query(
+        "SELECT COUNT(*) AS cnt FROM faces WHERE image_id = %s AND is_target IS NULL AND superseded_by IS NULL",
+        (image_id,),
+    )
+    return rows, not unclassified or unclassified[0]["cnt"] == 0
+
+
+def _pick_image_to_classify(
+    project_id: int, forced_image_id: int | None, skipped_ids: list[int], skipped_review_ids: list[int]
+) -> tuple[dict[str, Any] | None, bool]:
+    """Choose the next image: (image or None, reviewing_model).
+
+    Priority: the forced image (after an undo), then an image with unclassified faces, then an
+    image whose faces the model rejected and no human has reviewed. Skipped images are left out.
+    """
+    reviewing_model = False
+    try:
+        if forced_image_id:
+            image_rows, reviewing_model = _forced_candidate_image(project_id, forced_image_id)
+        else:
+            image_rows = _random_candidate_image(_UNCLASSIFIED_FACE_CONDITIONS, (project_id,), skipped_ids)
+
+        if not image_rows:
+            reviewing_model = True
+            image_rows = _random_candidate_image(_MODEL_REJECTED_FACE_CONDITIONS, (project_id,), skipped_review_ids)
+    except DatabaseError:
+        logger.exception("Failed to load image for classification")
+        image_rows = []
+    return (image_rows[0] if image_rows else None), reviewing_model
+
+
+def _faces_to_classify(image_id: int, reviewing_model: bool) -> list[dict[str, Any]]:
+    """The faces shown for an image: the model's rejections when reviewing, else the unclassified ones."""
+    if reviewing_model:
+        where, failure = (
+            "f.is_target = 0 AND f.classified_by = 'model' AND f.superseded_by IS NULL",
+            ("Failed to load faces for model review"),
+        )
+    else:
+        where, failure = "f.is_target IS NULL AND f.superseded_by IS NULL", "Failed to load faces for classification"
+    try:
+        return execute_query(
+            "SELECT f.id AS face_id, f.bbox_top, f.bbox_right, f.bbox_bottom, f.bbox_left, f.confidence "
+            f"FROM faces f WHERE f.image_id = %s AND {where} ORDER BY f.bbox_left ASC",
+            (image_id,),
+        )
+    except DatabaseError:
+        logger.exception(failure)
+        return []
+
+
+def _count_images(conditions: str, project_id: int) -> int:
+    """Number of distinct images of the project with a face matching *conditions* (0 if the lookup fails)."""
+    try:
+        rows = execute_query(
+            f"SELECT COUNT(DISTINCT i.id) AS cnt FROM images i JOIN faces f ON f.image_id = i.id WHERE {conditions}",
+            (project_id,),
+        )
+        return rows[0]["cnt"] if rows else 0
+    except DatabaseError:
+        return 0
+
+
 @app.route("/project/<int:project_id>/classify")
 @login_required
 def classify(project_id: int):
@@ -2023,189 +2151,27 @@ def classify(project_id: int):
     if not project:
         abort(404)
 
-    # Handle skipped images (stored in session, reset when project changes)
+    # Skipped images live in the session and are reset when the project changes.
+    _record_skip_request(project_id)
     skip_key = f"skipped_images_{project_id}"
     skip_key_review = f"skipped_images_review_{project_id}"
-    is_skip_review = request.args.get("skip_reviewing") == "1"
-    if request.args.get("skip_image_id"):
-        try:
-            skip_id = int(request.args["skip_image_id"])
-            active_skip_key = skip_key_review if is_skip_review else skip_key
-            skipped = session.get(active_skip_key, [])
-            if skip_id not in skipped:
-                skipped.append(skip_id)
-            session[active_skip_key] = skipped
-            session["last_classify"] = {
-                "action": "skip",
-                "project_id": project_id,
-                "image_id": skip_id,
-                "was_review": is_skip_review,
-                "face_ids": [],
-                "manual_face_ids": [],
-            }
-        except (ValueError, TypeError):
-            pass
 
-    skipped_ids = session.get(skip_key, [])
-
-    # If a specific image_id is requested (e.g. after undo), force-show it
-    forced_image_id = request.args.get("image_id", type=int)
-
-    # Get next image that has unclassified faces (excluding skipped)
-    # Priority: forced image_id > unclassified (is_target IS NULL) > model not-target review
-    reviewing_model = False
-    try:
-        if forced_image_id:
-            # Force-load a specific image (used after undo to return to the undone image)
-            image_row = execute_query(
-                "SELECT DISTINCT i.id AS image_id, i.file_title, i.commons_page_id, "
-                "i.detection_width, i.detection_height "
-                "FROM images i "
-                "JOIN faces f ON f.image_id = i.id "
-                "WHERE i.project_id = %s AND i.id = %s "
-                "AND f.superseded_by IS NULL "
-                "AND (f.is_target IS NULL OR (f.is_target = 0 AND f.classified_by = 'model')) "
-                "LIMIT 1",
-                (project_id, forced_image_id),
-            )
-            # Check if this image has model not-target faces (for review mode)
-            if image_row:
-                unclassified_check = execute_query(
-                    "SELECT COUNT(*) AS cnt FROM faces "
-                    "WHERE image_id = %s AND is_target IS NULL AND superseded_by IS NULL",
-                    (forced_image_id,),
-                )
-                if not unclassified_check or unclassified_check[0]["cnt"] == 0:
-                    reviewing_model = True
-        elif skipped_ids:
-            placeholders = ",".join(["%s"] * len(skipped_ids))
-            image_row = execute_query(
-                "SELECT DISTINCT i.id AS image_id, i.file_title, i.commons_page_id, "
-                "i.detection_width, i.detection_height "
-                "FROM images i "
-                "JOIN faces f ON f.image_id = i.id "
-                f"WHERE i.project_id = %s AND f.is_target IS NULL AND f.superseded_by IS NULL AND i.id NOT IN ({placeholders}) "
-                "LIMIT 200",
-                (project_id, *skipped_ids),
-            )
-            if image_row:
-                image_row = [random.choice(image_row)]
-        else:
-            image_row = execute_query(
-                "SELECT DISTINCT i.id AS image_id, i.file_title, i.commons_page_id, "
-                "i.detection_width, i.detection_height "
-                "FROM images i "
-                "JOIN faces f ON f.image_id = i.id "
-                "WHERE i.project_id = %s AND f.is_target IS NULL AND f.superseded_by IS NULL "
-                "LIMIT 200",
-                (project_id,),
-            )
-            if image_row:
-                image_row = [random.choice(image_row)]
-
-        # Fallback: if no unclassified faces, try model not-target faces for review
-        if not image_row:
-            reviewing_model = True
-            skipped_review_ids = session.get(skip_key_review, [])
-
-            if skipped_review_ids:
-                placeholders = ",".join(["%s"] * len(skipped_review_ids))
-                image_row = execute_query(
-                    "SELECT DISTINCT i.id AS image_id, i.file_title, i.commons_page_id, "
-                    "i.detection_width, i.detection_height "
-                    "FROM images i "
-                    "JOIN faces f ON f.image_id = i.id "
-                    f"WHERE i.project_id = %s AND f.is_target = 0 AND f.classified_by = 'model' "
-                    f"AND f.classified_by_user_id IS NULL AND f.superseded_by IS NULL AND i.id NOT IN ({placeholders}) "
-                    "LIMIT 200",
-                    (project_id, *skipped_review_ids),
-                )
-                if image_row:
-                    image_row = [random.choice(image_row)]
-            else:
-                image_row = execute_query(
-                    "SELECT DISTINCT i.id AS image_id, i.file_title, i.commons_page_id, "
-                    "i.detection_width, i.detection_height "
-                    "FROM images i "
-                    "JOIN faces f ON f.image_id = i.id "
-                    "WHERE i.project_id = %s AND f.is_target = 0 AND f.classified_by = 'model' "
-                    "AND f.classified_by_user_id IS NULL AND f.superseded_by IS NULL "
-                    "LIMIT 200",
-                    (project_id,),
-                )
-                if image_row:
-                    image_row = [random.choice(image_row)]
-    except DatabaseError:
-        logger.exception("Failed to load image for classification")
-        image_row = []
-
-    image = image_row[0] if image_row else None
-    faces_list = []
-
-    if image:
-        if reviewing_model:
-            # Get model not-target faces for review
-            try:
-                faces_list = execute_query(
-                    "SELECT f.id AS face_id, f.bbox_top, f.bbox_right, "
-                    "f.bbox_bottom, f.bbox_left, f.confidence "
-                    "FROM faces f "
-                    "WHERE f.image_id = %s AND f.is_target = 0 AND f.classified_by = 'model' "
-                    "AND f.superseded_by IS NULL "
-                    "ORDER BY f.bbox_left ASC",
-                    (image["image_id"],),
-                )
-            except DatabaseError:
-                logger.exception("Failed to load faces for model review")
-                faces_list = []
-        else:
-            # Get ALL unclassified faces for this image
-            try:
-                faces_list = execute_query(
-                    "SELECT f.id AS face_id, f.bbox_top, f.bbox_right, "
-                    "f.bbox_bottom, f.bbox_left, f.confidence "
-                    "FROM faces f "
-                    "WHERE f.image_id = %s AND f.is_target IS NULL AND f.superseded_by IS NULL "
-                    "ORDER BY f.bbox_left ASC",
-                    (image["image_id"],),
-                )
-            except DatabaseError:
-                logger.exception("Failed to load faces for classification")
-                faces_list = []
-
-    # Count remaining images (not faces) — both unclassified and model review
-    try:
-        remaining = execute_query(
-            "SELECT COUNT(DISTINCT i.id) AS cnt "
-            "FROM images i "
-            "JOIN faces f ON f.image_id = i.id "
-            "WHERE i.project_id = %s AND f.is_target IS NULL AND f.superseded_by IS NULL",
-            (project_id,),
-        )
-        remaining_count = remaining[0]["cnt"] if remaining else 0
-    except DatabaseError:
-        remaining_count = 0
-
-    try:
-        model_remaining = execute_query(
-            "SELECT COUNT(DISTINCT i.id) AS cnt "
-            "FROM images i "
-            "JOIN faces f ON f.image_id = i.id "
-            "WHERE i.project_id = %s AND f.is_target = 0 AND f.classified_by = 'model' "
-            "AND f.classified_by_user_id IS NULL AND f.superseded_by IS NULL",
-            (project_id,),
-        )
-        model_review_count = model_remaining[0]["cnt"] if model_remaining else 0
-    except DatabaseError:
-        model_review_count = 0
+    image, reviewing_model = _pick_image_to_classify(
+        project_id,
+        request.args.get("image_id", type=int),
+        session.get(skip_key, []),
+        session.get(skip_key_review, []),
+    )
+    faces_list = _faces_to_classify(image["image_id"], reviewing_model) if image else []
 
     return render_template(
         "classify.html",
         project=project,
         image=image,
         faces=faces_list,
-        remaining=remaining_count,
-        model_review_count=model_review_count,
+        # Remaining images (not faces): unclassified ones, and those awaiting a review of the model's rejections.
+        remaining=_count_images(_UNCLASSIFIED_FACE_CONDITIONS, project_id),
+        model_review_count=_count_images(_MODEL_REJECTED_FACE_CONDITIONS, project_id),
         reviewing_model=reviewing_model,
         has_undo=bool(session.get("last_classify")),
         skipped_count=len(session.get(skip_key, [])),
@@ -2410,6 +2376,130 @@ def api_classify():
     return jsonify({"status": "ok"})
 
 
+@dataclass
+class _UndoClaimContext:
+    """What an undo must know about Commons claims: read once, before anything changes."""
+
+    face_states: dict[int, dict[str, Any]]
+    sibling_keeps_claim: bool  # another target on the image keeps the P180 claim valid
+    write_in_flight: bool  # a send-to-Commons run is active, so a write for a face may be in progress
+
+
+def _undo_skip(last: dict[str, Any]):
+    """Undo a skip: no database change, the image just leaves the session's skip list."""
+    project_id, image_id = last["project_id"], last["image_id"]
+    try:
+        if not get_project_for_actor(project_id, g.user["id"]):
+            return jsonify({"error": _("Project not found")}), 404
+    except DatabaseError:
+        return jsonify({"error": _("Database error")}), 500
+
+    active_skip_key = (
+        f"skipped_images_review_{project_id}" if last.get("was_review", False) else f"skipped_images_{project_id}"
+    )
+    skipped = session.get(active_skip_key, [])
+    if image_id in skipped:
+        skipped.remove(image_id)
+        session[active_skip_key] = skipped
+    session.pop("last_classify", None)
+    return jsonify({"status": "ok", "project_id": project_id, "image_id": image_id})
+
+
+def _read_undo_claim_context(image_id: int, project_id: int, touched_ids: list[int]) -> _UndoClaimContext:
+    """Read the claim-related state of the faces an undo touches. Raises ``DatabaseError``."""
+    placeholders = ",".join(["%s"] * len(touched_ids))
+    state_rows = execute_query(
+        f"SELECT f.id, f.is_target, f.sdc_written, f.sdc_removal_pending, "
+        f"  i.commons_page_id, i.bootstrapped, p.wikidata_qid "
+        f"FROM faces f "
+        f"JOIN images i ON f.image_id = i.id "
+        f"JOIN projects p ON i.project_id = p.id "
+        f"WHERE f.image_id = %s AND f.id IN ({placeholders})",
+        (image_id, *touched_ids),
+    )
+    sibling_rows = execute_query(
+        f"SELECT EXISTS("
+        f"  SELECT 1 FROM faces f2 WHERE f2.image_id = %s "
+        f"  AND f2.is_target = 1 AND f2.superseded_by IS NULL "
+        f"  AND f2.id NOT IN ({placeholders})"
+        f") AS has_sibling",
+        (image_id, *touched_ids),
+    )
+    project_rows = execute_query("SELECT sdc_write_requested FROM projects WHERE id = %s", (project_id,))
+    return _UndoClaimContext(
+        face_states={int(r["id"]): r for r in (state_rows or ())},
+        sibling_keeps_claim=bool(sibling_rows and sibling_rows[0]["has_sibling"]),
+        write_in_flight=bool(project_rows and project_rows[0]["sdc_write_requested"]),
+    )
+
+
+def _remove_claims_before_undo(
+    context: _UndoClaimContext, manual_face_ids: list[int], *, undoing_rejection: bool
+) -> tuple[bool, bool]:
+    """Take a P180 claim off Commons before its face is reverted. Returns (removed, removal_queued).
+
+    A claim on record (sdc_written=1 or a queued removal) is removed now, or queued for the
+    worker to verify when removal is not possible. Undoing a rejection is the opposite case and
+    never removes a claim. Faces that get deleted (manual draws) cannot carry a queued removal,
+    so for them the claim must be gone before the delete: the undo is refused (``ApiError``)
+    rather than orphaning a claim.
+    """
+    claim_faces = [
+        face_id
+        for face_id, state in context.face_states.items()
+        if not undoing_rejection and (state["sdc_written"] == 1 or state["sdc_removal_pending"] == 1)
+    ]
+    if not claim_faces or context.sibling_keeps_claim:
+        return False, False
+
+    claim = context.face_states[claim_faces[0]]
+    access_token = _get_valid_token()
+    removed = False
+    if access_token and claim["commons_page_id"]:
+        removed = _remove_sdc_claim(claim["commons_page_id"], claim["wikidata_qid"], access_token)
+    if not removed and any(face_id in manual_face_ids for face_id in claim_faces):
+        if not access_token:
+            raise ApiError(_("OAuth token expired. Please log in again."), 401)
+        raise ApiError(_("Failed to remove SDC claim from Commons. The classification was not undone."), 502)
+    return removed, not removed
+
+
+def _undo_claim_flags(
+    state: dict[str, Any] | None,
+    *,
+    undoing_rejection: bool,
+    sibling_keeps_claim: bool,
+    sdc_removed: bool,
+    write_in_flight: bool,
+) -> tuple[int, int]:
+    """The (sdc_removal_pending, sdc_written) a reverted face ends up with.
+
+    Undoing a target must not strand a P180 claim on Commons, and undoing a rejection must
+    never delete one. The rules, in order:
+
+    * a face that is unknown, or whose claim a sibling target keeps, simply reverts: (0, 0);
+    * undoing a rejection cancels the removal the rejection queued. Only a rejection on a
+      bootstrapped image ever sets that flag; on other images a queued flag predates the
+      rejection (an earlier undo racing a write run), so it is kept for the worker to verify
+      the possibly in-flight claim. The written marker is never touched;
+    * a face with a claim on record is cleared if it was just removed, else it queues a
+      removal and keeps its written marker;
+    * a target without a claim on record queues a removal only while a write run is active,
+      the one window in which a claim can be in flight;
+    * anything else has nothing to clean up.
+    """
+    if state is None or sibling_keeps_claim:
+        return 0, 0
+    if undoing_rejection:
+        queued = 0 if state.get("bootstrapped") else int(state["sdc_removal_pending"] or 0)
+        return queued, int(state["sdc_written"] or 0)
+    if state["sdc_written"] == 1 or state["sdc_removal_pending"] == 1:
+        return (0, 0) if sdc_removed else (1, int(state["sdc_written"] or 0))
+    if state["is_target"] == 1 and write_in_flight:
+        return 1, 0
+    return 0, 0
+
+
 @app.route("/api/undo-classify", methods=["POST"])
 @login_required
 @limiter.limit("60 per minute")
@@ -2425,24 +2515,8 @@ def api_undo_classify():
     project_id = last["project_id"]
     image_id = last["image_id"]
 
-    # Handle undo of skip — no DB changes, just remove from skip list
     if last.get("action") == "skip":
-        try:
-            proj = get_project_for_actor(project_id, g.user["id"])
-            if not proj:
-                return jsonify({"error": _("Project not found")}), 404
-        except DatabaseError:
-            return jsonify({"error": _("Database error")}), 500
-
-        was_review = last.get("was_review", False)
-        active_skip_key = f"skipped_images_review_{project_id}" if was_review else f"skipped_images_{project_id}"
-        skipped = session.get(active_skip_key, [])
-        if image_id in skipped:
-            skipped.remove(image_id)
-            session[active_skip_key] = skipped
-        session.pop("last_classify", None)
-        g._skip_undo = True
-        return jsonify({"status": "ok", "project_id": project_id, "image_id": image_id})
+        return _undo_skip(last)
 
     face_ids = last.get("face_ids", [])
     manual_face_ids = last.get("manual_face_ids", [])
@@ -2459,73 +2533,16 @@ def api_undo_classify():
     except DatabaseError:
         return jsonify({"error": _("Database error")}), 500
 
-    # Undoing a target classification must not strand a P180 claim on Commons.
-    # A claim on record (sdc_written=1) is removed now, or queued for the worker
-    # to verify when removal is not possible; a face with no claim on record is
-    # queued only while a write run is active, because only then can a write for
-    # it still be in flight. Undoing a rejection ("none") is the opposite case:
-    # it cancels the removal the rejection queued instead of confirming it — a
-    # revert must never delete a claim. Faces that get deleted (manual draws)
-    # cannot carry a queued removal, so their claim is removed synchronously
-    # before the delete.
     undoing_rejection = last.get("action") == "none"
     touched_ids = list(dict.fromkeys([*face_ids, *manual_face_ids]))
-    face_states: dict[int, dict[str, Any]] = {}
-    sibling_keeps_claim = False
-    sdc_removed = False
-    sdc_removal_queued = False
-    write_in_flight = False
-    if touched_ids:
-        placeholders = ",".join(["%s"] * len(touched_ids))
-        try:
-            state_rows = execute_query(
-                f"SELECT f.id, f.is_target, f.sdc_written, f.sdc_removal_pending, "
-                f"  i.commons_page_id, i.bootstrapped, p.wikidata_qid "
-                f"FROM faces f "
-                f"JOIN images i ON f.image_id = i.id "
-                f"JOIN projects p ON i.project_id = p.id "
-                f"WHERE f.image_id = %s AND f.id IN ({placeholders})",
-                (image_id, *touched_ids),
-            )
-            sibling_rows = execute_query(
-                f"SELECT EXISTS("
-                f"  SELECT 1 FROM faces f2 WHERE f2.image_id = %s "
-                f"  AND f2.is_target = 1 AND f2.superseded_by IS NULL "
-                f"  AND f2.id NOT IN ({placeholders})"
-                f") AS has_sibling",
-                (image_id, *touched_ids),
-            )
-            project_rows = execute_query(
-                "SELECT sdc_write_requested FROM projects WHERE id = %s",
-                (project_id,),
-            )
-        except DatabaseError:
-            return jsonify({"error": _("Database error")}), 500
+    try:
+        context = _read_undo_claim_context(image_id, project_id, touched_ids)
+    except DatabaseError:
+        return jsonify({"error": _("Database error")}), 500
 
-        face_states = {int(r["id"]): r for r in (state_rows or ())}
-        sibling_keeps_claim = bool(sibling_rows and sibling_rows[0]["has_sibling"])
-        write_in_flight = bool(project_rows and project_rows[0]["sdc_write_requested"])
-        claim_faces = [
-            fid
-            for fid, st in face_states.items()
-            if not undoing_rejection and (st["sdc_written"] == 1 or st["sdc_removal_pending"] == 1)
-        ]
-
-        if claim_faces and not sibling_keeps_claim:
-            claim_meta = face_states[claim_faces[0]]
-            access_token = _get_valid_token()
-            if access_token and claim_meta["commons_page_id"]:
-                sdc_removed = _remove_sdc_claim(claim_meta["commons_page_id"], claim_meta["wikidata_qid"], access_token)
-            if not sdc_removed and any(fid in manual_face_ids for fid in claim_faces):
-                # Refuse the undo rather than orphan a claim: the face row
-                # disappears and with it any queued removal.
-                if not access_token:
-                    return jsonify({"error": _("OAuth token expired. Please log in again.")}), 401
-                return jsonify(
-                    {"error": _("Failed to remove SDC claim from Commons. The classification was not undone.")}
-                ), 502
-            if not sdc_removed:
-                sdc_removal_queued = True
+    sdc_removed, sdc_removal_queued = _remove_claims_before_undo(
+        context, manual_face_ids, undoing_rejection=undoing_rejection
+    )
 
     try:
         was_review = last.get("was_review", False)
@@ -2533,8 +2550,8 @@ def api_undo_classify():
             last.get("action") == "manual_face" and last.get("was_review")
         )
 
-        def _undo(conn, cursor):
-            nonlocal sdc_removal_queued
+        def _undo(conn, cursor) -> bool:
+            """Revert the faces; True when any of them now carries a queued removal."""
             _assert_project_access_locked(cursor, project_id, g.user["id"])
             if manual_face_ids:
                 m_placeholders = ",".join(["%s"] * len(manual_face_ids))
@@ -2543,28 +2560,16 @@ def api_undo_classify():
                     (*manual_face_ids, image_id),
                 )
 
-            original_ids = [fid for fid in face_ids if fid not in manual_face_ids]
-            for fid in original_ids:
-                st = face_states.get(int(fid))
-                if st is None or sibling_keeps_claim:
-                    # Sibling target keeps the claim; this face only reverts.
-                    pending, written = 0, 0
-                elif undoing_rejection:
-                    # Cancel the removal queue the rejection created. Only a
-                    # rejection on a bootstrapped image ever sets it; on other
-                    # images a queued flag predates the rejection (an earlier
-                    # undo racing a write run), so it is kept for the worker to
-                    # verify the possibly in-flight claim instead.
-                    queued = 0 if st.get("bootstrapped") else int(st["sdc_removal_pending"] or 0)
-                    pending, written = queued, int(st["sdc_written"] or 0)
-                elif st["sdc_written"] == 1 or st["sdc_removal_pending"] == 1:
-                    pending, written = (0, 0) if sdc_removed else (1, int(st["sdc_written"] or 0))
-                elif st["is_target"] == 1 and write_in_flight:
-                    pending, written = 1, 0
-                else:
-                    pending, written = 0, 0
-                if pending:
-                    sdc_removal_queued = True
+            queued_any = False
+            for fid in [fid for fid in face_ids if fid not in manual_face_ids]:
+                pending, written = _undo_claim_flags(
+                    context.face_states.get(int(fid)),
+                    undoing_rejection=undoing_rejection,
+                    sibling_keeps_claim=context.sibling_keeps_claim,
+                    sdc_removed=sdc_removed,
+                    write_in_flight=context.write_in_flight,
+                )
+                queued_any = queued_any or bool(pending)
 
                 if was_review:
                     cursor.execute(
@@ -2588,8 +2593,9 @@ def api_undo_classify():
                     "UPDATE projects SET faces_confirmed = GREATEST(faces_confirmed - 1, 0) WHERE id = %s",
                     (project_id,),
                 )
+            return queued_any
 
-        _run_authorized_transaction(_undo)
+        sdc_removal_queued = _run_authorized_transaction(_undo) or sdc_removal_queued
         session.pop("last_classify", None)
 
     except DatabaseError:
@@ -2636,55 +2642,13 @@ def api_manual_face():
     if not _validate_csrf():
         return jsonify({"error": _("Invalid CSRF token")}), 400
 
-    project_id_str = request.form.get("project_id")
-    image_id_str = request.form.get("image_id")
-    bbox_top_str = request.form.get("bbox_top")
-    bbox_right_str = request.form.get("bbox_right")
-    bbox_bottom_str = request.form.get("bbox_bottom")
-    bbox_left_str = request.form.get("bbox_left")
-
-    if not all(
-        [
-            project_id_str,
-            image_id_str,
-            bbox_top_str,
-            bbox_right_str,
-            bbox_bottom_str,
-            bbox_left_str,
-        ]
-    ):
-        return jsonify({"error": _("Missing required fields")}), 400
-
-    try:
-        project_id = int(project_id_str)  # type: ignore[arg-type]
-        image_id = int(image_id_str)  # type: ignore[arg-type]
-        bbox_top = int(bbox_top_str)  # type: ignore[arg-type]
-        bbox_right = int(bbox_right_str)  # type: ignore[arg-type]
-        bbox_bottom = int(bbox_bottom_str)  # type: ignore[arg-type]
-        bbox_left = int(bbox_left_str)  # type: ignore[arg-type]
-    except (ValueError, TypeError):
-        return jsonify({"error": _("Invalid field values")}), 400
-
-    bbox_error = _validate_bbox(bbox_top, bbox_right, bbox_bottom, bbox_left)
-    if bbox_error:
-        return jsonify({"error": bbox_error}), 400
+    (project_id, image_id), box = _read_box_request("project_id", "image_id")
 
     # In review mode, user is drawing a face the model missed — auto-classify
     is_review_mode = request.form.get("reviewing_model") == "1"
 
     # In normal classify mode, dismiss currently displayed faces as non-target
-    dismiss_face_ids: list[int] = []
-    if not is_review_mode:
-        dismiss_raw = request.form.get("dismiss_face_ids", "")
-        if dismiss_raw:
-            try:
-                parsed = json.loads(dismiss_raw)
-                if isinstance(parsed, list):
-                    if len(parsed) > MAX_DISMISS_FACE_IDS:
-                        return jsonify({"error": _("Too many face IDs in dismiss list")}), 400
-                    dismiss_face_ids = [int(fid) for fid in parsed]
-            except (json.JSONDecodeError, ValueError, TypeError):
-                pass
+    dismiss_face_ids = [] if is_review_mode else _read_dismiss_ids()
 
     try:
         img = verify_image_access(image_id, project_id, g.user["id"])
@@ -2696,39 +2660,10 @@ def api_manual_face():
     if img.get("status") != "processed":
         return jsonify({"error": _("Image has not finished processing yet")}), 409
 
-    file_title = img["file_title"]
-    clean_title = file_title[5:] if file_title.startswith("File:") else file_title
-    url = FILE_PATH_URL.format(file_title=clean_title)
-
     try:
-        image_bytes = _download_image(url)
-
-        try:
-            encoded = face_client.encode_known_face(
-                image_bytes,
-                (bbox_top, bbox_right, bbox_bottom, bbox_left),
-                box_space=_detection_space(img.get("detection_width"), img.get("detection_height")),
-            )
-        except FaceServiceRejected:
-            logger.warning("Face service rejected the image while encoding manual face (image %s)", image_id)
-            return jsonify({"error": _("This image could not be read by the face detection service.")}), 422
-        except FaceServiceError:
-            logger.exception("Face service unavailable while encoding manual face")
-            return jsonify({"error": _("Face detection service is unavailable. Please try again in a moment.")}), 503
-
-        if not encoded:
-            return jsonify(
-                {
-                    "error": _(
-                        "Could not compute face encoding for the selected region. Try drawing a slightly larger box."
-                    )
-                }
-            ), 422
-
-        encoding_bytes, embedding_model, aligned = encoded
-        if not aligned:
+        encoded = _encode_drawn_box(img, box, purpose=f"encoding manual face (image {image_id})")
+        if not encoded.aligned:
             logger.info("Manual face on image %s embedded without landmark alignment", image_id)
-        aligned_flag = 1 if aligned else 0
 
         def _insert_manual_face(conn, cursor):
             _assert_project_access_locked(cursor, project_id, g.user["id"])
@@ -2743,24 +2678,7 @@ def api_manual_face():
                 rows = cursor.fetchall()
                 review_confirmed_ids = [r["id"] for r in rows] if rows else []
 
-                cursor.execute(
-                    "INSERT INTO faces "
-                    "(image_id, encoding, embedding_model, aligned, bbox_top, bbox_right, bbox_bottom, bbox_left, "
-                    "is_target, classified_by, classified_by_user_id, classified_at) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 1, 'human', %s, NOW())",
-                    (
-                        image_id,
-                        encoding_bytes,
-                        embedding_model,
-                        aligned_flag,
-                        bbox_top,
-                        bbox_right,
-                        bbox_bottom,
-                        bbox_left,
-                        g.user["id"],
-                    ),
-                )
-                new_face_id = cursor.lastrowid
+                new_face_id = _insert_human_target_face(cursor, image_id, encoded, box, g.user["id"])
 
                 cursor.execute(
                     "UPDATE faces SET classified_by = 'human', "
@@ -2774,24 +2692,7 @@ def api_manual_face():
                     (project_id,),
                 )
             else:
-                cursor.execute(
-                    "INSERT INTO faces "
-                    "(image_id, encoding, embedding_model, aligned, bbox_top, bbox_right, bbox_bottom, bbox_left, "
-                    "is_target, classified_by, classified_by_user_id, classified_at) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 1, 'human', %s, NOW())",
-                    (
-                        image_id,
-                        encoding_bytes,
-                        embedding_model,
-                        aligned_flag,
-                        bbox_top,
-                        bbox_right,
-                        bbox_bottom,
-                        bbox_left,
-                        g.user["id"],
-                    ),
-                )
-                new_face_id = cursor.lastrowid
+                new_face_id = _insert_human_target_face(cursor, image_id, encoded, box, g.user["id"])
 
                 # Dismiss currently displayed faces as non-target so the image
                 # doesn't reappear in the classify queue endlessly.
@@ -2827,6 +2728,8 @@ def api_manual_face():
 
         return jsonify({"status": "ok"})
 
+    except ApiError:
+        raise
     except requests.RequestException as e:
         logger.error(f"Failed to download image for manual face: {e}")
         return jsonify({"error": _("Failed to download image from Commons")}), 502
@@ -2976,32 +2879,24 @@ def _remove_sdc_claim(commons_page_id: int, wikidata_qid: str, access_token: str
         return False
 
 
-@app.route("/api/reclassify", methods=["POST"])
-@login_required
-@limiter.limit("60 per minute")
-def api_reclassify():
-    """Reclassify a model/bootstrap-classified face as human-verified.
-    If rejecting a bootstrap face, queues P180 removal for the background worker.
-    If rejecting a non-bootstrap face with sdc_written=1, removes the P180 claim
-    from Commons immediately."""
-    if not _validate_csrf():
-        return jsonify({"error": _("Invalid CSRF token")}), 400
-
+def _read_reclassify_request() -> tuple[int, int]:
+    """(face_id, is_target) from the POST form. Raises ``ApiError`` (400) when missing or invalid."""
     face_id_str = request.form.get("face_id")
     is_target_str = request.form.get("is_target")  # "1" or "0"
-
     if not face_id_str or is_target_str is None:
-        return jsonify({"error": _("Missing required fields")}), 400
-
+        raise ApiError(_("Missing required fields"))
     try:
         face_id = int(face_id_str)
         is_target = int(is_target_str)
         if is_target not in (0, 1):
             raise ValueError
     except (ValueError, TypeError):
-        return jsonify({"error": _("Invalid field values")}), 400
+        raise ApiError(_("Invalid field values")) from None
+    return face_id, is_target
 
-    # Verify ownership: face → image → project → user (or member)
+
+def _load_face_for_reclassify(face_id: int) -> dict[str, Any]:
+    """The face with its image and project, if the user may act on it. Raises ``ApiError`` (404/500)."""
     try:
         rows = execute_query(
             "SELECT f.id, f.image_id, f.is_target AS old_is_target, f.sdc_written, "
@@ -3016,139 +2911,171 @@ def api_reclassify():
             "AND f.superseded_by IS NULL AND p.status != 'deleted'",
             (g.user["id"], face_id, g.user["id"]),
         )
-        if not rows:
-            return jsonify({"error": _("Face not found or access denied")}), 404
     except DatabaseError:
-        return jsonify({"error": _("Database error")}), 500
+        raise ApiError(_("Database error"), 500) from None
+    if not rows:
+        raise ApiError(_("Face not found or access denied"), 404)
+    return rows[0]
 
-    face_row = rows[0]
+
+def _settle_claim_for_rejection(face_row: dict[str, Any], face_id: int) -> tuple[bool, bool]:
+    """Decide what happens to the P180 claim when a face is rejected: (removed_now, removal_queued).
+
+    A claim must not survive a rejection unless another face on the same image still confirms
+    the target (the sibling guard). A claim on record for a non-bootstrap face is removed
+    immediately with the caller's token. Every other case is queued for the worker: bootstrap
+    faces, and faces whose claim may be written by a write run still in flight (sdc_written=0).
+    The worker re-verifies each face right before writing; without the queue, a rejection racing
+    an in-flight write left the claim on Commons. Raises ``ApiError`` (401/502/500).
+    """
+    try:
+        has_sibling = has_sibling_match(face_row["image_id"], face_id)
+    except DatabaseError:
+        raise ApiError(_("Database error"), 500) from None
+    if has_sibling:
+        return False, False
+
+    if face_row["bootstrapped"] or face_row["sdc_written"] != 1:
+        return False, True
+
+    access_token = _get_valid_token()
+    if not access_token:
+        raise ApiError(_("OAuth token expired. Please log in again."), 401)
+    if not _remove_sdc_claim(face_row["commons_page_id"], face_row["wikidata_qid"], access_token):
+        raise ApiError(_("Failed to remove SDC claim from Commons. The face was not reclassified."), 502)
+    return True, False
+
+
+def _require_same_reviewer(cursor: Any, face_id: int, user_id: int) -> None:
+    """After an UPDATE that touched no row: a repeat click by the same user is fine, anyone else is not.
+
+    Raises ``ValueError("already_reviewed:<username>")``, which ``_run_authorized_transaction``
+    re-raises unwrapped so the route can build the 409.
+    """
+    cursor.execute(
+        "SELECT f.classified_by_user_id, u.wiki_username "
+        "FROM faces f LEFT JOIN users u ON u.id = f.classified_by_user_id "
+        "WHERE f.id = %s",
+        (face_id,),
+    )
+    check = cursor.fetchone()
+    if check and check["classified_by_user_id"] == user_id:
+        return  # same user, same value: a no-op success
+    raise ValueError(f"already_reviewed:{(check or {}).get('wiki_username') or ''}")
+
+
+def _demote_sibling_targets(
+    cursor: Any, face_row: dict[str, Any], face_id: int, user_id: int
+) -> tuple[list[int], dict[int, int]]:
+    """A newly approved face replaces the image's other targets. Returns (demoted ids, their sdc_written)."""
+    image_id = face_row["image_id"]
+    cursor.execute(
+        "UPDATE faces SET sdc_removal_pending = 0 "
+        "WHERE image_id = %s AND sdc_removal_pending = 1 "
+        "AND superseded_by IS NULL AND id != %s",
+        (image_id, face_id),
+    )
+    # Lock sibling target faces to prevent concurrent reclassify races
+    cursor.execute(
+        "SELECT id, sdc_written FROM faces "
+        "WHERE image_id = %s AND id != %s AND is_target = 1 "
+        "AND superseded_by IS NULL FOR UPDATE",
+        (image_id, face_id),
+    )
+    sibling_rows = cursor.fetchall()
+    if not sibling_rows:
+        return [], {}
+
+    cursor.execute(
+        "UPDATE faces SET is_target = 0, classified_by = 'human', "
+        "classified_by_user_id = %s, classified_at = NOW(), "
+        "sdc_removal_pending = CASE WHEN sdc_written = 1 THEN 1 ELSE sdc_removal_pending END, "
+        "sdc_written = 0 "
+        "WHERE image_id = %s AND id != %s AND is_target = 1 "
+        "AND superseded_by IS NULL",
+        (user_id, image_id, face_id),
+    )
+    demoted_count = cursor.rowcount
+    if demoted_count > 0:
+        cursor.execute(
+            "UPDATE projects SET faces_confirmed = GREATEST(0, CAST(faces_confirmed AS SIGNED) - %s) WHERE id = %s",
+            (demoted_count, face_row["project_id"]),
+        )
+    return [row["id"] for row in sibling_rows], {row["id"]: row["sdc_written"] for row in sibling_rows}
+
+
+def _apply_reclassification(
+    cursor: Any,
+    face_row: dict[str, Any],
+    face_id: int,
+    is_target: int,
+    *,
+    sdc_written: int,
+    removal_queued: bool,
+    user_id: int,
+) -> tuple[list[int], dict[int, int]]:
+    """The transaction body of a reclassification. Returns (demoted sibling ids, their sdc_written)."""
+    cursor.execute(
+        "UPDATE faces SET is_target = %s, classified_by = 'human', "
+        "classified_by_user_id = %s, sdc_written = %s, "
+        "sdc_removal_pending = %s, classified_at = NOW() "
+        "WHERE id = %s AND (classified_by_user_id IS NULL OR classified_by_user_id = %s)",
+        (is_target, user_id, 0 if is_target == 0 else sdc_written, 1 if removal_queued else 0, face_id, user_id),
+    )
+    if cursor.rowcount == 0:
+        # Either another user owns this face, or the same user repeated the action (no column changed).
+        _require_same_reviewer(cursor, face_id, user_id)
+
     old_is_target = face_row["old_is_target"]
+    if is_target == 1 and old_is_target != 1:
+        cursor.execute(
+            "UPDATE projects SET faces_confirmed = faces_confirmed + 1 WHERE id = %s",
+            (face_row["project_id"],),
+        )
+        return _demote_sibling_targets(cursor, face_row, face_id, user_id)
+    if is_target == 0 and old_is_target == 1:
+        cursor.execute(
+            "UPDATE projects SET faces_confirmed = GREATEST(0, CAST(faces_confirmed AS SIGNED) - 1) WHERE id = %s",
+            (face_row["project_id"],),
+        )
+    return [], {}
+
+
+@app.route("/api/reclassify", methods=["POST"])
+@login_required
+@limiter.limit("60 per minute")
+def api_reclassify():
+    """Reclassify a model/bootstrap-classified face as human-verified.
+    If rejecting a bootstrap face, queues P180 removal for the background worker.
+    If rejecting a non-bootstrap face with sdc_written=1, removes the P180 claim
+    from Commons immediately."""
+    if not _validate_csrf():
+        return jsonify({"error": _("Invalid CSRF token")}), 400
+
+    face_id, is_target = _read_reclassify_request()
+    face_row = _load_face_for_reclassify(face_id)
     sdc_written = face_row["sdc_written"]
     commons_page_id = face_row["commons_page_id"]
-    wikidata_qid = face_row["wikidata_qid"]
-    is_bootstrapped = face_row["bootstrapped"]
 
-    # If rejecting (is_target=0), any P180 claim must not survive the rejection
-    # unless another face on the same image still confirms the target (sibling
-    # guard). A claim on record for a non-bootstrap face is removed immediately
-    # with the caller's token; every other case — bootstrap faces, and faces
-    # whose claim may be written by a write run that is still in flight
-    # (sdc_written=0) — is queued for the worker, which re-verifies each face
-    # right before writing and removes what should not be there. Without the
-    # queue, a rejection racing an in-flight write left the claim on Commons.
-    sdc_removed = False
-    sdc_removal_queued = False
+    sdc_removed, sdc_removal_queued = (False, False)
     if is_target == 0:
-        try:
-            has_sibling = has_sibling_match(face_row["image_id"], face_id)
-        except DatabaseError:
-            return jsonify({"error": _("Database error")}), 500
-
-        if not has_sibling:
-            if not is_bootstrapped and sdc_written == 1:
-                access_token = _get_valid_token()
-                if not access_token:
-                    return jsonify({"error": _("OAuth token expired. Please log in again.")}), 401
-
-                sdc_removed = _remove_sdc_claim(commons_page_id, wikidata_qid, access_token)
-                if not sdc_removed:
-                    return jsonify(
-                        {"error": _("Failed to remove SDC claim from Commons. The face was not reclassified.")}
-                    ), 502
-            else:
-                sdc_removal_queued = True
+        sdc_removed, sdc_removal_queued = _settle_claim_for_rejection(face_row, face_id)
 
     try:
-        demoted_ids: list[int] = []
-        demoted_sdc: dict[int, int] = {}
 
         def _reclassify(conn, cursor):
             _assert_project_access_locked(cursor, face_row["project_id"], g.user["id"])
-            nonlocal demoted_ids, demoted_sdc
-            demoted_ids = []  # Reset in case of (theoretical) re-entry
-            demoted_sdc = {}
-
-            cursor.execute(
-                "UPDATE faces SET is_target = %s, classified_by = 'human', "
-                "classified_by_user_id = %s, sdc_written = %s, "
-                "sdc_removal_pending = %s, classified_at = NOW() "
-                "WHERE id = %s AND (classified_by_user_id IS NULL OR classified_by_user_id = %s)",
-                (
-                    is_target,
-                    g.user["id"],
-                    0 if is_target == 0 else sdc_written,
-                    1 if sdc_removal_queued else 0,
-                    face_id,
-                    g.user["id"],
-                ),
+            return _apply_reclassification(
+                cursor,
+                face_row,
+                face_id,
+                is_target,
+                sdc_written=sdc_written,
+                removal_queued=sdc_removal_queued,
+                user_id=g.user["id"],
             )
-            if cursor.rowcount == 0:
-                # rowcount=0 means either another user owns this face, or the
-                # same user clicked the same action again (no columns changed).
-                # Re-check to distinguish the two cases.
-                cursor.execute(
-                    "SELECT f.classified_by_user_id, u.wiki_username "
-                    "FROM faces f LEFT JOIN users u ON u.id = f.classified_by_user_id "
-                    "WHERE f.id = %s",
-                    (face_id,),
-                )
-                check = cursor.fetchone()
-                if check and check["classified_by_user_id"] == g.user["id"]:
-                    # Same user, same value — treat as no-op success
-                    pass
-                else:
-                    # Smuggle the previous classifier's username through the
-                    # ValueError so the route handler can build a friendly,
-                    # actionable 409 message.
-                    other_user = (check or {}).get("wiki_username") or ""
-                    raise ValueError(f"already_reviewed:{other_user}")
 
-            if is_target == 1 and old_is_target != 1:
-                cursor.execute(
-                    "UPDATE projects SET faces_confirmed = faces_confirmed + 1 WHERE id = %s",
-                    (face_row["project_id"],),
-                )
-                cursor.execute(
-                    "UPDATE faces SET sdc_removal_pending = 0 "
-                    "WHERE image_id = %s AND sdc_removal_pending = 1 "
-                    "AND superseded_by IS NULL AND id != %s",
-                    (face_row["image_id"], face_id),
-                )
-                # Lock sibling target faces to prevent concurrent reclassify races
-                cursor.execute(
-                    "SELECT id, sdc_written FROM faces "
-                    "WHERE image_id = %s AND id != %s AND is_target = 1 "
-                    "AND superseded_by IS NULL FOR UPDATE",
-                    (face_row["image_id"], face_id),
-                )
-                sibling_rows = cursor.fetchall()
-                if sibling_rows:
-                    demoted_ids = [row["id"] for row in sibling_rows]
-                    demoted_sdc = {row["id"]: row["sdc_written"] for row in sibling_rows}
-                    cursor.execute(
-                        "UPDATE faces SET is_target = 0, classified_by = 'human', "
-                        "classified_by_user_id = %s, classified_at = NOW(), "
-                        "sdc_removal_pending = CASE WHEN sdc_written = 1 THEN 1 ELSE sdc_removal_pending END, "
-                        "sdc_written = 0 "
-                        "WHERE image_id = %s AND id != %s AND is_target = 1 "
-                        "AND superseded_by IS NULL",
-                        (g.user["id"], face_row["image_id"], face_id),
-                    )
-                    demoted_count = cursor.rowcount
-                    if demoted_count > 0:
-                        cursor.execute(
-                            "UPDATE projects SET faces_confirmed = "
-                            "GREATEST(0, CAST(faces_confirmed AS SIGNED) - %s) WHERE id = %s",
-                            (demoted_count, face_row["project_id"]),
-                        )
-            elif is_target == 0 and old_is_target == 1:
-                cursor.execute(
-                    "UPDATE projects SET faces_confirmed = "
-                    "GREATEST(0, CAST(faces_confirmed AS SIGNED) - 1) WHERE id = %s",
-                    (face_row["project_id"],),
-                )
-
-        _run_authorized_transaction(_reclassify)
+        demoted_ids, demoted_sdc = _run_authorized_transaction(_reclassify)
 
         # When approving, check if P180 already exists on Commons
         if is_target == 1 and commons_page_id and not sdc_written:
@@ -3158,15 +3085,7 @@ def api_reclassify():
     except ValueError as e:
         msg = str(e)
         if msg.startswith("already_reviewed"):
-            other_user = msg.split(":", 1)[1] if ":" in msg else ""
-            if other_user:
-                error_msg = _(
-                    "This face was already classified by %(user)s. Only they can change their own classification.",
-                    user=other_user,
-                )
-            else:
-                error_msg = _("This face has already been classified by another contributor.")
-            return jsonify({"error": error_msg, "reason": "already_reviewed"}), 409
+            raise _already_reviewed_error(msg.split(":", 1)[1] if ":" in msg else "") from None
         raise
     except DatabaseError:
         logger.exception("Failed to reclassify face")
@@ -3201,27 +3120,7 @@ def api_update_face_bbox():
     if not _validate_csrf():
         return jsonify({"error": _("Invalid CSRF token")}), 400
 
-    face_id_str = request.form.get("face_id")
-    bbox_top_str = request.form.get("bbox_top")
-    bbox_right_str = request.form.get("bbox_right")
-    bbox_bottom_str = request.form.get("bbox_bottom")
-    bbox_left_str = request.form.get("bbox_left")
-
-    if not all([face_id_str, bbox_top_str, bbox_right_str, bbox_bottom_str, bbox_left_str]):
-        return jsonify({"error": _("Missing required fields")}), 400
-
-    try:
-        face_id = int(face_id_str)  # type: ignore[arg-type]
-        bbox_top = int(bbox_top_str)  # type: ignore[arg-type]
-        bbox_right = int(bbox_right_str)  # type: ignore[arg-type]
-        bbox_bottom = int(bbox_bottom_str)  # type: ignore[arg-type]
-        bbox_left = int(bbox_left_str)  # type: ignore[arg-type]
-    except (ValueError, TypeError):
-        return jsonify({"error": _("Invalid field values")}), 400
-
-    bbox_error = _validate_bbox(bbox_top, bbox_right, bbox_bottom, bbox_left)
-    if bbox_error:
-        return jsonify({"error": bbox_error}), 400
+    (face_id,), box = _read_box_request("face_id")
 
     # Verify ownership: face → image → project → user (or member).
     # Also fetch previous classifier's wiki_username so we can build a friendly
@@ -3257,53 +3156,17 @@ def api_update_face_bbox():
     # An in-transaction re-check below closes the TOCTOU window.
     orig_classified_by_user_id = face_row.get("classified_by_user_id")
     if orig_classified_by_user_id is not None and orig_classified_by_user_id != g.user["id"]:
-        prev_user = face_row.get("prev_classifier_username") or ""
-        if prev_user:
-            error_msg = _(
-                "This face was already classified by %(user)s. Only they can change their own classification.",
-                user=prev_user,
-            )
-        else:
-            error_msg = _("This face has already been classified by another contributor.")
-        return jsonify({"error": error_msg, "reason": "already_reviewed"}), 409
+        raise _already_reviewed_error(face_row.get("prev_classifier_username") or "")
 
     image_id = face_row["image_id"]
     orig_is_target = face_row["is_target"]
     orig_confidence = face_row["confidence"]
     orig_sdc_written = face_row["sdc_written"]
-    file_title = face_row["file_title"]
-    clean_title = file_title[5:] if file_title.startswith("File:") else file_title
-    url = FILE_PATH_URL.format(file_title=clean_title)
 
     try:
-        image_bytes = _download_image(url)
-
-        try:
-            encoded = face_client.encode_known_face(
-                image_bytes,
-                (bbox_top, bbox_right, bbox_bottom, bbox_left),
-                box_space=_detection_space(face_row.get("detection_width"), face_row.get("detection_height")),
-            )
-        except FaceServiceRejected:
-            logger.warning("Face service rejected the image while re-encoding face bbox (face %s)", face_id)
-            return jsonify({"error": _("This image could not be read by the face detection service.")}), 422
-        except FaceServiceError:
-            logger.exception("Face service unavailable while re-encoding face bbox")
-            return jsonify({"error": _("Face detection service is unavailable. Please try again in a moment.")}), 503
-
-        if not encoded:
-            return jsonify(
-                {
-                    "error": _(
-                        "Could not compute face encoding for the selected region. Try drawing a slightly larger box."
-                    )
-                }
-            ), 422
-
-        encoding_bytes, embedding_model, aligned = encoded
-        if not aligned:
+        encoded = _encode_drawn_box(face_row, box, purpose=f"re-encoding face bbox (face {face_id})")
+        if not encoded.aligned:
             logger.info("Edited face %s embedded without landmark alignment", face_id)
-        aligned_flag = 1 if aligned else 0
 
         def _update_bbox(conn, cursor):
             _assert_project_access_locked(cursor, face_row["project_id"], g.user["id"])
@@ -3333,13 +3196,10 @@ def api_update_face_bbox():
                 "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'human', %s, %s, %s, NOW())",
                 (
                     image_id,
-                    encoding_bytes,
-                    embedding_model,
-                    aligned_flag,
-                    bbox_top,
-                    bbox_right,
-                    bbox_bottom,
-                    bbox_left,
+                    encoded.encoding,
+                    encoded.model_id,
+                    1 if encoded.aligned else 0,
+                    *box,
                     orig_is_target,
                     orig_confidence,
                     g.user["id"],
@@ -3368,21 +3228,15 @@ def api_update_face_bbox():
             }
         )
 
+    except ApiError:
+        raise
     except requests.RequestException as e:
         logger.error(f"Failed to download image for bbox update: {e}")
         return jsonify({"error": _("Failed to download image from Commons")}), 502
     except ValueError as e:
         msg = str(e)
         if msg.startswith("already_reviewed"):
-            other_user = msg.split(":", 1)[1] if ":" in msg else ""
-            if other_user:
-                error_msg = _(
-                    "This face was already classified by %(user)s. Only they can change their own classification.",
-                    user=other_user,
-                )
-            else:
-                error_msg = _("This face has already been classified by another contributor.")
-            return jsonify({"error": error_msg, "reason": "already_reviewed"}), 409
+            raise _already_reviewed_error(msg.split(":", 1)[1] if ":" in msg else "") from None
         if msg == "face_gone":
             return jsonify({"error": _("Face not found or access denied")}), 404
         raise
@@ -3585,7 +3439,7 @@ def api_gallery(project_id: int):
         "AND f.superseded_by IS NULL "
         "AND (f.classified_by IN ('model', 'bootstrap') "
         "     OR (f.classified_by = 'human' AND f.classified_by_user_id IS NOT NULL)) "
-        "AND LOWER(i.file_title) NOT REGEXP '\\\\.(webm|ogv|ogg|mp3|wav|flac|opus|mid|oga)$'"
+        f"AND {_EXCLUDE_NON_VISUAL_SQL}"
     )
     params: list = [project_id]
 
@@ -4699,6 +4553,12 @@ def commons_thumb_route(file_title: str):
 # ---------------------------------------------------------------------------
 
 
+@app.errorhandler(ApiError)
+def _handle_api_error(error: ApiError):
+    """Render a rejected API request as the JSON body the front end expects."""
+    return jsonify({"error": error.message, **error.extra}), error.status
+
+
 @app.errorhandler(400)
 def bad_request(e):
     """Handle 400 errors."""
@@ -4749,7 +4609,12 @@ def internal_error(e):
 # Initialize DB pool at import time so gunicorn `app:app` works without a
 # factory call.  The `create_app()` factory is kept for backwards compat
 # (e.g. tests, one-off scripts) but is no longer required for production.
-init_db(pool_size=2)
+# Web pool per gunicorn worker. Not WIKIVISAGE_DB_POOL_SIZE: Toolforge envvars are
+# tool-wide, so that variable already sizes the background workers' pools.
+# ToolsDB allows 20 connections for the whole tool: 2 web workers x 3 here plus
+# 2 background workers x 6 = 18, leaving two spare for migrations and one-off scripts.
+WEB_DB_POOL_SIZE = int(os.environ.get("WIKIVISAGE_WEB_DB_POOL_SIZE", "3"))
+init_db(pool_size=WEB_DB_POOL_SIZE)
 
 
 def create_app() -> Flask:
@@ -4758,4 +4623,9 @@ def create_app() -> Flask:
 
 
 if __name__ == "__main__":
-    app.run(debug=app.debug, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+    # The Werkzeug debugger allows code execution: never expose it beyond loopback.
+    app.run(
+        debug=app.debug,
+        host="127.0.0.1" if app.debug else "0.0.0.0",
+        port=int(os.environ.get("PORT", 8000)),
+    )

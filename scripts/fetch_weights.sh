@@ -4,7 +4,7 @@
 #   scripts/fetch_weights.sh           # download buffalo_sc.zip, verify, install
 #   scripts/fetch_weights.sh --check   # verify the files already in place; no network
 #
-# Verification order (see docs/plans/face-model-upgrade.md, section 1c):
+# Verification order:
 #   1. SHA-256 of the downloaded zip,
 #   2. SHA-256 of both extracted files,
 # and nothing is written to model-server/weights/ unless every check passes.

@@ -11,13 +11,15 @@ Face detection and 512D embedding (SCRFD-500M + ArcFace MobileFaceNet on ONNX Ru
 
 ```
 WikiVisage/
-├── app.py              # Flask web app: OAuth (PKCE), routes, classification API, CSP (~4600 lines)
-├── worker.py           # Background pipeline: crawl, remote detect, infer (~3500 lines)
+├── app.py              # Flask web app: OAuth (PKCE), routes, classification API, CSP (~4700 lines; the big routes are thin orchestration over named helpers)
+├── worker.py           # Background pipeline: crawl, remote detect, infer (~3700 lines). `write_sdc_claims` is a thin entry over `_SdcRun`; `main` is a sequence of small functions (see Worker)
 ├── face_client.py      # HTTP client for the face service. ZERO ML deps — shared by app.py + worker.py
 ├── liftwing_client.py  # Experimental LiftWing Qwen metadata pre-filter client (fail-open, circuit breaker, completion probe, optional bearer token) — worker-only
 ├── config.py           # Shared config: WAKE_FILE_PATH, HEARTBEAT_FILE_DIR, COMMONS_THUMB_STEPS, DETECTION_WIDTH, LIFTWING_PROBE_INTERVAL, PROJECT_VERSION
 ├── token_crypto.py     # Fernet encrypt/decrypt helpers for OAuth tokens at rest (~125 lines)
 ├── redis_lock.py       # Best-effort Redis single-flight lock; used to serialize OAuth refresh (~100 lines)
+├── oauth_refresh.py    # The OAuth refresh-token protocol shared by app.py and worker.py: Redis single-flight lock, DB compare-and-swap, re-read after a lost race. DB access and the token exchange are passed in as callables
+├── api_errors.py       # `ApiError`: how JSON routes reject a request (status + body). Its own module on purpose: the Flask handler matches by class identity, and test fixtures reload `app`
 ├── database.py         # MariaDB connection pool with retry logic (~510 lines)
 ├── model-server/       # Face detection service — the ONLY place ML runs
 │   ├── model.py        # KServe V1 predictor: WikiVisageModel(kserve.Model), async predict, box_space scaling
@@ -25,24 +27,25 @@ WikiVisage/
 │   ├── guard.py        # Stdlib-only ASGI middleware: bearer token + 40 MiB body cap (public-facing)
 │   ├── weights/        # det_500m.onnx, w600k_mbf.onnx (plain git blobs, NOT LFS), SHA256SUMS, LICENSE-NOTICE (non-commercial terms)
 │   ├── requirements.in # Top-level pins (kserve, onnxruntime, opencv-headless, Pillow, numpy); the source of requirements.txt
-│   ├── requirements.txt # Fully pinned transitive lock (uv pip compile, Python 3.11/x86_64-manylinux_2_28) — plain pip, no system packages
+│   ├── requirements.txt # Fully pinned transitive lock (uv pip compile, Python 3.12/x86_64-manylinux_2_28) — plain pip, no system packages
 │   ├── Procfile        # Toolforge buildpack entrypoint: `web: python model.py ... --http_port 8000`
-│   ├── .python-version # 3.11 (Heroku Python buildpack)
-│   ├── Dockerfile      # Local dev + CI only. Two-stage, python:3.11-slim-bookworm, uid 10001
-│   ├── blubber.yaml    # Forward-looking only — NOT deployable (see Known Issues)
+│   ├── .python-version # 3.12 (Heroku Python buildpack)
+│   ├── Dockerfile      # Local dev + CI only. Two-stage, python:3.12-slim-bookworm, uid 10001
 │   ├── docker-compose.yml # Local harness with memory/CPU ceilings + read-only rootfs
 │   ├── make_input.py   # Builds KServe request JSON from local image files
 │   └── .dockerignore
 ├── scripts/
+│   ├── check_coverage_floors.py # CI gate: per-module coverage floors (a ratchet; raise, never lower)
 │   ├── fetch_weights.sh   # Re-create/verify model-server/weights/ from the official InsightFace release (zip SHA, then both file SHAs)
 │   ├── check_no_lfs.sh    # CI guard: no .gitmodules, no LFS filter on the weights, no LFS pointer files
 │   └── eval_prefilter.py  # Offline readout for the LiftWing shadow verdicts (keep recall, skip rate, detector signal, sample reasons)
 ├── healthcheck.sh      # Toolforge liveness health check script (per-worker heartbeat file age check)
-├── schema.sql          # DDL for 10 tables: users, sessions, projects, images, faces, user_stats, sdc_claims, project_members, worker_heartbeat, service_status
+├── schema.sql          # DDL for 9 tables: users, projects, images, faces, user_stats, sdc_claims, project_members, worker_heartbeat, service_status
 ├── migrate.py          # Idempotent schema migration with --reset flag; one-time embedding-model wipe (apply_embedding_model_upgrade)
 ├── pyproject.toml      # Project config: Ruff linter/formatter rules, pytest config, markers, version
-├── requirements.txt    # Python 3.11+, NO ML dependencies (see model-server/ for those)
-├── requirements-dev.txt # Dev/test deps: pytest, pytest-cov, ruff (includes requirements.txt)
+├── requirements.in     # Top-level web/worker requirements; the source of requirements.txt
+├── requirements.txt    # Fully pinned universal lock (uv pip compile --universal, constrained by model-server/requirements.txt). NO ML dependencies. Never hand-edit
+├── requirements-dev.txt # Dev/test deps: pytest, pytest-cov, ruff, mypy + stubs (includes requirements.txt)
 ├── requirements-browser.txt # Optional Playwright browser tests (includes requirements-dev.txt); never installed in production
 ├── babel.cfg           # pybabel extraction config (explicit file list, excludes venv)
 ├── messages.pot        # Extracted translatable strings template
@@ -53,12 +56,17 @@ WikiVisage/
 │   ├── nb/LC_MESSAGES/ # Norwegian Bokmål
 │   ├── es/LC_MESSAGES/ # Spanish
 │   └── fr/LC_MESSAGES/ # French
-├── docs/plans/         # Design and migration plans (classify mobile, PTD adoption, face model upgrade)
 ├── tests/              # Hybrid test suite: unit + integration + contract tests
 │   ├── __init__.py
 │   ├── conftest.py     # Integration fixture infrastructure; `_make_embedding(seed, dim)` (unit-norm float32)
 │   ├── data/           # Public-domain portrait sample + provenance README used by the real-face tests
-│   ├── test_app.py     # Unit + integration tests
+│   ├── test_app_*.py   # Web-app tests by domain: auth, classify_api, commons, face_drawing, membership, misc, project_pages, sdc, system, undo_reclassify (one 13,000-line file before). `_app_preamble.py` does the env/app import once, `_app_support.py` holds helpers shared by several files
+│   ├── test_app_helpers.py # Direct tests of the helpers extracted from the big routes (box parsing, undo decision table, reclassify, image choice, project creation)
+│   ├── test_config.py  # The shared User-Agent
+│   ├── test_gallery_filter.py # The non-visual-media filter equals the old regex on real rows (integration)
+│   ├── test_oauth_refresh.py # The refresh protocol: lock, compare-and-swap, peer wait, retry
+│   ├── test_worker_sdc.py # write_sdc_claims end to end through a scripted DB + Commons API (every error path, the removal phase, the blocked-page back-off)
+│   ├── test_worker_loop.py # The worker's main loop pieces: startup, supervisor, inference drain, sleep, shutdown
 │   ├── test_bbox_editor_browser.py # Chromium/WebKit tests of the rendered bbox editor (touch identity, cancel, resize, scrolling)
 │   ├── test_database.py # Unit + integration tests
 │   ├── test_face_client.py # Unit tests for the face service client (dim/model_id validation, box_space, startup probe)
@@ -79,13 +87,12 @@ WikiVisage/
 │   ├── wikivisage-common.js       # Shared JS helpers: snapThumbWidth(), commonsThumbUrl()
 │   └── view-it-tool.png           # View it! Tool icon (local copy)
 ├── .github/
-│   ├── dependabot.yml  # Weekly update PRs: root pip, model-server uv (grouped), github-actions
+│   ├── dependabot.yml  # Weekly update PRs: root uv, model-server uv (grouped), github-actions
 │   └── workflows/
-│       ├── audit.yml   # Dependency audit: pip-audit + uv lock freshness (dependency changes, weekly, manual)
-│       ├── ci.yml      # CI: Ruff lint + no-LFS check, pytest on Python 3.11/3.15 (integration tests skipped), face-service unit/contract jobs
+│       ├── audit.yml   # Dependency audit: pip-audit + uv lock freshness for both locks (dependency changes, weekly, manual)
+│       ├── ci.yml      # CI: Ruff + mypy + no-LFS check, pytest on Python 3.12/3.15.1, MariaDB integration + coverage gates, browser, face-service unit/contract jobs
 │       └── deploy.yml  # CD: Release-triggered Toolforge deploy via SSH (2 workers + health checks)
-├── Procfile            # web: gunicorn (2 workers, module-level app), worker: python -u worker.py
-├── jobs.yaml           # Toolforge jobs definition (2 ml-worker instances, health check scripts)
+├── Procfile            # web: gunicorn (2 gthread workers x 4 threads, module-level app), worker: python -u worker.py
 ├── how-to-run-it.md    # Toolforge deployment guide
 ├── test-local.md       # Local development setup guide
 ├── LICENSE             # MIT license (does NOT cover model-server/weights; see its LICENSE-NOTICE)
@@ -358,14 +365,14 @@ rejects it and the worker treats any non-`off` value as shadow).
 
 ### Web (app.py)
 
-Flask app served by gunicorn (2 workers, `app:app`; the module-level app is built at import, and `create_app()` remains as a backwards-compatible factory for tests and scripts). Handles OAuth 2.0 login, project CRUD, face classification UI, and a Commons thumbnail proxy. SDC write requests are queued via a flag; the background worker performs the actual API writes.
+Flask app served by gunicorn (2 `gthread` workers x 4 threads, `app:app`; the module-level app is built at import, and `create_app()` remains as a backwards-compatible factory for tests and scripts). Handles OAuth 2.0 login, project CRUD, face classification UI, and a Commons thumbnail proxy. SDC write requests are queued via a flag; the background worker performs the actual API writes.
 
 **Security middleware:**
 - Open redirect protection on login (`_is_safe_url()`)
 - CSRF protection on all POST routes (per-request CSRF token stored in Flask's signed session cookie)
 - PKCE (RFC 7636, S256) on the OAuth authorization code flow as defense-in-depth against intercepted authorization codes
 - Rate limiting via Flask-Limiter (global 200/hour default, 10/min on bbox endpoints)
-- Security headers: `Content-Security-Policy` (with `object-src 'none'`, `base-uri 'none'`, `frame-ancestors 'none'`), `X-Content-Type-Options`, `X-Frame-Options`, `X-XSS-Protection`, `Referrer-Policy`, `Permissions-Policy`
+- Security headers: `Content-Security-Policy` (`script-src 'self' 'nonce-<per-request nonce>'` with **no** `'unsafe-inline'` for scripts, `script-src-attr 'none'`, plus `object-src 'none'`, `base-uri 'none'`, `frame-ancestors 'none'`; `style-src` keeps `'unsafe-inline'` for the remaining `style=""` attributes). The nonce is generated by `_generate_csp_nonce()` (`g.csp_nonce`), exposed to templates as `{{ csp_nonce }}` and emitted by `set_security_headers()`, so header and tags always carry the same value. `X-Content-Type-Options`, `X-Frame-Options`, `X-XSS-Protection`, `Referrer-Policy`, `Permissions-Policy`
 - OAuth refresh single-flight via Redis lock (`redis_lock.single_flight()`, 15s TTL, key `wikivisage:lock:oauth-refresh:<user_id>`) — prevents concurrent token-refresh requests from invalidating each other's freshly rotated refresh tokens. Degrades to no-op if Redis is unreachable; DB-level CAS on `token_expires_at` remains as a second line of defense.
 
 **Routes (37 total):**
@@ -471,7 +478,7 @@ Two query paths:
 | `_convert_box_to_stored_space` | Re-expresses a box from one pixel space into the stored `detection_width/height` space (for re-detection on images whose boxes live in another size) |
 | `_persist_inference_batch` | Takes the project-row lock, re-checks candidate eligibility and sibling targets, then applies model decisions in one transaction. Returns actual classified and match counts |
 | `run_autonomous_inference` | Cosine-distance classification on unclassified faces against the renormalised mean centroid (needs >= `min_confirmed` target faces). Only reads faces whose `embedding_model` equals `face_client.EXPECTED_MODEL_ID`, and skips faces with `sdc_removal_pending = 1` so a model guess can never re-target a face whose claim a human asked to remove (the removal phase would then strip the claim of a fresh match). A candidate on an image that already has a confirmed target (`image_has_target`) is always resolved as a non-match, so a re-run cannot promote a second face after the human approved one of several model faces on the same image |
-| `write_sdc_claims` | Writes P180 claims to Commons SDC via Wikibase API (idempotent). Triggered by `sdc_write_requested` flag set from web UI. Before every write it re-reads the face's live `is_target`/`superseded_by` and skips faces that were rejected, undone or replaced while the batch was in flight (the web side queues a removal for those too; a whole unverifiable batch stops the run instead of looping). Re-checks `sdc_write_requested` every 5 faces (`_PER_FACE_CANCEL_CHECK_EVERY`) so the user can stop a running batch quickly, and calls `_keepalive_sdc_write` on the same cadence. Treats `no-such-entity` / `no-such-claim` / `no-such-statement` / `notfound` as already-gone successes (`_ALREADY_GONE_CODES`). |
+| `write_sdc_claims` | Thin entry over `_SdcRun` (`begin` → `write_phase` → `removal_phase` → `finish`; each Commons call site, the token-refresh retry, the abort and the cancel check exist once). A page held by another project's fresh claim is `BLOCKED`: the run backs off `_SDC_BLOCKED_BACKOFF_SECONDS` between fully blocked passes and ends after `_SDC_BLOCKED_MAX_PASSES` with a notice, instead of re-selecting it in a tight loop. Writes P180 claims to Commons SDC via Wikibase API (idempotent). Triggered by `sdc_write_requested` flag set from web UI. Before every write it re-reads the face's live `is_target`/`superseded_by` and skips faces that were rejected, undone or replaced while the batch was in flight (the web side queues a removal for those too; a whole unverifiable batch stops the run instead of looping). Re-checks `sdc_write_requested` every 5 faces (`_PER_FACE_CANCEL_CHECK_EVERY`) so the user can stop a running batch quickly, and calls `_keepalive_sdc_write` on the same cadence. Treats `no-such-entity` / `no-such-claim` / `no-such-statement` / `notfound` as already-gone successes (`_ALREADY_GONE_CODES`). |
 | `_keepalive_sdc_write` | Refreshes the DB heartbeat row, the heartbeat file and `projects.worker_claimed_at` (only for this worker's claim) while a long SDC run blocks the main loop — otherwise a run over 5 minutes trips `healthcheck.sh` and a run over `CLAIM_EXPIRY_MINUTES` lets the other worker claim the same project. Best-effort: every statement is wrapped in its own `try/except DatabaseError`. Called every 5 written faces and once per removal page. |
 | `_api_request` | Wrapper for Commons/Wikidata API calls with maxlag, retry, and User-Agent |
 | `_get_csrf_token` | Fetches CSRF token for Wikibase API writes |
@@ -481,7 +488,7 @@ Two query paths:
 Both processes import from `database.py`. Thread-safe connection pool (`Queue`-based) with exponential backoff retry (3 attempts).
 
 **Exports:**
-- `init_db(pool_size)` — Initialize connection pool. The web app calls it at import with `pool_size=2` per gunicorn worker; the worker passes `WIKIVISAGE_DB_POOL_SIZE` when set, else `min(MAX_CONCURRENT_PROJECTS * IMAGE_THREADS + 3, 6)`.
+- `init_db(pool_size)` — Initialize connection pool. The web app calls it at import with `WEB_DB_POOL_SIZE` (`WIKIVISAGE_WEB_DB_POOL_SIZE`, default 3) per gunicorn worker; the worker passes `WIKIVISAGE_DB_POOL_SIZE` when set, else `min(MAX_CONCURRENT_PROJECTS * IMAGE_THREADS + 3, 6)`.
 - `execute_query(sql, params, fetch)` — Universal read/write. Returns `List[Dict]` (fetch=True) or `int` rowcount (fetch=False).
 - `execute_insert(sql, params)` — INSERT with `cursor.lastrowid` return (race-free).
 - `execute_transaction(queries)` — Atomic multi-statement transaction. Takes list of `(sql, params)` tuples.
@@ -500,7 +507,7 @@ users 1──N projects 1──N images 1──N faces
   |           +-- sdc_write_error       +-- classified_by: 'human' | 'model' | 'bootstrap'
   |           +-- last_inference_threshold   +-- classified_by_user_id: FK to users (human classifications)
   |           +-- last_inference_min_confirmed +-- encoding: 512D float32 embedding (2048 bytes BLOB)
-  +---- sessions (Flask-Session)       +-- embedding_model: e.g. 'scrfd500m+arcface_mbf' (NOT NULL)
+  |                                      +-- embedding_model: e.g. 'scrfd500m+arcface_mbf' (NOT NULL)
                                        +-- det_score: SCRFD confidence (NULL for manual faces)
                                        +-- aligned: 1=landmark-aligned embedding, 0=unaligned (drawn box the detector missed)
                                        +-- confidence: cosine distance from target centroid
@@ -652,7 +659,8 @@ images.prefilter_checked_at DATETIME NULL  -- when the verdict was stored
 - `TOOL_TOOLSDB_HOST` — Default: `tools.db.svc.wikimedia.cloud`
 - `FLASK_SECRET_KEY` — Default: random hex (regenerates on restart — sessions lost)
 - `PORT` — Default: `8000`
-- `WIKIVISAGE_DB_POOL_SIZE` — Default: `5` (web process). The worker reads the same var; when unset it computes `min(MAX_CONCURRENT_PROJECTS * IMAGE_THREADS + 3, 6)` and warns above 6 (ToolsDB shares a 20-connection cap across all processes).
+- `WIKIVISAGE_WEB_DB_POOL_SIZE` — Default: `3` (connections per gunicorn web worker; 2 workers x 3 + 2 background workers x 6 = 18 of ToolsDB's 20). Separate from the next variable because Toolforge envvars are tool-wide.
+- `WIKIVISAGE_DB_POOL_SIZE` — Background worker pool size. The worker reads it; when unset it computes `min(MAX_CONCURRENT_PROJECTS * IMAGE_THREADS + 3, 6)` and warns above 6 (ToolsDB shares a 20-connection cap across all processes).
 - `WIKIVISAGE_WORKER_POLL_INTERVAL` — Default: `60` seconds
 - `WIKIVISAGE_WORKER_BATCH_SIZE` — Default: `50` (images per processing batch)
 - `WIKIVISAGE_WORKER_MAX_PROJECTS` — Default: `4` (concurrent projects processed by worker)
@@ -707,7 +715,7 @@ images.prefilter_checked_at DATETIME NULL  -- when the verdict was stored
 ## Conventions
 
 ### Python
-- **Linter/formatter**: Ruff configured in `pyproject.toml` (line-length 120, target py311). Selects E/W/F/I/UP/B/SIM/S rule sets with project-specific ignores. Run: `ruff check .` and `ruff format --check .`.
+- **Linter/formatter**: Ruff configured in `pyproject.toml` (line-length 120, target py312). Selects E/W/F/I/UP/B/SIM/S rule sets with project-specific ignores. Run: `ruff check .` and `ruff format --check .`.
 - **Test framework**: pytest configured in `pyproject.toml` (`testpaths = ["tests"]`, `pythonpath = ["."]`). Integration tests marked with `@pytest.mark.integration`, skipped unless `WIKIVISAGE_TEST_DB=1` env var is set. See **Testing** section below.
 - Code uses type hints, f-strings, DictCursor everywhere.
 - `execute_query()` is the universal DB read/write interface. `execute_insert()` for INSERTs needing lastrowid. `execute_transaction()` for atomic multi-step mutations.
@@ -720,7 +728,7 @@ images.prefilter_checked_at DATETIME NULL  -- when the verdict was stored
 - CSS is embedded in `base.html` `<style>` tag (CSS custom properties) + per-page `{% block extra_head %}`. No external CSS files.
 - Reusable CSS classes live in `base.html`: `.decorated-card` (scanline + corner overlay pattern, accent color via `--card-accent` CSS variable), unified pagination styles (`.pagination a, .pagination button`).
 - Shared JS helpers are in `static/wikivisage-common.js` (thumbnail snapping, Commons URL building). Templates that need them add `<script src="{{ url_for('static', filename='wikivisage-common.js') }}">` in `{% block extra_head %}`.
-- No JavaScript build system. Inline `<script>` tags in templates for page-specific logic.
+- No JavaScript build system. Inline `<script>` tags in templates for page-specific logic. **Every inline `<script>` must carry `nonce="{{ csp_nonce }}"`** (the CSP has no `'unsafe-inline'` for scripts) and **inline event-handler attributes (`onclick=`, `onsubmit=`, `onchange=` …) and `javascript:` URLs are forbidden** (`script-src-attr 'none'` blocks them silently). Wire behaviour with `addEventListener` from the nonce'd script, using ids or `data-*` attributes, and delegate for markup built at runtime (build DOM with `createElement`/`textContent`, not `innerHTML` with handlers). Page-wide helpers live in the first script of `base.html`: `<button data-dismiss-parent>` removes its parent (banners, flashes), `<form data-confirm="message">` asks `confirm()` before submitting (put the message in an autoescaped attribute, e.g. `data-confirm="{{ _('...') }}"`; interpolate names with `.replace('{username}', name)`), and `showInlineAlert(message)` fills the `role="alert"` region (`#inline-alert`) instead of `window.alert()`. `tests/test_security_round2.py::TestTemplatesAreCSPClean` fails on a handler attribute, an un-nonced `<script>`, a `javascript:` URL or an `alert(` call.
 - Title format: `Page Name - WikiVisage BETA`
 - Dark brutalist/industrial theme with CSS variables: `--bg: #090e17`, `--surface: #141f33`, `--primary: #14b8a6`, etc.
 
@@ -779,7 +787,6 @@ Extracted common patterns to reduce duplication across routes, templates, and JS
 | `THUMB_STEPS` | Array of Commons-allowed thumbnail widths |
 | `snapThumbWidth(w)` | Snaps arbitrary width to nearest allowed Commons step |
 | `commonsThumbUrl(filename, width)` | Builds proxied Commons thumbnail URL with step-snapped width |
-| `VIDEO_EXTENSIONS`, `TIF_EXTENSIONS` | File extension sets for media type detection |
 | `postForm(url, csrfToken, fields)` | CSRF-enabled POST helper — builds FormData, returns parsed JSON Promise |
 | `bboxToDisplayRect(bbox, scaleX, scaleY, offsetX, offsetY)` | Converts detection-space bbox `{top,right,bottom,left}` to display-space `{left,top,width,height}` |
 | `displayRectToDetectionBbox(rect, scaleX, scaleY, offsetX, offsetY)` | Inverse of `bboxToDisplayRect` — display rect to rounded detection bbox |
@@ -795,7 +802,7 @@ The face service used to run dlib HOG + `face_recognition` (128D float64). It no
 **The weights are third-party and non-commercial research only** (InsightFace `buffalo_sc`). They are committed as ordinary git blobs in `model-server/weights/` with `LICENSE-NOTICE` stating the terms; the project owner accepted this for the experiment. Wikimedia admins could object, so keep the `FaceBackend` protocol pluggable (YuNet + SFace is the fallback). **Never use Git LFS or submodules for them**: the Toolforge build service does a plain clone, and a pointer file would build "successfully" and then fail. Three guards enforce it: `scripts/check_no_lfs.sh` in the CI lint job, `sha256sum -c SHA256SUMS` in every face-service CI job, and `backend.verify_weights` at startup (fail-closed). `scripts/fetch_weights.sh` re-creates and verifies the files from the official release URL.
 
 ### The embedding-model wipe (one-time, in `migrate.py`)
-Old 128D dlib encodings and new 512D embeddings are not comparable, so `migrate.apply_embedding_model_upgrade()` wipes derived data exactly once. It is gated on `information_schema.COLUMNS`: if `faces.embedding_model` is absent it runs `DELETE FROM images` (cascades to faces and sdc_claims; never `TRUNCATE`, InnoDB refuses it on FK-referenced tables) and `DELETE FROM sdc_claims`, resets every project (counters, inference settings, completion reason, SDC flags, worker claim, `distance_threshold` = the new default), reactivates `completed` projects, then applies the schema changes (`det_score`, comments, default) and adds `embedding_model` **last**, so an interrupted run repeats the wipe instead of skipping it. The ALTER list that runs *before* this step must never anchor a column on `det_score` or `embedding_model` — they do not exist yet on a legacy database (error 1054): `faces.aligned` is positioned after the old `confidence` column instead, and `test_run_migration_upgrades_a_legacy_faces_schema_end_to_end` exercises the full entry point against a simulated 0.10.x table. Later runs and fresh databases (whose `schema.sql` already has the column) skip it. It keeps users, sessions, projects, project_members, user_stats and worker_heartbeat. Wiping `sdc_claims` cannot create duplicate P180 claims because `write_sdc_claims` checks Commons first, and `bootstrap_from_sparql` re-seeds from existing claims. Take a DB dump before the first run on real data. `migrate.py --reset` is a different, harsher tool (it also drops users and tokens).
+Old 128D dlib encodings and new 512D embeddings are not comparable, so `migrate.apply_embedding_model_upgrade()` wipes derived data exactly once. It is gated on `information_schema.COLUMNS`: if `faces.embedding_model` is absent it runs `DELETE FROM images` (cascades to faces and sdc_claims; never `TRUNCATE`, InnoDB refuses it on FK-referenced tables) and `DELETE FROM sdc_claims`, resets every project (counters, inference settings, completion reason, SDC flags, worker claim, `distance_threshold` = the new default), reactivates `completed` projects, then applies the schema changes (`det_score`, comments, default) and adds `embedding_model` **last**, so an interrupted run repeats the wipe instead of skipping it. The ALTER list that runs *before* this step must never anchor a column on `det_score` or `embedding_model` — they do not exist yet on a legacy database (error 1054): `faces.aligned` is positioned after the old `confidence` column instead, and `test_run_migration_upgrades_a_legacy_faces_schema_end_to_end` exercises the full entry point against a simulated 0.10.x table. Later runs and fresh databases (whose `schema.sql` already has the column) skip it. It keeps users, projects, project_members, user_stats and worker_heartbeat. Wiping `sdc_claims` cannot create duplicate P180 claims because `write_sdc_claims` checks Commons first, and `bootstrap_from_sparql` re-seeds from existing claims. Take a DB dump before the first run on real data. `migrate.py --reset` is a different, harsher tool (it also drops users and tokens).
 
 ### The LiftWing pre-filter is shadow-only and fails open
 `projects.prefilter_mode` accepts `off` and `shadow`; `enforce` is in the ENUM so adding it later needs no schema change, but settings reject it and the worker treats any non-`off` value as shadow. Whatever the model says, every image is still downloaded and face-detected — the verdicts only land on `images.prefilter_keep/_reason/_checked_at` for `scripts/eval_prefilter.py`. Do not wire the verdicts into `process_images` before that readout shows a keep recall of at least 99.5% on human-confirmed target images (the readout also reports dropped images that had detected faces, and keeps with none).
@@ -837,9 +844,6 @@ The ONNX models run in float32, so the same image embedded on different CPU / ON
 
 Stored embeddings can also drift because **Commons re-renders thumbnails**: with the old pipeline three March-era faces re-encoded 0.06–0.2 L2 away from their stored vectors, and one was no longer detected. The input bytes changed, not the code.
 
-### model-server/blubber.yaml is not deployable
-Wikimedia LiftWing builds production images exclusively with Blubber, so the file exists to keep the service in the right shape. It **cannot be deployed today**: LiftWing is not self-service (it requires membership in the internal `deploy-ml-service` LDAP group, and Toolforge tools are classified as external API consumers), it hosts no biometric models, and the committed weights are non-commercial. Production uses Toolforge buildpacks; local development uses the `Dockerfile`.
-
 ### OAuth scope & token handling
 SDC writes require the `editpage` OAuth grant. The access token is stored per-user in the `users` table. Token refresh is handled in `app.py` `@before_request`. Access tokens from the DB may be `bytes` — normalized to `str` at read time in `before_request`.
 
@@ -853,7 +857,7 @@ The worker is a long-running `python worker.py` process. Code changes require ma
 Commons enforces `$wgThumbnailSteps` — only standard sizes (20, 40, 60, 120, 250, 330, 500, 960, 1280, 1920, 3840px) are allowed. Non-standard widths return HTTP 429. Both Python (`_snap_thumb_width`) and JavaScript (`snapThumbWidth`) snap requested widths to the nearest allowed step.
 
 ### Shutdown handling
-Worker uses `signal.SIGTERM`/`SIGINT` handlers setting `shutdown_requested = True`. Each pipeline stage and the main loop check this flag for graceful shutdown. Uses `multiprocessing.set_start_method("spawn")` to avoid fork-safety issues.
+Worker uses `signal.SIGTERM`/`SIGINT` handlers setting `shutdown_requested = True`. Each pipeline stage and the main loop check this flag for graceful shutdown.
 
 ### Worker heartbeat & downtime banner
 The worker writes `REPLACE INTO worker_heartbeat (id, last_seen) VALUES (1, NOW())` at the start of each poll cycle. The web app checks `last_seen < NOW() - INTERVAL 5 MINUTE` via a context processor (`inject_worker_status`). If stale, `base.html` displays an amber banner: "The background worker appears to be offline." The banner is hidden on the landing page and leaderboard (not relevant there). Graceful on fresh installs — returns `worker_down=False` if no heartbeat row exists.
@@ -891,11 +895,14 @@ The project detail page includes approve/reject/edit-bbox controls on each Model
 - **Filter interaction**: After reclassification, `data-source` is NOT changed — the card remains visible under its original source filter (Model/Bootstrap). Only the visible method label updates to "human".
 - **State sync**: the reclassify success handler refreshes `data-sdc-written` from the response's `sdc_written` (the authoritative post-action value — reject always clears it, approve may set it when the P180 check finds the claim already on Commons) and computes the "send pending" badge from it, so a reject-then-approve cannot keep a stale written flag. The removal counter is decremented only when the card actually carried a queued removal; a synchronous removal (`sdc_removed`) shows the note without touching the counters, which keeps them consistent with the server stats between reloads.
 
+### Sessions are signed cookies only
+The unused `sessions` table (reserved for server-side sessions that were never built) was dropped: `schema.sql` no longer creates it and `_ALTER_MIGRATIONS` runs `DROP TABLE IF EXISTS sessions` on existing databases (`_ALL_TABLES` still lists it so `--reset` cleans older databases). Consequence: logout only clears the browser's cookie, so a stolen signed cookie stays valid until `PERMANENT_SESSION_LIFETIME` (8 h). Deleting the user row does revoke it, because `before_request` loads the user from the database on every request.
+
 ### Cookies
 Only 2 cookies: `session` (strictly necessary, managed by Flask's built-in signed session cookie mechanism) and `locale` (functional, language preference). No tracking cookies. A non-blocking consent banner is shown. Without consent the `locale` cookie is session-scoped: switching language still works, but the choice is only persisted (1 year) once the visitor accepts the banner.
 
 ### Worker memory is bounded by DETECTION_WAVE_SIZE, not BATCH_SIZE
-`process_images` works in waves. A wave's downloaded image bytes are all resident at once while its detection request is in flight, so `DETECTION_WAVE_SIZE` (8) is what caps peak memory — not `BATCH_SIZE` (10). Downloading a whole batch up front would be 50 x 50 MB worst case. Inference itself is cheap: each encoding is 1024 bytes, so even 10K faces is ~10 MB.
+`process_images` works in waves. A wave's downloaded image bytes are all resident at once while its detection request is in flight, so `DETECTION_WAVE_SIZE` (8) is what caps peak memory — not `BATCH_SIZE` (50). Downloading a whole batch up front would be 50 x 50 MB worst case. Inference itself is cheap: each encoding is 2048 bytes, so even 10K faces is ~20 MB.
 
 ### Wikidata label fetching
 `_fetch_wikidata_label(qid)` in `app.py` calls the Wikidata `wbgetentities` API with `languages=en&languagefallback=1` to retrieve human-readable labels. The `languagefallback=1` parameter makes the API automatically fall back through language variants (e.g., `mul` → `en`, `en-ca` → `en`) when no exact `en` label exists. Used during project creation to auto-fill empty project labels. Without this parameter, entities like Q153694 (Michael Bublé) return empty labels because they only have `mul`/`en-ca`/`en-gb` labels, not `en`.
@@ -907,12 +914,15 @@ Hybrid test suite: unit tests (run in CI), integration tests (require local Dock
 ### Architecture
 
 - **Unit tests**: Pure mocks, no DB, no network. Run everywhere (CI, local). Cover thumb snapping, URL safety, CSRF validation, error classes, migration parsing, route logic, token encryption, CSP hardening, PKCE, single-flight Redis lock, idempotent SDC removal, mid-batch cancel, the face service client (wire parsing, batching, error classification), and the LiftWing pre-filter client (verdict parsing, fail-open, circuit breaker, probe).
-- **Integration tests**: Hit a real MariaDB via Docker. Marked with `@pytest.mark.integration`. Skipped in CI (GitHub Actions) — only run locally when `WIKIVISAGE_TEST_DB=1` is set.
+- **Integration tests**: Hit a real MariaDB via Docker. Marked with `@pytest.mark.integration`. Run in the `integration` CI job (MariaDB service container) and locally when `WIKIVISAGE_TEST_DB=1` is set.
 - **Contract tests**: Run the real `face_client` against a real running face service container. Marked with `@pytest.mark.contract`, skipped unless `WIKIVISAGE_FACE_SERVICE_CONTRACT=1`. This is the only place both sides of the HTTP boundary are exercised together — everything else mocks it — so it is what catches a broken Dockerfile, an unresolvable dependency, or wire-format drift. Auth tests additionally need `WIKIVISAGE_FACE_SERVICE_TOKEN` set on both the container and the client. Tests that need a real face read `tests/data/portrait_sample.jpg` (override: `WIKIVISAGE_TEST_SAMPLE_IMAGE`); they skip when it is absent unless `WIKIVISAGE_REQUIRE_SAMPLE` is an explicit affirmative (`1`/`true`/`yes`/`on`; `"0"`/`"false"`/unset skip). CI sets it. The sample **is committed**: a close-cropped public-domain White House portrait whose ~514x756 px face at 960 px exercises the half-scale pass; `tests/data/README.md` records its provenance. CI runs the contract tests in both face-service jobs, with a token, and fails if the service log contains ORT `VerifyOutputSizes` warnings.
 - **Face-service unit tests**: `test_face_service_backend.py` (fake ONNX sessions for decode/scaling/alignment/chunking/box recovery, plus the real weights) and `test_face_service_model.py` (the KServe envelope with a scripted backend) import `model-server/` directly and need `onnxruntime`, `opencv` and `kserve`; they `importorskip` in the plain environment and run in the `face-service-unit` CI job.
-- **Guard tests**: `test_face_service_guard.py` loads `model-server/guard.py` by file path (it is stdlib-only), so the public-facing auth and body-cap rules are unit-tested without KServe or dlib.
+- **Guard tests**: `test_face_service_guard.py` loads `model-server/guard.py` by file path (it is stdlib-only), so the public-facing auth and body-cap rules are unit-tested without KServe or the ML stack.
 - **Test DB**: `wikiface_test` — created fresh per pytest session, dropped on teardown. Never touches `wikiface_dev`.
 - **Config**: `pyproject.toml` has `testpaths = ["tests"]`, `pythonpath = ["."]`, and integration marker.
+- **Coverage**: the baseline when the gates were added was app 95%, worker 70% (its main loop and SDC writer were the least covered code in the repository), total 86%. After splitting `write_sdc_claims` and `main` it is worker 91%, total 93%. Floors live in `scripts/check_coverage_floors.py` and `fail_under`; raise them when coverage rises, never lower them to pass.
+- **Complexity ratchet**: Ruff's `C90` rule with `max-complexity = 20` in `pyproject.toml` (it was 70, then 30). It is set to the worst function that exists, so it only blocks new giants; lower it after each refactor, target 15.
+- **Test order independence**: every `test_app_*.py` passes on its own and in reverse order. Tests that change shared app config must restore it (`flask_app.config["SERVER_NAME"] = None`, never `pop`: a missing key breaks Flask's URL adapter for whatever runs next).
 
 ### Test files
 
@@ -934,7 +944,7 @@ The review-follow-up round added: the reclassify `sdc_written` echo test (approv
 
 The undo-semantics round added: undo-of-rejection tests (a `sdc_removal_pending=1` state row cancels the queue instead of removing the claim; the written marker is preserved; a non-bootstrapped pre-existing queue is kept for the worker) and the model-inference exclusion test (`run_autonomous_inference`'s candidate query requires `sdc_removal_pending = 0`, plus an integration case proving a pending face is left unclassified).
 
-The DevOps-follow-up round added: `test_translations.py` (the committed `.mo` catalogs must serve exactly what their `.po` sources declare — catches a forgotten `pybabel compile` locally and in CI) and a pinned Ruff (`ruff==0.17.1`) in the CI lint job so a new Ruff release cannot turn it red on unchanged code.
+The DevOps-follow-up round added: `test_translations.py` (the committed `.mo` catalogs must serve exactly what their `.po` sources declare — catches a forgotten `pybabel compile` locally and in CI) and a pinned Ruff (`ruff==0.17.2`) in the CI lint job so a new Ruff release cannot turn it red on unchanged code.
 
 ### Commands
 
@@ -982,14 +992,15 @@ test_db (session) → creates/drops wikiface_test DB
 
 ### CI (`.github/workflows/ci.yml`)
 
-Runs on push/PR to `main`. Six jobs:
+Runs on push/PR to `main`. Seven jobs:
 
-1. **Lint**: Ruff check + format check (Python 3.11; Ruff is version-pinned in the workflow so a new Ruff release cannot turn the job red on unchanged code), then `scripts/check_no_lfs.sh` — fails if `.gitmodules` exists, a weight file is routed through the LFS filter, or a weight file is an LFS pointer.
-2. **Test**: `pytest --tb=short -q` on Python 3.11 and 3.15 matrix. Integration tests auto-skipped (no `WIKIVISAGE_TEST_DB` env var in CI); the face-service unit and contract files skip too (no ML stack here). No system deps needed — the ML stack lives in the face service, and the suite mocks `face_client` rather than reaching the network. Caches pip dependencies.
-3. **Face service (backend + model unit tests)** (`face-service-unit`): verifies `model-server/weights/SHA256SUMS`, installs `model-server/requirements.txt` + dev requirements on Python 3.11, and runs `test_face_service_backend.py` and `test_face_service_model.py` with `WIKIVISAGE_REQUIRE_SAMPLE=1`.
-4. **Face service** (`face-service`): verifies `SHA256SUMS`, builds `model-server/` with buildx (gha layer cache), starts the container **with a random token**, waits for readiness, runs the contract tests through the guard, and fails if the service log contains ONNX Runtime `VerifyOutputSizes` warnings. It builds the Dockerfile.
-5. **Face service (Toolforge buildpack)** (`face-service-buildpack`): verifies `SHA256SUMS`, builds `model-server/` with `pack` and Toolforge's own builder (`tools-harbor.wmcloud.org/toolforge/heroku-builder:24_0.21.8`, buildpacks `heroku/python` + `heroku/procfile` only — no deb packages are needed) — the production image — starts it via the `web` Procfile entry on port 8000 with `TOOL_TOOLFORGE_API_URL` set (so the fail-closed token check is live), and runs the same contract tests and log check. Catches `requirements.txt` / `Procfile` breakage that only affects the buildpack path.
-6. **Bbox editor** (`browser`): installs the optional `requirements-browser.txt` and Chromium/WebKit, then runs `test_bbox_editor_browser.py` with `WIKIVISAGE_BROWSER_TESTS=1`. It renders the real Flask page with mocked DB/gallery/thumbnail responses and exercises the DOM events and layout, including multi-touch cancellation, rotation and landscape scrolling. The plain suite skips these tests; production never installs Playwright.
+1. **Lint**: Ruff check + format check, then **mypy** (pinned `mypy==2.4.0`; scope is the small modules listed in `[tool.mypy]`: config, token_crypto, redis_lock, database, face_client, liftwing_client, oauth_refresh, api_errors) (Python 3.12; Ruff is version-pinned in the workflow so a new Ruff release cannot turn the job red on unchanged code), then `scripts/check_no_lfs.sh` — fails if `.gitmodules` exists, a weight file is routed through the LFS filter, or a weight file is an LFS pointer.
+2. **Test**: `pytest --tb=short -q` on Python 3.12 and 3.15.1 matrix, installing the pinned root lock. Integration tests auto-skipped (no `WIKIVISAGE_TEST_DB` env var in CI); the face-service unit and contract files skip too (no ML stack here). No system deps needed — the ML stack lives in the face service, and the suite mocks `face_client` rather than reaching the network. Caches pip dependencies.
+3. **Integration tests (MariaDB) + coverage** (`integration`): a `mariadb:10.11` service container, then `pytest --cov` with `WIKIVISAGE_TEST_DB=1`, so the tests that guard the race-condition fixes (SDC writes, inference persistence, claims, migrations) run in CI and not only locally. `[tool.coverage.report] fail_under` gates the whole project and `scripts/check_coverage_floors.py` gates each module; both are ratchets.
+4. **Face service (backend + model unit tests)** (`face-service-unit`): verifies `model-server/weights/SHA256SUMS`, installs `model-server/requirements.txt` + dev requirements on Python 3.12, and runs `test_face_service_backend.py` and `test_face_service_model.py` with `WIKIVISAGE_REQUIRE_SAMPLE=1`.
+5. **Face service** (`face-service`): verifies `SHA256SUMS`, builds `model-server/` with buildx (gha layer cache), starts the container **with a random token**, waits for readiness, runs the contract tests through the guard, and fails if the service log contains ONNX Runtime `VerifyOutputSizes` warnings. It builds the Dockerfile.
+6. **Face service (Toolforge buildpack)** (`face-service-buildpack`): verifies `SHA256SUMS`, builds `model-server/` with `pack` and Toolforge's own builder (`tools-harbor.wmcloud.org/toolforge/heroku-builder:24_20261023`, buildpacks `heroku/python` + `heroku/procfile` only — no deb packages are needed; keep the builder tag in step with Toolforge's current default, published at `Module:Toolforge images/buildpack data.json`) — the production image — starts it via the `web` Procfile entry on port 8000 with `TOOL_TOOLFORGE_API_URL` set (so the fail-closed token check is live), and runs the same contract tests and log check. Catches `requirements.txt` / `Procfile` breakage that only affects the buildpack path.
+7. **Bbox editor** (`browser`): installs the optional `requirements-browser.txt` and Chromium/WebKit, then runs `test_bbox_editor_browser.py` with `WIKIVISAGE_BROWSER_TESTS=1`. It renders the real Flask page with mocked DB/gallery/thumbnail responses and exercises the DOM events and layout, including multi-touch cancellation, rotation and landscape scrolling. The plain suite skips these tests; production never installs Playwright.
 
 The contract tests need `tests/data/portrait_sample.jpg` (CI sets `WIKIVISAGE_REQUIRE_SAMPLE=1`). The sample is committed, so the three face-service jobs run the real-face tests rather than failing by design.
 
@@ -997,14 +1008,14 @@ Concurrency: `ci-${{ github.ref }}` with cancel-in-progress.
 
 ### Dependency audit (`.github/workflows/audit.yml`)
 
-Runs on push/PR to `main` when a requirements file changes, every Monday at 06:17 UTC, and on `workflow_dispatch`. Python 3.11 (the face service lock cannot resolve on 3.15 — `kserve` requires `<3.14`).
+Runs on push/PR to `main` when a requirements file changes, every Monday at 06:17 UTC, and on `workflow_dispatch`. Python 3.12 (the project floor: `numpy` 2.5 requires `>=3.12`; the face service additionally caps `kserve` at `<3.14`).
 
 1. `pip-audit -r requirements.txt` and `pip-audit -r model-server/requirements.txt`; any known vulnerability fails the run. pip-audit is version-pinned like Ruff.
 2. `uv pip compile` (uv pinned to 0.13.5, the version Dependabot ships) regenerates `model-server/requirements.txt` in place and `git diff --exit-code` fails when the committed lock is not what `requirements.in` produces — a hand-edit, an unresolved merge, or a Dependabot PR that did not regenerate. The recipe is in `TESTING.md` §7.
 
 A CVE with no fixed release yet is suppressed with `--ignore-vuln <ID>` on the affected `pip-audit` line, with the ID and a review date in a comment; remove it when a fix lands.
 
-**Dependabot** (`.github/dependabot.yml`) watches root `pip`, `model-server` `uv` and `github-actions`, weekly. The face service entry is grouped into one PR because its transitive lock has to move as a unit, and the uv ecosystem reads `requirements.in` and regenerates `requirements.txt`. The Dockerfile is deliberately not watched: production builds from the Toolforge buildpack (which resolves the latest Python 3.11 patch on every build), so the Dockerfile only affects local development and the CI image job.
+**Dependabot** (`.github/dependabot.yml`) watches root `uv`, `model-server` `uv` and `github-actions`, weekly. The root lock is generated from `requirements.in` with `uv pip compile --universal --python-version 3.12 -c model-server/requirements.txt requirements.in -o requirements.txt` (run from the repository root, uv 0.13.5); the `-c` keeps the packages both locks pin on the same versions, because the face-service CI job installs both. `audit.yml` regenerates it and fails on any diff, which is also the safety net if a Dependabot PR does not regenerate it with that command. The face service entry is grouped into one PR because its transitive lock has to move as a unit, and the uv ecosystem reads `requirements.in` and regenerates `requirements.txt`. `protobuf >=7.0.0` is ignored because `kserve 0.21.0` requires `<7` and the probe can never resolve; drop that rule when a kserve release widens the cap. The Dockerfile is deliberately not watched: production builds from the Toolforge buildpack (which resolves the latest Python 3.12 patch on every build), so the Dockerfile only affects local development and the CI image job.
 
 ### CD (`.github/workflows/deploy.yml`)
 

@@ -344,7 +344,7 @@ other input sizes do not flood the log).
 ## Verified behaviour
 
 Checked locally against a freshly started service process (real KServe — 0.15.2 when
-this check was made, 0.21.0 in the current lock — real weights, Python 3.11,
+this check was made, 0.21.0 in the current lock — real weights, Python 3.12,
 Apple-silicon laptop; **not** inside Docker or the
 Toolforge buildpack image):
 
@@ -363,8 +363,8 @@ Toolforge buildpack image):
 | Service log | No `VerifyOutputSizes` warnings after the contract suite |
 
 Not measured: behaviour on Toolforge CPUs (expect 2–3x slower than a laptop),
-recall on hard Commons images against your own labelled faces (that is the
-plan's Phase 0), and encodings across machines.
+recall on hard Commons images against your own labelled faces (threshold
+calibration), and encodings across machines.
 
 ### Embeddings across machines
 
@@ -382,16 +382,16 @@ current model.
 
 ```bash
 cd model-server
-python3.11 -m venv .venv
+python3.12 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 .venv/bin/python model.py --model_name wikivisage --http_port 8080
 ```
 
-Python 3.11 is required: the `kserve` 0.21.x SDK runs on FastAPI/uvicorn
-(requires Python >=3.10,<3.14) and needs a modern interpreter. Do not
+Python 3.12 is required: `numpy` 2.5 declares `Requires-Python >=3.12`, and the
+`kserve` 0.21.x SDK caps the other end at `<3.14`. Do not
 downgrade to the `kserve` 0.8.x line — it pins
 `numpy~=1.19`, `ray==1.9.0`, and `protobuf==3.19.1`, none of which have wheels
-for or build on Python 3.11+.
+for or build on Python 3.12.
 
 ---
 
@@ -402,11 +402,11 @@ for or build on Python 3.11+.
 
 ```bash
 cd model-server
-uv pip compile --python-version 3.11 --python-platform x86_64-manylinux_2_28 \
+uv pip compile --python-version 3.12 --python-platform x86_64-manylinux_2_28 \
   requirements.in -o requirements.txt
 ```
 
-The target is the buildpack's Python and platform (Python 3.11, x86_64
+The target is the buildpack's Python and platform (Python 3.12, x86_64
 manylinux). Without `--upgrade`, uv keeps the pins already in
 `requirements.txt` and only changes what `requirements.in` demands; add
 `--upgrade` to also refresh every transitive pin to the newest version the
@@ -418,7 +418,7 @@ the generated lock with a plain `pip install -r requirements.txt`.
 For a targeted security bump, upgrade only the affected package:
 
 ```bash
-uv pip compile --python-version 3.11 --python-platform x86_64-manylinux_2_28 \
+uv pip compile --python-version 3.12 --python-platform x86_64-manylinux_2_28 \
   requirements.in -o requirements.txt --upgrade-package certifi
 ```
 
@@ -445,9 +445,9 @@ against a copy of `model-server/`:
 
 ```bash
 docker run --rm -u root -v /var/run/docker.sock:/var/run/docker.sock \
-  -v "$PWD/model-server":/workspace -w /workspace buildpacksio/pack \
+  -v "$PWD/model-server":/workspace -w /workspace buildpacksio/pack:0.40.10 \
   build wikivisage-face-bp --platform linux/amd64 \
-  --builder tools-harbor.wmcloud.org/toolforge/heroku-builder:24_0.21.8 \
+  --builder tools-harbor.wmcloud.org/toolforge/heroku-builder:24_20261023 \
   --buildpack heroku/python --buildpack heroku/procfile
 
 docker run --rm -p 8082:8000 --entrypoint web \

@@ -222,6 +222,26 @@
             flex-shrink: 0;
         }
         .flash-close:hover { opacity: 1; }
+        .inline-alert {
+            position: fixed;
+            top: 1rem;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 10001;
+            width: max-content;
+            max-width: min(92vw, 40rem);
+            padding: 1rem 1.5rem;
+            border-left: 4px solid var(--danger);
+            background-color: var(--surface);
+            color: var(--danger);
+            font-weight: 600;
+            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 1rem;
+        }
+        .inline-alert[hidden] { display: none; }
         .flash.success { border-color: var(--success); color: var(--success); }
         .flash.error { border-color: var(--danger); color: var(--danger); }
         .flash.warning { border-color: var(--warning); color: var(--warning); }
@@ -508,7 +528,7 @@
     <nav>
         <div class="nav-container nav-inner">
             <a href="{{ url_for('index') }}" class="nav-brand">WikiVisage <span class="beta-tag">BETA</span></a>
-            <button class="nav-toggle" onclick="var nl=document.querySelector('.nav-links');nl.classList.toggle('open');this.setAttribute('aria-expanded',nl.classList.contains('open'))" aria-label="{{ _('Toggle menu') }}" aria-expanded="false">&#9776;</button>
+            <button class="nav-toggle" id="navToggle" type="button" aria-label="{{ _('Toggle menu') }}" aria-expanded="false">&#9776;</button>
             <div class="nav-links">
                 {% if g.user %}
                     <a href="{{ url_for('dashboard') }}" {% if request.endpoint in ('dashboard', 'project_detail', 'classify', 'project_settings') %}class="active"{% endif %}>{{ _('Dashboard') }}</a>
@@ -525,14 +545,14 @@
                     <a href="{{ url_for('login') }}" class="btn btn-primary btn-sm">{{ _('Log in') }}</a>
                 {% endif %}
                 <span class="nav-separator"></span>
-                <select class="lang-select" onchange="handleLanguageChange(this)" aria-label="{{ _('Language') }}">
+                <select class="lang-select" id="langSelect" aria-label="{{ _('Language') }}">
                     {% for code, name in languages.items() %}
                     <option value="{{ code }}" {% if current_locale == code %}selected{% endif %}>🌐 {{ name }}</option>
                     {% endfor %}
                 </select>
             </div>
         </div>
-        <script>
+        <script nonce="{{ csp_nonce }}">
             function handleLanguageChange(selectEl) {
                 var v = selectEl && selectEl.value;
                 if (!v || !/^[a-z]{2,3}$/.test(v)) {
@@ -544,26 +564,77 @@
                 }
                 window.location.href = u;
             }
+
+            /* Page-wide behaviour that used to live in inline on*= attributes
+               (the CSP forbids those). Delegated on document so it also covers
+               elements rendered later and works on every page. */
+            (function() {
+                var langSelect = document.getElementById('langSelect');
+                if (langSelect) {
+                    langSelect.addEventListener('change', function() { handleLanguageChange(langSelect); });
+                }
+
+                var navToggle = document.getElementById('navToggle');
+                if (navToggle) {
+                    navToggle.addEventListener('click', function() {
+                        var nl = document.querySelector('.nav-links');
+                        nl.classList.toggle('open');
+                        navToggle.setAttribute('aria-expanded', nl.classList.contains('open'));
+                    });
+                }
+
+                /* <button data-dismiss-parent>: remove the element that wraps the button. */
+                document.addEventListener('click', function(e) {
+                    var btn = e.target.closest && e.target.closest('[data-dismiss-parent]');
+                    if (btn && btn.parentElement) btn.parentElement.remove();
+                });
+
+                /* <form data-confirm="message">: ask before submitting; Cancel blocks the submit. */
+                document.addEventListener('submit', function(e) {
+                    var msg = e.target.getAttribute && e.target.getAttribute('data-confirm');
+                    if (msg && !window.confirm(msg)) e.preventDefault();
+                });
+
+                /* The alert region is rendered after this script, so its close button is delegated too. */
+                document.addEventListener('click', function(e) {
+                    var btn = e.target.closest && e.target.closest('#inline-alert-close');
+                    if (btn) document.getElementById('inline-alert').hidden = true;
+                });
+            })();
+
+            /* Accessible replacement for window.alert(): fills the role="alert"
+               region declared below the flash messages. */
+            function showInlineAlert(message) {
+                var box = document.getElementById('inline-alert');
+                var text = document.getElementById('inline-alert-text');
+                if (!box || !text) return;
+                text.textContent = message;
+                box.hidden = false;
+            }
         </script>
     </nav>
 
     {% if worker_down and request.endpoint not in ('index', 'leaderboard', 'account_settings') %}
-    <div class="system-banner"><span>⚠ {{ _('The background worker appears to be offline. Image processing and face detection are paused.') }}</span><button class="banner-close" onclick="this.parentElement.remove()" aria-label="{{ _('Close') }}">&times;</button></div>
+    <div class="system-banner"><span>⚠ {{ _('The background worker appears to be offline. Image processing and face detection are paused.') }}</span><button class="banner-close" type="button" data-dismiss-parent aria-label="{{ _('Close') }}">&times;</button></div>
     {% endif %}
 
     {# Experimental LiftWing metadata pre-filter: only on the pages of a project
        that actually uses it, and only while the worker's probe says it is down. #}
     {% if liftwing_down and request.endpoint in ('project_detail', 'project_settings') and project and project.get('prefilter_mode', 'off') != 'off' %}
-    <div class="system-banner"><span>⚠ {{ _('The LiftWing AI service used for the metadata filter is currently unavailable. Image processing continues without it.') }}</span><button class="banner-close" onclick="this.parentElement.remove()" aria-label="{{ _('Close') }}">&times;</button></div>
+    <div class="system-banner"><span>⚠ {{ _('The LiftWing AI service used for the metadata filter is currently unavailable. Image processing continues without it.') }}</span><button class="banner-close" type="button" data-dismiss-parent aria-label="{{ _('Close') }}">&times;</button></div>
     {% endif %}
 
     <main class="container">
         <div class="flash-messages">
             {% for category, message in get_flashed_messages(with_categories=true) %}
-                <div class="flash {{ category }}"><span>{{ message }}</span><button class="flash-close" onclick="this.parentElement.remove()" aria-label="{{ _('Close') }}">&times;</button></div>
+                <div class="flash {{ category }}"><span>{{ message }}</span><button class="flash-close" type="button" data-dismiss-parent aria-label="{{ _('Close') }}">&times;</button></div>
             {% endfor %}
         </div>
-        
+        <div class="inline-alert" id="inline-alert" role="alert" aria-live="assertive" aria-atomic="true" hidden>
+            <span id="inline-alert-text"></span>
+            <button class="flash-close" id="inline-alert-close" type="button" aria-label="{{ _('Close') }}">&times;</button>
+        </div>
+
         {% block content %}{% endblock %}
     </main>
 
@@ -578,8 +649,8 @@
         <div class="cookie-banner-inner">
             <p class="cookie-text">{{ _('This site uses a cookie to remember your language preference. The session cookie is required for the site to function.') }}</p>
             <div class="cookie-actions">
-                <button class="btn btn-primary btn-sm" onclick="acceptCookies()">{{ _('Accept') }}</button>
-                <button class="btn btn-sm" onclick="declineCookies()">{{ _('Decline') }}</button>
+                <button class="btn btn-primary btn-sm" id="cookieAccept" type="button">{{ _('Accept') }}</button>
+                <button class="btn btn-sm" id="cookieDecline" type="button">{{ _('Decline') }}</button>
             </div>
         </div>
     </div>
@@ -618,7 +689,7 @@
         }
     </style>
     <div id="pwa-install" class="pwa-banner" style="display:none;">
-        <button class="pwa-close" onclick="localStorage.setItem('pwa_dismissed',new Date().toDateString());document.getElementById('pwa-install').style.display='none'" aria-label="{{ _('Close') }}">&times;</button>
+        <button class="pwa-close" id="pwa-close" type="button" aria-label="{{ _('Close') }}">&times;</button>
         <div class="pwa-banner-inner">
             <img src="{{ url_for('static', filename='icon-192.png') }}" alt="" class="pwa-icon">
             <div class="pwa-content">
@@ -710,6 +781,12 @@
             localStorage.setItem('cookie_consent', 'declined');
             document.getElementById('cookie-consent').style.display = 'none';
         }
+        document.getElementById('cookieAccept').addEventListener('click', acceptCookies);
+        document.getElementById('cookieDecline').addEventListener('click', declineCookies);
+        document.getElementById('pwa-close').addEventListener('click', function() {
+            localStorage.setItem('pwa_dismissed', new Date().toDateString());
+            document.getElementById('pwa-install').style.display = 'none';
+        });
     </script>
     <script nonce="{{ csp_nonce }}">
         if ("serviceWorker" in navigator) {

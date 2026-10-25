@@ -2,7 +2,8 @@ WikiVisage face service — third-party model weights
 ====================================================
 
 STATUS: EXPERIMENTAL. Accepted by the project owner on 2026-10-16 as a known
-licence risk; see docs/plans/face-model-upgrade.md, section 3.
+licence risk (decision recorded in PR #116, released as v0.11.0); the terms are
+summarised under "Terms" below.
 
 Files in this directory
 -----------------------

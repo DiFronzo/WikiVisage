@@ -41,19 +41,13 @@ INITIAL_BACKOFF = 1.0  # seconds
 class DatabaseError(Exception):
     """Base exception for database-related errors."""
 
-    pass
-
 
 class PoolExhaustedError(DatabaseError):
     """Raised when connection pool is exhausted and timeout is reached."""
 
-    pass
-
 
 class ConfigurationError(DatabaseError):
     """Raised when database configuration is invalid or missing."""
-
-    pass
 
 
 def _get_db_config() -> dict[str, Any]:
@@ -266,8 +260,7 @@ def get_connection(timeout: float = 30.0):
     """
     pc: _PooledConnection | None = None
     try:
-        result = _execute_with_retry(_get_connection_from_pool, timeout)
-        pc = result  # type: _PooledConnection
+        pc = _execute_with_retry(_get_connection_from_pool, timeout)
         yield pc.conn
     except Exception:
         if pc and pc.conn.open:

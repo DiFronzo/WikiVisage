@@ -1,8 +1,7 @@
 """Round-2 security patch tests.
 
 Covers (in order):
-- C1: Worker face-detect subprocess hardening (env scrub + RLIMIT)
-- H1: CSP nonce + object-src/base-uri/frame-ancestors
+- H1: CSP nonce-only script-src, script-src-attr 'none', object-src/base-uri/frame-ancestors
 - H2: OAuth refresh single-flight Redis lock (redis_lock.single_flight)
 - M1: /health surfaces Redis fallback as `degraded: true`
 - M2: PKCE (S256) on the OAuth authorize/token flow
@@ -17,6 +16,8 @@ from __future__ import annotations
 import base64
 import hashlib
 import os
+import re
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -65,17 +66,15 @@ def _normalize_server_name():
 
 
 class TestCSPHardening:
-    """Round-2 H1 (partial): tighten Content-Security-Policy with the three
-    directives that don't require a template refactor.
+    """Round-2 H1: object-src / base-uri / frame-ancestors, plus a nonce-only
+    script-src.
 
-    NOTE: We intentionally do NOT include a `'nonce-...'` source alongside
-    `'unsafe-inline'`. Per CSP Level 3, browsers ignore `'unsafe-inline'` when
-    a nonce or hash source is present — which would silently break ~106 inline
-    style="" attributes and ~41 inline event handlers across our templates
-    (logout button, mobile nav toggle, language selector, PWA install banner).
-    A future ticket can do the full nonce-only refactor; for now we keep the
-    inline-style/handler ergonomics and ship the three directives below, which
-    are the genuine security wins of H1 and are independent of nonces.
+    Scripts are allowed only by the per-request nonce (`script-src 'self'
+    'nonce-...'`) and inline event-handler attributes are forbidden by
+    `script-src-attr 'none'`. Per CSP Level 3 a nonce makes browsers ignore
+    `'unsafe-inline'` in the same directive, so `script-src` must never carry
+    both. `style-src` keeps `'unsafe-inline'` (many style="" attributes remain)
+    and has no nonce, so it is unaffected.
     """
 
     def test_csp_header_contains_required_directives(self):
@@ -87,38 +86,53 @@ class TestCSPHardening:
         assert "frame-ancestors 'none'" in csp, "must block clickjacking"
         assert "default-src 'self'" in csp, "baseline restriction"
 
-    def test_csp_does_not_neutralize_unsafe_inline_with_nonce(self):
-        """Regression guard: if a future change re-introduces 'nonce-...' into
-        script-src or style-src while 'unsafe-inline' is also present, browsers
-        per CSP3 will silently ignore 'unsafe-inline' and break inline styles
-        and inline event handlers (logout button white background, mobile nav
-        toggle dead, language selector dead, PWA banner mispositioned, etc.).
-        """
-        client = app_module.app.test_client()
-        resp = client.get("/health")
-        csp = resp.headers.get("Content-Security-Policy", "")
-        # Either drop 'unsafe-inline', or drop the nonce — never both together.
-        if "'unsafe-inline'" in csp:
-            assert "'nonce-" not in csp, (
-                "CSP regression: 'nonce-...' alongside 'unsafe-inline' makes "
-                "browsers ignore 'unsafe-inline' (CSP3 §6.7.2.2) and breaks "
-                'all inline style="" and inline event handlers.'
-            )
+    @staticmethod
+    def _directive(csp, name):
+        for part in csp.split(";"):
+            part = part.strip()
+            if part.startswith(name + " "):
+                return part
+        raise AssertionError(f"{name} missing from CSP: {csp}")
 
-    def test_csp_unsafe_inline_present_for_template_compat(self):
-        """We currently rely on 'unsafe-inline' for inline styles/handlers."""
+    def test_script_src_is_nonce_only_without_unsafe_inline(self):
         client = app_module.app.test_client()
-        resp = client.get("/health")
-        csp = resp.headers.get("Content-Security-Policy", "")
-        assert "script-src 'self' 'unsafe-inline'" in csp
-        assert "style-src 'self' 'unsafe-inline'" in csp
+        csp = client.get("/health").headers.get("Content-Security-Policy", "")
+        script_src = self._directive(csp, "script-src")
+        assert "'unsafe-inline'" not in script_src
+        assert re.fullmatch(r"script-src 'self' 'nonce-[A-Za-z0-9_-]{32,}'", script_src), script_src
+
+    def test_script_src_attr_forbids_inline_handlers(self):
+        client = app_module.app.test_client()
+        csp = client.get("/health").headers.get("Content-Security-Policy", "")
+        assert self._directive(csp, "script-src-attr") == "script-src-attr 'none'"
+
+    def test_style_src_keeps_unsafe_inline_for_style_attributes(self):
+        client = app_module.app.test_client()
+        csp = client.get("/health").headers.get("Content-Security-Policy", "")
+        assert self._directive(csp, "style-src") == "style-src 'self' 'unsafe-inline'"
+
+    def test_header_nonce_differs_per_request(self):
+        client = app_module.app.test_client()
+        nonces = {
+            re.search(r"'nonce-([^']+)'", client.get("/health").headers["Content-Security-Policy"]).group(1)
+            for _ in range(3)
+        }
+        assert len(nonces) == 3
+
+    def test_header_nonce_matches_the_nonce_on_rendered_script_tags(self):
+        """The nonce in the header must be the very value templates render."""
+        client = app_module.app.test_client()
+        resp = client.get("/")
+        assert resp.status_code == 200
+        header_nonce = re.search(r"'nonce-([^']+)'", resp.headers["Content-Security-Policy"]).group(1)
+        html = resp.get_data(as_text=True)
+        script_nonces = set(re.findall(r'<script\b[^>]*\bnonce="([^"]+)"', html))
+        assert script_nonces == {header_nonce}
+        assert len(re.findall(r"<script\b", html)) == len(re.findall(r'<script\b[^>]*\bnonce="', html))
 
     def test_per_request_csp_nonce_still_generated_for_templates(self):
-        """`g.csp_nonce` is still populated on every request so templates that
-        reference `{{ csp_nonce }}` (~30 occurrences) keep rendering. The
-        nonce just isn't advertised in the CSP header right now — harmless,
-        and means a future nonce-only refactor won't need template changes.
-        """
+        """`g.csp_nonce` is populated on every request; the header and the
+        `{{ csp_nonce }}` template variable both read it."""
         with app_module.app.test_request_context("/"):
             # Trigger before_request manually
             for func in app_module.app.before_request_funcs.get(None, []):
@@ -128,6 +142,48 @@ class TestCSPHardening:
             assert hasattr(g, "csp_nonce"), "g.csp_nonce must be set per request"
             assert isinstance(g.csp_nonce, str)
             assert len(g.csp_nonce) >= 32, "nonce must have >=32 chars of entropy"
+
+
+class TestTemplatesAreCSPClean:
+    """Static guard: with `script-src-attr 'none'` and nonce-only `script-src`,
+    a single inline handler or un-nonced <script> silently stops working in
+    production. Check the Jinja sources so a regression fails in CI."""
+
+    TEMPLATES = sorted((Path(__file__).resolve().parent.parent / "templates").glob("*.html"))
+
+    @staticmethod
+    def _markup_without_script_bodies(source):
+        source = re.sub(r"\{#.*?#\}", "", source, flags=re.DOTALL)
+        return re.sub(r"(<script\b[^>]*>).*?(</script\b[^>]*>)", r"\1\2", source, flags=re.DOTALL | re.IGNORECASE)
+
+    def test_templates_found(self):
+        assert len(self.TEMPLATES) >= 10
+
+    def test_no_inline_event_handler_attributes(self):
+        pattern = re.compile(r"""[\s"'/]on[a-z]{3,}\s*=""", re.IGNORECASE)
+        offenders = []
+        for path in self.TEMPLATES:
+            markup = self._markup_without_script_bodies(path.read_text(encoding="utf-8"))
+            for match in pattern.finditer(markup):
+                line = markup[: match.start()].count("\n") + 1
+                offenders.append(f"{path.name}: {markup.splitlines()[line - 1].strip()[:100]}")
+        assert not offenders, "inline event handlers are blocked by the CSP:\n" + "\n".join(offenders)
+
+    def test_no_javascript_urls(self):
+        for path in self.TEMPLATES:
+            assert not re.search(r"javascript\s*:", path.read_text(encoding="utf-8"), re.IGNORECASE), path.name
+
+    def test_every_script_tag_carries_the_nonce(self):
+        offenders = []
+        for path in self.TEMPLATES:
+            for tag in re.findall(r"<script\b[^>]*>", path.read_text(encoding="utf-8"), re.IGNORECASE):
+                if 'nonce="{{ csp_nonce }}"' not in tag:
+                    offenders.append(f"{path.name}: {tag}")
+        assert not offenders, "<script> without nonce is blocked by the CSP:\n" + "\n".join(offenders)
+
+    def test_no_window_alert_calls(self):
+        for path in self.TEMPLATES:
+            assert not re.search(r"(?<![\w.])alert\(", path.read_text(encoding="utf-8")), path.name
 
 
 # ---------------------------------------------------------------------------
@@ -341,43 +397,18 @@ class TestSDCMidBatchCancel:
     """`write_sdc_claims` re-checks `sdc_write_requested` every
     `_PER_FACE_CANCEL_CHECK_EVERY` faces. Without this, a user clicking Stop
     could still see up to SDC_BATCH (=50) extra Commons writes happen before
-    the next outer-loop check fires."""
+    the next outer-loop check fires.
 
-    def test_per_face_cancel_constant_present_and_small(self):
-        """The interval must exist and be <= SDC_BATCH (otherwise the inner
-        check is structurally useless)."""
-        # Read the module source to assert the constant is defined inside
-        # write_sdc_claims (it's a function-local for clarity).
-        import inspect
+    The behaviour (a stop is noticed within five faces; a failed check never
+    stops the run) is exercised end to end in tests/test_worker_sdc.py
+    (`test_stop_button_is_noticed_within_five_faces` and
+    `test_a_failed_mid_batch_cancel_check_does_not_stop_the_write`). These
+    tests only pin the configuration those rely on."""
 
-        src = inspect.getsource(worker_module.write_sdc_claims)
-        assert "_PER_FACE_CANCEL_CHECK_EVERY" in src
-        # Must be checked against sdc_write_requested
-        assert "sdc_write_requested" in src
-
-    def test_inner_check_uses_sdc_write_requested_column(self):
-        """The mid-batch query must SELECT the cancel flag — not some other
-        weaker indicator (e.g. project state)."""
-        import inspect
-
-        src = inspect.getsource(worker_module.write_sdc_claims)
-        # Look for the mid-batch SELECT (separate from the outer loop's check).
-        # Both checks query the same column; we assert at least 2 occurrences.
-        assert src.count("sdc_write_requested") >= 2, (
-            "Expected both outer-loop and per-face cancel checks to query sdc_write_requested"
-        )
-
-    def test_mid_batch_database_error_is_non_fatal(self):
-        """A failed cancel-check during a batch must not abort the write —
-        we keep going with what we have, since failing-closed would block
-        legitimate writes during a brief DB hiccup."""
-        import inspect
-
-        src = inspect.getsource(worker_module.write_sdc_claims)
-        # The pattern: `except DatabaseError: pass` (or equivalent) should be
-        # present near the inner check.
-        assert "DatabaseError" in src
-        assert "pass" in src
+    def test_per_face_cancel_interval_is_small_relative_to_the_batch(self):
+        """An interval at or above the batch size would make the inner check useless."""
+        assert 1 <= worker_module._PER_FACE_CANCEL_CHECK_EVERY < worker_module._SDC_WRITE_BATCH
+        assert worker_module._PER_FACE_CANCEL_CHECK_EVERY <= 5
 
 
 # ---------------------------------------------------------------------------

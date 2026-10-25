@@ -1646,6 +1646,7 @@ def test_write_sdc_insert_ignore_zero_other_project_fresh_skips():
         patch("worker._refresh_worker_token", return_value="fake-token"),
         patch("worker._get_csrf_token", return_value="fake-csrf"),
         patch("worker._api_request"),
+        patch("worker.time.sleep"),  # the blocked-page back-off must not really wait
         patch("worker.shutdown_requested", False),
     ):
         result = write_sdc_claims(project)
@@ -2459,33 +2460,6 @@ def test_touch_heartbeat_file_uses_worker_id(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Tests for _build_skip_extensions_regex
-# ---------------------------------------------------------------------------
-
-
-def test_build_skip_extensions_regex_empty_set():
-    import re
-
-    from worker import _build_skip_extensions_regex
-
-    pattern = _build_skip_extensions_regex(set())
-    assert pattern == r"(?!)"
-    assert not re.search(pattern, "File:something.webm")
-    assert not re.search(pattern, "anything")
-
-
-def test_build_skip_extensions_regex_nonempty():
-    import re
-
-    from worker import _build_skip_extensions_regex
-
-    pattern = _build_skip_extensions_regex({".webm", ".ogg"})
-    assert re.search(pattern, "File:clip.webm")
-    assert re.search(pattern, "File:audio.ogg")
-    assert not re.search(pattern, "File:photo.jpg")
-
-
-# ---------------------------------------------------------------------------
 # Tests for _api_request
 # ---------------------------------------------------------------------------
 
@@ -2769,7 +2743,7 @@ def test_refresh_worker_token_still_valid():
 
     with (
         patch("worker.execute_query", return_value=[user]),
-        patch("worker.decrypt_token", side_effect=lambda t: t),
+        patch("oauth_refresh.decrypt_token", side_effect=lambda t: t),
     ):
         result = _refresh_worker_token(1)
 
@@ -2791,7 +2765,7 @@ def test_refresh_worker_token_no_refresh_token():
 
     with (
         patch("worker.execute_query", return_value=[user]),
-        patch("worker.decrypt_token", side_effect=lambda t: t),
+        patch("oauth_refresh.decrypt_token", side_effect=lambda t: t),
     ):
         result = _refresh_worker_token(1)
 
@@ -2817,7 +2791,7 @@ def test_refresh_worker_token_api_failure():
 
     with (
         patch("worker.execute_query", return_value=[user]),
-        patch("worker.decrypt_token", side_effect=lambda t: t),
+        patch("oauth_refresh.decrypt_token", side_effect=lambda t: t),
         patch("worker._get_session") as mock_session,
     ):
         mock_session.return_value.post.return_value = mock_resp
@@ -2846,8 +2820,8 @@ def test_refresh_worker_token_missing_access_token_in_response():
 
     with (
         patch("worker.execute_query", return_value=[user]),
-        patch("worker.decrypt_token", side_effect=lambda t: t),
-        patch("worker.encrypt_token", side_effect=lambda t: t),
+        patch("oauth_refresh.decrypt_token", side_effect=lambda t: t),
+        patch("oauth_refresh.encrypt_token", side_effect=lambda t: t),
         patch("worker._get_session") as mock_session,
     ):
         mock_session.return_value.post.return_value = mock_resp
@@ -2899,8 +2873,8 @@ def test_refresh_worker_token_rowcount_zero_reads_fresh():
 
     with (
         patch("worker.execute_query", side_effect=mock_execute_query),
-        patch("worker.decrypt_token", side_effect=lambda t: t),
-        patch("worker.encrypt_token", side_effect=lambda t: t),
+        patch("oauth_refresh.decrypt_token", side_effect=lambda t: t),
+        patch("oauth_refresh.encrypt_token", side_effect=lambda t: t),
         patch("worker._get_session") as mock_session,
         # Round 2 H2: refresh now acquires a single-flight lock. Force the
         # acquire path so we exercise the full UPDATE → rowcount==0 → re-read.
@@ -3511,7 +3485,7 @@ def test_write_sdc_no_access_token_sets_error():
     assert result == 0
     error_updates = [(s, p) for s, p in db_calls if "sdc_write_error" in s and "UPDATE projects" in s]
     assert len(error_updates) == 1
-    assert "Token expired" in error_updates[0][0]  # error message is in SQL, not params
+    assert "Token expired" in error_updates[0][1][0]
 
 
 def test_write_sdc_csrf_failure_sets_error():
@@ -3535,7 +3509,7 @@ def test_write_sdc_csrf_failure_sets_error():
     assert result == 0
     error_updates = [(s, p) for s, p in db_calls if "sdc_write_error" in s and "UPDATE projects" in s]
     assert len(error_updates) == 1
-    assert "CSRF" in error_updates[0][0]  # error message is in SQL, not params
+    assert "CSRF" in error_updates[0][1][0]
 
 
 def test_write_sdc_invalid_qid_sets_error():
@@ -3557,7 +3531,7 @@ def test_write_sdc_invalid_qid_sets_error():
         result = write_sdc_claims(project)
 
     assert result == 0
-    error_updates = [(s, p) for s, p in db_calls if "Invalid QID" in str(s)]
+    error_updates = [(s, p) for s, p in db_calls if "UPDATE projects" in s and "Invalid QID" in str(p)]
     assert len(error_updates) == 1
 
 
@@ -4161,7 +4135,7 @@ def test_inference_skips_invalid_confirmed_encodings():
     project = {"id": 20, "min_confirmed": 2, "distance_threshold": 0.6}
 
     confirmed_rows = [
-        {"encoding": b"short"},  # Invalid: not 1024 bytes
+        {"encoding": b"short"},  # Invalid: not 2048 bytes
         {"encoding": _make_embedding(1)},  # Valid
         {"encoding": _make_embedding(2)},  # Valid
     ]

@@ -137,9 +137,8 @@ def test_requirements_drop_dlib_and_pin_the_onnx_stack():
 
 def test_no_deb_packages_are_needed():
     assert not (MODEL_SERVER / "project.toml").exists()
-    for name in ("Dockerfile", "blubber.yaml"):
-        text = (MODEL_SERVER / name).read_text()
-        assert "openblas" not in text and "liblapack" not in text
+    dockerfile = (MODEL_SERVER / "Dockerfile").read_text()
+    assert "openblas" not in dockerfile and "liblapack" not in dockerfile
 
 
 def test_dockerfile_and_dockerignore_ship_the_backend_and_weights():
@@ -404,7 +403,7 @@ def test_pixel_limit_is_enforced(model, monkeypatch):
 
 
 def test_exif_orientation_is_not_applied(model):
-    """Behaviour must match the dlib service: the decoded array is used as stored."""
+    """Behaviour must match the old dlib-based service: the decoded array is used as stored."""
     exif = Image.Exif()
     exif[0x0112] = 6  # "rotate 90 degrees"
     buf = io.BytesIO()

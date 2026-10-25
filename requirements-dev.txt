@@ -4,8 +4,8 @@
 -r requirements.txt
 
 # Testing
-pytest>=9.1
+pytest>=9.1.1
 pytest-cov>=7.1
 
 # Linting
-ruff>=0.17
+ruff>=0.17.2

@@ -237,7 +237,6 @@ def db_conn(test_db):
                 "faces",
                 "images",
                 "projects",
-                "sessions",
                 "user_stats",
                 "users",
                 "worker_heartbeat",
@@ -490,3 +489,18 @@ def integration_client(integration_app, db_conn, seed_user):
     yield test_client, seed_user, app_module
 
     monkeypatch.undo()
+
+
+@pytest.fixture
+def fake_user():
+    """A logged-in user row, as ``before_request`` loads it, for the web-app route tests."""
+    from datetime import UTC, datetime, timedelta
+
+    return {
+        "id": 1,
+        "wiki_user_id": 123,
+        "wiki_username": "tester",
+        "access_token": "token",
+        "refresh_token": "refresh",
+        "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
+    }

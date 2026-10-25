@@ -18,23 +18,6 @@ CREATE TABLE IF NOT EXISTS users (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 
--- Sessions table: reserved for future server-side session storage (Flask-Session).
--- Currently unused — the app uses signed cookie sessions. Kept for forward compatibility.
-CREATE TABLE IF NOT EXISTS sessions (
-    id              VARCHAR(255)    PRIMARY KEY,
-    user_id         BIGINT UNSIGNED NULL,
-    data            MEDIUMBLOB      NOT NULL,
-    expires_at      DATETIME        NOT NULL,
-    created_at      DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
-
-    INDEX idx_sessions_user_id (user_id),
-    INDEX idx_sessions_expires_at (expires_at),
-
-    CONSTRAINT fk_sessions_user
-        FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
-
 -- Projects table: each project targets one Wikidata entity in one Commons category.
 CREATE TABLE IF NOT EXISTS projects (
     id                  BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
@@ -42,7 +25,7 @@ CREATE TABLE IF NOT EXISTS projects (
     wikidata_qid        VARCHAR(20)     NOT NULL COMMENT 'e.g. Q42',
     commons_category    VARCHAR(255)    NOT NULL COMMENT 'Category name without "Category:" prefix',
     label               VARCHAR(255)    NOT NULL DEFAULT '' COMMENT 'Human-readable label for the target entity',
-    distance_threshold  FLOAT           NOT NULL DEFAULT 0.5 COMMENT 'Cosine distance threshold for autonomous inference (provisional default, see docs/plans/face-model-upgrade.md)',
+    distance_threshold  FLOAT           NOT NULL DEFAULT 0.5 COMMENT 'Cosine distance threshold for autonomous inference (provisional default)',
     min_confirmed       INT UNSIGNED    NOT NULL DEFAULT 5 COMMENT 'Minimum confirmed faces before autonomous mode',
     status              ENUM('active', 'paused', 'completed', 'deleted') NOT NULL DEFAULT 'active',
     completion_reason   ENUM('no_faces', 'insufficient_faces') NULL COMMENT 'Why the project was auto-completed by the worker',

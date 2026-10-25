@@ -3,7 +3,7 @@
 The service is published on the public internet (``https://<tool>.toolforge.org``),
 so this middleware is what stands between it and anyone who finds the URL.
 It is plain ASGI with no third-party imports so it can be unit-tested without
-installing KServe or dlib.
+installing KServe or the ML stack.
 
 With a token configured:
 

@@ -1,5 +1,3 @@
-var VIDEO_EXTENSIONS = ['.webm', '.ogv', '.ogg'];
-var TIF_EXTENSIONS = ['.tif', '.tiff'];
 var THUMB_STEPS = [20, 40, 60, 120, 250, 330, 500, 960, 1280, 1920, 3840];
 function snapThumbWidth(w) {
     for (var i = 0; i < THUMB_STEPS.length; i++) {

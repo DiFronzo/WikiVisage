@@ -363,22 +363,6 @@ def test_execute_query_with_parameterized_insert(db_pool, db_conn):
 # ---------------------------------------------------------------------------
 
 
-def _fake_op_error():
-    """Build a fake pymysql OperationalError."""
-    return OperationalError(2006, "Server gone away")
-
-
-class _FakePCWithCursor:
-    """Fake _PooledConnection that also supports cursor context manager."""
-
-    def __init__(self, *, is_open=True, rollback_raises=False):
-        self.conn = _FakeConn(is_open=is_open, rollback_raises=rollback_raises)
-
-    @property
-    def is_expired(self):
-        return False
-
-
 def test_execute_with_retry_success_on_first_attempt(monkeypatch):
     """`_execute_with_retry` returns the result immediately on success."""
 
@@ -578,9 +562,6 @@ def test_get_connection_from_pool_exhausted_raises(monkeypatch):
 def test_get_connection_from_pool_evicts_dead_connection(monkeypatch):
     """`_get_connection_from_pool` replaces a dead connection with a fresh one."""
     dead_conn = _FakeConn()
-
-    class DeadPC(database._PooledConnection):
-        pass
 
     dead_pc = database._PooledConnection(dead_conn)
 

@@ -133,7 +133,7 @@ toolforge jobs run migrate \
   --mem 512Mi
 ```
 
-This creates all 10 tables (`users`, `sessions`, `projects`, `images`, `faces`, `user_stats`, `sdc_claims`, `project_members`, `worker_heartbeat`, `service_status`) and their indexes. Safe to re-run — migrations are idempotent.
+This creates all 9 tables (`users`, `projects`, `images`, `faces`, `user_stats`, `sdc_claims`, `project_members`, `worker_heartbeat`, `service_status`) and their indexes. Safe to re-run — migrations are idempotent.
 
 Check the migration completed:
 
@@ -149,7 +149,7 @@ toolforge jobs logs migrate
 toolforge webservice buildservice start --mount none
 ```
 
-The `Procfile` runs gunicorn with 2 workers on port 8000.
+The `Procfile` runs gunicorn with 2 `gthread` workers (4 threads each) on port 8000, so a slow request (face service, Wikidata) occupies one thread instead of a whole worker.
 
 Your app will be live at: **https://wikivisage.toolforge.org**
 
@@ -159,27 +159,21 @@ Your app will be live at: **https://wikivisage.toolforge.org**
 
 WikiVisage uses 2 concurrent worker instances for distributed processing. Workers claim projects via `SELECT … FOR UPDATE` with automatic stale-claim expiry (15 min).
 
-Load both workers from `jobs.yaml`:
-
-```bash
-toolforge jobs load jobs.yaml
-```
-
-This starts two continuous jobs (`ml-worker` and `ml-worker-2`) that crawl Commons categories, download images, detect faces, and run the classification model. Each worker polls for new work every 60 seconds.
-
-If `jobs.yaml` loading fails, start workers manually:
+Start both workers:
 
 ```bash
 toolforge jobs run ml-worker \
   --command 'python -u worker.py --worker-id ml-worker-1' \
   --image tool-wikivisage/tool-wikivisage:latest \
-  --continuous --mem 2Gi --cpu 2
+  --continuous --mem 2Gi --cpu 2 --health-check-script './healthcheck.sh ml-worker-1'
 
 toolforge jobs run ml-worker-2 \
   --command 'python -u worker.py --worker-id ml-worker-2' \
   --image tool-wikivisage/tool-wikivisage:latest \
-  --continuous --mem 2Gi --cpu 2
+  --continuous --mem 2Gi --cpu 2 --health-check-script './healthcheck.sh ml-worker-2'
 ```
+
+This starts two continuous jobs (`ml-worker` and `ml-worker-2`) that crawl Commons categories, download images, detect faces, and run the classification model. Each worker polls for new work every 60 seconds. `deploy.yml` starts them the same way.
 
 Check worker status:
 
@@ -397,12 +391,12 @@ toolforge build show
 # Restart web service
 toolforge webservice restart
 
-# Restart both workers (delete + run because jobs load doesn't restart unchanged jobs)
+# Restart both workers (delete + run; there is no "update" command)
 toolforge jobs delete ml-worker || true
-toolforge jobs run ml-worker --command 'python -u worker.py --worker-id ml-worker-1' --image tool-wikivisage/tool-wikivisage:latest --continuous --mem 2Gi --cpu 2
+toolforge jobs run ml-worker --command 'python -u worker.py --worker-id ml-worker-1' --image tool-wikivisage/tool-wikivisage:latest --continuous --mem 2Gi --cpu 2 --health-check-script './healthcheck.sh ml-worker-1'
 
 toolforge jobs delete ml-worker-2 || true
-toolforge jobs run ml-worker-2 --command 'python -u worker.py --worker-id ml-worker-2' --image tool-wikivisage/tool-wikivisage:latest --continuous --mem 2Gi --cpu 2
+toolforge jobs run ml-worker-2 --command 'python -u worker.py --worker-id ml-worker-2' --image tool-wikivisage/tool-wikivisage:latest --continuous --mem 2Gi --cpu 2 --health-check-script './healthcheck.sh ml-worker-2'
 ```
 
 ### Restart web service only
@@ -438,9 +432,9 @@ toolforge envvars create FLASK_SECRET_KEY "<new-value>"
 # Restart services to pick up changes
 toolforge webservice restart
 toolforge jobs delete ml-worker || true
-toolforge jobs run ml-worker --command 'python -u worker.py --worker-id ml-worker-1' --image tool-wikivisage/tool-wikivisage:latest --continuous --mem 2Gi --cpu 2
+toolforge jobs run ml-worker --command 'python -u worker.py --worker-id ml-worker-1' --image tool-wikivisage/tool-wikivisage:latest --continuous --mem 2Gi --cpu 2 --health-check-script './healthcheck.sh ml-worker-1'
 toolforge jobs delete ml-worker-2 || true
-toolforge jobs run ml-worker-2 --command 'python -u worker.py --worker-id ml-worker-2' --image tool-wikivisage/tool-wikivisage:latest --continuous --mem 2Gi --cpu 2
+toolforge jobs run ml-worker-2 --command 'python -u worker.py --worker-id ml-worker-2' --image tool-wikivisage/tool-wikivisage:latest --continuous --mem 2Gi --cpu 2 --health-check-script './healthcheck.sh ml-worker-2'
 ```
 
 ---
@@ -461,13 +455,10 @@ toolforge jobs logs ml-worker-2
 
 # Restart workers
 toolforge jobs delete ml-worker || true
-toolforge jobs run ml-worker --command 'python -u worker.py --worker-id ml-worker-1' --image tool-wikivisage/tool-wikivisage:latest --continuous --mem 2Gi --cpu 2
+toolforge jobs run ml-worker --command 'python -u worker.py --worker-id ml-worker-1' --image tool-wikivisage/tool-wikivisage:latest --continuous --mem 2Gi --cpu 2 --health-check-script './healthcheck.sh ml-worker-1'
 
 toolforge jobs delete ml-worker-2 || true
-toolforge jobs run ml-worker-2 --command 'python -u worker.py --worker-id ml-worker-2' --image tool-wikivisage/tool-wikivisage:latest --continuous --mem 2Gi --cpu 2
-
-# Or reload from jobs.yaml
-toolforge jobs load jobs.yaml
+toolforge jobs run ml-worker-2 --command 'python -u worker.py --worker-id ml-worker-2' --image tool-wikivisage/tool-wikivisage:latest --continuous --mem 2Gi --cpu 2 --health-check-script './healthcheck.sh ml-worker-2'
 ```
 
 ### OAuth login fails
@@ -515,4 +506,4 @@ become wikivisage-face && toolforge jobs logs face-service | tail -50
 
 - Verify credentials: `toolforge envvars list`
 - Verify the database exists: `mariadb --defaults-file=$HOME/replica.my.cnf -h tools.db.svc.wikimedia.cloud -e "SHOW DATABASES LIKE '%wikiface%'"`
-- Check that migration has run: look for 10 tables in the database
+- Check that migration has run: look for 9 tables in the database

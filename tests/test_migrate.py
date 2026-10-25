@@ -298,7 +298,6 @@ def test_all_tables_exist(test_db: str, db_conn) -> None:
     existing_tables = {list(row.values())[0] for row in rows}
     expected_tables = {
         "users",
-        "sessions",
         "projects",
         "images",
         "faces",
@@ -306,6 +305,7 @@ def test_all_tables_exist(test_db: str, db_conn) -> None:
     }
 
     assert expected_tables.issubset(existing_tables)
+    assert "sessions" not in existing_tables
 
 
 @pytest.mark.integration
@@ -405,7 +405,6 @@ def test_foreign_keys_exist(test_db: str, db_conn) -> None:
 
     constraints = {row["CONSTRAINT_NAME"] for row in rows}
     expected_constraints = {
-        "fk_sessions_user",
         "fk_projects_user",
         "fk_images_project",
         "fk_faces_image",
@@ -414,6 +413,7 @@ def test_foreign_keys_exist(test_db: str, db_conn) -> None:
     }
 
     assert expected_constraints.issubset(constraints)
+    assert "fk_sessions_user" not in constraints
 
 
 @pytest.mark.integration
@@ -873,6 +873,34 @@ def test_alter_migrations_include_faces_aligned():
     assert "AFTER confidence" in matching[0]
 
 
+def test_alter_migrations_drop_the_unused_sessions_table():
+    matching = [sql for _desc, sql in _ALTER_MIGRATIONS if "sessions" in sql]
+
+    assert matching == ["DROP TABLE IF EXISTS sessions"]
+
+
+def test_schema_sql_no_longer_defines_a_sessions_table() -> None:
+    schema = (Path(__file__).resolve().parent.parent / "schema.sql").read_text(encoding="utf-8")
+
+    assert "CREATE TABLE IF NOT EXISTS sessions" not in schema
+    # reset still drops the legacy table from older databases.
+    assert "sessions" in _ALL_TABLES
+
+
+def test_alter_migrations_refresh_the_distance_threshold_comment():
+    matching = [
+        sql
+        for _desc, sql in _ALTER_MIGRATIONS
+        if sql.startswith("ALTER TABLE projects") and "distance_threshold" in sql and "MODIFY COLUMN" in sql
+    ]
+
+    assert len(matching) == 1
+    # The comment must not point at a document that no longer exists, and must
+    # match schema.sql / the embedding upgrade.
+    assert "provisional default)" in matching[0]
+    assert "docs/plans" not in matching[0]
+
+
 def test_alter_migrations_never_anchor_on_columns_the_upgrade_creates():
     """The ALTER list runs before apply_embedding_model_upgrade(), so an AFTER
     on a column only the upgrade creates (det_score, embedding_model) breaks the
@@ -880,6 +908,49 @@ def test_alter_migrations_never_anchor_on_columns_the_upgrade_creates():
     for description, sql in _ALTER_MIGRATIONS:
         assert "AFTER det_score" not in sql, description
         assert "AFTER embedding_model" not in sql, description
+
+
+@pytest.mark.integration
+def test_alter_migrations_remove_a_legacy_sessions_table(test_db: str, db_conn, db_pool) -> None:
+    """Older databases still carry the unused sessions table; the migration drops it."""
+    import migrate
+
+    with db_conn.cursor() as cur:
+        cur.execute(
+            "CREATE TABLE sessions (id VARCHAR(255) PRIMARY KEY, user_id BIGINT UNSIGNED NULL, "
+            "data MEDIUMBLOB NOT NULL, expires_at DATETIME NOT NULL, "
+            "CONSTRAINT fk_sessions_user FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE)"
+        )
+
+    migrate._apply_alter_migrations()
+
+    with db_conn.cursor() as cur:
+        cur.execute("SHOW TABLES LIKE 'sessions'")
+        assert cur.fetchone() is None
+
+
+@pytest.mark.integration
+def test_alter_migrations_apply_the_current_distance_threshold_comment(test_db: str, db_conn, db_pool) -> None:
+    """Every database must end up with the schema.sql comment, not just fresh ones.
+
+    The comment is also written by apply_embedding_model_upgrade(), which runs
+    once. A database migrated before the text changed would otherwise keep a
+    comment pointing at a deleted document.
+    """
+    import migrate
+
+    with db_conn.cursor() as cur:
+        cur.execute(
+            "ALTER TABLE projects MODIFY COLUMN distance_threshold FLOAT NOT NULL DEFAULT 0.5 COMMENT 'stale text'"
+        )
+
+    migrate._apply_alter_migrations()
+
+    with db_conn.cursor() as cur:
+        cur.execute("SHOW FULL COLUMNS FROM projects LIKE 'distance_threshold'")
+        comment = cur.fetchone()["Comment"]
+
+    assert comment == "Cosine distance threshold for autonomous inference (provisional default)"
 
 
 def test_schema_sql_defines_faces_aligned_column():
