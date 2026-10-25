@@ -154,7 +154,7 @@ class TestTemplatesAreCSPClean:
     @staticmethod
     def _markup_without_script_bodies(source):
         source = re.sub(r"\{#.*?#\}", "", source, flags=re.DOTALL)
-        return re.sub(r"(<script\b[^>]*>).*?(</script>)", r"\1\2", source, flags=re.DOTALL | re.IGNORECASE)
+        return re.sub(r"(<script\b[^>]*>).*?(</script\b[^>]*>)", r"\1\2", source, flags=re.DOTALL | re.IGNORECASE)
 
     def test_templates_found(self):
         assert len(self.TEMPLATES) >= 10
