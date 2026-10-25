@@ -152,6 +152,14 @@ def refresh_tokens(
 
     with single_flight(get_redis(), f"oauth-refresh:{user_id}", ttl_seconds=LOCK_TTL_SECONDS) as got_lock:
         if got_lock:
+            credentials = read_user_tokens(query, user_id, label=label)
+            if credentials is None:
+                return None
+            if is_fresh(credentials.expires_at):
+                return credentials
+            if not credentials.refresh_token:
+                logger.error(f"No refresh token for {label}, cannot refresh")
+                return None
             return _exchange_and_store(
                 user_id,
                 credentials,
