@@ -40,6 +40,7 @@ _ALL_TABLES = [
     "user_stats",
     "worker_heartbeat",
     "worker_heartbeats",
+    "worker_wake",
     "service_status",
     "users",
 ]
@@ -492,6 +493,36 @@ _ALTER_MIGRATIONS = [
         "  version VARCHAR(32) NULL"
         ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
     ),
+    (
+        "Create worker_wake table",
+        "CREATE TABLE IF NOT EXISTS worker_wake ("
+        "  id TINYINT UNSIGNED NOT NULL PRIMARY KEY,"
+        "  seq BIGINT UNSIGNED NOT NULL DEFAULT 0"
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
+    ),
+    (
+        "Add detect_attempts and detect_isolate to images",
+        "ALTER TABLE images "
+        "ADD COLUMN detect_attempts TINYINT UNSIGNED NOT NULL DEFAULT 0 "
+        "COMMENT 'Detections that failed on this image alone after a test detection had just worked' "
+        "AFTER error_message, "
+        "ADD COLUMN detect_isolate TINYINT(1) NOT NULL DEFAULT 0 "
+        "COMMENT '1=send this image to the face service alone (its request failed and the service could not be tested)' "
+        "AFTER detect_attempts",
+    ),
+    (
+        "Add the last inference run record to projects",
+        "ALTER TABLE projects "
+        "ADD COLUMN last_inference_run INT UNSIGNED NOT NULL DEFAULT 0 "
+        "COMMENT 'Counts the inference runs that classified faces, never reset, so the page can tell a newer run from one the user already closed' "
+        "AFTER last_inference_min_confirmed, "
+        "ADD COLUMN last_inference_at DATETIME NULL "
+        "COMMENT 'When an inference run last classified faces (the project page keeps its completion card until the user closes it)' "
+        "AFTER last_inference_run, "
+        "ADD COLUMN last_inference_matches INT UNSIGNED NULL "
+        "COMMENT 'Faces that run classified as matches' "
+        "AFTER last_inference_at",
+    ),
 ]
 
 
@@ -658,6 +689,7 @@ def verify_tables() -> None:
         "user_stats",
         "worker_heartbeat",
         "worker_heartbeats",
+        "worker_wake",
         "sdc_claims",
         "project_members",
         "service_status",

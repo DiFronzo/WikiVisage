@@ -393,10 +393,14 @@
                             </span>
                         {% endif %}
                         
-                        {% if project.images_total == 0 %}
+                        {% if project.images_total == 0 and project.status != 'active' %}
+                            <div class="dash-status">
+                                <span class="dash-status-label">{{ _('No images') }}</span>
+                            </div>
+                        {% elif project.images_total == 0 %}
                             <div class="dash-status">
                                 <div class="dash-status-pulse"></div>
-                                <span class="dash-status-label">{{ _('Waiting for worker') }}&hellip;</span>
+                                <span class="dash-status-label">{% if project.id in claimed_ids %}{{ _('Reading category') }}{% else %}{{ _('Waiting for worker') }}{% endif %}&hellip;</span>
                             </div>
                         {% elif project.images_processed == project.images_total %}
                             <div class="dash-progress">

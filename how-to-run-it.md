@@ -615,6 +615,63 @@ curl -s https://wikivisage-face.toolforge.org/v1/models/wikivisage
 become wikivisage-face && toolforge jobs logs face-service | tail -50
 ```
 
+### One project stops part-way ("224 / 264 images")
+
+The face service is up and everything else processes, but one project stays at
+the same count. A few images are failing **on their own**. There are two ways,
+and the cause of the one production report was never confirmed, so look at the
+logs first:
+
+- **A download keeps failing** (`Transient error downloading image` in the log): Commons
+  answers 5xx or times out for that one file's thumbnail. It earns a strike
+  whenever another download of the same wave worked (or a small canary thumbnail
+  downloads), and never while Commons serves nothing or answers 429. The third
+  strike marks it `error`.
+- **The face service chokes on it** (a huge or damaged file hangs or crashes the
+  service and takes the other images of its request down with it).
+
+The worker handles the second in three steps (strikes are shared):
+
+1. After a failed request it waits up to `WIKIVISAGE_DETECT_RECOVERY_WAIT`
+   (60 s) for the face service to **detect** again (a tiny real detection, not
+   just "ready"), then re-sends the images one at a time, testing the service
+   before each one.
+2. An image that fails alone right after a working test is sent alone once more
+   (another thread or worker may have hurt the shared service meanwhile); one that
+   fails both times gets a strike
+   (`images.detect_attempts`). The third strike (`WIKIVISAGE_MAX_DETECT_ATTEMPTS`)
+   marks it `error`, so the project can finish.
+3. If the service does not recover in time, nobody is blamed: the images are
+   flagged `detect_isolate` and go alone next cycle.
+
+It takes about three poll cycles for a bad image to be written off, so wait a few
+minutes before digging.
+
+```bash
+# Which images are holding it up
+toolforge jobs logs ml-worker   | grep -E "Transient error downloading|Detection failed for|Giving up on|Face service batch of|stopped early"
+toolforge jobs logs ml-worker-2 | grep -E "Transient error downloading|Detection failed for|Giving up on|Face service batch of|stopped early"
+```
+
+```sql
+-- in the tool's database: the stragglers of one project, worst first
+SELECT id, file_title, status, detect_attempts, detect_isolate, error_message
+FROM images WHERE project_id = <ID> AND (status = 'pending' OR detect_attempts > 0 OR detect_isolate = 1)
+ORDER BY detect_attempts DESC, id;
+```
+
+If `detect_attempts` stays 0 while images stay pending and the log says `Face
+service unreachable` or `batch ... failed` for every image, it is the service
+itself (the previous section, or a face service that answers readiness but cannot
+detect: look at `toolforge jobs logs face-service`), not the images. Images are
+never struck while a test detection fails, so this cannot write good images off.
+
+A project that never leaves "Waiting for worker..." is the wake-up or the
+workers: the web app wakes them through the `worker_wake` table (they also poll
+every minute), and `/health` shows how many workers have a fresh heartbeat. A
+project that is paused or completed with no images says "No images have been
+found" instead, because no worker will come for it.
+
 ### Database connection errors
 
 - Verify credentials: `toolforge envvars list`

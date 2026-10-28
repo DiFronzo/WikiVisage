@@ -36,6 +36,9 @@ CREATE TABLE IF NOT EXISTS projects (
     faces_confirmed     INT UNSIGNED    NOT NULL DEFAULT 0,
     last_inference_threshold FLOAT       NULL COMMENT 'distance_threshold used in last inference run',
     last_inference_min_confirmed INT UNSIGNED NULL COMMENT 'min_confirmed used in last inference run',
+    last_inference_run INT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'Counts the inference runs that classified faces, never reset, so the page can tell a newer run from one the user already closed',
+    last_inference_at DATETIME   NULL COMMENT 'When an inference run last classified faces (the project page keeps its completion card until the user closes it)',
+    last_inference_matches INT UNSIGNED NULL COMMENT 'Faces that run classified as matches',
     sdc_write_requested TINYINT(1)      NOT NULL DEFAULT 0 COMMENT '1=user requested SDC writes, worker picks up',
     sdc_write_user_id   BIGINT UNSIGNED NULL COMMENT 'User who triggered SDC writes (their token is used)',
     sdc_write_error     VARCHAR(1024)   NULL COMMENT 'Error message from last SDC write attempt',
@@ -76,6 +79,8 @@ CREATE TABLE IF NOT EXISTS images (
     prefilter_reason VARCHAR(160)   NULL COMMENT 'LiftWing reason for the pre-filter verdict',
     prefilter_checked_at DATETIME   NULL COMMENT 'When the LiftWing pre-filter checked this image',
     error_message   VARCHAR(1024)   NULL COMMENT 'Error details if status is error',
+    detect_attempts TINYINT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'Detections that failed on this image alone after a test detection had just worked',
+    detect_isolate  TINYINT(1)      NOT NULL DEFAULT 0 COMMENT '1=send this image to the face service alone (its request failed and the service could not be tested)',
     created_at      DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at      DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
 
@@ -223,6 +228,17 @@ CREATE TABLE IF NOT EXISTS worker_heartbeats (
     phase               VARCHAR(64)     NULL COMMENT 'What the main loop was doing at last_progress',
     started_at          DATETIME        NULL,
     version             VARCHAR(32)     NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+
+-- Wake counter. The web app bumps seq when it wants the workers to run a cycle now (a new
+-- project, a send-edits request, a re-run). Every worker remembers the last value it handled
+-- and wakes when it sees a new one. A counter in the database, because the web app and the
+-- workers run in different containers and share nothing else. No seed row is needed: the first
+-- bump inserts it and a missing row reads as 0.
+CREATE TABLE IF NOT EXISTS worker_wake (
+    id      TINYINT UNSIGNED NOT NULL PRIMARY KEY,
+    seq     BIGINT UNSIGNED  NOT NULL DEFAULT 0
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 

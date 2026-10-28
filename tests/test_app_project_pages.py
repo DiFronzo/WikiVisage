@@ -1,6 +1,7 @@
 """Tests for the web app: project pages."""
 
 from datetime import UTC, datetime, timedelta
+from html.parser import HTMLParser
 from unittest.mock import MagicMock, mock_open, patch
 
 import pytest
@@ -277,6 +278,60 @@ def test_dashboard_defaults_page_and_totals(monkeypatch):
     assert captured["context"]["projects"] == []
     assert any("COUNT(DISTINCT p.id) AS cnt" in sql for sql, _params, _fetch in calls)
     assert any("SELECT DISTINCT p.*" in sql for sql, _params, _fetch in calls)
+
+
+def _dashboard_body(monkeypatch, projects, claimed_ids=()):
+    fake_user = _fake_user_chunk3()
+    claim_queries = []
+
+    def _handler(sql, params, fetch):
+        if "COUNT(DISTINCT p.id) AS cnt" in sql:
+            return [{"cnt": len(projects)}]
+        if "SELECT DISTINCT p.*" in sql:
+            return projects
+        if "worker_claimed_by IS NOT NULL" in sql:
+            claim_queries.append(params)
+            return [{"id": i} for i in claimed_ids]
+        if "FROM project_members" in sql:
+            return ()
+        raise AssertionError(sql)
+
+    client, _ = _make_authenticated_client_chunk3(monkeypatch, _user_aware_execute(fake_user, _handler))
+    return client.get("/dashboard").get_data(as_text=True), claim_queries
+
+
+def _dash_project(project_id, status, images_total):
+    return {
+        "id": project_id,
+        "user_id": 1,
+        "label": f"Project {project_id}",
+        "wikidata_qid": "Q42",
+        "commons_category": "Cat",
+        "p18_thumb_url": "https://thumb.jpg",
+        "status": status,
+        "images_total": images_total,
+        "images_processed": 0,
+        "faces_confirmed": 0,
+        "min_confirmed": 5,
+    }
+
+
+def test_dashboard_says_waiting_reading_or_no_images_per_project(monkeypatch):
+    projects = [_dash_project(1, "active", 0), _dash_project(2, "active", 0), _dash_project(3, "completed", 0)]
+
+    body, claim_queries = _dashboard_body(monkeypatch, projects, claimed_ids=[2])
+
+    assert body.count("Waiting for worker&hellip;") == 1  # project 1, queued
+    assert body.count("Reading category&hellip;") == 1  # project 2, a worker has it
+    assert body.count("No images") == 1  # project 3: completed, nobody will come
+    assert claim_queries[0][:2] == (1, 2)  # asked once, about the two active projects only
+
+
+def test_dashboard_asks_no_claim_question_when_every_project_has_images(monkeypatch):
+    body, claim_queries = _dashboard_body(monkeypatch, [_dash_project(1, "active", 12)])
+
+    assert claim_queries == []
+    assert "Waiting for worker" not in body
 
 
 def test_dashboard_invalid_page_falls_back_to_one(monkeypatch):
@@ -1212,7 +1267,7 @@ def test_project_new_successful_creation_with_missing_p18_thumb(monkeypatch):
     assert insert_calls[0][0][6] is None
 
 
-def test_project_new_wake_file_oserror_is_non_critical(monkeypatch):
+def test_project_new_wakes_the_workers_and_a_failed_wake_is_non_critical(monkeypatch):
     fake_user = _fake_user_chunk3()
 
     def _handler(sql, _params, _fetch):
@@ -1232,10 +1287,8 @@ def test_project_new_wake_file_oserror_is_non_critical(monkeypatch):
     monkeypatch.setattr(app_module, "_fetch_p18_thumb_url", lambda _qid: "thumb")
     monkeypatch.setattr(app_module, "_fetch_wikidata_label", lambda _qid: "Label")
 
-    def _raise_open(*_args, **_kwargs):
-        raise OSError("disk full")
-
-    monkeypatch.setattr("builtins.open", _raise_open)
+    wake = MagicMock(return_value=False)  # the wake could not be written
+    monkeypatch.setattr(app_module, "request_wake", wake)
 
     client, _ = _make_authenticated_client_chunk3(monkeypatch, _user_aware_execute(fake_user, _handler))
     _set_csrf_chunk3(client)
@@ -1246,6 +1299,7 @@ def test_project_new_wake_file_oserror_is_non_critical(monkeypatch):
 
     assert response.status_code == 302
     assert response.headers["Location"].endswith("/dashboard")
+    wake.assert_called_once_with()
 
 
 def test_project_new_db_error_on_insert_renders_form_with_error(monkeypatch):
@@ -1673,17 +1727,352 @@ def test_project_detail_offers_no_reauthorize_for_other_worker_errors(monkeypatc
     assert 'href="/login?reauth=1' not in body
 
 
-def test_project_detail_inference_banner_hidden_while_processing(monkeypatch):
-    """Queued image work with no eligible faces → banner exists hidden so the poller can reveal it."""
+def _no_images_yet_body(monkeypatch, *, claimed, status="active"):
+    """The project page of a project with no images yet; *claimed* says whether a worker holds it."""
+    base = _project_detail_banner_eq(
+        project_overrides={"images_total": 0, "images_processed": 0, "status": status},
+        stats_overrides={"total_faces": 0, "unclassified": 0, "human_confirmed": 0},
+    )
+    claim_queries = []
+
+    def eq(sql, params=None, fetch=True):
+        if "worker_claimed_by IS NOT NULL" in sql:
+            claim_queries.append((sql, params))
+            return [{"id": 1}] if claimed else ()
+        return base(sql, params, fetch)
+
+    client, _ = _auth_client_chunk4(monkeypatch, eq)
+    body = client.get("/project/1").get_data(as_text=True)
+    return body, claim_queries
+
+
+def _progress_card(body):
+    return body.split('id="progressCard"')[1].split("</div>\n</div>")[0]
+
+
+def test_project_with_no_images_yet_says_it_is_waiting_for_a_worker_until_one_claims_it(monkeypatch):
+    body, _queries = _no_images_yet_body(monkeypatch, claimed=False)
+    card = _progress_card(body)
+
+    assert "This project is waiting for a background worker. It starts as soon as one is free." in card
+    assert "Waiting for worker&hellip;" in card
+    assert "listing the images in this category" not in card
+    assert "hasn&#39;t discovered" not in body and "minute or two" not in body  # the old, wrong promise
+
+
+def test_project_with_no_images_yet_says_the_worker_is_reading_the_category_once_it_has_it(monkeypatch):
+    body, _queries = _no_images_yet_body(monkeypatch, claimed=True)
+    card = _progress_card(body)
+
+    assert "The background worker is listing the images in this category." in card
+    assert "Reading category&hellip;" in card
+    assert "waiting for a background worker" not in card
+    assert "Waiting for worker" not in card
+
+
+def test_the_claim_only_counts_while_it_has_not_expired(monkeypatch):
+    """A claim a dead worker left behind must not make the page say somebody is reading the category."""
+    from config import CLAIM_EXPIRY_MINUTES
+
+    _body, queries = _no_images_yet_body(monkeypatch, claimed=True)
+
+    assert len(queries) == 1
+    sql, params = queries[0]
+    assert "worker_claimed_at > NOW() - INTERVAL %s MINUTE" in sql
+    assert params == (1, CLAIM_EXPIRY_MINUTES)
+
+
+@pytest.mark.parametrize("status", ["completed", "paused"])
+def test_a_project_nobody_will_work_on_does_not_promise_a_worker(monkeypatch, status):
+    """On a completed project this sat right above "automatically completed", promising a worker that never comes."""
+    body, queries = _no_images_yet_body(monkeypatch, claimed=False, status=status)
+    card = _progress_card(body)
+
+    assert "No images have been found for this project." in card
+    assert "waiting for a background worker" not in card and "Waiting for worker" not in card
+    assert 'id="progressBar"' not in card and 'id="progressMsg"' not in card  # the poller leaves such a card alone
+    assert queries == []  # and nothing asked for a claim
+
+
+def test_a_project_that_has_images_never_asks_for_a_claim(monkeypatch):
+    eq = _project_detail_banner_eq()
+    claim_queries = []
+
+    def wrapped(sql, params=None, fetch=True):
+        if "worker_claimed_by IS NOT NULL" in sql:
+            claim_queries.append(sql)
+        return eq(sql, params, fetch)
+
+    client, _ = _auth_client_chunk4(monkeypatch, wrapped)
+    client.get("/project/1")
+
+    assert claim_queries == []
+
+
+def test_the_progress_poller_swaps_the_waiting_text_for_the_reading_text(monkeypatch):
+    body, _queries = _no_images_yet_body(monkeypatch, claimed=False)
+
+    assert "readingMsg:" in body and "waitingMsg:" in body and "reading:" in body
+    assert "data.claimed ? i18nProgress.readingMsg : i18nProgress.waitingMsg" in body
+    assert "if (total === 0) return;" not in body  # it used to give up here and leave "waiting" for ever
+
+
+class _InferenceCard(HTMLParser):
+    """What the page's inference card says and looks like, read from the rendered HTML (not pinned markup)."""
+
+    def __init__(self, body):
+        super().__init__()
+        self.present = False
+        self.classes: set[str] = set()
+        self.run = None
+        self.hidden = False
+        self.text = ""
+        self.has_spinner = self.has_done_icon = False
+        self._depth = 0  # > 0 while inside the card
+        self._in_text = False
+        self.feed(body)
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if attrs.get("id") == "inferenceBanner":
+            self.present, self._depth = True, 1
+            self.classes = set((attrs.get("class") or "").split())
+            self.run = int(attrs.get("data-run", "0"))
+            self.hidden = "display:none" in (attrs.get("style") or "").replace(" ", "")
+            return
+        if not self._depth:
+            return
+        if tag not in ("br", "img", "input"):
+            self._depth += 1
+        classes = (attrs.get("class") or "").split()
+        self.has_spinner |= "inference-spinner" in classes
+        self.has_done_icon |= "inference-done-icon" in classes
+        self._in_text = self._in_text or attrs.get("id") == "inferenceText"
+
+    def handle_endtag(self, tag):
+        if self._depth:
+            self._depth -= 1
+            if tag == "p":
+                self._in_text = False
+
+    def handle_data(self, data):
+        if self._in_text:
+            self.text += data
+
+    @property
+    def state(self):
+        """'absent', 'hidden', 'waiting', 'running' or 'done': what a visitor sees."""
+        if not self.present:
+            return "absent"
+        if self.hidden:
+            return "hidden"
+        if "inference-banner-done" in self.classes:
+            return "done"
+        return "waiting" if self.text.strip().startswith("Waiting for") else "running"
+
+    @property
+    def message(self):
+        return " ".join(self.text.split())
+
+
+def _card(body):
+    return _InferenceCard(body)
+
+
+def _processing_page(monkeypatch, *, pending, query_string=""):
+    """224 of 264 images processed, 728 faces waiting: the page of the production report."""
+    eq = _project_detail_banner_eq(
+        project_overrides={"images_total": 264, "images_processed": 264 - pending},
+        stats_overrides={"human_confirmed": 6, "unclassified": 728},
+        pending=pending,
+        eligible=728,
+    )
+    client, _ = _auth_client_chunk4(monkeypatch, eq)
+    return client.get("/project/1" + query_string).get_data(as_text=True)
+
+
+def test_a_card_says_the_model_waits_for_the_images_while_some_are_pending(monkeypatch):
+    """The model starts once every image has been processed: until then the card says it is waiting."""
+    card = _card(_processing_page(monkeypatch, pending=40))
+
+    assert card.state == "waiting"
+    assert card.message == "Waiting for 40 more images to be processed before running the model…"
+    assert card.has_spinner and not card.has_done_icon
+    assert "in progress" not in card.message
+
+
+def test_the_waiting_card_has_a_singular_form_for_the_last_image(monkeypatch):
+    card = _card(_processing_page(monkeypatch, pending=1))
+
+    assert card.message == "Waiting for the last image to be processed before running the model…"
+
+
+def test_the_info_banner_steps_aside_for_the_waiting_card(monkeypatch):
+    """Both used to say the same thing: the worker is still processing images, inference follows."""
+    body = _processing_page(monkeypatch, pending=40)
+
+    assert 'id="infoBanner"' not in body
+    assert "Model inference will start once all images have been processed." not in body
+
+
+def test_the_info_banner_still_reports_pending_images_when_the_card_does_not(monkeypatch):
+    """Not enough human-confirmed faces: no card to wait on, so the banner keeps its job."""
+    eq = _project_detail_banner_eq(
+        project_overrides={"images_total": 264, "images_processed": 224},
+        stats_overrides={"human_confirmed": 1},
+        pending=40,
+    )
+    client, _ = _auth_client_chunk4(monkeypatch, eq)
+    body = client.get("/project/1").get_data(as_text=True)
+
+    assert _card(body).state in ("absent", "hidden")
+    assert 'id="infoBanner"' in body
+    assert "More faces will appear as processing continues." in body
+
+
+def test_a_paused_project_does_not_claim_the_model_waits_for_images(monkeypatch):
+    """Nothing processes the images of a paused project, so "waiting" would never end."""
+    eq = _project_detail_banner_eq(
+        project_overrides={"status": "paused", "images_total": 264, "images_processed": 224},
+        stats_overrides={"human_confirmed": 6},
+        pending=40,
+    )
+    client, _ = _auth_client_chunk4(monkeypatch, eq)
+
+    assert _card(client.get("/project/1").get_data(as_text=True)).state != "waiting"
+
+
+def test_the_inference_card_appears_once_the_last_image_is_processed(monkeypatch):
+    card = _card(_processing_page(monkeypatch, pending=0))
+
+    assert card.state == "running"
+    assert card.message == "Model inference in progress — 728 faces remaining…"
+
+
+def test_the_poller_follows_waiting_running_and_done(monkeypatch):
+    body = _processing_page(monkeypatch, pending=40)
+
+    assert "var waiting = projectActive && canInfer && pending > 0;" in body
+    assert "var running = eligible > 0 && canInfer && pending === 0;" in body
+    assert "var projectActive = true;" in body
+    assert "waitingOne:" in body and "waiting:" in body
+
+
+def test_a_rerun_does_not_announce_completion_while_images_are_pending(monkeypatch):
+    card = _card(_processing_page(monkeypatch, pending=40, query_string="?inference_triggered=1"))
+
+    assert card.state == "waiting"
+    assert "complete" not in card.message
+
+
+def _page_after_a_run(monkeypatch, *, finished=datetime(2026, 10, 28, 12, 0), run=3, matches=12, pending=0, eligible=0):
+    """The project page some time after an inference run ended (nothing running, nothing to process)."""
+    eq = _project_detail_banner_eq(
+        project_overrides={"last_inference_at": finished, "last_inference_run": run, "last_inference_matches": matches},
+        pending=pending,
+        eligible=eligible,
+    )
+    client, _ = _auth_client_chunk4(monkeypatch, eq)
+    return client.get("/project/1").get_data(as_text=True)
+
+
+def test_the_complete_card_is_there_after_a_reload_without_any_flag_in_the_url(monkeypatch):
+    """It used to exist only in the page that watched the run end: a reload or a later visit had nothing to show."""
+    card = _card(_page_after_a_run(monkeypatch))
+
+    assert card.state == "done"
+    assert card.run == 3  # the run's number, which closing the card remembers
+    assert card.message == "Model inference complete — 12 new matches found."
+    assert card.has_done_icon and not card.has_spinner
+
+
+@pytest.mark.parametrize(
+    ("matches", "message"),
+    [
+        (1, "Model inference complete — 1 new match found."),
+        (0, "Model inference complete — 0 new matches found."),
+        (None, "Model inference complete."),
+    ],
+)
+def test_the_complete_card_counts_its_matches_in_the_right_number(monkeypatch, matches, message):
+    assert _card(_page_after_a_run(monkeypatch, matches=matches)).message == message
+
+
+def test_no_card_for_a_project_that_never_finished_an_inference_run(monkeypatch):
+    eq = _project_detail_banner_eq()
+    client, _ = _auth_client_chunk4(monkeypatch, eq)
+
+    assert _card(client.get("/project/1").get_data(as_text=True)).state == "absent"
+
+
+def test_an_earlier_complete_card_gives_way_to_the_running_look_when_a_new_run_starts(monkeypatch):
+    card = _card(_page_after_a_run(monkeypatch, eligible=7))
+
+    assert card.state == "running"
+    assert card.message == "Model inference in progress — 7 faces remaining…"
+    assert card.has_spinner and not card.has_done_icon
+
+
+def test_an_earlier_complete_card_gives_way_to_the_waiting_card_when_new_images_arrive(monkeypatch):
+    """Live (the poller) and after a reload agree: pending images mean waiting, not "complete"."""
+    card = _card(_page_after_a_run(monkeypatch, pending=40))
+
+    assert card.state == "waiting"
+
+
+def test_a_rerun_record_that_was_cleared_shows_no_complete_card(monkeypatch):
+    """The re-run route clears the timestamp and the count, not the run counter: nothing to announce."""
+    card = _card(_page_after_a_run(monkeypatch, finished=None, matches=None))
+
+    assert card.state == "absent"
+
+
+def test_closing_the_card_remembers_which_run_it_was_so_a_newer_run_shows_again(monkeypatch):
+    body = _page_after_a_run(monkeypatch)
+
+    # at load: hidden only if the closed run is this one or newer
+    assert "parseInt(card.dataset.run||'0',10)" in body
+    assert "if(closedRun>0&&closedRun>=shownRun)card.remove()" in body
+    # in a function: a top-level "var closed" is window.closed, which silently ignores the assignment
+    assert "(function(){try{var card=document.getElementById('inferenceBanner')" in body
+    assert "var closed=" not in body
+    # on the X: only a finished run's card remembers its run (a waiting or running card has none to
+    # remember, and the old fixed "1" hid every later completion for good)
+    assert "card.classList.contains('inference-banner-done')" in body
+    assert "String(Math.max(run, 1))" not in body
+    assert "localStorage.setItem('inference_closed_run_1', String(run))" in body
+    assert "localStorage.removeItem('inference_closed_run_1')" not in body
+    assert "inference_dismissed_1'" not in body  # the 0.12.0 key held a fixed '1', not a run number
+    # and the poller tags the card with the run it just announced
+    assert "banner.dataset.run = String(recorded ? recordedRun : baseRun);" in body
+    assert "var baseRun = 3;" in body  # the run on record when the page was rendered
+
+
+def test_inference_run_token_is_the_run_counter_and_zero_without_a_record():
+    from datetime import datetime as dt
+
+    token = app_module._inference_run_token
+    now = dt(2026, 10, 28, 12, 0, 0)
+
+    assert token({}) == 0 and token({"last_inference_at": None, "last_inference_run": 4}) == 0
+    assert token({"last_inference_at": now, "last_inference_run": 1}) == 1
+    # two runs in the same second, or a database clock set back, cannot confuse a counter
+    assert token({"last_inference_at": now, "last_inference_run": 2}) == 2
+    assert token({"last_inference_at": dt(2020, 1, 1), "last_inference_run": 3}) == 3
+    assert token({"last_inference_at": now}) == 0  # the column does not exist yet (not migrated)
+
+
+def test_project_detail_inference_banner_hidden_while_the_category_is_still_being_read(monkeypatch):
+    """Images still being discovered, nothing eligible → the card exists hidden so the poller can reveal it."""
     eq = _project_detail_banner_eq(
         project_overrides={"images_processed": 3, "images_total": 10},
-        pending=4,
+        pending=0,
         eligible=0,
     )
     client, _ = _auth_client_chunk4(monkeypatch, eq)
     body = client.get("/project/1").get_data(as_text=True)
 
-    assert 'id="inferenceBanner" role="status" aria-live="polite" style="display:none"' in body
+    assert _card(body).state == "hidden"
     assert "pollInference" in body
     # Regression pins for the poller's stop/finalize rules (Copilot review, PR #118):
     # a removed banner must stop the timer, and the observed-work marker must persist.
@@ -1707,8 +2096,8 @@ def test_project_detail_inference_banner_visible_while_running(monkeypatch):
     client, _ = _auth_client_chunk4(monkeypatch, eq)
     body = client.get("/project/1").get_data(as_text=True)
 
-    assert '<div class="card inference-banner" id="inferenceBanner" role="status" aria-live="polite">' in body
-    assert "Model inference in progress — 7 faces remaining…" in body
+    assert _card(body).state == "running"
+    assert _card(body).message == "Model inference in progress — 7 faces remaining…"
     assert "(fs.sdc_pending || 0) + (fs.sdc_removal_pending_faces || 0)" in body
 
 
@@ -1729,7 +2118,9 @@ def test_project_detail_inference_completion_counts_only_model_matches(monkeypat
     body = client.get("/project/1?inference_triggered=1").get_data(as_text=True)
 
     assert "var initialModelMatches = 3;" in body
-    assert "var newMatches = Math.max(0, (fs.model_matches || 0) - initialModelMatches);" in body
+    # the run's own count when the server has it, else only the model's matches (not by_model) since load
+    assert "(recorded && typeof data.inference_matches === 'number')" in body
+    assert ": Math.max(0, (fs.model_matches || 0) - initialModelMatches);" in body
 
 
 def test_project_settings_get_renders_form(monkeypatch, fake_user):
@@ -2193,6 +2584,8 @@ def test_project_rerun_inference_successful_reset_with_affected_faces(monkeypatc
     assert response.status_code == 302
     assert any("UPDATE faces f" in sql for sql in executed_sql)
     assert any("UPDATE projects SET last_inference_threshold = NULL" in sql for sql in executed_sql)
+    # the results of the earlier run are being reset, so its "complete" record goes too
+    assert any("last_inference_at = NULL, last_inference_matches = NULL" in sql for sql in executed_sql)
     flashes = _flashes_chunk6(client)
     assert any(cat == "success" and "Reset 4 model-classified faces." in msg for cat, msg in flashes)
     assert any(cat == "info" and "10/7 human-confirmed" in msg for cat, msg in flashes)
@@ -3306,7 +3699,7 @@ def test_project_rerun_inference_db_error_loading_project_returns_500(monkeypatc
     assert response.status_code == 500
 
 
-def test_project_rerun_inference_ignores_wake_file_oserror(monkeypatch, fake_user):
+def test_project_rerun_inference_wakes_the_workers_and_ignores_a_failed_wake(monkeypatch, fake_user):
     def route_execute(sql, _params, _fetch):
         if "SELECT * FROM projects WHERE id = %s AND user_id = %s" in sql:
             return [
@@ -3327,12 +3720,14 @@ def test_project_rerun_inference_ignores_wake_file_oserror(monkeypatch, fake_use
         "execute_transaction",
         lambda fn: _fake_rerun_transaction(fn, min_confirmed=7, human_confirmed=8, rows_reset=3),
     )
-    monkeypatch.setattr("builtins.open", MagicMock(side_effect=OSError("disk error")))
+    wake = MagicMock(return_value=False)
+    monkeypatch.setattr(app_module, "request_wake", wake)
 
     response = client.post("/project/1/rerun-inference", data={"csrf_token": "testtoken"})
 
     assert response.status_code == 302
     assert any(cat == "success" and "Reset 3 model-classified faces." in msg for cat, msg in _flashes_chunk6(client))
+    wake.assert_called_once_with()
 
 
 def test_project_rerun_inference_stats_query_db_error_resets_nothing(monkeypatch, fake_user):

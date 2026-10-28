@@ -362,7 +362,7 @@ def test_api_write_sdc_update_db_error(monkeypatch, fake_user):
     assert response.get_json()["error"] == "Database error"
 
 
-def test_api_write_sdc_wakeup_file_oserror_ignored(monkeypatch, fake_user):
+def test_api_write_sdc_wakes_the_workers_and_ignores_a_failed_wake(monkeypatch, fake_user):
     def route_execute(sql, _params, _fetch):
         if "FROM projects p LEFT JOIN project_members" in sql:
             return [{"id": 1, "user_id": 1, "status": "active", "sdc_write_requested": 0}]
@@ -375,11 +375,14 @@ def test_api_write_sdc_wakeup_file_oserror_ignored(monkeypatch, fake_user):
     client = _make_authed_client(monkeypatch, fake_user, route_execute)
     _set_csrf_chunk6(client)
 
-    with patch("builtins.open", side_effect=OSError("nope")):
-        response = client.post("/api/write-sdc/1", data={"csrf_token": "testtoken"})
+    wake = MagicMock(return_value=False)
+    monkeypatch.setattr(app_module, "request_wake", wake)
+
+    response = client.post("/api/write-sdc/1", data={"csrf_token": "testtoken"})
 
     assert response.status_code == 200
     assert response.get_json()["status"] == "ok"
+    wake.assert_called_once_with()
 
 
 def test_api_sdc_status_project_not_found(monkeypatch, fake_user):

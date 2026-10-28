@@ -641,3 +641,314 @@ def test_inline_alert_action_only_accepts_same_origin_paths(open_gallery):
     playwright.expect(action).to_be_visible()
     assert action.get_attribute("href") == "/login?reauth=1"
     assert not page.errors
+
+
+# The waiting card: a new project shows "waiting" until a worker takes it, then "reading the category".
+
+
+def _open_project_page(browser, flask_app, monkeypatch, project_overrides):
+    module = importlib.import_module("app")
+    project = {**_PROJECT, "status": "active", "images_total": 0, "images_processed": 0, **project_overrides}
+
+    def query(sql, params=None, fetch=True):
+        if "FROM users WHERE id = %s" in sql:
+            return [
+                {
+                    "id": 1,
+                    "wiki_username": "tester",
+                    "access_token": "token",
+                    "refresh_token": "refresh",
+                    "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
+                }
+            ]
+        if "worker_claimed_by IS NOT NULL" in sql:  # is a worker holding the project right now?
+            return [{"id": 1}] if project.get("worker_claimed_by") else ()
+        if "status = 'pending'" in sql:
+            return [{"cnt": counts["pending"]}]
+        if "f.is_target IS NULL" in sql:  # faces waiting for the model
+            return [{"cnt": counts["eligible"]}]
+        if "COUNT(*) AS cnt" in sql:
+            return [{"cnt": 0}]
+        return ()
+
+    counts = {"pending": 0, "eligible": 0}
+    monkeypatch.setattr(module, "execute_query", query)
+    monkeypatch.setattr(module, "get_project_for_actor", lambda *args: project.copy())
+    monkeypatch.setattr(module, "_get_face_stats", lambda *args: _STATS.copy())
+    client = flask_app.test_client()
+    with client.session_transaction() as session:
+        session["user_id"] = 1
+
+    def serve(route):
+        parsed = urlparse(route.request.url)
+        if parsed.hostname != "wikivisage.test":
+            route.abort()
+            return
+        if parsed.path.startswith("/commons-thumb/"):  # the app answers with a redirect, which cannot be fulfilled
+            route.fulfill(content_type="image/svg+xml", body='<svg xmlns="http://www.w3.org/2000/svg"/>')
+            return
+        if parsed.path == "/api/project/1/gallery":
+            route.fulfill(json={"faces": [], "page": 1, "total_pages": 1, "total": 0})
+            return
+        response = client.get(parsed.path + ("?" + parsed.query if parsed.query else ""))
+        route.fulfill(status=response.status_code, content_type=response.content_type, body=response.data)
+
+    context = browser.new_context(service_workers="block")
+    context.route("**/*", serve)
+    page = context.new_page()
+    page.counts = counts
+    page.errors = []
+    page.on("pageerror", lambda error: page.errors.append(str(error)))
+    page.clock.install()
+    page.goto("https://wikivisage.test/project/1")
+    return page, project, context
+
+
+def test_the_waiting_card_turns_into_reading_the_category_when_a_worker_takes_the_project(
+    browser, flask_app, monkeypatch
+):
+    page, project, context = _open_project_page(browser, flask_app, monkeypatch, {"worker_claimed_by": None})
+    try:
+        message, label = page.locator("#progressMsg"), page.locator("#progressPct")
+        playwright.expect(label).to_have_text("Waiting for worker\u2026")
+        assert "waiting for a background worker" in message.inner_text()
+
+        project["worker_claimed_by"] = "ml-worker-1"  # a worker claims it: the next poll shows it
+        page.clock.run_for(5500)
+        playwright.expect(label).to_have_text("Reading category\u2026")
+        assert "listing the images in this category" in message.inner_text()
+        assert "waiting for a background worker" not in message.inner_text()
+
+        project["images_total"] = 12  # the first rows land: the card becomes a real progress bar
+        page.clock.run_for(5500)
+        playwright.expect(message).to_be_hidden()
+        playwright.expect(label).to_have_text("0.0%")
+        assert not page.errors
+    finally:
+        context.close()
+
+
+def test_the_waiting_card_is_already_reading_when_the_page_loads_after_a_worker_claimed_it(
+    browser, flask_app, monkeypatch
+):
+    page, _project, context = _open_project_page(browser, flask_app, monkeypatch, {"worker_claimed_by": "ml-worker-2"})
+    try:
+        playwright.expect(page.locator("#progressPct")).to_have_text("Reading category\u2026")
+        assert "listing the images in this category" in page.locator("#progressMsg").inner_text()
+        assert not page.errors
+    finally:
+        context.close()
+
+
+# The "inference complete" card stays until the user closes it: across reloads, and for a later run too.
+
+_FINISHED = {
+    "images_total": 12,
+    "images_processed": 12,
+    "status": "completed",
+    "last_inference_run": 1,
+    "last_inference_matches": 12,
+}
+
+
+def test_the_complete_card_survives_reloads_and_stays_closed_until_a_newer_run_finishes(
+    browser, flask_app, monkeypatch
+):
+    first_run = datetime(2026, 10, 28, 12, 0)
+    page, project, context = _open_project_page(
+        browser, flask_app, monkeypatch, {**_FINISHED, "last_inference_at": first_run}
+    )
+    try:
+        card = page.locator("#inferenceBanner")
+        playwright.expect(card).to_be_visible()
+        assert "Model inference complete — 12 new matches found." in card.inner_text()
+
+        for _ in range(2):  # a reload, and another: nothing but the user closing it makes it go
+            page.reload()
+            playwright.expect(card).to_be_visible()
+
+        page.locator("#inferenceBannerClose").click()
+        playwright.expect(card).to_have_count(0)
+        page.reload()
+        playwright.expect(card).to_have_count(0)  # closed means closed, also after a reload
+
+        project["last_inference_at"] = datetime(2026, 10, 28, 13, 30)  # a newer run finished
+        project["last_inference_run"] = 2
+        project["last_inference_matches"] = 3
+        page.reload()
+        playwright.expect(card).to_be_visible()
+        assert "Model inference complete — 3 new matches found." in card.inner_text()
+        assert not page.errors
+    finally:
+        context.close()
+
+
+def test_a_card_that_was_live_when_the_run_ended_remembers_that_run_when_closed(browser, flask_app, monkeypatch):
+    """Closing the card the poller just showed must not bring it back on the next load."""
+    page, project, context = _open_project_page(browser, flask_app, monkeypatch, {**_FINISHED, "status": "active"})
+    try:
+        page.counts["eligible"] = 7  # the model is working on 7 faces
+        page.reload()
+        card = page.locator("#inferenceBanner")
+        playwright.expect(card).to_contain_text("Model inference in progress")
+
+        page.counts["eligible"] = 0  # it finishes while the user watches
+        project["last_inference_at"] = datetime(2026, 10, 28, 14, 0)
+        project["last_inference_run"] = 2
+        project["last_inference_matches"] = 5
+        page.clock.run_for(5500)
+        playwright.expect(card).to_contain_text("Model inference complete — 5 new matches found.")
+
+        page.clock.run_for(60000)  # and it does not go away by itself
+        playwright.expect(card).to_be_visible()
+
+        page.locator("#inferenceBannerClose").click()
+        page.reload()
+        playwright.expect(card).to_have_count(0)
+        assert not page.errors
+    finally:
+        context.close()
+
+
+def test_the_card_waits_for_the_images_then_runs_the_model_then_says_it_is_done(browser, flask_app, monkeypatch):
+    """Waiting for the remaining images, the model working, the result: one card, live, in that order."""
+    page, project, context = _open_project_page(
+        browser, flask_app, monkeypatch, {"images_total": 12, "images_processed": 8}
+    )
+    try:
+        page.counts.update(pending=4, eligible=30)  # 4 images to go, 30 faces already waiting for the model
+        page.reload()
+        card = page.locator("#inferenceBanner")
+        playwright.expect(card).to_contain_text("Waiting for 4 more images to be processed before running the model")
+        assert "in progress" not in card.inner_text()
+
+        page.counts["pending"] = 1
+        page.clock.run_for(5500)
+        playwright.expect(card).to_contain_text("Waiting for the last image to be processed before running the model")
+
+        page.counts["pending"] = 0  # the last image is done: now the model runs
+        project["images_processed"] = 12
+        page.clock.run_for(5500)
+        playwright.expect(card).to_contain_text("Model inference in progress — 30 faces remaining")
+
+        page.counts["eligible"] = 0  # and it is over
+        project.update(last_inference_at=datetime(2026, 10, 28, 15, 0), last_inference_run=1, last_inference_matches=21)
+        page.clock.run_for(5500)
+        playwright.expect(card).to_contain_text("Model inference complete — 21 new matches found.")
+        assert "in progress" not in card.inner_text()
+        assert not page.errors
+    finally:
+        context.close()
+
+
+def test_a_closed_waiting_card_does_not_hide_the_later_completion(browser, flask_app, monkeypatch):
+    """Closing a card that has no finished run must not remember a run: it used to store "1" for ever."""
+    page, project, context = _open_project_page(
+        browser, flask_app, monkeypatch, {"images_total": 12, "images_processed": 8}
+    )
+    try:
+        page.counts.update(pending=4, eligible=30)
+        page.reload()
+        playwright.expect(page.locator("#inferenceBanner")).to_contain_text("Waiting for 4 more images")
+        page.locator("#inferenceBannerClose").click()
+
+        page.counts.update(pending=0, eligible=0)
+        project.update(
+            images_processed=12,
+            last_inference_at=datetime(2026, 10, 28, 15, 0),
+            last_inference_run=1,
+            last_inference_matches=21,
+        )
+        page.reload()
+        playwright.expect(page.locator("#inferenceBanner")).to_contain_text("Model inference complete — 21 new matches")
+        assert not page.errors
+    finally:
+        context.close()
+
+
+def test_a_complete_card_gives_way_to_the_waiting_card_on_the_next_visit_after_new_images_arrived(
+    browser, flask_app, monkeypatch
+):
+    page, project, context = _open_project_page(
+        browser,
+        flask_app,
+        monkeypatch,
+        {**_FINISHED, "status": "active", "last_inference_at": datetime(2026, 10, 28, 12)},
+    )
+    try:
+        card = page.locator("#inferenceBanner")
+        playwright.expect(card).to_contain_text("Model inference complete")
+
+        project.update(images_total=16)  # four more images turn up in the category
+        page.counts.update(pending=4, eligible=9)
+        page.reload()
+        playwright.expect(card).to_contain_text("Waiting for 4 more images")
+        assert not page.errors
+    finally:
+        context.close()
+
+
+def test_a_flag_stored_by_the_old_release_does_not_hide_the_first_completion(browser, flask_app, monkeypatch):
+    """0.12.0 stored a fixed '1' under inference_dismissed_<id> when any inference card was closed."""
+    page, _project, context = _open_project_page(
+        browser, flask_app, monkeypatch, {**_FINISHED, "last_inference_at": datetime(2026, 10, 28, 12)}
+    )
+    try:
+        page.evaluate("localStorage.setItem('inference_dismissed_1', '1')")
+        page.reload()
+        playwright.expect(page.locator("#inferenceBanner")).to_contain_text("Model inference complete — 12 new matches")
+        assert not page.errors
+    finally:
+        context.close()
+
+
+def _running_after_a_run(browser, flask_app, monkeypatch):
+    """A page that watches the model work on 7 faces, while run 1 (12 matches) is the one on record."""
+    page, project, context = _open_project_page(
+        browser,
+        flask_app,
+        monkeypatch,
+        {**_FINISHED, "status": "active", "last_inference_at": datetime(2026, 10, 28, 12)},
+    )
+    page.counts["eligible"] = 7
+    page.reload()
+    playwright.expect(page.locator("#inferenceBanner")).to_contain_text("Model inference in progress")
+    return page, project, context
+
+
+def test_the_card_does_not_announce_the_previous_runs_result_before_the_new_one_is_recorded(
+    browser, flask_app, monkeypatch
+):
+    """The worker commits its classifications first and the completion record a moment later."""
+    page, project, context = _running_after_a_run(browser, flask_app, monkeypatch)
+    try:
+        card = page.locator("#inferenceBanner")
+        page.counts["eligible"] = 0  # the classifications are in, the record of this run is not
+        page.clock.run_for(5500)
+        page.clock.run_for(5500)
+        assert "12 new matches" not in card.inner_text()  # run 1's result must not pass for this run's
+
+        project.update(last_inference_at=datetime(2026, 10, 28, 14), last_inference_run=2, last_inference_matches=5)
+        page.clock.run_for(5500)
+        playwright.expect(card).to_contain_text("Model inference complete — 5 new matches found.")
+
+        page.locator("#inferenceBannerClose").click()  # it remembers run 2, not run 1
+        page.reload()
+        playwright.expect(card).to_have_count(0)
+        assert not page.errors
+    finally:
+        context.close()
+
+
+def test_the_card_stops_waiting_for_a_record_that_never_comes(browser, flask_app, monkeypatch):
+    """A run that classified nothing records nothing: the card must still finish, from what the page saw."""
+    page, _project, context = _running_after_a_run(browser, flask_app, monkeypatch)
+    try:
+        page.counts["eligible"] = 0
+        for _ in range(5):
+            page.clock.run_for(5500)
+        card = page.locator("#inferenceBanner")
+        playwright.expect(card).to_contain_text("Model inference complete")
+        assert not page.errors
+    finally:
+        context.close()

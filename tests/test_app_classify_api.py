@@ -1494,6 +1494,72 @@ def test_api_progress_active_with_pending_and_stats(monkeypatch, fake_user):
     assert payload["inference_eligible"] == 4
 
 
+def _progress_payload(monkeypatch, fake_user, project_row, *, live_claim=False):
+    claim_queries = []
+
+    def route_execute(sql, params, _fetch):
+        if "FROM projects p LEFT JOIN project_members" in sql:
+            return [project_row]
+        if "worker_claimed_by IS NOT NULL" in sql:
+            claim_queries.append(params)
+            return [{"id": 1}] if live_claim else ()
+        if "SELECT COUNT(*) AS cnt FROM images" in sql:
+            return [{"cnt": 0}]
+        if "COUNT(*) AS total_faces" in sql:
+            return [{}]
+        if "AND f.is_target IS NULL" in sql:
+            return [{"cnt": 0}]
+        raise AssertionError(f"Unexpected SQL: {sql}")
+
+    client = _make_authed_client(monkeypatch, fake_user, route_execute)
+    return client.get("/api/progress/1").get_json(), claim_queries
+
+
+def test_api_progress_says_whether_a_worker_already_has_the_project(monkeypatch, fake_user):
+    """With no images yet, "claimed" tells a project being read apart from one still queued."""
+    base = {"id": 1, "user_id": 1, "images_processed": 0, "images_total": 0, "status": "active"}
+
+    queued, _ = _progress_payload(monkeypatch, fake_user, base, live_claim=False)
+    reading, queries = _progress_payload(monkeypatch, fake_user, base, live_claim=True)
+
+    assert queued["claimed"] is False
+    assert reading["claimed"] is True
+    assert reading["images_total"] == 0 and reading["complete"] is False
+    assert len(queries) == 1  # and it only asks when there is something to tell
+
+
+def test_api_progress_never_claims_for_a_project_with_images_or_one_that_is_not_active(monkeypatch, fake_user):
+    with_images = {"id": 1, "user_id": 1, "images_processed": 2, "images_total": 10, "status": "active"}
+    paused = {"id": 1, "user_id": 1, "images_processed": 0, "images_total": 0, "status": "paused"}
+
+    busy, busy_queries = _progress_payload(monkeypatch, fake_user, with_images, live_claim=True)
+    idle, idle_queries = _progress_payload(monkeypatch, fake_user, paused, live_claim=True)
+
+    assert busy["claimed"] is False and idle["claimed"] is False
+    assert busy_queries == [] and idle_queries == []  # no database question at all
+
+
+def test_api_progress_reports_the_last_completed_inference_run(monkeypatch, fake_user):
+    from datetime import datetime as dt
+
+    row = {
+        "id": 1,
+        "user_id": 1,
+        "images_processed": 10,
+        "images_total": 10,
+        "status": "completed",
+        "last_inference_at": dt(2026, 10, 28, 12, 0, 0),
+        "last_inference_run": 5,
+        "last_inference_matches": 7,
+    }
+    payload, _ = _progress_payload(monkeypatch, fake_user, row)
+    never, _ = _progress_payload(monkeypatch, fake_user, {k: v for k, v in row.items() if "inference" not in k})
+
+    assert payload["inference_run"] == 5  # the run counter, not a timestamp
+    assert payload["inference_matches"] == 7
+    assert never["inference_run"] == 0 and never["inference_matches"] is None
+
+
 def test_api_progress_completed_project(monkeypatch, fake_user):
     seen_pending_query = {"called": False}
 

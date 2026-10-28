@@ -7,6 +7,7 @@ dist/
 build/
 .venv/
 venv/
+# Legacy wake-up file: replaced by the worker_wake table, kept here so a stale copy is never committed
 .worker-wake-up
 .opencode/
 .worker_wake

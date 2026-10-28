@@ -1,10 +1,12 @@
 import os
+import time
 
 os.environ.setdefault("TOOL_TOOLSDB_USER", "testuser")
 os.environ.setdefault("TOOL_TOOLSDB_PASSWORD", "testpass")
 os.environ.setdefault("WIKIVISAGE_DB_NAME", "testdb")
 os.environ.setdefault("TOOL_TOOLSDB_HOST", "localhost")
 
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -14,6 +16,7 @@ import requests
 import face_client
 import liftwing_client
 from config import SDC_AUTH_EXPIRED_MESSAGE
+from database import DatabaseError
 
 with patch("database.init_db"):
     import worker as _worker_module
@@ -652,6 +655,14 @@ def test_inference_with_real_db_skips_below_min_confirmed(db_pool, db_conn, seed
 
     assert classified == 0
 
+    # A run that did nothing is nothing to announce.
+    with db_conn.cursor() as cur:
+        cur.execute(
+            "SELECT last_inference_at, last_inference_matches FROM projects WHERE id = %s", (seed_project["id"],)
+        )
+        recorded = cur.fetchone()
+    assert recorded["last_inference_at"] is None and recorded["last_inference_matches"] is None
+
 
 @pytest.mark.integration
 def test_inference_with_real_db_classifies_faces(
@@ -686,6 +697,18 @@ def test_inference_with_real_db_classifies_faces(
         assert row["is_target"] in (0, 1)
         assert row["classified_by"] == "model"
         assert row["confidence"] is not None
+
+    # The run is on record, with what it found: the project page keeps its "complete" card from it.
+    with db_conn.cursor() as cur:
+        cur.execute(
+            "SELECT last_inference_at, last_inference_matches FROM projects WHERE id = %s", (seed_project["id"],)
+        )
+        recorded = cur.fetchone()
+    assert recorded["last_inference_at"] is not None
+    assert recorded["last_inference_matches"] == sum(1 for row in rows if row["is_target"] == 1)
+    with db_conn.cursor() as cur:
+        cur.execute("SELECT last_inference_run FROM projects WHERE id = %s", (seed_project["id"],))
+        assert cur.fetchone()["last_inference_run"] == 1
 
 
 @pytest.mark.integration
@@ -1039,6 +1062,35 @@ def test_claim_shadow_project_real_db_skips_inference_eligible_completed_project
         # … and the sweep must leave it alone even after that claim is released.
         _release_project(seed_project["id"])
         assert _claim_shadow_project() is None
+
+
+@pytest.mark.integration
+def test_inference_claim_waits_for_the_images_of_an_active_project_but_not_of_a_completed_one(
+    db_pool, db_conn, seed_project, seed_images, seed_faces, seed_unclassified_faces
+):
+    """The model starts once every image is processed: an idle worker must not pick the project up before."""
+    with db_conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO images (project_id, commons_page_id, file_title, status) VALUES (%s, %s, %s, 'pending')",
+            (seed_project["id"], 900100, "File:Still_pending.jpg"),
+        )
+
+    with patch("worker._worker_id", "test-worker-1"):
+        assert _claim_inference_projects(1) == []  # active, faces waiting, but an image is still pending
+
+        with db_conn.cursor() as cur:
+            cur.execute("UPDATE images SET status = 'processed' WHERE status = 'pending'")
+        assert [p["id"] for p in _claim_inference_projects(1)] == [seed_project["id"]]  # all processed: now it may
+        _release_project(seed_project["id"])
+
+        # A completed project is no longer processed, so a leftover pending image does not hold it back.
+        with db_conn.cursor() as cur:
+            cur.execute("UPDATE projects SET status = 'completed' WHERE id = %s", (seed_project["id"],))
+            cur.execute(
+                "INSERT INTO images (project_id, commons_page_id, file_title, status) VALUES (%s, %s, %s, 'pending')",
+                (seed_project["id"], 900101, "File:Left_over.jpg"),
+            )
+        assert [p["id"] for p in _claim_inference_projects(1)] == [seed_project["id"]]
 
 
 @pytest.mark.integration
@@ -2891,6 +2943,148 @@ def test_refresh_worker_token_rowcount_zero_reads_fresh():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.integration
+def test_strikes_and_fresh_first_ordering_against_the_real_database(db_pool, db_conn, seed_project):
+    """Three strikes write an image off, and images that keep failing are tried last."""
+    project_id = seed_project["id"]
+    with db_conn.cursor() as cur:
+        for page_id, attempts in ((1, 2), (2, 0), (3, 1), (4, 0)):
+            cur.execute(
+                "INSERT INTO images (project_id, commons_page_id, file_title, status, detect_attempts) "
+                "VALUES (%s, %s, %s, 'pending', %s)",
+                (project_id, page_id, f"File:{page_id}.jpg", attempts),
+            )
+        cur.execute("SELECT id, commons_page_id FROM images WHERE project_id = %s", (project_id,))
+        ids = {row["commons_page_id"]: row["id"] for row in cur.fetchall()}
+
+    # Fresh images first, the repeat offenders last (the old query had no ORDER BY at all).
+    waves: list[list[str]] = []
+
+    def record_wave(wave, _project_id):
+        waves.append([row["file_title"] for row in wave])
+        return 0, (0.0, 0.0, 0.0)
+
+    with patch("worker._process_image_wave", side_effect=record_wave), patch("worker.shutdown_requested", False):
+        process_images({"id": project_id})
+    assert [title for wave in waves for title in wave] == ["File:2.jpg", "File:4.jpg", "File:3.jpg", "File:1.jpg"]
+
+    # Image 1 already has two strikes: the third writes it off, so it counts as processed.
+    assert _worker_module._record_detect_failure(ids[1], "File:1.jpg", "timeout") == 3
+    with db_conn.cursor() as cur:
+        cur.execute("SELECT status, error_message, detect_attempts FROM images WHERE id = %s", (ids[1],))
+        row = cur.fetchone()
+    assert row["status"] == "error" and row["detect_attempts"] == 3
+    assert "after 3 attempts" in row["error_message"] and "timeout" in row["error_message"]
+
+    # Image 3 has one: it just gets its second strike and stays pending.
+    assert _worker_module._record_detect_failure(ids[3], "File:3.jpg", "timeout") == 2
+    with db_conn.cursor() as cur:
+        cur.execute("SELECT status FROM images WHERE id = %s", (ids[3],))
+        assert cur.fetchone()["status"] == "pending"
+
+    # An image that is no longer pending is never struck again, nor written off a second time.
+    assert _worker_module._record_detect_failure(ids[1], "File:1.jpg", "timeout") == 0
+    with db_conn.cursor() as cur:
+        cur.execute("SELECT detect_attempts FROM images WHERE id = %s", (ids[1],))
+        assert cur.fetchone()["detect_attempts"] == 3
+
+    # Images whose request failed while the service could not be tested are flagged to go alone next
+    # time. Only pending rows: image 1 is an error by now, and a flag is not a strike.
+    _worker_module._flag_for_solo_retry([ids[2], ids[1]])
+    with db_conn.cursor() as cur:
+        cur.execute("SELECT id, detect_isolate, detect_attempts FROM images WHERE project_id = %s", (project_id,))
+        rows = {row["id"]: row for row in cur.fetchall()}
+    assert rows[ids[2]]["detect_isolate"] == 1 and rows[ids[2]]["detect_attempts"] == 0
+    assert rows[ids[1]]["detect_isolate"] == 0
+    assert rows[ids[4]]["detect_isolate"] == 0
+
+    # ...and the flag reaches the wave, which is what sends them alone.
+    waves.clear()
+    seen_flags: dict[str, int] = {}
+
+    def record_flags(wave, _project_id):
+        seen_flags.update({row["file_title"]: row["detect_isolate"] for row in wave})
+        return 0, (0.0, 0.0, 0.0)
+
+    with patch("worker._process_image_wave", side_effect=record_flags), patch("worker.shutdown_requested", False):
+        process_images({"id": project_id})
+    assert seen_flags["File:2.jpg"] == 1 and seen_flags["File:4.jpg"] == 0
+
+
+def _two_page_category(insert_results, total_update=None):
+    """Run traverse_category over a category that answers in two pages, logging every step."""
+    events: list[str] = []
+    pages = iter(
+        [
+            {
+                "query": {"categorymembers": [{"ns": 6, "title": "File:A.jpg", "pageid": 1}]},
+                "continue": {"cmcontinue": "next"},
+            },
+            {"query": {"categorymembers": [{"ns": 6, "title": "File:B.jpg", "pageid": 2}]}},
+        ]
+    )
+    inserts = iter(insert_results)
+
+    def execute(sql, params=None, fetch=True):
+        if "COUNT(*) AS cnt FROM images" in sql:
+            return [{"cnt": 0}]
+        if "INSERT IGNORE INTO images" in sql:
+            events.append("insert")
+            return next(inserts)
+        if "UPDATE projects SET images_total" in sql:
+            events.append("total")
+            if total_update is not None:
+                return total_update()
+            return 1
+        return []
+
+    def api(*_args, **_kwargs):
+        events.append("api")
+        response = MagicMock()
+        response.json.return_value = next(pages)
+        return response
+
+    with (
+        patch("worker.execute_query", side_effect=execute),
+        patch("worker._api_request", side_effect=api),
+        patch("worker.time.sleep"),
+        patch("worker.shutdown_requested", False),
+    ):
+        added = _worker_module.traverse_category({"id": 1, "commons_category": "Cat"})
+    return added, events
+
+
+def test_traverse_category_publishes_the_image_total_after_every_page():
+    """The page shows "waiting" until images_total is above 0: not after the whole tree has been read."""
+    added, events = _two_page_category([1, 1])
+
+    assert added == 2
+    # the total is written right after page 1's rows, before page 2 is even requested
+    assert events == ["api", "insert", "total", "api", "insert", "total", "total"]
+
+
+def test_traverse_category_does_not_touch_the_total_for_a_page_with_nothing_new():
+    added, events = _two_page_category([0, 0])
+
+    assert added == 0
+    assert events == ["api", "insert", "api", "insert", "total"]  # only the final, exact figure
+
+
+def test_traverse_category_carries_on_when_publishing_the_total_fails():
+    from database import DatabaseError
+
+    def fail_once(calls=[]):  # noqa: B006 - deliberate per-test state
+        calls.append(1)
+        if len(calls) == 1:
+            raise DatabaseError("lock wait timeout")
+        return 1
+
+    added, events = _two_page_category([1, 1], total_update=fail_once)
+
+    assert added == 2  # page 2 was still read and stored
+    assert events.count("insert") == 2
+
+
 def test_traverse_category_already_at_limit():
     """When project already has MAX_IMAGES_PER_PROJECT images, skip traversal."""
     from worker import traverse_category
@@ -3374,11 +3568,599 @@ def test_process_image_wave_unavailable_leaves_row_pending():
         patch("worker.execute_query", side_effect=mock_execute_query),
         patch("worker._download_for_detection", return_value=b"bytes"),
         patch("worker.face_client.detect_faces_batch", return_value=batch),
+        # an outage: the test detection cannot work either (the autouse default), so nobody is to blame
     ):
         processed, _timings = _process_image_wave([{"id": 1, "file_title": "File:A.jpg", "bootstrapped": 0}], 5)
 
     assert processed == 0
     assert not any("status = 'error'" in sql for sql in db_calls)
+    assert not any("detect_attempts" in sql for sql in db_calls)  # and no strike is counted
+
+
+# ---------------------------------------------------------------------------
+# One image that breaks the face service must not hold its neighbours (and the project) hostage,
+# and a face service that is merely broken must never get the images blamed
+# ---------------------------------------------------------------------------
+
+_REAL_SERVICE_DETECTS = _worker_module._service_detects  # the autouse fixture below replaces it
+
+
+@pytest.fixture(autouse=True)
+def _no_real_face_service(monkeypatch):
+    """No test here may reach a real face service: by default it cannot detect, and nothing waits."""
+    monkeypatch.setattr(_worker_module, "_service_detects", lambda: False)
+    monkeypatch.setattr(_worker_module, "DETECT_RECOVERY_WAIT", 0)
+    monkeypatch.setattr(_worker_module, "_service_down_until", 0.0)
+
+
+class _FakeTime:
+    """``worker.time`` on a clock that only moves when the code sleeps (or the test advances it)."""
+
+    def __init__(self, sleeps=None):
+        self.now = 1000.0
+        self.sleeps = sleeps if sleeps is not None else []
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+    def __getattr__(self, name):
+        return getattr(time, name)
+
+
+def _wave(*flagged):
+    return [
+        {"id": i, "file_title": f"File:{i}.jpg", "bootstrapped": 0, "detect_isolate": int(i in flagged)}
+        for i in (1, 2, 3)
+    ]
+
+
+def _good():
+    return _detection_result(
+        width=800, height=600, faces=[face_client.DetectedFace(10, 110, 110, 10, encoding=_make_embedding(9))]
+    )
+
+
+class FakeFaceService:
+    """Answers detect requests; any request that contains a *poison* image fails as a whole.
+
+    ``crash_polls`` makes the test detection fail that many times after a poisoned request,
+    like a service that crashed on the image and is restarting.
+    """
+
+    def __init__(self, poison=(), crash_polls=0, detects=True):
+        self.poison = {str(key) for key in poison}
+        self.crash_polls = crash_polls
+        self.down_polls = 0
+        self.detects = detects  # False: readiness would answer, but nothing detects
+        self.requests: list[tuple[list[str], bool]] = []
+        self.canaries = 0
+
+    def detect(self, items, retry=True):
+        keys = [key for key, _data in items]
+        self.requests.append((sorted(keys), retry))
+        if self.poison & set(keys):
+            self.down_polls = self.crash_polls
+            return {key: face_client.FaceServiceUnavailable("timeout") for key in keys}
+        return {key: _good() for key in keys}
+
+    def canary(self):
+        self.canaries += 1
+        if not self.detects:
+            return False
+        if self.down_polls:
+            self.down_polls -= 1
+            return False
+        return True
+
+
+def _run_wave(service, rows, *, strikes=1, wait=0, strike_updates=1):
+    """Run one wave against *service*, returning (processed, db statements, sleeps)."""
+    db: list[tuple[str, Any]] = []
+    sleeps: list[float] = []
+
+    def execute(sql, params=None, fetch=True):
+        db.append((sql, params))
+        if "SET detect_attempts" in sql:
+            return strike_updates
+        if "SELECT detect_attempts" in sql:
+            return [{"detect_attempts": strikes}]
+        return None
+
+    with (
+        patch("worker.execute_query", side_effect=execute),
+        patch("worker._download_for_detection", return_value=b"bytes"),
+        patch("worker.face_client.detect_faces_batch", side_effect=service.detect),
+        patch("worker._service_detects", side_effect=service.canary),
+        patch("worker.DETECT_RECOVERY_WAIT", wait),
+        patch("worker.time", _FakeTime(sleeps)),
+    ):
+        processed, _timings = _process_image_wave(rows, 5)
+    return processed, db, sleeps
+
+
+def _struck(db):
+    return sorted(params[0] for sql, params in db if "SET detect_attempts = detect_attempts + 1" in sql)
+
+
+def _flagged(db):
+    return sorted(p for sql, params in db if "SET detect_isolate = 1" in sql for p in params)
+
+
+def test_a_failed_request_is_retried_image_by_image_and_only_the_culprit_is_struck():
+    service = FakeFaceService(poison=["2"])
+
+    processed, db, _sleeps = _run_wave(service, _wave())
+
+    assert processed == 2  # the two good neighbours were saved after all
+    # (keys come back in download-completion order, so compare sorted)
+    assert service.requests[0] == (["1", "2", "3"], True)  # the batch, with the client's normal retries
+    # then alone, no retries; the one that failed is asked a second time before it is blamed
+    assert sorted(service.requests[1:]) == [(["1"], False), (["2"], False), (["2"], False), (["3"], False)]
+    assert _struck(db) == [2]
+    # One strike is not the end: the image stays pending for the next cycle.
+    assert not any("status = 'error'" in sql for sql, _params in db)
+    assert _flagged(db) == []
+
+
+def test_the_third_strike_writes_the_image_off_so_the_project_can_finish():
+    processed, db, _sleeps = _run_wave(
+        FakeFaceService(poison=["2"]), _wave(), strikes=_worker_module.MAX_DETECT_ATTEMPTS
+    )
+
+    assert processed == 2
+    errors = [params for sql, params in db if "UPDATE images SET status = 'error'" in sql]
+    assert len(errors) == 1
+    message, image_id = errors[0]
+    assert image_id == 2 and "after 3 attempts" in message and "timeout" in message
+
+
+def test_nothing_is_struck_when_detection_is_broken_though_the_service_says_it_is_up():
+    """Readiness answers, every detection fails: blaming images would write off every pending image."""
+    service = FakeFaceService(poison=["1", "2", "3"], detects=False)
+
+    processed, db, _sleeps = _run_wave(service, _wave())
+
+    assert processed == 0
+    assert len(service.requests) == 1  # the batch only: no image was sent alone to a service that cannot detect
+    assert _struck(db) == []
+    assert not any("status = 'error'" in sql for sql, _params in db)
+    assert _flagged(db) == [1, 2, 3]  # they are sent alone once it works again, without a strike
+
+
+def test_a_service_that_crashed_on_an_image_gets_time_to_restart_and_the_culprit_is_found():
+    service = FakeFaceService(poison=["1"], crash_polls=2)
+
+    processed, db, sleeps = _run_wave(service, _wave(), wait=60)
+
+    assert processed == 2  # the innocent images were processed once the service was back
+    assert _struck(db) == [1]  # and only the culprit got the strike
+    assert len(sleeps) >= 2 and set(sleeps) == {3}  # it polled while the service restarted
+    assert _flagged(db) == []
+
+
+def test_images_are_flagged_not_struck_when_the_service_does_not_recover_in_time():
+    service = FakeFaceService(poison=["1"], crash_polls=10**6)
+
+    processed, db, sleeps = _run_wave(service, _wave(), wait=9)
+
+    assert processed == 0
+    assert len(service.requests) == 1  # nothing was sent alone: it never worked again
+    assert sleeps == [3, 3, 3]  # polled at 0, 3, 6 and 9 s: the wait is a time limit
+    assert _struck(db) == []
+    assert _flagged(db) == [1, 2, 3]
+
+
+def test_after_a_timeout_the_next_wave_does_not_wait_again():
+    service = FakeFaceService(poison=["1", "2", "3"], detects=False)
+
+    _run_wave(service, _wave(), wait=9)
+    canaries_after_first_wave = service.canaries
+    _processed, _db, sleeps = _run_wave(service, _wave(), wait=9)
+
+    assert service.canaries == canaries_after_first_wave  # not even tested: it is known to be down
+    assert sleeps == []
+
+
+def test_flagged_images_are_sent_alone_from_the_start():
+    service = FakeFaceService(poison=["2"])
+
+    processed, db, _sleeps = _run_wave(service, _wave(2))
+
+    assert processed == 2
+    assert (["1", "3"], True) in service.requests  # the others still travel as one batch
+    assert (["2"], False) in service.requests  # the flagged one never joins a batch
+    assert all("2" not in keys for keys, _retry in service.requests if len(keys) > 1)
+    assert _struck(db) == [2]
+
+
+def test_a_flagged_image_that_works_alone_is_simply_processed():
+    processed, db, _sleeps = _run_wave(FakeFaceService(), _wave(2))
+
+    assert processed == 3
+    assert _struck(db) == [] and _flagged(db) == []
+
+
+def test_a_test_detection_must_work_before_every_single_image():
+    """If the service dies on one image, nothing is attributed and nothing else is tried until it works."""
+    service = FakeFaceService(poison=["1", "2", "3"], crash_polls=10**6)
+    working = iter([True])  # the first test detection works, then the service is down for good
+
+    def canary_once():
+        service.canaries += 1
+        return next(working, False)
+
+    db: list[tuple[str, Any]] = []
+
+    def execute(sql, params=None, fetch=True):
+        db.append((sql, params))
+        return (
+            1
+            if "SET detect_attempts" in sql
+            else ([{"detect_attempts": 1}] if "SELECT detect_attempts" in sql else None)
+        )
+
+    with (
+        patch("worker.execute_query", side_effect=execute),
+        patch("worker._download_for_detection", return_value=b"bytes"),
+        patch("worker.face_client.detect_faces_batch", side_effect=service.detect),
+        patch("worker._service_detects", side_effect=canary_once),
+    ):
+        _process_image_wave(_wave(1, 2, 3), 5)
+
+    assert len(service.requests) == 1  # only the first image went out
+    # It failed right after a working test, but the service did not work again to confirm it:
+    # something else may have hurt the service meanwhile, so nobody is struck.
+    assert _struck(db) == []
+    assert _flagged(db) == [1, 2, 3]  # all three wait, unstruck, for the service
+
+
+def test_a_model_mismatch_is_the_services_problem_not_the_images():
+    service = FakeFaceService()
+    service.detect = lambda items, retry=True: {  # type: ignore[method-assign]
+        key: face_client.FaceServiceModelMismatch("wrong model") for key, _data in items
+    }
+
+    processed, db, _sleeps = _run_wave(service, _wave())
+
+    assert processed == 0
+    assert _struck(db) == [] and _flagged(db) == []  # not even retried: no single image is to blame
+
+
+def test_recording_a_strike_survives_a_database_error():
+    with patch("worker.execute_query", side_effect=DatabaseError("down")):
+        assert _worker_module._record_detect_failure(1, "File:A.jpg", "timeout") == 0
+
+
+def test_an_image_that_is_no_longer_pending_is_not_struck_or_written_off():
+    executed: list[str] = []
+
+    def execute(sql, params=None, fetch=True):
+        executed.append(sql)
+        return 0  # the UPDATE matched nothing: processed or written off in the meantime
+
+    with patch("worker.execute_query", side_effect=execute):
+        assert _worker_module._record_detect_failure(1, "File:A.jpg", "timeout") == 0
+
+    assert len(executed) == 1  # no read-back and, above all, no "error" for an image that was just processed
+
+
+def test_flagging_images_survives_a_database_error_and_skips_nothing_to_do():
+    with patch("worker.execute_query") as query:
+        _worker_module._flag_for_solo_retry([])
+    query.assert_not_called()
+    with patch("worker.execute_query", side_effect=DatabaseError("down")):
+        _worker_module._flag_for_solo_retry([1, 2])  # must not raise
+
+
+# --- the test detection and the wait for a restarting service -------------------------------
+
+
+def test_the_test_detection_is_a_real_detection_without_retries():
+    with patch("worker.face_client.check_service_model", return_value=("model", 512)) as check:
+        assert _REAL_SERVICE_DETECTS() is True
+    check.assert_called_once_with(retry=False, read_timeout=_worker_module.SERVICE_PROBE_TIMEOUT)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        face_client.FaceServiceUnavailable("HTTP 500"),
+        face_client.FaceServiceModelMismatch("wrong model"),
+        face_client.FaceServiceRejected("bad probe"),
+        RuntimeError("anything else"),
+    ],
+)
+def test_the_test_detection_is_false_for_every_way_it_can_fail_and_never_raises(error):
+    with patch("worker.face_client.check_service_model", side_effect=error):
+        assert _REAL_SERVICE_DETECTS() is False
+
+
+def test_waiting_for_the_service_returns_as_soon_as_it_detects_again():
+    answers = iter([False, False, True])
+    sleeps: list[float] = []
+    with (
+        patch("worker._service_detects", side_effect=lambda: next(answers)),
+        patch("worker.DETECT_RECOVERY_WAIT", 60),
+        patch("worker.time", _FakeTime(sleeps)),
+    ):
+        assert _worker_module._wait_for_service() is True
+
+    assert sleeps == [3, 3]
+
+
+def test_waiting_for_the_service_gives_up_after_the_wait_and_then_does_not_wait_again():
+    polls: list[int] = []
+    sleeps: list[float] = []
+    with (
+        patch("worker._service_detects", side_effect=lambda: polls.append(1) or False),
+        patch("worker.DETECT_RECOVERY_WAIT", 9),
+        patch("worker.time", _FakeTime(sleeps)),
+    ):
+        assert _worker_module._wait_for_service() is False
+        assert (len(polls), len(sleeps)) == (4, 3)
+        assert _worker_module._wait_for_service() is False  # known to be down: answered at once
+        assert (len(polls), len(sleeps)) == (4, 3)
+
+
+def test_the_wait_is_wall_clock_time_even_when_every_test_detection_is_slow():
+    """A hung service makes each test detection take its whole timeout: the wait must still end on time."""
+    clock = _FakeTime()
+
+    def slow_probe():
+        clock.now += 10  # a probe that runs into its timeout
+        return False
+
+    with (
+        patch("worker._service_detects", side_effect=slow_probe),
+        patch("worker.DETECT_RECOVERY_WAIT", 60),
+        patch("worker.time", clock),
+    ):
+        assert _worker_module._wait_for_service() is False
+
+    assert clock.now - 1000.0 < 60 + 10  # the limit plus at most one probe (it was ~16 minutes)
+
+
+def test_without_a_wait_the_service_is_tested_once_and_never_slept_on():
+    sleeps: list[float] = []
+    with (
+        patch("worker._service_detects", return_value=False) as check,
+        patch("worker.time.sleep", side_effect=sleeps.append),
+    ):
+        assert _worker_module._wait_for_service() is False
+
+    check.assert_called_once_with()
+    assert sleeps == []
+
+
+def test_waiting_for_the_service_stops_at_shutdown():
+    with (
+        patch("worker._service_detects", return_value=False) as check,
+        patch("worker.DETECT_RECOVERY_WAIT", 60),
+        patch("worker.time.sleep"),
+        patch.object(_worker_module, "shutdown_requested", True),
+    ):
+        assert _worker_module._wait_for_service() is False
+
+    check.assert_called_once_with()
+
+
+# --- the loop keeps going while images leave 'pending', whatever the reason ---------------
+
+
+def _loop(pending_counts, batch_results):
+    counts = iter(pending_counts)
+    results = iter(batch_results)
+    calls = []
+
+    def process(project):
+        calls.append("batch")
+        return next(results)
+
+    with (
+        patch("worker._pending_image_count", side_effect=lambda _id: next(counts)),
+        patch("worker.process_images", side_effect=process),
+        patch("worker._project_still_active", return_value=True),
+    ):
+        _seconds, total = _worker_module._process_pending_images({"id": 5})
+    return len(calls), total
+
+
+def test_the_image_loop_continues_when_a_batch_only_wrote_images_off_as_errors():
+    # 40 pending -> a batch of failures written off (0 successes, 6 fewer pending) -> carry on
+    batches, total = _loop([40, 34, 34, 34], [0, 0])
+
+    assert batches == 2
+    assert total == 0
+
+
+def test_the_image_loop_stops_when_nothing_left_pending_and_nothing_succeeded():
+    batches, _total = _loop([40, 40], [0])
+
+    assert batches == 1
+
+
+def test_the_image_loop_continues_after_successes_even_if_the_count_is_unknown():
+    batches, total = _loop([None, None, None, None], [5, 0])
+
+    assert batches == 2
+    assert total == 5
+
+
+def test_waiting_faces_are_classified_with_the_projects_current_settings():
+    fresh = {"id": 5, "distance_threshold": 0.4}
+    with (
+        patch("worker._pending_image_count", return_value=0),
+        patch("worker._has_inference_candidates", return_value=True),
+        patch("worker.execute_query", return_value=[fresh]),
+        patch("worker.run_autonomous_inference", return_value=7) as infer,
+    ):
+        assert _worker_module._classify_waiting_faces({"id": 5, "distance_threshold": 0.9}) == 7
+
+    infer.assert_called_once_with(fresh)
+
+
+def test_a_finished_inference_run_is_recorded_with_what_it_found():
+    with patch("worker.execute_query") as query:
+        _worker_module._record_inference_completion(5, classified=9, matches=4)
+
+    sql, params = query.call_args.args[0], query.call_args.args[1]
+    assert "last_inference_run = last_inference_run + 1" in sql  # a counter: runs cannot share a number
+    assert "last_inference_at = NOW()" in sql and "last_inference_matches = %s" in sql
+    assert params == (4, 5)
+
+
+def test_a_run_that_classified_nothing_is_not_announced():
+    with patch("worker.execute_query") as query:
+        _worker_module._record_inference_completion(5, classified=0, matches=0)
+
+    query.assert_not_called()
+
+
+def test_recording_the_completion_never_fails_the_run(caplog):
+    with patch("worker.execute_query", side_effect=DatabaseError("down")):
+        _worker_module._record_inference_completion(5, classified=3, matches=1)  # must not raise
+
+    assert "failed to record the inference completion" in caplog.text
+
+
+def test_nothing_is_classified_without_candidates_or_during_shutdown():
+    with (
+        patch("worker._pending_image_count", return_value=0),
+        patch("worker._has_inference_candidates", return_value=False),
+        patch("worker.run_autonomous_inference") as infer,
+    ):
+        assert _worker_module._classify_waiting_faces({"id": 5}) is None
+    with (
+        patch.object(_worker_module, "shutdown_requested", True),
+        patch("worker._pending_image_count", return_value=0),
+        patch("worker._has_inference_candidates", return_value=True),
+        patch("worker.run_autonomous_inference") as infer,
+    ):
+        assert _worker_module._classify_waiting_faces({"id": 5}) is None
+    infer.assert_not_called()
+
+
+# --- the model starts once every image has been processed, on every path ------------------
+
+
+@pytest.mark.parametrize("pending", [40, 1, None])  # None: the database could not say, so do not guess
+def test_inference_waits_while_images_are_pending(pending):
+    with (
+        patch("worker._pending_image_count", return_value=pending),
+        patch("worker._has_inference_candidates", return_value=True) as candidates,
+        patch("worker.run_autonomous_inference") as infer,
+    ):
+        assert _worker_module._classify_waiting_faces({"id": 5}) is None
+
+    infer.assert_not_called()
+    candidates.assert_not_called()  # not even asked: the images decide first
+
+
+def test_early_inference_runs_for_a_rerun_on_a_fully_processed_project(caplog):
+    """Its purpose: after "re-run" the user should not wait through the crawl. No pending images: it runs."""
+    caplog.set_level("INFO", logger="worker")
+    with (
+        patch("worker._pending_image_count", return_value=0),
+        patch("worker._has_inference_candidates", return_value=True),
+        patch("worker.execute_query", return_value=[{"id": 5}]),
+        patch("worker.run_autonomous_inference", return_value=3) as infer,
+    ):
+        _worker_module._run_early_inference({"id": 5})
+
+    infer.assert_called_once()
+    assert "early inference classified 3 face(s) before discovery" in caplog.text
+
+
+def test_early_inference_skips_a_project_that_still_has_images_to_process(caplog):
+    caplog.set_level("INFO", logger="worker")
+    with patch("worker._pending_image_count", return_value=40), patch("worker.run_autonomous_inference") as infer:
+        _worker_module._run_early_inference({"id": 5})
+
+    infer.assert_not_called()
+    assert "early inference classified" not in caplog.text
+
+
+def test_final_inference_waits_when_the_image_loop_ended_with_images_left(caplog):
+    caplog.set_level("INFO", logger="worker")
+    with patch("worker._pending_image_count", return_value=3), patch("worker.run_autonomous_inference") as infer:
+        _worker_module._run_final_inference({"id": 5})
+
+    infer.assert_not_called()
+    assert "images are still pending, inference waits for them" in caplog.text
+
+
+def test_final_inference_runs_once_no_image_is_pending():
+    fresh = {"id": 5, "distance_threshold": 0.4}
+    with (
+        patch("worker._pending_image_count", return_value=0),
+        patch("worker._project_still_active", return_value=True),
+        patch("worker.execute_query", return_value=[fresh]),
+        patch("worker.run_autonomous_inference") as infer,
+    ):
+        _worker_module._run_final_inference({"id": 5})
+
+    infer.assert_called_once_with(fresh)
+
+
+def test_the_image_loop_never_runs_inference_between_batches():
+    counts = iter([100, 50, 50, 0, 0, 0])
+    results = iter([50, 50, 0])
+    with (
+        patch("worker._pending_image_count", side_effect=lambda _id: next(counts)),
+        patch("worker.process_images", side_effect=lambda _p: next(results)),
+        patch("worker._project_still_active", return_value=True),
+        patch("worker.run_autonomous_inference") as infer,
+        patch("worker._classify_waiting_faces") as classify,
+    ):
+        _worker_module._process_pending_images({"id": 5})
+
+    infer.assert_not_called()
+    classify.assert_not_called()
+
+
+def test_the_inference_only_claim_leaves_a_project_that_is_still_being_processed_alone():
+    """An idle worker must not pick up an active project with pending images just because faces are waiting."""
+    cursor = MagicMock()
+    cursor.fetchall.return_value = []
+    with patch("worker.execute_transaction", side_effect=lambda fn: fn(MagicMock(), cursor)):
+        _claim_inference_projects(2)
+
+    sql = " ".join(cursor.execute.call_args_list[0].args[0].split())
+    assert (
+        "AND (p.status = 'completed' OR NOT EXISTS ( SELECT 1 FROM images i WHERE i.project_id = p.id AND i.status = 'pending')) "
+        in sql
+    )
+
+
+def test_pending_image_count_reads_the_projects_pending_images_and_tolerates_a_database_error():
+    with patch("worker.execute_query", return_value=[{"cnt": 40}]) as query:
+        assert _worker_module._pending_image_count(5) == 40
+    assert "status = 'pending'" in query.call_args.args[0]
+    with patch("worker.execute_query", side_effect=DatabaseError("down")):
+        assert _worker_module._pending_image_count(5) is None
+
+
+def test_process_images_takes_fresh_images_before_the_ones_that_keep_failing():
+    selects: list[str] = []
+
+    def execute(sql, params=None, fetch=True):
+        if "SUM(CASE WHEN bootstrapped" in sql:
+            return [{"bs_done": 0, "total": 3}]
+        if "COUNT(*) AS cnt FROM images" in sql:
+            return [{"cnt": 0}]
+        if "status = 'pending'" in sql and "LIMIT" in sql:
+            selects.append(sql)
+        return []
+
+    with patch("worker.execute_query", side_effect=execute):
+        process_images({"id": 99})
+
+    assert len(selects) == 2  # bootstrap images, then the rest
+    assert all("ORDER BY detect_attempts ASC, id ASC" in sql for sql in selects)
 
 
 def test_process_images_splits_batch_into_memory_bounded_waves():
@@ -4735,7 +5517,9 @@ def test_download_for_detection_leaves_transient_failures_pending(exc):
         patch.object(_worker_module, "_download_image", side_effect=exc),
         patch.object(_worker_module, "_mark_image_error") as mark,
     ):
-        assert _worker_module._download_for_detection(1, "File:X.jpg") is None
+        with pytest.raises(_worker_module.TransientDownloadError) as caught:
+            _worker_module._download_for_detection(1, "File:X.jpg")
+    assert caught.value.rate_limited is (getattr(exc.response, "status_code", None) == 429)
     mark.assert_not_called()
 
 
@@ -5500,3 +6284,205 @@ def test_fetch_metadata_empty_titles_makes_no_request():
         assert _fetch_metadata([]) == {}
 
     api.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# A download that keeps failing must not keep a project from finishing (and so from inference)
+# ---------------------------------------------------------------------------
+
+
+def _run_download_wave(failing, *, rate_limited=(), canary=True, strikes=1):
+    """One wave of images 1..3 where the downloads of *failing* raise a transient error."""
+    db: list[tuple[str, Any]] = []
+    canary_calls: list[str] = []
+
+    def execute(sql, params=None, fetch=True):
+        db.append((sql, params))
+        if "SET detect_attempts" in sql:
+            return 1
+        if "SELECT detect_attempts" in sql:
+            return [{"detect_attempts": strikes}]
+        return None
+
+    def download(img_id, title):
+        if img_id in failing:
+            raise _worker_module.TransientDownloadError("HTTP 500", rate_limited=img_id in rate_limited)
+        return b"bytes"
+
+    def canary_download(url):
+        canary_calls.append(url)
+        if not canary:
+            raise requests.ConnectionError("down")
+        return b"bytes"
+
+    service = FakeFaceService()
+    with (
+        patch("worker.execute_query", side_effect=execute),
+        patch("worker._download_for_detection", side_effect=download),
+        patch("worker._download_image", side_effect=canary_download),
+        patch("worker.face_client.detect_faces_batch", side_effect=service.detect),
+        patch("worker._service_detects", side_effect=service.canary),
+    ):
+        processed, _timings = _process_image_wave(_wave(), 5)
+    return processed, db, canary_calls
+
+
+@pytest.fixture(autouse=True)
+def _no_canary_memory(monkeypatch):
+    monkeypatch.setattr(_worker_module, "_canary_ok_until", 0.0)
+
+
+def test_a_download_that_fails_while_the_others_work_is_struck_without_asking_commons_again():
+    processed, db, canary_calls = _run_download_wave({2})
+
+    assert processed == 2
+    assert _struck(db) == [2]
+    assert canary_calls == []  # the other downloads of the wave already proved Commons works
+
+
+def test_a_download_that_fails_alone_is_struck_when_the_canary_thumbnail_downloads():
+    """The tail of a project: one image left, nothing in its wave to compare with."""
+    processed, db, canary_calls = _run_download_wave({1, 2, 3})
+
+    assert processed == 0
+    assert _struck(db) == [1, 2, 3]
+    assert canary_calls == [_worker_module.COMMONS_CANARY_URL]
+
+
+def test_nobody_is_struck_for_failed_downloads_while_commons_serves_nothing():
+    _processed, db, canary_calls = _run_download_wave({1, 2, 3}, canary=False)
+
+    assert _struck(db) == []  # an outage is nobody's fault, the images stay pending
+    assert len(canary_calls) == 1
+
+
+def test_a_rate_limited_download_is_never_struck():
+    _processed, db, canary_calls = _run_download_wave({1, 2}, rate_limited={1, 2})
+
+    assert _struck(db) == []
+    assert canary_calls == []  # nothing to blame, so nothing to prove
+
+
+def test_the_third_download_strike_writes_the_image_off():
+    _processed, db, _canary = _run_download_wave({2}, strikes=_worker_module.MAX_DETECT_ATTEMPTS)
+
+    errors = [params for sql, params in db if "UPDATE images SET status = 'error'" in sql]
+    assert len(errors) == 1 and errors[0][1] == 2 and "download failed" in errors[0][0]
+
+
+def test_the_canary_answer_is_remembered_for_a_while():
+    with patch("worker._download_image", return_value=b"x") as download:
+        assert _worker_module._commons_serves_thumbnails() is True
+        assert _worker_module._commons_serves_thumbnails() is True
+    assert download.call_count == 1
+
+
+def test_the_remaining_waves_are_left_alone_once_the_service_is_known_down(monkeypatch):
+    rows = [
+        {"id": i, "file_title": f"File:{i}.jpg", "bootstrapped": 0, "detect_isolate": 0}
+        for i in range(1, _worker_module.DETECTION_WAVE_SIZE * 3 + 1)
+    ]
+
+    def execute(sql, params=None, fetch=True):
+        if "SELECT id, file_title" in sql and "bootstrapped = 0" in sql:
+            return rows[: _worker_module.BATCH_SIZE]
+        if "COUNT(*)" in sql or "SUM(" in sql:
+            return [{"bs_done": 0, "total": len(rows), "cnt": 0}]
+        return []
+
+    waves = []
+
+    def wave(batch, project_id):
+        waves.append(len(batch))
+        _worker_module._mark_service_down()  # the first wave found the service down
+        return 0, (0.0, 0.0, 0.0)
+
+    monkeypatch.setattr(_worker_module, "DETECT_RECOVERY_WAIT", 60)
+    monkeypatch.setattr(_worker_module, "BATCH_SIZE", len(rows))
+    with patch("worker.execute_query", side_effect=execute), patch("worker._process_image_wave", side_effect=wave):
+        _worker_module.process_images({"id": 5})
+
+    assert waves == [_worker_module.DETECTION_WAVE_SIZE]  # the other two waves were not even tried
+
+
+def test_a_failure_that_does_not_repeat_is_not_blamed_on_the_image():
+    """Another thread or worker can hurt the shared service while one image is in flight."""
+    service = FakeFaceService()
+    attempts: list[str] = []
+
+    def detect(items, retry=True):
+        keys = [key for key, _data in items]
+        service.requests.append((sorted(keys), retry))
+        if keys == ["1"] and not attempts:  # the service is hurt once, by someone else, during image 1
+            attempts.append("hurt")
+            return {"1": face_client.FaceServiceUnavailable("connection reset")}
+        if len(keys) > 1:
+            return {key: face_client.FaceServiceUnavailable("batch failed") for key in keys}
+        return {key: _good() for key in keys}
+
+    service.detect = detect  # type: ignore[method-assign]
+
+    processed, db, _sleeps = _run_wave(service, _wave(1, 2, 3))  # all flagged: they go alone from the start
+
+    assert processed == 3  # the second attempt at image 1 worked
+    assert _struck(db) == []
+    assert service.requests.count((["1"], False)) == 2
+
+
+def test_an_image_that_fails_twice_alone_is_blamed():
+    service = FakeFaceService(poison=["2"])
+
+    _processed, db, _sleeps = _run_wave(service, _wave(1, 2, 3))
+
+    assert _struck(db) == [2]
+    assert service.requests.count((["2"], False)) == 2
+
+
+def test_a_download_that_is_still_rate_limited_after_the_retries_stays_recognisable_as_a_429():
+    """urllib3 raised RetryError (no response) when its 429 retries ran out, so the download looked like
+    any other failure and was struck. The session must hand back the last response instead."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    class Limited(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(429)
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Limited)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{server.server_port}/thumb.jpg"
+
+    real_retry = _worker_module.Retry
+
+    def quick_retry(**kwargs):
+        return real_retry(**{**kwargs, "backoff_factor": 0})
+
+    def download(_url, max_bytes=0):
+        with patch("worker.Retry", quick_retry):
+            session = _worker_module._create_session()
+        resp = session.get(url, timeout=5)
+        resp.raise_for_status()
+        return resp.content
+
+    try:
+        with (
+            patch.object(_worker_module, "_download_image", side_effect=download),
+            patch.object(_worker_module, "_mark_image_error") as mark,
+            pytest.raises(_worker_module.TransientDownloadError) as caught,
+        ):
+            _worker_module._download_for_detection(1, "File:X.jpg")
+    finally:
+        server.shutdown()
+
+    assert caught.value.rate_limited is True
+    mark.assert_not_called()
+
+
+def test_the_session_hands_back_the_last_response_when_its_retries_run_out():
+    session = _worker_module._create_session()
+    policy = session.get_adapter("https://commons.wikimedia.org/").max_retries
+    assert policy.raise_on_status is False

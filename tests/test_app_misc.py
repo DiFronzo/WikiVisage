@@ -172,21 +172,19 @@ def test_session_cleared_on_login_callback(monkeypatch):
         assert "attacker_data" not in sess
 
 
-def test_wake_file_path_consistent():
-    """Both app.py and worker.py should import WAKE_FILE_PATH from config."""
+def test_the_wake_up_goes_through_the_database_not_a_file():
+    """The web app and the workers run in different containers, so a wake-up file never arrives."""
     import inspect
 
     import config as config_module
+    import worker as worker_module
 
-    # config.py must define the canonical path using '.worker-wake-up'
-    config_source = inspect.getsource(config_module)
-    assert ".worker-wake-up" in config_source, "config.py must define WAKE_FILE_PATH with '.worker-wake-up'"
-
-    # app.py must import WAKE_FILE_PATH from config (not define its own)
+    assert not hasattr(config_module, "WAKE_FILE_PATH")
     app_source = inspect.getsource(app_module)
-    assert re.search(r"^from config import (?:[^\n(]*|\([^)]*)\bWAKE_FILE_PATH\b", app_source, re.M), (
-        "app.py must import WAKE_FILE_PATH from config"
-    )
+    assert "WAKE_FILE_PATH" not in app_source
+    assert re.search(r"^from wake import request_wake$", app_source, re.M)
+    assert app_source.count("request_wake()") == 3  # new project, send edits, re-run inference
+    assert "WAKE_FILE_PATH" not in inspect.getsource(worker_module)
 
 
 def test_set_security_headers_sets_all_required_headers():

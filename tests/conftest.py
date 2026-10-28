@@ -243,6 +243,7 @@ def db_conn(test_db):
                 "users",
                 "worker_heartbeat",
                 "worker_heartbeats",
+                "worker_wake",
                 "service_status",
             ):
                 cur.execute(f"TRUNCATE TABLE `{table}`")
