@@ -430,6 +430,29 @@ def test_set_language_invalid_lang_falls_back_to_en(monkeypatch):
     assert "locale=en" in resp.headers.get("Set-Cookie", "")
 
 
+def test_reauth_login_url_points_back_at_the_page_being_rendered():
+    with flask_app.test_request_context("/project/1/classify?skip_image_id=5&skip_reviewing=1"):
+        url = app_module.inject_reauth_login_url()["reauth_login_url"]
+    assert url == "/login?reauth=1&next=/project/1/classify?skip_image_id%3D5%26skip_reviewing%3D1"
+    with flask_app.test_request_context("/"):
+        assert app_module.inject_reauth_login_url()["reauth_login_url"] == "/login?reauth=1&next=/"
+    # Outside a request (a template rendered from a script) there is no page to come back to.
+    assert app_module.inject_reauth_login_url() == {"reauth_login_url": ""}
+
+
+def test_locale_cookie_values_match_the_supported_languages():
+    assert set(app_module._COOKIE_LOCALES) == set(app_module.LANGUAGES)
+
+
+def test_locale_cookie_helper_coerces_unknown_values_at_the_sink():
+    """Callers validate first, but the helper must never write request text into the cookie."""
+    response = Response()
+    app_module._set_locale_cookie(response, "zz; Domain=evil.example", persistent=True)
+    cookie = response.headers["Set-Cookie"]
+    assert cookie.startswith("locale=en;")
+    assert "evil.example" not in cookie
+
+
 def test_set_language_nocookie_uses_session_scoped_cookie(monkeypatch):
     """Without consent the choice still applies for the visit, but is not persisted."""
     flask_app.config["TESTING"] = True
@@ -1587,7 +1610,7 @@ def test_write_sdc_asks_for_a_new_login_only_when_the_grant_is_gone(monkeypatch)
     assert response.status_code == 401
     body = response.get_json()
     assert "re-authorize" in body["error"]
-    assert body["reauth_url"] == "/login?reauth=1"  # the page appends &next=
+    assert body["reauth_url"] == "/login?reauth=1"  # only says "offer the button"; the page renders the link
 
 
 def test_write_sdc_answers_503_for_a_transient_refresh_failure(monkeypatch):

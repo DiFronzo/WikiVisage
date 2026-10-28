@@ -264,11 +264,17 @@ def set_language(lang: str):
     return resp
 
 
+# Exact values the ``locale`` cookie may hold. The input reaches _set_locale_cookie() from a
+# URL segment and from the client-controlled cookie, so the sink maps it to a literal instead
+# of writing request text (CodeQL's cookie-injection query flags anything else).
+_COOKIE_LOCALES = {"en": "en", "nb": "nb", "es": "es", "fr": "fr"}
+
+
 def _set_locale_cookie(resp: Any, lang: str, *, persistent: bool) -> None:
     """Write the (HttpOnly) language cookie, kept for a year only when *persistent*."""
     resp.set_cookie(
         "locale",
-        lang,
+        _COOKIE_LOCALES.get(lang, "en"),
         max_age=LOCALE_COOKIE_MAX_AGE if persistent else None,
         httponly=True,
         samesite="Lax",
@@ -892,8 +898,23 @@ def _token_unavailable_error() -> ApiError:
 
 
 def _reauth_url() -> str:
-    """Where the front end sends the user to authorize again (the page appends ``&next=``)."""
+    """The re-authorize target an API answer carries as ``reauth_url``.
+
+    It only tells the page *whether* to offer the button; the link the page shows is the one
+    the server renders for that page (``_reauth_login_url``, exposed as ``reauth_login_url``).
+    """
     return url_for("login", reauth=1)
+
+
+def _reauth_login_url() -> str:
+    """The re-authorize link for the page being rendered: log in again, then come back here."""
+    return url_for("login", reauth=1, next=request.full_path.rstrip("?"))
+
+
+@app.context_processor
+def inject_reauth_login_url() -> dict[str, str]:
+    """Expose ``reauth_login_url`` to templates, so none repeats the ``next`` expression."""
+    return {"reauth_login_url": _reauth_login_url() if has_request_context() else ""}
 
 
 def _get_valid_token() -> str | None:

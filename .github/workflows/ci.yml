@@ -147,7 +147,7 @@ jobs:
       - name: Run browser regressions
         env:
           WIKIVISAGE_BROWSER_TESTS: "1"
-        run: pytest tests/test_bbox_editor_browser.py tests/test_gallery_thumb_browser.py -v --tb=short
+        run: pytest tests/test_bbox_editor_browser.py tests/test_gallery_thumb_browser.py tests/test_session_persistence_browser.py -v --tb=short
 
   face-service-unit:
     name: Face service (backend + model unit tests)

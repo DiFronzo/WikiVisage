@@ -1624,8 +1624,7 @@ def test_project_detail_offers_reauthorize_for_a_stored_authorization_error(monk
     body = _project_detail_with_worker_error(monkeypatch, SDC_AUTH_EXPIRED_MESSAGE)
 
     assert "Worker error: " in body
-    assert "login?reauth=1" in body
-    assert 'login?reauth=1&amp;next=/project/1"' in body
+    assert 'href="/login?reauth=1&amp;next=/project/1"' in body
 
 
 @pytest.mark.parametrize(
@@ -1669,7 +1668,9 @@ def test_project_detail_offers_no_reauthorize_for_other_worker_errors(monkeypatc
     body = _project_detail_with_worker_error(monkeypatch, error)
 
     assert "Worker error: " in body
-    assert "login?reauth=1" not in body
+    # The page-wide REAUTH_URL constant always mentions the route; only a rendered anchor
+    # for this error would offer the button.
+    assert 'href="/login?reauth=1' not in body
 
 
 def test_project_detail_inference_banner_hidden_while_processing(monkeypatch):

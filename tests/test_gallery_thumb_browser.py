@@ -578,8 +578,8 @@ def test_reauthorize_button_comes_back_to_the_page_after_an_authorization_failur
     action = page.locator("#inline-alert-action")
     assert action.is_visible()
     assert action.inner_text().lower().replace("-", "") == "reauthorize"
-    # The page appends where to return to, so the user lands back on it after the OAuth round trip.
-    assert action.get_attribute("href") == "/login?reauth=1&next=%2Fproject%2F1"
+    # The server rendered the link for this page, so the user lands back on it after the OAuth round trip.
+    assert action.get_attribute("href") == "/login?reauth=1&next=/project/1"
     assert "expired or was revoked" in page.locator("#inline-alert-text").inner_text()
     assert not page.errors
 
@@ -603,3 +603,41 @@ def test_reauthorize_button_does_not_linger_on_the_next_error(open_gallery):
     _reject_first_card(page, 502, {"error": "Failed to remove SDC claim from Commons."})
 
     assert page.locator("#inline-alert-action").is_hidden()
+
+
+def test_reauthorize_button_ignores_the_url_in_the_api_answer(open_gallery):
+    """The answer only says "offer the button"; its reauth_url text never reaches the link."""
+    page, _ = open_gallery([make_face(1)], {"File:Photo.jpg": (960, 1440)})
+    _reject_first_card(page, 401, {**_REAUTH_ERROR, "reauth_url": "javascript:alert(1)"})
+
+    action = page.locator("#inline-alert-action")
+    playwright.expect(action).to_be_visible()
+    assert action.get_attribute("href") == "/login?reauth=1&next=/project/1"
+    assert not page.errors
+
+
+def test_inline_alert_action_only_accepts_same_origin_paths(open_gallery):
+    """A caller passing any other URL still cannot make the link leave the site."""
+    page, _ = open_gallery([make_face(1)], {"File:Photo.jpg": (960, 1440)})
+    action = page.locator("#inline-alert-action")
+
+    hostile = [
+        "javascript:alert(1)",
+        "data:text/html,x",
+        "https://evil.example/login?reauth=1",
+        "//evil.example/x",
+        "\\\\evil.example/x",
+        # These normalize to "//evil.example/x", which a browser reads as another site.
+        "/.//evil.example/x",
+        "/%2e//evil.example/x",
+        "/a/..//evil.example/x",
+        "https://wikivisage.test//evil.example/x",
+    ]
+    for url in hostile:
+        page.evaluate("(url) => showInlineAlert('boom', url)", url)
+        playwright.expect(action).to_be_hidden()
+
+    page.evaluate("showInlineAlert('boom', '/login?reauth=1')")
+    playwright.expect(action).to_be_visible()
+    assert action.get_attribute("href") == "/login?reauth=1"
+    assert not page.errors

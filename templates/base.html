@@ -605,6 +605,21 @@
                 });
             })();
 
+            /* The action URL arrives in an API response. Only a same-origin path may become
+               the link's href: a script-scheme or data-scheme value must never reach it. */
+            function sameOriginHref(url) {
+                if (!url) return null;
+                try {
+                    var parsed = new URL(url, location.href);
+                    if (parsed.origin !== location.origin) return null;
+                    /* "/.//host" normalizes to "//host", which a browser reads as another site. */
+                    if (parsed.pathname.slice(0, 2) === '//') return null;
+                    return parsed.pathname + parsed.search;
+                } catch (e) {
+                    return null;
+                }
+            }
+
             /* Accessible replacement for window.alert(): fills the role="alert"
                region declared below the flash messages. */
             function showInlineAlert(message, actionUrl, actionLabel) {
@@ -614,24 +629,23 @@
                 if (!box || !text) return;
                 text.textContent = message;
                 if (action) {
-                    action.hidden = !actionUrl;
-                    if (actionUrl) {
-                        action.href = actionUrl;
+                    var href = sameOriginHref(actionUrl);
+                    action.hidden = !href;
+                    if (href) {
+                        action.href = href;
                         action.textContent = actionLabel || REAUTH_LABEL;
                     }
                 }
                 box.hidden = false;
             }
 
-            /* One-click re-authorize. The server answers "Wikimedia no longer accepts your
-               authorization" with a reauth_url (the login route with ?reauth=1); this adds the
-               page to come back to, so the user lands where they were after the OAuth round trip. */
+            /* One-click re-authorize. The server renders the link for this page; the API
+               response only decides whether to show it. Building the href from response
+               text would put untrusted data into the URL. */
             var REAUTH_LABEL = {{ _('Re-authorize')|tojson }};
+            var REAUTH_URL = {{ reauth_login_url|tojson }};
             function reauthHref(data) {
-                if (!data || !data.reauth_url) return null;
-                var u = new URL(data.reauth_url, location.href);
-                u.searchParams.set('next', location.pathname + location.search);
-                return u.pathname + u.search;
+                return data && data.reauth_url ? REAUTH_URL : null;
             }
         </script>
     </nav>

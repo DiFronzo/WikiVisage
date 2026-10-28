@@ -829,7 +829,7 @@
         {% if project.sdc_write_error and not project.sdc_write_requested %}
         <p style="color: var(--danger); font-weight: 700;">{{ _('Worker error: {error}').replace('{error}', project.sdc_write_error) }}</p>
         {% if sdc_needs_reauth %}
-        <a class="btn btn-primary btn-sm" style="margin-top: 0.5rem;" href="{{ url_for('login', reauth=1, next=request.full_path.rstrip('?')) }}">{{ _('Re-authorize') }}</a>
+        <a class="btn btn-primary btn-sm" style="margin-top: 0.5rem;" href="{{ reauth_login_url }}">{{ _('Re-authorize') }}</a>
         {% endif %}
         {% endif %}
     </div>
@@ -1948,10 +1948,12 @@
         p.textContent = text;
         container.appendChild(p);
         if (reauthUrl) {
+            var href = sameOriginHref(reauthUrl);
+            if (!href) return;
             var a = document.createElement('a');
             a.className = 'btn btn-primary btn-sm';
             a.style.marginTop = '0.5rem';
-            a.href = reauthUrl;
+            a.href = href;
             a.textContent = REAUTH_LABEL;
             container.appendChild(a);
         }
