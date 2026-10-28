@@ -254,18 +254,26 @@ def _request_timeout(batch_len: int) -> tuple[float, float]:
     return (FACE_SERVICE_CONNECT_TIMEOUT, read)
 
 
-def _post(instances: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _post(
+    instances: list[dict[str, Any]], *, retry: bool = True, read_timeout: float | None = None
+) -> list[dict[str, Any]]:
     """POST a batch and return the raw per-instance prediction dicts.
 
     Raises FaceServiceUnavailable for any transport- or envelope-level problem.
     Per-instance failures are left in the returned dicts for the caller to
-    classify.
+    classify. ``retry=False`` uses the session without retries: for a request that
+    is itself a probe, where three retries of a hung request would cost minutes.
+    ``read_timeout`` replaces the size-scaled read timeout (and caps the connect timeout) for a
+    request that must answer quickly or not at all.
     """
+    timeout = _request_timeout(len(instances))
+    if read_timeout is not None:
+        timeout = (min(timeout[0], read_timeout), read_timeout)
     try:
-        resp = get_session().post(
+        resp = (get_session() if retry else get_probe_session()).post(
             predict_url(),
             json={"instances": instances},
-            timeout=_request_timeout(len(instances)),
+            timeout=timeout,
         )
     except requests.RequestException as exc:
         raise FaceServiceUnavailable(f"face service request failed: {exc}") from exc
@@ -409,14 +417,17 @@ def _check_image_size(image_bytes: bytes) -> None:
         )
 
 
-def detect_faces_batch(items: Sequence[tuple[str, bytes]]) -> dict[str, DetectionResult | FaceServiceError]:
+def detect_faces_batch(
+    items: Sequence[tuple[str, bytes]], *, retry: bool = True
+) -> dict[str, DetectionResult | FaceServiceError]:
     """Detect faces in several images, splitting them across batched requests.
 
     ``items`` is a sequence of ``(key, image_bytes)``. The returned mapping has
     one entry per key: either a :class:`DetectionResult` or the
     :class:`FaceServiceError` explaining why that image failed. Transport
     failures fail every key in the affected batch but leave other batches
-    intact, so one flaky request does not discard a whole run's work.
+    intact, so one flaky request does not discard a whole run's work. ``retry=False`` sends
+    each request once (see :func:`_post`).
     """
     results: dict[str, DetectionResult | FaceServiceError] = {}
     sendable = []
@@ -434,7 +445,7 @@ def detect_faces_batch(items: Sequence[tuple[str, bytes]]) -> dict[str, Detectio
             for key, image_bytes in batch
         ]
         try:
-            predictions = _post(instances)
+            predictions = _post(instances) if retry else _post(instances, retry=False)
         except FaceServiceError as exc:
             logger.warning("Face service batch of %d failed: %s", len(batch), exc)
             for key, _bytes in batch:
@@ -522,14 +533,19 @@ _PROBE_PNG = base64.b64decode(
 )
 
 
-def check_service_model() -> tuple[str, int]:
+def check_service_model(*, retry: bool = True, read_timeout: float | None = None) -> tuple[str, int]:
     """Ask the service which embedding model it runs, via one tiny real request.
 
     Returns ``(model_id, dim)`` as reported, after the same validation every
     prediction gets. Raises :class:`FaceServiceError` if the service cannot be
     reached or reports a model other than ``EXPECTED_MODEL_ID`` or the wrong
-    width — callers use this at startup to refuse to run against the wrong model.
+    width — callers use this at startup to refuse to run against the wrong model. It is also
+    the only probe that runs the model (``is_healthy`` only asks whether the service is up), so
+    ``retry=False`` makes it a quick "can it detect right now" check; ``read_timeout`` bounds how
+    long one such check may take (a hung service would otherwise cost the whole request timeout).
     """
-    predictions = _post([{"id": "probe", "task": "detect", "image": base64.b64encode(_PROBE_PNG).decode("ascii")}])
+    instance = {"id": "probe", "task": "detect", "image": base64.b64encode(_PROBE_PNG).decode("ascii")}
+    kwargs: dict[str, Any] = {} if read_timeout is None else {"read_timeout": read_timeout}
+    predictions = _post([instance], **kwargs) if retry else _post([instance], retry=False, **kwargs)
     result = _parse_prediction(predictions[0])
     return result.model_id, result.dim

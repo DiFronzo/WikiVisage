@@ -558,14 +558,22 @@
 <script nonce="{{ csp_nonce }}">try{if(localStorage.getItem('viewit_dismissed')==='1'){var s=document.getElementById('viewitStrip');if(s)s.remove()}}catch(e){}</script>
 
 <div class="card decorated-card" id="progressCard">
-    {% if project.images_total == 0 %}
+    {% if project.images_total == 0 and project.status != 'active' %}
+        {# No worker will come for a paused or completed project: do not promise one. These ids are absent on purpose, so the poller leaves the card alone. #}
+        <h2>{{ _('Processing Progress') }}</h2>
+        <p class="text-muted-msg">{{ _('No images have been found for this project.') }}</p>
+    {% elif project.images_total == 0 %}
         <h2>{{ _('Processing Progress') }}</h2>
         <p id="progressMsg" class="text-muted-msg">
-            {{ _("The background worker hasn't discovered images in this category yet. This usually takes a minute or two after creating a project.") }}
+            {% if worker_claimed %}
+            {{ _('The background worker is listing the images in this category. This usually takes a few seconds.') }}
+            {% else %}
+            {{ _('This project is waiting for a background worker. It starts as soon as one is free.') }}
+            {% endif %}
         </p>
         <div class="progress-wrap progress-wrap-lg">
             <div class="progress-bar" id="progressBar" style="width: 100%; opacity: 0.15; animation: pulse 2s ease-in-out infinite;"></div>
-            <div class="progress-text" id="progressPct">{{ _('Waiting for worker') }}&hellip;</div>
+            <div class="progress-text" id="progressPct">{% if worker_claimed %}{{ _('Reading category') }}{% else %}{{ _('Waiting for worker') }}{% endif %}&hellip;</div>
         </div>
     {% elif project.images_processed == project.images_total %}
         <div class="progress-header">
@@ -675,17 +683,23 @@
 {% set confirmed = stats.confirmed_matches or 0 %}
 {% set human_confirmed = stats.human_confirmed or 0 %}
 {% set eligible = inference_eligible or 0 %}
-{% if unclassified > 0 or pending_images > 0 %}
+{% set inference_capable = human_confirmed >= (project.min_confirmed or 5) %}
+{% set processing_incomplete = project.status == 'active' and (pending_images > 0 or (project.images_processed or 0) != (project.images_total or 0) or project.images_total == 0) %}
+{# inference_run: the number of the last recorded run (0 = none). The card stays until the user closes it, also after a reload or a visit later on. #}
+{% set run_token = inference_run or 0 %}
+{% set inference_watch = inference_triggered or run_token > 0 or (inference_capable and (eligible > 0 or processing_incomplete)) %}
+{# The model starts once every image has been processed: until then the card says it is waiting, and nothing is "in progress". #}
+{% set inference_waiting = inference_capable and project.status == 'active' and pending_images > 0 %}
+{% set inference_running = eligible > 0 and inference_capable and pending_images == 0 %}
+{% set inference_done = (inference_triggered or run_token > 0) and not inference_running and pending_images == 0 %}
+{# The waiting card already says what the info banner would (images remaining), so the banner steps aside. #}
+{% if (unclassified > 0 or pending_images > 0) and not inference_waiting %}
 <div class="card info-banner" id="infoBanner">
     {% if human_confirmed >= project.min_confirmed and eligible > 0 and pending_images == 0 %}
     <p class="info-banner-text info-text-info">
         {{ ngettext('%(num)d face waiting for model inference. The background worker will classify it automatically within the next minute.', '%(num)d faces waiting for model inference. The background worker will classify them automatically within the next minute.', eligible, num=eligible) }}
     </p>
-    {% elif human_confirmed >= project.min_confirmed and pending_images > 0 %}
-    <p class="info-banner-text info-text-info" id="infoBannerText">
-        {{ ngettext('The background worker is still processing images (%(pending)d image remaining). Model inference will start once all images have been processed.', 'The background worker is still processing images (%(pending)d images remaining). Model inference will start once all images have been processed.', pending_images, pending=pending_images) }}
-    </p>
-    {% elif human_confirmed >= project.min_confirmed %}
+    {% elif human_confirmed >= project.min_confirmed and pending_images == 0 %}
     <p class="info-banner-text info-text-info">
         {{ ngettext('%(num)d unclassified face remaining, but none are currently eligible for automatic model inference.', '%(num)d unclassified faces remaining, but none are currently eligible for automatic model inference.', unclassified, num=unclassified) }}
     </p>
@@ -717,13 +731,8 @@
 </div>
 {% endif %}
 
-{% set inference_capable = human_confirmed >= (project.min_confirmed or 5) %}
-{% set processing_incomplete = project.status == 'active' and (pending_images > 0 or (project.images_processed or 0) != (project.images_total or 0) or project.images_total == 0) %}
-{% set inference_watch = inference_triggered or (inference_capable and (eligible > 0 or processing_incomplete)) %}
-{% set inference_running = eligible > 0 and inference_capable %}
-{% set inference_done = inference_triggered and not inference_running %}
 {% if inference_watch %}
-<div class="card inference-banner{% if inference_done %} inference-banner-done{% endif %}" id="inferenceBanner" role="status" aria-live="polite"{% if not inference_running and not inference_done %} style="display:none"{% endif %}>
+<div class="card inference-banner{% if inference_done %} inference-banner-done{% endif %}" id="inferenceBanner" data-run="{{ run_token }}" role="status" aria-live="polite"{% if not inference_waiting and not inference_running and not inference_done %} style="display:none"{% endif %}>
     <div class="inference-banner-row">
         {% if inference_done %}
         <span class="inference-done-icon" aria-hidden="true">✓</span>
@@ -731,8 +740,12 @@
         <div class="inference-spinner" id="inferenceSpinner" aria-hidden="true"></div>
         {% endif %}
         <p class="inference-banner-text" id="inferenceText">
-            {% if inference_done %}
+            {% if inference_done and inference_matches is not none %}
+            {{ (_('Model inference complete — {num} new match found.') if inference_matches == 1 else _('Model inference complete — {num} new matches found.')).replace('{num}', inference_matches|string) }}
+            {% elif inference_done %}
             {{ _('Model inference complete.') }}
+            {% elif inference_waiting %}
+            {{ (_('Waiting for the last image to be processed before running the model…') if pending_images == 1 else _('Waiting for {num} more images to be processed before running the model…')).replace('{num}', pending_images|string) }}
             {% else %}
             {{ ngettext('Model inference in progress — %(num)d face remaining…', 'Model inference in progress — %(num)d faces remaining…', inference_eligible, num=inference_eligible) }}
             {% endif %}
@@ -741,7 +754,9 @@
     <button class="inference-banner-close" id="inferenceBannerClose" type="button" aria-label="{{ _('Close') }}">&times;</button>
 </div>
 {% if inference_done %}
-<script nonce="{{ csp_nonce }}">try{if(localStorage.getItem('inference_dismissed_{{ project.id }}')==='1'){var ib=document.getElementById('inferenceBanner');if(ib)ib.remove()}}catch(e){}</script>
+{# The user closed the card of this run (or of a later one): do not show it again. A newer run has a larger number. #}
+{# In a function on purpose: "closed" at the top level is window.closed, a read-only property, so a "var closed" there silently keeps its value false. #}
+<script nonce="{{ csp_nonce }}">(function(){try{var card=document.getElementById('inferenceBanner');var shownRun=parseInt(card.dataset.run||'0',10);var closedRun=parseInt(localStorage.getItem('inference_dismissed_{{ project.id }}')||'0',10);if(closedRun>0&&closedRun>=shownRun)card.remove()}catch(e){}})();</script>
 {% endif %}
 {% endif %}
 
@@ -1840,8 +1855,15 @@
         var inferenceClose = document.getElementById('inferenceBannerClose');
         if (inferenceClose) {
             inferenceClose.addEventListener('click', function() {
-                inferenceClose.parentElement.remove();
-                try { localStorage.setItem('inference_dismissed_{{ project.id }}', '1'); } catch (e) {}
+                var card = inferenceClose.parentElement;
+                // Closing the card of a finished run remembers which run, so only a newer one shows its
+                // card again. A waiting or running card has no run to remember.
+                var run = parseInt(card.dataset.run || '0', 10);
+                var finished = card.classList.contains('inference-banner-done');
+                card.remove();
+                if (finished && run > 0) {
+                    try { localStorage.setItem('inference_dismissed_{{ project.id }}', String(run)); } catch (e) {}
+                }
             });
         }
     })();
@@ -2237,10 +2259,11 @@
             imagesCount: {{ _('{done} / {total} images')|tojson }},
             imagesProcessed: {{ _('{num} images processed')|tojson }},
             waiting: {{ _('Waiting for worker')|tojson }},
+            reading: {{ _('Reading category')|tojson }},
+            waitingMsg: {{ _('This project is waiting for a background worker. It starts as soon as one is free.')|tojson }},
+            readingMsg: {{ _('The background worker is listing the images in this category. This usually takes a few seconds.')|tojson }},
             pendingOne: {{ _('The background worker is still processing images ({pending} image remaining). More faces will appear as processing continues.')|tojson }},
             pendingMany: {{ _('The background worker is still processing images ({pending} images remaining). More faces will appear as processing continues.')|tojson }},
-            inferenceAfterOne: {{ _('The background worker is still processing images ({pending} image remaining). Model inference will start once all images have been processed.')|tojson }},
-            inferenceAfterMany: {{ _('The background worker is still processing images ({pending} images remaining). Model inference will start once all images have been processed.')|tojson }},
             inferenceWaiting: {{ ngettext('{num} face waiting for model inference. The background worker will classify it automatically within the next minute.', '{num} faces waiting for model inference. The background worker will classify them automatically within the next minute.', 2)|tojson }},
             inferenceWaitingOne: {{ ngettext('{num} face waiting for model inference. The background worker will classify it automatically within the next minute.', '{num} faces waiting for model inference. The background worker will classify them automatically within the next minute.', 1)|tojson }}
         };
@@ -2285,7 +2308,12 @@
                 var done = data.images_processed || 0;
                 var total = data.images_total || 0;
 
-                if (total === 0) return;
+                if (total === 0) {
+                    // Nothing found yet: say whether a worker already has the project.
+                    if (msgEl) msgEl.textContent = data.claimed ? i18nProgress.readingMsg : i18nProgress.waitingMsg;
+                    pctEl.textContent = (data.claimed ? i18nProgress.reading : i18nProgress.waiting) + '\u2026';
+                    return;
+                }
 
                 if (msgEl) msgEl.style.display = 'none';
 
@@ -2340,14 +2368,8 @@
                     if (banner) {
                         var p = document.getElementById('infoBannerText') || banner.querySelector('p');
                         if (p) {
-                            var confirmed = (data.face_stats && data.face_stats.confirmed_matches) || 0;
-                            if (data.pending_images > 0 && confirmed >= minConfirmed) {
-                                p.style.color = 'var(--info)';
-                                p.style.fontWeight = '700';
-                                p.textContent = data.pending_images === 1
-                                    ? i18nProgress.inferenceAfterOne.replace('{pending}', '1')
-                                    : i18nProgress.inferenceAfterMany.replace('{pending}', data.pending_images);
-                            } else if (data.pending_images > 0) {
+                            var confirmed = (data.face_stats && data.face_stats.human_confirmed) || 0;
+                            if (data.pending_images > 0) {
                                 p.style.color = 'var(--info)';
                                 p.style.fontWeight = '700';
                                 p.textContent = data.pending_images === 1
@@ -2390,8 +2412,12 @@
         var i18nInference = {
             inProgressOne: {{ _('Model inference in progress — {num} face remaining…')|tojson }},
             inProgressMany: {{ _('Model inference in progress — {num} faces remaining…')|tojson }},
-            done: {{ _('Model inference complete — {matches} new matches found.')|tojson }}
+            doneOne: {{ _('Model inference complete — {num} new match found.')|tojson }},
+            done: {{ _('Model inference complete — {num} new matches found.')|tojson }},
+            waitingOne: {{ _('Waiting for the last image to be processed before running the model…')|tojson }},
+            waiting: {{ _('Waiting for {num} more images to be processed before running the model…')|tojson }}
         };
+        var projectActive = {{ (project.status == 'active')|tojson }};
         var initialByModel = {{ (stats.by_model or 0)|tojson }};
         var initialModelMatches = {{ (stats.model_matches or 0)|tojson }};
 
@@ -2439,20 +2465,31 @@
                 updateSdcStatusText();
 
                 var canInfer = (fs.human_confirmed || 0) >= minConfirmed;
-                var running = eligible > 0 && canInfer;
-                var quiescent = data.complete && (data.pending_images || 0) === 0;
+                var pending = data.pending_images || 0;
+                // The model starts once every image has been processed: until then the card says it
+                // is waiting, and nothing is "in progress".
+                var waiting = projectActive && canInfer && pending > 0;
+                var running = eligible > 0 && canInfer && pending === 0;
+                var quiescent = data.complete && pending === 0;
 
                 // Eligible faces or model-classification growth since load mean a
                 // cycle is (or has been) working; keep that fact across the hidden
                 // gaps so a between-polls cycle still finalizes the card below.
                 if (eligible > 0 || (fs.by_model || 0) > initialByModel) sawWork = true;
 
-                if (running) {
-                    // Still running
-                    var msg = eligible === 1 ? i18nInference.inProgressOne : i18nInference.inProgressMany;
-                    if (textEl) textEl.textContent = msg.replace('{num}', eligible);
+                if (waiting || running) {
+                    var msg;
+                    var count;
+                    if (waiting) {
+                        msg = pending === 1 ? i18nInference.waitingOne : i18nInference.waiting;
+                        count = pending;
+                    } else {
+                        msg = eligible === 1 ? i18nInference.inProgressOne : i18nInference.inProgressMany;
+                        count = eligible;
+                    }
+                    if (textEl) textEl.textContent = msg.replace('{num}', count);
                     if (banner.classList.contains('inference-banner-done')) {
-                        // A late cycle started after a completion card — back to the running look
+                        // New work started after a completion card — back to the spinner look
                         banner.classList.remove('inference-banner-done');
                         var doneIcon = banner.querySelector('.inference-done-icon');
                         if (doneIcon) doneIcon.outerHTML = '<div class="inference-spinner" id="inferenceSpinner" aria-hidden="true"></div>';
@@ -2462,14 +2499,15 @@
                     // Everything finished after observed work — show the completion note
                     clearInterval(inferenceTimer);
                     inferenceTimer = null;
-                    var newMatches = Math.max(0, (fs.model_matches || 0) - initialModelMatches);
+                    // The run's own count when the server has it, else the growth seen since page load.
+                    var newMatches = (typeof data.inference_matches === 'number')
+                        ? data.inference_matches
+                        : Math.max(0, (fs.model_matches || 0) - initialModelMatches);
+                    banner.dataset.run = String(data.inference_run || 0);  // closing it remembers this run
                     banner.classList.add('inference-banner-done');
                     var spinner = document.getElementById('inferenceSpinner');
                     if (spinner) spinner.outerHTML = '<span class="inference-done-icon" aria-hidden="true">✓</span>';
-                    if (textEl) textEl.textContent = i18nInference.done.replace('{matches}', newMatches);
-
-                    // Clear dismissal so the completed banner shows fresh
-                    try { localStorage.removeItem('inference_dismissed_{{ project.id }}'); } catch(e) {}
+                    if (textEl) textEl.textContent = (newMatches === 1 ? i18nInference.doneOne : i18nInference.done).replace('{num}', newMatches);
 
                     // Ensure banner is visible (user may have dismissed in-progress state)
                     banner.style.display = '';
@@ -2485,8 +2523,9 @@
                     clearInterval(inferenceTimer);
                     inferenceTimer = null;
                 } else {
-                    // More work remains — hide the in-progress look until the next cycle
-                    if (!banner.classList.contains('inference-banner-done')) banner.style.display = 'none';
+                    // More work remains. A finished run's card stays (as it does after a reload) unless
+                    // images are pending again; anything else waits hidden for the next cycle.
+                    if (!banner.classList.contains('inference-banner-done') || pending > 0) banner.style.display = 'none';
                 }
             }).catch(function(e) {
                 console.error('Inference poll error:', e);

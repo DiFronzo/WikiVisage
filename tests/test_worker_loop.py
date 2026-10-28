@@ -23,6 +23,7 @@ from database import DatabaseError
 def _running(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(worker, "shutdown_requested", False)
     monkeypatch.setattr(worker, "_worker_id", "test-worker")
+    monkeypatch.setattr(worker, "_last_cycle_started", 0.0)  # no earlier cycle holds a wake-up back
 
 
 def finished(value: Any = None, error: Exception | None = None) -> Future[Any]:
@@ -210,23 +211,30 @@ def test_a_failed_purge_is_logged_and_the_cycle_continues(caplog: pytest.LogCapt
 # --------------------------------------------------------------------------
 
 
-def test_a_wake_up_file_is_consumed_exactly_once(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
-    wake = tmp_path / ".wake"
-    wake.write_text("")
-    monkeypatch.setattr(worker, "WAKE_FILE_PATH", str(wake))
+def test_the_wake_up_signal_comes_from_this_workers_database_watcher(monkeypatch: pytest.MonkeyPatch) -> None:
+    watcher = MagicMock()
+    watcher.consume.side_effect = [True, False]
+    monkeypatch.setattr(worker, "_wake_watcher", watcher)
 
     assert worker._consume_wake_signal() is True
-    assert not wake.exists()
     assert worker._consume_wake_signal() is False
 
 
-def test_a_wake_up_file_that_cannot_be_removed_still_counts(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
-    wake = tmp_path / ".wake"
-    wake.write_text("")
-    monkeypatch.setattr(worker, "WAKE_FILE_PATH", str(wake))
+def test_main_takes_the_wake_counter_as_handled_before_the_first_cycle(
+    main_env: dict[str, MagicMock], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    order: list[str] = []
+    main_env["_wake_watcher"].prime.side_effect = lambda: order.append("prime")
 
-    with patch.object(worker.os, "remove", side_effect=OSError("read-only")):
-        assert worker._consume_wake_signal() is True
+    def cycle() -> None:
+        order.append("cycle")
+        monkeypatch.setattr(worker, "shutdown_requested", True)
+
+    monkeypatch.setattr(worker, "_run_cycle", cycle)
+
+    worker.main()
+
+    assert order == ["prime", "cycle"]
 
 
 # --------------------------------------------------------------------------
@@ -593,6 +601,63 @@ def test_the_cycle_lets_a_database_error_reach_the_main_loop() -> None:
         worker._run_cycle()
 
 
+def test_a_cycle_records_when_it_began_for_the_wake_up_gap(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(worker.time, "monotonic", lambda: 4242.0)
+    with (
+        patch.object(worker, "_probe_liftwing_if_due"),
+        patch.object(worker, "_purge_deleted_projects"),
+        patch.object(worker, "_process_sdc_writes"),
+        patch.object(worker, "_claim_active_projects", return_value=[]),
+        patch.object(worker, "_drain_inference_queue"),
+        patch.object(worker, "_process_active_projects"),
+    ):
+        worker._run_cycle()
+
+    assert worker._last_cycle_started == 4242.0
+
+
+def test_a_wake_up_shortly_after_a_cycle_began_waits_out_the_gap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every cycle crawls every active project: repeated wake-ups must not turn that into a crawl every few seconds."""
+    monkeypatch.setattr(worker.time, "monotonic", lambda: 1000.0)
+    monkeypatch.setattr(worker, "_last_cycle_started", 997.0)  # began 3 s ago
+    with patch.object(worker, "WAKE_MIN_GAP", 10), patch.object(worker.time, "sleep") as sleeper:
+        worker._wait_out_wake_gap()
+
+    assert sleeper.call_count == 7  # the 7 s still missing, in one-second slices
+
+
+def test_a_wake_up_long_after_the_last_cycle_is_not_delayed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(worker.time, "monotonic", lambda: 1000.0)
+    monkeypatch.setattr(worker, "_last_cycle_started", 500.0)
+    with patch.object(worker, "WAKE_MIN_GAP", 10), patch.object(worker.time, "sleep") as sleeper:
+        worker._wait_out_wake_gap()
+
+    sleeper.assert_not_called()
+
+
+def test_the_wake_up_gap_stops_at_shutdown(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(worker.time, "monotonic", lambda: 1000.0)
+    monkeypatch.setattr(worker, "_last_cycle_started", 1000.0)
+    monkeypatch.setattr(worker, "shutdown_requested", True)
+    with patch.object(worker, "WAKE_MIN_GAP", 10), patch.object(worker.time, "sleep") as sleeper:
+        worker._wait_out_wake_gap()
+
+    sleeper.assert_not_called()
+
+
+def test_a_wake_up_in_the_poll_sleep_goes_through_the_gap() -> None:
+    with (
+        patch.object(worker, "POLL_INTERVAL", 60),
+        patch.object(worker.random, "randint", return_value=0),
+        patch.object(worker, "_consume_wake_signal", side_effect=[True]),
+        patch.object(worker, "_wait_out_wake_gap") as gap,
+        patch.object(worker.time, "sleep"),
+    ):
+        worker._sleep_until_next_cycle()
+
+    gap.assert_called_once_with()
+
+
 def test_sleep_ends_early_for_a_wake_up_signal() -> None:
     with (
         patch.object(worker, "POLL_INTERVAL", 60),
@@ -712,6 +777,7 @@ def main_env(monkeypatch: pytest.MonkeyPatch) -> dict[str, MagicMock]:
         "_release_resources": MagicMock(),
         "_shadow_prefilter_loop": MagicMock(),
         "_heartbeat_loop": MagicMock(),
+        "_wake_watcher": MagicMock(),
     }
     for name, mock in mocks.items():
         monkeypatch.setattr(worker, name, mock)

@@ -28,6 +28,7 @@ FLOORS = {
     "token_crypto.py": 100,
     "oauth_refresh.py": 98,
     "api_errors.py": 100,
+    "wake.py": 98,
 }
 
 

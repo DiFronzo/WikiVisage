@@ -992,6 +992,56 @@ def test_alter_migrations_add_session_epoch_and_worker_heartbeats():
     assert "CREATE TABLE IF NOT EXISTS worker_heartbeats" in table  # idempotent by construction
 
 
+def test_all_tables_include_worker_wake():
+    assert "worker_wake" in _ALL_TABLES  # so --reset drops and recreates it
+
+
+def test_schema_sql_defines_worker_wake_and_image_detect_attempts():
+    statements = load_schema(str(Path(__file__).resolve().parent.parent / "schema.sql"))
+    wake = next(stmt for stmt in statements if "CREATE TABLE IF NOT EXISTS worker_wake" in stmt)
+    images = next(stmt for stmt in statements if "CREATE TABLE IF NOT EXISTS images" in stmt)
+
+    wake_columns = wake.split("CREATE TABLE", 1)[1]  # past the explanatory comment
+    assert "PRIMARY KEY" in wake_columns
+    assert "BIGINT UNSIGNED" in wake_columns.split("seq", 1)[1].split("\n", 1)[0]
+    columns = images.split("CREATE TABLE", 1)[1]
+    attempts = columns.split("detect_attempts", 1)[1].split("\n", 1)[0]
+    assert "TINYINT UNSIGNED NOT NULL DEFAULT 0" in attempts
+    isolate = " ".join(columns.split("detect_isolate", 1)[1].split("\n", 1)[0].split())  # schema.sql aligns columns
+    assert "TINYINT(1) NOT NULL DEFAULT 0" in isolate
+    assert columns.index("detect_attempts") < columns.index("detect_isolate") < columns.index("created_at")
+    projects = next(stmt for stmt in statements if "CREATE TABLE IF NOT EXISTS projects" in stmt).split(
+        "CREATE TABLE", 1
+    )[1]
+    assert (
+        projects.index("last_inference_min_confirmed")
+        < projects.index("last_inference_run")
+        < projects.index("last_inference_at")
+        < projects.index("last_inference_matches")
+        < projects.index("sdc_write_requested")
+    )  # same order as the ALTERs
+    # Strike counting must not need a seed row: wake.request_wake() is an upsert.
+    assert not any("INSERT" in stmt and "worker_wake" in stmt for stmt in statements)
+
+
+def test_alter_migrations_add_worker_wake_and_image_detect_attempts():
+    by_description = dict(_ALTER_MIGRATIONS)
+    table = by_description["Create worker_wake table"]
+    assert "CREATE TABLE IF NOT EXISTS worker_wake" in table  # idempotent by construction
+    # One ALTER per table: it applies all its columns or none, and a large table is rebuilt once.
+    images = by_description["Add detect_attempts and detect_isolate to images"]
+    assert "ADD COLUMN detect_attempts TINYINT UNSIGNED NOT NULL DEFAULT 0" in images
+    assert "AFTER error_message" in images  # same column order as schema.sql
+    assert "ADD COLUMN detect_isolate TINYINT(1) NOT NULL DEFAULT 0" in images
+    assert images.index("detect_attempts") < images.index("AFTER detect_attempts")  # the flag follows the counter
+    projects = by_description["Add the last inference run record to projects"]
+    assert "ADD COLUMN last_inference_run INT UNSIGNED NOT NULL DEFAULT 0" in projects
+    assert "AFTER last_inference_min_confirmed" in projects
+    assert "ADD COLUMN last_inference_at DATETIME NULL" in projects and "AFTER last_inference_run" in projects
+    assert "ADD COLUMN last_inference_matches INT UNSIGNED NULL" in projects and "AFTER last_inference_at" in projects
+    assert sum("ADD COLUMN last_inference_at" in sql for _d, sql in _ALTER_MIGRATIONS) == 1
+
+
 def test_schema_sql_defines_liftwing_prefilter_objects():
     statements = load_schema(str(Path(__file__).resolve().parent.parent / "schema.sql"))
     joined = "\n".join(statements)

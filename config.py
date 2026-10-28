@@ -16,15 +16,14 @@ except (OSError, KeyError, tomllib.TOMLDecodeError):  # pragma: no cover - pypro
 # face-service clients).
 USER_AGENT = f"WikiVisage/{PROJECT_VERSION} (https://github.com/DiFronzo/WikiVisage)"
 
-# Path to the file used to wake the background worker immediately.
-# Both the web process (writes it) and the worker (reads/deletes it) use
-# this path, so it must be defined in one place to stay consistent.
-WAKE_FILE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".worker-wake-up")
-
 # Base directory for heartbeat files touched by each worker instance.
 # Each worker appends its own worker-id to form a unique file path,
 # so independent Toolforge health checks can detect per-worker staleness.
 HEARTBEAT_FILE_DIR = os.path.expanduser("~")
+
+# A project claim older than this no longer holds the project: the other worker may take it. The web
+# app uses the same figure to tell "a worker is on it" from "a worker died holding the claim".
+CLAIM_EXPIRY_MINUTES = 15
 
 # Standard thumbnail widths Commons will serve (``$wgThumbnailSteps``); any other
 # width is answered with HTTP 429. Shared so every thumbnail URL is built from

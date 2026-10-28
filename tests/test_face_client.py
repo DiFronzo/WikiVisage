@@ -509,3 +509,67 @@ def test_web_and_worker_side_modules_load_no_ml_libraries(module):
     }
     result = subprocess.run([sys.executable, "-c", code], cwd=root, env=env, capture_output=True, text=True)  # noqa: S603
     assert result.returncode == 0, result.stderr
+
+
+# --- single requests that must not be retried (the isolation of a failing image) -------------
+
+
+def _ok_http_response(predictions):
+    response = MagicMock(status_code=200)
+    response.json.return_value = {"predictions": predictions}
+    return response
+
+
+def test_post_uses_the_retrying_session_unless_told_not_to():
+    retrying, probing = MagicMock(), MagicMock()
+    retrying.post.return_value = probing.post.return_value = _ok_http_response([{}])
+    with (
+        patch("face_client.get_session", return_value=retrying),
+        patch("face_client.get_probe_session", return_value=probing),
+    ):
+        face_client._post([{"id": "1"}])
+        assert retrying.post.call_count == 1 and probing.post.call_count == 0
+        face_client._post([{"id": "1"}], retry=False)
+        assert retrying.post.call_count == 1 and probing.post.call_count == 1
+
+
+def test_detect_faces_batch_without_retries_sends_each_request_once():
+    with patch("face_client._post", return_value=[_ok_prediction(key="a")]) as post:
+        face_client.detect_faces_batch([("a", b"x")], retry=False)
+    assert post.call_args.kwargs == {"retry": False}
+
+
+def test_detect_faces_batch_keeps_calling_post_the_old_way_by_default():
+    with patch("face_client._post", return_value=[_ok_prediction(key="a")]) as post:
+        face_client.detect_faces_batch([("a", b"x")])
+    assert post.call_args.kwargs == {}  # existing callers and their test doubles see no new argument
+
+
+def test_check_service_model_can_skip_the_retries_to_be_a_quick_probe():
+    with patch("face_client._post", return_value=[_ok_prediction(key="probe")]) as post:
+        face_client.check_service_model(retry=False)
+    assert post.call_args.kwargs == {"retry": False}
+    with patch("face_client._post", return_value=[_ok_prediction(key="probe")]) as post:
+        face_client.check_service_model()
+    assert post.call_args.kwargs == {}
+
+
+def test_post_read_timeout_replaces_the_size_scaled_one_and_caps_the_connect_timeout():
+    session = MagicMock()
+    session.post.return_value = _ok_http_response([{}])
+    with patch("face_client.get_probe_session", return_value=session):
+        face_client._post([{"id": "1"}], retry=False)
+        default = session.post.call_args.kwargs["timeout"]
+        face_client._post([{"id": "1"}], retry=False, read_timeout=4)
+        quick = session.post.call_args.kwargs["timeout"]
+
+    assert default == face_client._request_timeout(1)
+    assert quick == (4, 4)  # connect timeout is capped too, so a quick check cannot hang on connect
+
+
+def test_check_service_model_passes_a_read_timeout_only_when_given():
+    with patch("face_client._post", return_value=[_ok_prediction(key="probe", faces=[])]) as post:
+        face_client.check_service_model(retry=False)
+        assert post.call_args.kwargs == {"retry": False}
+        face_client.check_service_model(retry=False, read_timeout=7)
+        assert post.call_args.kwargs == {"retry": False, "read_timeout": 7}

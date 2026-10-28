@@ -61,6 +61,7 @@ import face_client
 import oauth_refresh
 from api_errors import ApiError
 from config import (
+    CLAIM_EXPIRY_MINUTES,
     COMMONS_THUMB_STEPS,
     DETECTION_WIDTH,
     LIFTWING_PROBE_INTERVAL,
@@ -68,7 +69,6 @@ from config import (
     SESSION_IDLE_DAYS,
     SESSION_MAX_AGE_DAYS,
     USER_AGENT,
-    WAKE_FILE_PATH,
     WORKER_STALE_SECONDS,
 )
 from database import (
@@ -79,6 +79,7 @@ from database import (
 )
 from face_client import FaceServiceError, FaceServiceRejected
 from token_crypto import TokenDecryptionError, decrypt_token, encrypt_token
+from wake import request_wake
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -1687,6 +1688,40 @@ def get_project_for_actor(project_id: int, user_id: int, *, require_owner: bool 
     return rows[0] if rows else None
 
 
+def _inference_run_token(project: dict) -> int:
+    """The number of the project's last recorded inference run (0 = no run on record).
+
+    The project page keeps its "inference complete" card until the user closes it, and the browser
+    remembers *which run* it closed: a newer run has a larger number (a counter the worker bumps on
+    every recorded run, so neither a clock nor two runs in one second can confuse it), and its card
+    shows again. A re-run clears the record but not the counter.
+    """
+    if not project.get("last_inference_at"):
+        return 0
+    return int(project.get("last_inference_run") or 0)
+
+
+def _live_claim_ids(project_ids: list[int]) -> set[int]:
+    """The ids among *project_ids* that a worker holds right now: claimed, and the claim has not expired.
+
+    A claim that a dead worker left behind stops counting after ``CLAIM_EXPIRY_MINUTES``, so a page
+    never says "a worker is reading the category" about a project nobody is working on. A database
+    error reads as "no claim".
+    """
+    if not project_ids:
+        return set()
+    placeholders = ", ".join(["%s"] * len(project_ids))
+    try:
+        rows = execute_query(
+            f"SELECT id FROM projects WHERE id IN ({placeholders}) "
+            "AND worker_claimed_by IS NOT NULL AND worker_claimed_at > NOW() - INTERVAL %s MINUTE",
+            (*project_ids, CLAIM_EXPIRY_MINUTES),
+        )
+    except DatabaseError:
+        return set()
+    return {row["id"] for row in rows or ()}
+
+
 def verify_image_access(image_id: int, project_id: int, user_id: int) -> dict | None:
     """Confirm *image_id* belongs to a project accessible to *user_id* (owner or member).
 
@@ -1893,8 +1928,16 @@ def dashboard():
                     except DatabaseError:
                         pass  # Non-critical — will retry next page load
 
+    # Projects with no images yet: which of the active ones does a worker already hold?
+    claimed_ids = _live_claim_ids(
+        [p["id"] for p in projects if p.get("status") == "active" and not p.get("images_total")]
+        if isinstance(projects, list)
+        else []
+    )
+
     return render_template(
         "dashboard.html",
+        claimed_ids=claimed_ids,
         projects=projects,
         member_counts=member_counts,
         current_user_id=g.user["id"],
@@ -2192,12 +2235,8 @@ def _create_project(form: _NewProjectForm):
         _insert_project(form, p18_thumb_url)
         flash(_("Project created successfully!"), "success")
 
-        # Signal the worker to wake up and process the new project immediately
-        try:
-            with open(WAKE_FILE_PATH, "w") as f:
-                f.write("")
-        except OSError:
-            pass  # Non-critical — worker will pick it up on next poll
+        # Wake the workers so the new project starts at once (they poll every minute otherwise)
+        request_wake()
 
         return redirect(url_for("dashboard"))
     except DatabaseError as exc:
@@ -2364,10 +2403,16 @@ def project_detail(project_id: int):
     inference_triggered = request.args.get("inference_triggered") == "1"
 
     is_owner = project["user_id"] == g.user["id"]
+    # Only a project with no images yet shows the waiting card, which is what the claim decides.
+    waiting_for_images = project.get("status") == "active" and images_total == 0
+    worker_claimed = bool(waiting_for_images and _live_claim_ids([project_id]))
 
     return render_template(
         "project_detail.html",
         project=project,
+        worker_claimed=worker_claimed,
+        inference_run=_inference_run_token(project),
+        inference_matches=project.get("last_inference_matches"),
         stats=face_stats,
         gallery_total=gallery_total,
         member_count=member_count,
@@ -3678,12 +3723,8 @@ def api_write_sdc(project_id: int):
     except DatabaseError:
         return jsonify({"error": _("Database error")}), 500
 
-    # Touch wake-up file to reduce latency (worker checks every 60s)
-    try:
-        with open(WAKE_FILE_PATH, "w") as f:
-            f.write("sdc")
-    except OSError:
-        pass
+    # Wake the workers to cut the latency (they poll every minute otherwise)
+    request_wake()
 
     return jsonify({"status": "ok", "pending": write_count, "removal_pending": removal_count})
 
@@ -4047,9 +4088,13 @@ def api_progress(project_id: int):
             "images_processed": images_processed,
             "images_total": images_total,
             "pending_images": pending_images,
+            # A worker holds the project: with no images yet it is reading the category, not queued.
+            "claimed": bool(images_total == 0 and project["status"] == "active" and _live_claim_ids([project_id])),
             "complete": images_total > 0 and images_processed >= images_total,
             "face_stats": face_stats,
             "inference_eligible": inference_eligible,
+            "inference_run": _inference_run_token(project),
+            "inference_matches": project.get("last_inference_matches"),
         }
     )
 
@@ -4542,7 +4587,8 @@ def project_rerun_inference(project_id: int):
             rows_reset = cursor.rowcount
             if rows_reset:
                 cursor.execute(
-                    "UPDATE projects SET last_inference_threshold = NULL, last_inference_min_confirmed = NULL "
+                    "UPDATE projects SET last_inference_threshold = NULL, last_inference_min_confirmed = NULL, "
+                    "last_inference_at = NULL, last_inference_matches = NULL "
                     "WHERE id = %s",
                     (project_id,),
                 )
@@ -4611,11 +4657,7 @@ def project_rerun_inference(project_id: int):
 
     # Wake the worker even when no face needed a reset: unclassified faces
     # may still be waiting, and the user explicitly asked for a run.
-    try:
-        with open(WAKE_FILE_PATH, "w") as f:
-            f.write("")
-    except OSError:
-        pass  # Non-critical — worker will pick it up on next poll
+    request_wake()
 
     flash(
         _(

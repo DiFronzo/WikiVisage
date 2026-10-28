@@ -3,6 +3,7 @@ import html
 import io
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -40,6 +41,7 @@ import face_client
 import liftwing_client
 import oauth_refresh
 from config import (
+    CLAIM_EXPIRY_MINUTES,
     DETECTION_WIDTH,
     HEARTBEAT_FILE_DIR,
     LIFTWING_PROBE_INTERVAL,
@@ -47,7 +49,6 @@ from config import (
     SDC_AUTH_EXPIRED_MESSAGE,
     SDC_AUTH_UNAVAILABLE_MESSAGE,
     USER_AGENT,
-    WAKE_FILE_PATH,
     WORKER_RESTART_GRACE_SECONDS,
 )
 from database import (
@@ -60,6 +61,7 @@ from database import (
     open_dedicated_connection,
 )
 from face_client import FaceServiceError, FaceServiceModelMismatch, FaceServiceRejected
+from wake import WakeWatcher
 
 # Configure Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
@@ -72,6 +74,32 @@ FILE_PATH_URL = f"https://commons.wikimedia.org/wiki/Special:FilePath/{{file_tit
 
 POLL_INTERVAL = int(os.environ.get("WIKIVISAGE_WORKER_POLL_INTERVAL", 60))
 BATCH_SIZE = int(os.environ.get("WIKIVISAGE_WORKER_BATCH_SIZE", 50))
+# An image that fails on its own, while the thing it depends on demonstrably works (a test detection
+# for the face service, another thumbnail download for Commons), this many times is written off as
+# an error instead of being retried for ever (see _isolate_images and _strike_failed_downloads).
+MAX_DETECT_ATTEMPTS = int(os.environ.get("WIKIVISAGE_MAX_DETECT_ATTEMPTS", 3))
+# How long a failed request waits for the face service to detect again before its images are left for
+# the next cycle. A service that crashed on one image (out of memory) needs a while to restart.
+DETECT_RECOVERY_WAIT = int(os.environ.get("WIKIVISAGE_DETECT_RECOVERY_WAIT", 60))
+_RECOVERY_POLL_SECONDS = 3
+# One test detection must answer within this long, so a service that accepts requests and never
+# answers cannot stretch the recovery wait to a multiple of the request timeout.
+SERVICE_PROBE_TIMEOUT = float(os.environ.get("WIKIVISAGE_SERVICE_PROBE_TIMEOUT", 10))
+# Set (monotonic) when the service did not recover in time, so the other waves and projects of this
+# worker do not each wait the whole time again. Several project threads read and write it.
+_service_down_until = 0.0
+_service_state_lock = threading.Lock()
+# A thumbnail that Commons cannot render fails its download every time. Such an image is only
+# blamed when Commons demonstrably serves another thumbnail right now (one that downloaded in the
+# same wave, else this small canary file), so an outage never writes images off.
+COMMONS_CANARY_URL = "https://commons.wikimedia.org/wiki/Special:FilePath/Example.jpg?width=20"
+CANARY_PROOF_SECONDS = 60
+_canary_ok_until = 0.0
+# A wake-up never starts a cycle sooner than this after the previous one began: every cycle crawls
+# every active project's category, and a user pressing "send edits" repeatedly must not turn that
+# into a crawl every few seconds.
+WAKE_MIN_GAP = int(os.environ.get("WIKIVISAGE_WAKE_MIN_GAP", 10))
+_last_cycle_started = 0.0
 MAX_CONCURRENT_PROJECTS = int(os.environ.get("WIKIVISAGE_WORKER_MAX_PROJECTS", 4))
 IMAGE_THREADS = int(os.environ.get("WIKIVISAGE_WORKER_IMAGE_THREADS", 4))
 
@@ -92,7 +120,6 @@ EMBEDDING_NORM_MIN = 0.9
 EMBEDDING_NORM_MAX = 1.1
 
 # Distributed locking: stale claims from crashed workers expire after this many minutes
-CLAIM_EXPIRY_MINUTES = 15
 
 # Maximum image download size (50 MB) — prevents OOM on abnormally large files
 MAX_IMAGE_DOWNLOAD_BYTES = 50 * 1024 * 1024
@@ -684,6 +711,22 @@ def _refresh_worker_token(user_id: int) -> str | None:
     return tokens.access_token if tokens else None
 
 
+def _refresh_images_total(project_id: int) -> None:
+    """Set ``projects.images_total`` to the number of images the project has now.
+
+    Called after every page of the crawl, so a failure here must not abort the crawl: the final
+    call at the end of ``traverse_category`` sets the exact figure anyway.
+    """
+    try:
+        execute_query(
+            "UPDATE projects SET images_total = (SELECT COUNT(*) FROM images WHERE project_id = %s) WHERE id = %s",
+            (project_id, project_id),
+            fetch=False,
+        )
+    except DatabaseError as exc:
+        logger.warning(f"Could not update the image total of project {project_id}: {exc}")
+
+
 def traverse_category(project: dict[str, Any]) -> int:
     """Fetch all files in the project's Commons category (including subcategories) and insert them as pending."""
     _mark_progress("traverse_category")
@@ -786,6 +829,10 @@ def traverse_category(project: dict[str, Any]) -> int:
                         fetch=False,
                     )
                     added_count += result if isinstance(result, int) else 0
+                    if result:
+                        # The project page shows "waiting" until this is above 0: tell it now,
+                        # not after the whole category tree has been read.
+                        _refresh_images_total(project["id"])
 
                 if added_count >= remaining:
                     break
@@ -805,12 +852,7 @@ def traverse_category(project: dict[str, Any]) -> int:
             f"{len(visited_cats)} categories visited, {len(cat_queue)} queued"
         )
 
-    # Update total image count
-    execute_query(
-        "UPDATE projects SET images_total = (SELECT COUNT(*) FROM images WHERE project_id = %s) WHERE id = %s",
-        (project["id"], project["id"]),
-        fetch=False,
-    )
+    _refresh_images_total(project["id"])
 
     return added_count
 
@@ -829,12 +871,25 @@ def _mark_image_error(img_id: int, message: str) -> None:
     )
 
 
+class TransientDownloadError(Exception):
+    """A download failed in a way that may pass (network error, timeout, HTTP 429/5xx).
+
+    ``rate_limited`` marks an HTTP 429: Commons asking us to slow down says nothing about the image.
+    """
+
+    def __init__(self, message: str, *, rate_limited: bool = False):
+        super().__init__(message)
+        self.rate_limited = rate_limited
+
+
 def _download_for_detection(img_id: int, title: str) -> bytes | None:
     """Download and dimension-check one image, ready for detection.
 
-    Returns the image bytes, or None if the image cannot be used now. A
-    transient failure (network error, timeout, HTTP 429/5xx) leaves the row
-    'pending' for a later cycle; anything else marks it 'error'. Keeping
+    Returns the image bytes, or None if the image was marked 'error'. A
+    transient failure (network error, timeout, HTTP 429/5xx) raises
+    :class:`TransientDownloadError` and leaves the row 'pending' for a later cycle
+    (the wave decides whether the image earns a strike, see ``_strike_failed_downloads``);
+    anything else marks it 'error'. Keeping
     transient failures pending matters: 'error' counts as processed, so a CDN
     outage would otherwise let the project auto-complete as "no faces".
     Dimension validation stays on this side so oversized images are rejected
@@ -850,7 +905,7 @@ def _download_for_detection(img_id: int, title: str) -> bytes | None:
         status = getattr(getattr(e, "response", None), "status_code", None)
         if status is None or status == 429 or status >= 500:
             logger.warning(f"Transient error downloading image {title}, leaving pending: {e}")
-            return None
+            raise TransientDownloadError(str(e), rate_limited=status == 429) from e
         logger.error(f"Error downloading image {title}: {e}")
         _mark_image_error(img_id, str(e))
         return None
@@ -976,6 +1031,186 @@ def _handle_detection_failure(img_id: int, title: str, error: FaceServiceError) 
         logger.warning(f"Face service unavailable for image {title}, leaving pending: {error}")
 
 
+def _is_retryable_failure(outcome: object) -> bool:
+    """A transport-style failure that may be the image's fault: not a rejection, not a model mismatch.
+
+    A mismatch means the wrong service version is answering, which no image can fix.
+    """
+    return (
+        isinstance(outcome, face_client.FaceServiceUnavailable)
+        and not isinstance(outcome, face_client.FaceServiceRejected)
+        and not isinstance(outcome, face_client.FaceServiceModelMismatch)
+    )
+
+
+def _service_detects() -> bool:
+    """True when the face service runs a real, tiny detection right now. One request, no retries.
+
+    ``face_client.is_healthy()`` is not enough to blame an image: it only asks whether the service
+    is up. A service that answers its readiness probe while every detection fails passes it, and
+    striking images for that would write off every pending image of every project.
+    """
+    try:
+        face_client.check_service_model(retry=False, read_timeout=SERVICE_PROBE_TIMEOUT)
+    except Exception:
+        return False
+    return True
+
+
+def _service_known_down() -> bool:
+    """True while a wait for the face service has just ended without it recovering."""
+    with _service_state_lock:
+        return time.monotonic() < _service_down_until
+
+
+def _mark_service_down() -> None:
+    global _service_down_until
+    with _service_state_lock:
+        _service_down_until = time.monotonic() + DETECT_RECOVERY_WAIT
+
+
+def _wait_for_service() -> bool:
+    """Wait until the face service detects again. True as soon as it does, False if it does not in time.
+
+    A service that crashed on one image needs a while to restart, and until it does nothing can be
+    attributed to any image. The limit is wall-clock time (each test detection is itself capped by
+    ``SERVICE_PROBE_TIMEOUT``, so a hung service cannot stretch it). After a timeout the answer stays
+    False for another ``DETECT_RECOVERY_WAIT`` seconds without waiting, so a down service costs each
+    worker one wait, not one per wave.
+    """
+    if _service_known_down():
+        return False
+    deadline = time.monotonic() + DETECT_RECOVERY_WAIT
+    while True:
+        if _service_detects():
+            return True
+        remaining = deadline - time.monotonic()
+        if shutdown_requested or remaining <= 0:
+            break
+        _mark_progress("waiting_for_face_service")
+        time.sleep(min(_RECOVERY_POLL_SECONDS, remaining))
+    _mark_service_down()
+    return False
+
+
+def _isolate_images(
+    detections: dict[str, face_client.DetectionResult | FaceServiceError], items: dict[str, bytes]
+) -> tuple[set[str], set[str]]:
+    """Send each of *items* to the face service on its own and put the outcome in *detections*.
+
+    The client fails every image of a request together, so one image that hangs or crashes the face
+    service takes its neighbours down with it, in every cycle, for ever. Alone, the culprit shows.
+    Before each image a test detection must work (``_wait_for_service``): only then is a failure the
+    image's, even if it crashes the service, which then gets time to restart before the next image.
+
+    Returns ``(blamed, deferred)``: the keys that failed alone after a working test, and the keys
+    that could not be tried because the service never worked in time (nobody is to blame for that).
+    """
+    blamed: set[str] = set()
+    deferred: set[str] = set()
+    keys = list(items)
+    for position, key in enumerate(keys):
+        if shutdown_requested or not _wait_for_service():
+            deferred.update(keys[position:])
+            break
+        detections.update(face_client.detect_faces_batch([(key, items[key])], retry=False))
+        if _is_retryable_failure(detections[key]):
+            blamed.add(key)
+    for key in deferred:
+        detections.setdefault(key, face_client.FaceServiceUnavailable("the face service could not be tested in time"))
+    return blamed, deferred
+
+
+def _flag_for_solo_retry(image_ids: list[int]) -> None:
+    """Mark images to be sent alone next time: their request failed and the service could not be tested.
+
+    No strike: nothing says the image is at fault. Best effort.
+    """
+    if not image_ids:
+        return
+    placeholders = ", ".join(["%s"] * len(image_ids))
+    try:
+        execute_query(
+            f"UPDATE images SET detect_isolate = 1 WHERE id IN ({placeholders}) AND status = 'pending'",
+            tuple(image_ids),
+            fetch=False,
+        )
+    except DatabaseError as exc:
+        logger.warning(f"Could not flag {len(image_ids)} image(s) to be sent alone next time: {exc}")
+
+
+def _record_detect_failure(img_id: int, title: str, reason: str) -> int:
+    """Count one failed detection for an image that failed alone after a test detection had just worked.
+
+    After ``MAX_DETECT_ATTEMPTS`` strikes the image is marked 'error' so it stops holding up the
+    project (an errored image counts as processed). Returns the number of strikes, 0 if unknown
+    or if the image is no longer pending.
+    """
+    try:
+        counted = execute_query(
+            "UPDATE images SET detect_attempts = detect_attempts + 1 WHERE id = %s AND status = 'pending'",
+            (img_id,),
+            fetch=False,
+        )
+        if not counted:  # no longer pending (processed or written off meanwhile): leave it alone
+            return 0
+        rows = execute_query("SELECT detect_attempts FROM images WHERE id = %s", (img_id,), fetch=True)
+    except DatabaseError as exc:
+        logger.warning(f"Could not record the failed detection of {title}: {exc}")
+        return 0
+    attempts = int(rows[0]["detect_attempts"]) if rows else 0
+    if attempts >= MAX_DETECT_ATTEMPTS:
+        logger.error(f"Giving up on {title} after {attempts} failed attempts: {reason}")
+        try:
+            _mark_image_error(img_id, f"could not be processed after {attempts} attempts: {reason}")
+        except DatabaseError as exc:
+            logger.warning(f"Could not mark {title} as an error: {exc}")
+    else:
+        logger.warning(f"Detection failed for {title} (attempt {attempts} of {MAX_DETECT_ATTEMPTS}): {reason}")
+    return attempts
+
+
+def _commons_serves_thumbnails() -> bool:
+    """True when Commons renders a thumbnail of a small, always-present file right now.
+
+    The proof that a failed download is the image's own problem and not an outage. Cached for
+    ``CANARY_PROOF_SECONDS``. Never raises.
+    """
+    global _canary_ok_until
+    if time.monotonic() < _canary_ok_until:
+        return True
+    try:
+        _download_image(COMMONS_CANARY_URL)
+    except Exception as exc:
+        logger.warning(f"Commons canary thumbnail failed: {exc}")
+        return False
+    _canary_ok_until = time.monotonic() + CANARY_PROOF_SECONDS
+    return True
+
+
+def _strike_failed_downloads(
+    failed: dict[str, TransientDownloadError], rows_by_key: dict[str, dict[str, Any]], *, proven: bool
+) -> None:
+    """Give a strike to each image whose download failed while Commons demonstrably worked.
+
+    A transient download failure leaves the image 'pending' without any counter, so a thumbnail
+    that Commons cannot render (a 5xx every time) kept its project from ever finishing. It shares
+    the strikes of failed detections: ``MAX_DETECT_ATTEMPTS`` of them mark it 'error'. Nobody is
+    struck for a 429 (Commons asking us to slow down) or while Commons does not serve any other
+    thumbnail either: ``proven`` says another download of this wave worked, otherwise the canary
+    decides.
+    """
+    blamable = {key: exc for key, exc in failed.items() if not exc.rate_limited}
+    if not blamable:
+        return
+    if not proven and not _commons_serves_thumbnails():
+        logger.warning(f"{len(blamable)} download(s) failed while Commons serves no other thumbnail: no strikes")
+        return
+    for key, exc in blamable.items():
+        row = rows_by_key[key]
+        _record_detect_failure(row["id"], row["file_title"], f"download failed: {exc}")
+
+
 def _process_image_wave(wave: list[dict[str, Any]], project_id: int) -> tuple[int, tuple[float, float, float]]:
     """Download, detect, and persist one wave of images.
 
@@ -997,6 +1232,7 @@ def _process_image_wave(wave: list[dict[str, Any]], project_id: int) -> tuple[in
 
     rows_by_key: dict[str, dict[str, Any]] = {}
     downloaded: list[tuple[str, bytes]] = []
+    failed_downloads: dict[str, TransientDownloadError] = {}
     with ThreadPoolExecutor(max_workers=IMAGE_THREADS) as executor:
         futures = {}
         for img_row in wave:
@@ -1013,20 +1249,32 @@ def _process_image_wave(wave: list[dict[str, Any]], project_id: int) -> tuple[in
             key = futures[future]
             try:
                 image_bytes = future.result()
+            except TransientDownloadError as e:
+                failed_downloads[key] = e
+                continue
             except Exception as e:
                 logger.error(f"Thread error downloading {rows_by_key[key]['file_title']}: {e}")
                 continue
             if image_bytes is not None:
                 downloaded.append((key, image_bytes))
 
+    if failed_downloads and not shutdown_requested:
+        _strike_failed_downloads(failed_downloads, rows_by_key, proven=bool(downloaded))
     t_download = time.monotonic()
 
     detections: dict[str, face_client.DetectionResult | FaceServiceError] = {}
+    to_isolate: dict[str, bytes] = {}  # images to send alone: flagged earlier, or whose request failed
     if downloaded and not shutdown_requested:
-        detections = face_client.detect_faces_batch(downloaded)
+        to_isolate = {key: data for key, data in downloaded if rows_by_key[key].get("detect_isolate")}
+        batch_items = [(key, data) for key, data in downloaded if key not in to_isolate]
+        if batch_items:
+            detections = face_client.detect_faces_batch(batch_items)
+            to_isolate.update({key: data for key, data in batch_items if _is_retryable_failure(detections.get(key))})
     # Release the wave's image bytes before touching the DB — this is the peak
-    # memory point of the whole pipeline.
+    # memory point of the whole pipeline. (Only the images to send alone stay, for that.)
     downloaded.clear()
+    blamed, deferred = _isolate_images(detections, to_isolate)
+    to_isolate.clear()
 
     t_detect = time.monotonic()
 
@@ -1037,6 +1285,10 @@ def _process_image_wave(wave: list[dict[str, Any]], project_id: int) -> tuple[in
             break
         img_row = rows_by_key[key]
         if isinstance(outcome, FaceServiceError):
+            if key in blamed:
+                # Failed alone right after a test detection worked: the image is the problem.
+                _record_detect_failure(img_row["id"], img_row["file_title"], str(outcome))
+                continue
             if not isinstance(outcome, FaceServiceRejected):
                 unavailable += 1
             _handle_detection_failure(img_row["id"], img_row["file_title"], outcome)
@@ -1048,6 +1300,8 @@ def _process_image_wave(wave: list[dict[str, Any]], project_id: int) -> tuple[in
             project_id=project_id,
         ):
             processed_count += 1
+
+    _flag_for_solo_retry([rows_by_key[key]["id"] for key in deferred])
 
     # A whole wave failing as "unavailable" means the service is down, not that
     # the images were bad. Those rows stay pending by design, so without an
@@ -1124,9 +1378,9 @@ def process_images(project: dict[str, Any]) -> int:
     bs_to_fetch = min(BATCH_SIZE, bootstrap_remaining)
     if bs_to_fetch > 0:
         bs = execute_query(
-            "SELECT id, file_title, bootstrapped FROM images "
+            "SELECT id, file_title, bootstrapped, detect_isolate FROM images "
             "WHERE project_id = %s AND status = 'pending' AND bootstrapped = 1 "
-            "LIMIT %s",
+            "ORDER BY detect_attempts ASC, id ASC LIMIT %s",
             (project_id, bs_to_fetch),
             fetch=True,
         )
@@ -1136,9 +1390,9 @@ def process_images(project: dict[str, Any]) -> int:
     remaining_slots = BATCH_SIZE - len(pending_images)
     if remaining_slots > 0:
         non_bs = execute_query(
-            "SELECT id, file_title, bootstrapped FROM images "
+            "SELECT id, file_title, bootstrapped, detect_isolate FROM images "
             "WHERE project_id = %s AND status = 'pending' AND bootstrapped = 0 "
-            "LIMIT %s",
+            "ORDER BY detect_attempts ASC, id ASC LIMIT %s",
             (project_id, remaining_slots),
             fetch=True,
         )
@@ -1176,6 +1430,12 @@ def process_images(project: dict[str, Any]) -> int:
     # Waves, not one big download pass — see DETECTION_WAVE_SIZE.
     for wave_start in range(0, len(pending_images), DETECTION_WAVE_SIZE):
         if shutdown_requested:
+            break
+        if wave_start and _service_known_down():
+            logger.warning(
+                f"Face service is down: leaving {len(pending_images) - wave_start} image(s) of project "
+                f"{project_id} for the next cycle"
+            )
             break
         wave = pending_images[wave_start : wave_start + DETECTION_WAVE_SIZE]
         processed, timings = _process_image_wave(wave, project_id)
@@ -1816,6 +2076,26 @@ def _persist_inference_batch(project_id: int, batch: list[tuple[int, int, float]
     return execute_transaction(_apply)
 
 
+def _record_inference_completion(project_id: int, classified: int, matches: int) -> None:
+    """Remember that an inference run finished and what it found.
+
+    The project page keeps its "inference complete" card until the user closes it, also after a
+    reload and when the run ended while they were away, and it reads this. A run that classified
+    nothing is not worth announcing. Best effort: it must never fail the run.
+    """
+    if classified <= 0:
+        return
+    try:
+        execute_query(
+            "UPDATE projects SET last_inference_run = last_inference_run + 1, last_inference_at = NOW(), "
+            "last_inference_matches = %s WHERE id = %s",
+            (matches, project_id),
+            fetch=False,
+        )
+    except Exception:
+        logger.warning(f"Project {project_id}: failed to record the inference completion", exc_info=True)
+
+
 def run_autonomous_inference(project: dict[str, Any]) -> int:
     """
     Run model inference on unclassified faces based on confirmed faces.
@@ -2030,6 +2310,8 @@ def run_autonomous_inference(project: dict[str, Any]) -> int:
         )
     except Exception:
         logger.warning(f"Project {project['id']}: failed to record inference settings", exc_info=True)
+
+    _record_inference_completion(project["id"], classified_count, matches)
 
     return classified_count
 
@@ -2905,9 +3187,13 @@ def _claim_inference_projects(max_count: int) -> list[dict[str, Any]]:
 
     An inference-eligible project is active or completed, has enough human-confirmed
     target faces (>= min_confirmed), and still has inferable unclassified faces
-    remaining (``run_autonomous_inference`` skips faces with a queued removal).
+    remaining (``run_autonomous_inference`` skips faces with a queued removal). An
+    **active** project must also have no image left to process: it is then still in
+    the image pipeline, and the model starts once every image is done (a completed
+    project is not processed any more, so its leftover pending images do not count).
     The work predicate is mirrored (negated) by ``_claim_shadow_project``; keep
-    them in sync.
+    them in sync (an active project with pending images stays claimable by
+    ``_claim_active_projects``, so this leaves no gap).
     """
 
     def _txn(conn: Any, cursor: Any) -> list[dict[str, Any]]:
@@ -2916,6 +3202,9 @@ def _claim_inference_projects(max_count: int) -> list[dict[str, Any]]:
             "WHERE p.status IN ('active', 'completed') "
             "AND (p.worker_claimed_by IS NULL "
             "     OR p.worker_claimed_at < NOW() - INTERVAL %s MINUTE) "
+            "AND (p.status = 'completed' OR NOT EXISTS ("
+            "  SELECT 1 FROM images i WHERE i.project_id = p.id AND i.status = 'pending'"
+            ")) "
             "AND ("
             "  SELECT COUNT(*) FROM faces f "
             "  JOIN images i ON f.image_id = i.id "
@@ -3215,16 +3504,41 @@ def _run_early_inference(project: dict[str, Any]) -> None:
     through the category crawl and SPARQL bootstrap before the inference card resolves. The
     final pass in ``process_project`` still handles faces from newly processed images.
     """
+    classified = _classify_waiting_faces(project)
+    if classified is not None:
+        logger.info(f"Project {project['id']}: early inference classified {classified} face(s) before discovery")
+
+
+def _classify_waiting_faces(project: dict[str, Any]) -> int | None:
+    """Run inference on the faces that are waiting, with the project's current settings.
+
+    Returns how many faces it classified, or None when there was nothing to do **or when images
+    are still waiting for detection**: inference works on all of a project's faces, and the model
+    only starts once every image has been processed. Inference itself refuses to run below
+    ``min_confirmed`` human-confirmed targets, so this is cheap early on.
+    """
     project_id = project["id"]
-    if shutdown_requested or not _has_inference_candidates(project_id):
-        return
+    if shutdown_requested or _pending_image_count(project_id) != 0 or not _has_inference_candidates(project_id):
+        return None
     fresh_rows = execute_query(
         "SELECT * FROM projects WHERE id = %s AND status != 'deleted'",
         (project_id,),
         fetch=True,
     )
-    early_classified = run_autonomous_inference(fresh_rows[0] if fresh_rows else project)
-    logger.info(f"Project {project_id}: early inference classified {early_classified} face(s) before discovery")
+    return run_autonomous_inference(fresh_rows[0] if fresh_rows else project)
+
+
+def _pending_image_count(project_id: int) -> int | None:
+    """Images of the project still waiting for detection, None when the database cannot say."""
+    try:
+        rows = execute_query(
+            "SELECT COUNT(*) AS cnt FROM images WHERE project_id = %s AND status = 'pending'",
+            (project_id,),
+            fetch=True,
+        )
+    except DatabaseError:
+        return None
+    return int(rows[0]["cnt"]) if rows else 0
 
 
 def _process_pending_images(project: dict[str, Any]) -> tuple[float, int]:
@@ -3232,8 +3546,14 @@ def _process_pending_images(project: dict[str, Any]) -> tuple[float, int]:
     t0 = time.monotonic()
     total_processed = 0
     while not shutdown_requested:
+        pending_before = _pending_image_count(project["id"])
         batch_count = process_images(project)
-        if batch_count == 0:
+        pending_after = _pending_image_count(project["id"])
+        # Progress is images leaving 'pending', not only successes: images written off as errors
+        # count too. Stopping on "no successes" left everything behind a failing batch waiting
+        # for the next poll, and for ever when those images kept failing.
+        resolved = pending_before is not None and pending_after is not None and pending_after < pending_before
+        if batch_count == 0 and not resolved:
             break
         total_processed += batch_count
         logger.info(f"Processed batch of {batch_count} images ({total_processed} total so far)")
@@ -3317,9 +3637,16 @@ def _auto_complete_unusable_project(project: dict[str, Any]) -> bool:
 
 
 def _run_final_inference(project: dict[str, Any]) -> float:
-    """Classify whatever is still unclassified. Returns the seconds spent."""
+    """Classify whatever is still unclassified, once no image is left to process. Returns the seconds spent.
+
+    The image loop can end with images still pending (the face service is down, or images keep
+    failing). Inference then waits: it works on all of a project's faces, and the next cycle gets
+    here again once they are processed or written off.
+    """
     t0 = time.monotonic()
-    if not shutdown_requested and _project_still_active(project["id"]):
+    if _pending_image_count(project["id"]) != 0:
+        logger.info(f"Project {project['id']}: images are still pending, inference waits for them")
+    elif not shutdown_requested and _project_still_active(project["id"]):
         fresh = execute_query(
             "SELECT * FROM projects WHERE id = %s AND status != 'deleted'", (project["id"],), fetch=True
         )
@@ -3677,15 +4004,14 @@ def _purge_deleted_projects() -> None:
         logger.warning("Failed to purge soft-deleted projects: %s", exc)
 
 
+# This worker's view of the wake counter the web app bumps (see wake.py). Every worker has its
+# own baseline, so a request wakes all of them and none is lost while one is busy.
+_wake_watcher = WakeWatcher()
+
+
 def _consume_wake_signal() -> bool:
-    """True once per wake-up request. The web app creates the file to ask for an immediate cycle."""
-    if not os.path.exists(WAKE_FILE_PATH):
-        return False
-    try:
-        os.remove(WAKE_FILE_PATH)
-    except OSError:
-        pass
-    return True
+    """True once per wake-up request from the web app (new project, send edits, re-run)."""
+    return _wake_watcher.consume()
 
 
 def _keep_alive_during_cycle() -> None:
@@ -3829,6 +4155,8 @@ def _process_active_projects(active_projects: list[dict[str, Any]], seen_ids: se
 
 def _run_cycle() -> None:
     """One poll cycle: purge, SDC writes, inference, active projects."""
+    global _last_cycle_started
+    _last_cycle_started = time.monotonic()
     _mark_progress("cycle")
     _probe_liftwing_if_due()
 
@@ -3848,6 +4176,15 @@ def _run_cycle() -> None:
     _process_active_projects(active_projects, seen_ids)
 
 
+def _wait_out_wake_gap() -> None:
+    """Hold a wake-up back until ``WAKE_MIN_GAP`` seconds after the previous cycle began (see there)."""
+    remaining = WAKE_MIN_GAP - (time.monotonic() - _last_cycle_started)
+    for _ in range(max(0, math.ceil(remaining))):
+        if shutdown_requested:
+            break
+        time.sleep(1)
+
+
 def _sleep_until_next_cycle() -> None:
     """Sleep one poll interval, waking early for a wake-up signal or finished SDC work.
 
@@ -3861,6 +4198,7 @@ def _sleep_until_next_cycle() -> None:
             break
         if _consume_wake_signal():
             logger.info("Wake-up signal received, starting next cycle")
+            _wait_out_wake_gap()
             break
         if time.time() - last_sdc_check >= 10:
             written = _process_sdc_writes()
@@ -3928,6 +4266,8 @@ def main():
     sweep_thread = threading.Thread(target=_shadow_prefilter_loop, name="shadow-prefilter-sweep", daemon=True)
     sweep_thread.start()
 
+    # Take the wake counter as handled before the first cycle, which looks at everything anyway.
+    _wake_watcher.prime()
     try:
         while not shutdown_requested:
             try:
