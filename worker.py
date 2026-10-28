@@ -462,6 +462,10 @@ def _create_session() -> requests.Session:
         backoff_factor=2,
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=["HEAD", "GET", "OPTIONS", "POST"],
+        # Once the retries are used up, hand back the last response instead of raising RetryError, which
+        # carries no response: every caller calls raise_for_status(), so it sees the real status (a
+        # download that is still rate limited after the retries must stay recognisable as a 429).
+        raise_on_status=False,
     )
     adapter = HTTPAdapter(max_retries=retries, pool_connections=10, pool_maxsize=20)
     session.mount("http://", adapter)
@@ -1103,13 +1107,25 @@ def _isolate_images(
     Before each image a test detection must work (``_wait_for_service``): only then is a failure the
     image's, even if it crashes the service, which then gets time to restart before the next image.
 
-    Returns ``(blamed, deferred)``: the keys that failed alone after a working test, and the keys
-    that could not be tried because the service never worked in time (nobody is to blame for that).
+    A test that worked does not prove the image alone broke the service: another thread or worker
+    sharing it may have hurt it while this request was in flight. So a failure is asked again, once the
+    service works again, and only an image that fails twice in a row is blamed. If the service does not
+    work again in time the outcome cannot be attributed to anyone and the image is deferred.
+
+    Returns ``(blamed, deferred)``: the keys that failed alone twice, each after a working test, and the
+    keys that could not be tried or confirmed because the service never worked in time (nobody is to
+    blame for that).
     """
     blamed: set[str] = set()
     deferred: set[str] = set()
     keys = list(items)
     for position, key in enumerate(keys):
+        if shutdown_requested or not _wait_for_service():
+            deferred.update(keys[position:])
+            break
+        detections.update(face_client.detect_faces_batch([(key, items[key])], retry=False))
+        if not _is_retryable_failure(detections[key]):
+            continue
         if shutdown_requested or not _wait_for_service():
             deferred.update(keys[position:])
             break

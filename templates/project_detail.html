@@ -755,8 +755,9 @@
 </div>
 {% if inference_done %}
 {# The user closed the card of this run (or of a later one): do not show it again. A newer run has a larger number. #}
+{# The key is new on purpose: 0.12.0 stored a fixed '1' under "inference_dismissed_<id>" whenever any card was closed, which would read as "run 1 was closed". #}
 {# In a function on purpose: "closed" at the top level is window.closed, a read-only property, so a "var closed" there silently keeps its value false. #}
-<script nonce="{{ csp_nonce }}">(function(){try{var card=document.getElementById('inferenceBanner');var shownRun=parseInt(card.dataset.run||'0',10);var closedRun=parseInt(localStorage.getItem('inference_dismissed_{{ project.id }}')||'0',10);if(closedRun>0&&closedRun>=shownRun)card.remove()}catch(e){}})();</script>
+<script nonce="{{ csp_nonce }}">(function(){try{var card=document.getElementById('inferenceBanner');var shownRun=parseInt(card.dataset.run||'0',10);var closedRun=parseInt(localStorage.getItem('inference_closed_run_{{ project.id }}')||'0',10);if(closedRun>0&&closedRun>=shownRun)card.remove()}catch(e){}})();</script>
 {% endif %}
 {% endif %}
 
@@ -1862,7 +1863,7 @@
                 var finished = card.classList.contains('inference-banner-done');
                 card.remove();
                 if (finished && run > 0) {
-                    try { localStorage.setItem('inference_dismissed_{{ project.id }}', String(run)); } catch (e) {}
+                    try { localStorage.setItem('inference_closed_run_{{ project.id }}', String(run)); } catch (e) {}
                 }
             });
         }
@@ -2408,6 +2409,12 @@
         // holds, so the completion note appears even when the final poll only
         // sees a finished project.
         var sawWork = {{ inference_eligible }} > 0;
+        // The run recorded when the page was rendered. A finished cycle is only announced once the server
+        // has recorded a newer one: the worker commits its classifications first and the completion record
+        // a moment later, and a poll in between would show (and remember) the previous run's result.
+        var baseRun = {{ run_token }};
+        var recordWaits = 0;
+        var MAX_RECORD_WAITS = 3;  // a run that classified nothing records nothing: do not wait for ever
         var minConfirmed = {{ project.min_confirmed or 5 }};
         var i18nInference = {
             inProgressOne: {{ _('Model inference in progress — {num} face remaining…')|tojson }},
@@ -2496,14 +2503,20 @@
                     }
                     banner.style.display = '';
                 } else if (sawWork && canInfer && quiescent) {
+                    var recordedRun = data.inference_run || 0;
+                    var recorded = recordedRun > baseRun;
+                    if (!recorded && recordWaits < MAX_RECORD_WAITS) {
+                        recordWaits++;  // the record of this cycle is not there yet: look again
+                        return;
+                    }
                     // Everything finished after observed work — show the completion note
                     clearInterval(inferenceTimer);
                     inferenceTimer = null;
-                    // The run's own count when the server has it, else the growth seen since page load.
-                    var newMatches = (typeof data.inference_matches === 'number')
+                    // The run's own count once it is recorded, else the growth seen since page load.
+                    var newMatches = (recorded && typeof data.inference_matches === 'number')
                         ? data.inference_matches
                         : Math.max(0, (fs.model_matches || 0) - initialModelMatches);
-                    banner.dataset.run = String(data.inference_run || 0);  // closing it remembers this run
+                    banner.dataset.run = String(recorded ? recordedRun : baseRun);  // closing it remembers this run
                     banner.classList.add('inference-banner-done');
                     var spinner = document.getElementById('inferenceSpinner');
                     if (spinner) spinner.outerHTML = '<span class="inference-done-icon" aria-hidden="true">✓</span>';

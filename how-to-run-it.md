@@ -636,7 +636,9 @@ The worker handles the second in three steps (strikes are shared):
    (60 s) for the face service to **detect** again (a tiny real detection, not
    just "ready"), then re-sends the images one at a time, testing the service
    before each one.
-2. An image that fails alone right after a working test gets a strike
+2. An image that fails alone right after a working test is sent alone once more
+   (another thread or worker may have hurt the shared service meanwhile); one that
+   fails both times gets a strike
    (`images.detect_attempts`). The third strike (`WIKIVISAGE_MAX_DETECT_ATTEMPTS`)
    marks it `error`, so the project can finish.
 3. If the service does not recover in time, nobody is blamed: the images are

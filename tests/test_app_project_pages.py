@@ -2040,10 +2040,12 @@ def test_closing_the_card_remembers_which_run_it_was_so_a_newer_run_shows_again(
     # remember, and the old fixed "1" hid every later completion for good)
     assert "card.classList.contains('inference-banner-done')" in body
     assert "String(Math.max(run, 1))" not in body
-    assert "localStorage.setItem('inference_dismissed_1', String(run))" in body
-    assert "localStorage.removeItem('inference_dismissed_1')" not in body
+    assert "localStorage.setItem('inference_closed_run_1', String(run))" in body
+    assert "localStorage.removeItem('inference_closed_run_1')" not in body
+    assert "inference_dismissed_1'" not in body  # the 0.12.0 key held a fixed '1', not a run number
     # and the poller tags the card with the run it just announced
-    assert "banner.dataset.run = String(data.inference_run || 0);" in body
+    assert "banner.dataset.run = String(recorded ? recordedRun : baseRun);" in body
+    assert "var baseRun = 3;" in body  # the run on record when the page was rendered
 
 
 def test_inference_run_token_is_the_run_counter_and_zero_without_a_record():
@@ -2117,7 +2119,7 @@ def test_project_detail_inference_completion_counts_only_model_matches(monkeypat
 
     assert "var initialModelMatches = 3;" in body
     # the run's own count when the server has it, else only the model's matches (not by_model) since load
-    assert "(typeof data.inference_matches === 'number')" in body
+    assert "(recorded && typeof data.inference_matches === 'number')" in body
     assert ": Math.max(0, (fs.model_matches || 0) - initialModelMatches);" in body
 
 

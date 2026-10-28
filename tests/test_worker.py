@@ -3698,7 +3698,8 @@ def test_a_failed_request_is_retried_image_by_image_and_only_the_culprit_is_stru
     assert processed == 2  # the two good neighbours were saved after all
     # (keys come back in download-completion order, so compare sorted)
     assert service.requests[0] == (["1", "2", "3"], True)  # the batch, with the client's normal retries
-    assert sorted(service.requests[1:]) == [(["1"], False), (["2"], False), (["3"], False)]  # then alone, no retries
+    # then alone, no retries; the one that failed is asked a second time before it is blamed
+    assert sorted(service.requests[1:]) == [(["1"], False), (["2"], False), (["2"], False), (["3"], False)]
     assert _struck(db) == [2]
     # One strike is not the end: the image stays pending for the next cycle.
     assert not any("status = 'error'" in sql for sql, _params in db)
@@ -3784,7 +3785,7 @@ def test_a_flagged_image_that_works_alone_is_simply_processed():
 
 
 def test_a_test_detection_must_work_before_every_single_image():
-    """If the service dies on one image, the next image is not tried (and not struck) until it works."""
+    """If the service dies on one image, nothing is attributed and nothing else is tried until it works."""
     service = FakeFaceService(poison=["1", "2", "3"], crash_polls=10**6)
     working = iter([True])  # the first test detection works, then the service is down for good
 
@@ -3811,9 +3812,10 @@ def test_a_test_detection_must_work_before_every_single_image():
         _process_image_wave(_wave(1, 2, 3), 5)
 
     assert len(service.requests) == 1  # only the first image went out
-    assert len(_struck(db)) == 1  # it failed right after a working test: its strike
-    assert len(_flagged(db)) == 2  # the other two wait, unstruck, for the service
-    assert sorted(_struck(db) + _flagged(db)) == [1, 2, 3]
+    # It failed right after a working test, but the service did not work again to confirm it:
+    # something else may have hurt the service meanwhile, so nobody is struck.
+    assert _struck(db) == []
+    assert _flagged(db) == [1, 2, 3]  # all three wait, unstruck, for the service
 
 
 def test_a_model_mismatch_is_the_services_problem_not_the_images():
@@ -6401,3 +6403,86 @@ def test_the_remaining_waves_are_left_alone_once_the_service_is_known_down(monke
         _worker_module.process_images({"id": 5})
 
     assert waves == [_worker_module.DETECTION_WAVE_SIZE]  # the other two waves were not even tried
+
+
+def test_a_failure_that_does_not_repeat_is_not_blamed_on_the_image():
+    """Another thread or worker can hurt the shared service while one image is in flight."""
+    service = FakeFaceService()
+    attempts: list[str] = []
+
+    def detect(items, retry=True):
+        keys = [key for key, _data in items]
+        service.requests.append((sorted(keys), retry))
+        if keys == ["1"] and not attempts:  # the service is hurt once, by someone else, during image 1
+            attempts.append("hurt")
+            return {"1": face_client.FaceServiceUnavailable("connection reset")}
+        if len(keys) > 1:
+            return {key: face_client.FaceServiceUnavailable("batch failed") for key in keys}
+        return {key: _good() for key in keys}
+
+    service.detect = detect  # type: ignore[method-assign]
+
+    processed, db, _sleeps = _run_wave(service, _wave(1, 2, 3))  # all flagged: they go alone from the start
+
+    assert processed == 3  # the second attempt at image 1 worked
+    assert _struck(db) == []
+    assert service.requests.count((["1"], False)) == 2
+
+
+def test_an_image_that_fails_twice_alone_is_blamed():
+    service = FakeFaceService(poison=["2"])
+
+    _processed, db, _sleeps = _run_wave(service, _wave(1, 2, 3))
+
+    assert _struck(db) == [2]
+    assert service.requests.count((["2"], False)) == 2
+
+
+def test_a_download_that_is_still_rate_limited_after_the_retries_stays_recognisable_as_a_429():
+    """urllib3 raised RetryError (no response) when its 429 retries ran out, so the download looked like
+    any other failure and was struck. The session must hand back the last response instead."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    class Limited(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(429)
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Limited)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{server.server_port}/thumb.jpg"
+
+    real_retry = _worker_module.Retry
+
+    def quick_retry(**kwargs):
+        return real_retry(**{**kwargs, "backoff_factor": 0})
+
+    def download(_url, max_bytes=0):
+        with patch("worker.Retry", quick_retry):
+            session = _worker_module._create_session()
+        resp = session.get(url, timeout=5)
+        resp.raise_for_status()
+        return resp.content
+
+    try:
+        with (
+            patch.object(_worker_module, "_download_image", side_effect=download),
+            patch.object(_worker_module, "_mark_image_error") as mark,
+            pytest.raises(_worker_module.TransientDownloadError) as caught,
+        ):
+            _worker_module._download_for_detection(1, "File:X.jpg")
+    finally:
+        server.shutdown()
+
+    assert caught.value.rate_limited is True
+    mark.assert_not_called()
+
+
+def test_the_session_hands_back_the_last_response_when_its_retries_run_out():
+    session = _worker_module._create_session()
+    policy = session.get_adapter("https://commons.wikimedia.org/").max_retries
+    assert policy.raise_on_status is False

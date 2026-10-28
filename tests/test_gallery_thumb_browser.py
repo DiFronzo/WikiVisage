@@ -886,3 +886,69 @@ def test_a_complete_card_gives_way_to_the_waiting_card_on_the_next_visit_after_n
         assert not page.errors
     finally:
         context.close()
+
+
+def test_a_flag_stored_by_the_old_release_does_not_hide_the_first_completion(browser, flask_app, monkeypatch):
+    """0.12.0 stored a fixed '1' under inference_dismissed_<id> when any inference card was closed."""
+    page, _project, context = _open_project_page(
+        browser, flask_app, monkeypatch, {**_FINISHED, "last_inference_at": datetime(2026, 10, 28, 12)}
+    )
+    try:
+        page.evaluate("localStorage.setItem('inference_dismissed_1', '1')")
+        page.reload()
+        playwright.expect(page.locator("#inferenceBanner")).to_contain_text("Model inference complete — 12 new matches")
+        assert not page.errors
+    finally:
+        context.close()
+
+
+def _running_after_a_run(browser, flask_app, monkeypatch):
+    """A page that watches the model work on 7 faces, while run 1 (12 matches) is the one on record."""
+    page, project, context = _open_project_page(
+        browser,
+        flask_app,
+        monkeypatch,
+        {**_FINISHED, "status": "active", "last_inference_at": datetime(2026, 10, 28, 12)},
+    )
+    page.counts["eligible"] = 7
+    page.reload()
+    playwright.expect(page.locator("#inferenceBanner")).to_contain_text("Model inference in progress")
+    return page, project, context
+
+
+def test_the_card_does_not_announce_the_previous_runs_result_before_the_new_one_is_recorded(
+    browser, flask_app, monkeypatch
+):
+    """The worker commits its classifications first and the completion record a moment later."""
+    page, project, context = _running_after_a_run(browser, flask_app, monkeypatch)
+    try:
+        card = page.locator("#inferenceBanner")
+        page.counts["eligible"] = 0  # the classifications are in, the record of this run is not
+        page.clock.run_for(5500)
+        page.clock.run_for(5500)
+        assert "12 new matches" not in card.inner_text()  # run 1's result must not pass for this run's
+
+        project.update(last_inference_at=datetime(2026, 10, 28, 14), last_inference_run=2, last_inference_matches=5)
+        page.clock.run_for(5500)
+        playwright.expect(card).to_contain_text("Model inference complete — 5 new matches found.")
+
+        page.locator("#inferenceBannerClose").click()  # it remembers run 2, not run 1
+        page.reload()
+        playwright.expect(card).to_have_count(0)
+        assert not page.errors
+    finally:
+        context.close()
+
+
+def test_the_card_stops_waiting_for_a_record_that_never_comes(browser, flask_app, monkeypatch):
+    """A run that classified nothing records nothing: the card must still finish, from what the page saw."""
+    page, _project, context = _running_after_a_run(browser, flask_app, monkeypatch)
+    try:
+        page.counts["eligible"] = 0
+        for _ in range(5):
+            page.clock.run_for(5500)
+        card = page.locator("#inferenceBanner")
+        playwright.expect(card).to_contain_text("Model inference complete")
+        assert not page.errors
+    finally:
+        context.close()

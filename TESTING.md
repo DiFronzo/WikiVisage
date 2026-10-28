@@ -492,7 +492,7 @@ Coverage includes touch identity and multi-touch cancellation, `touchcancel`,
 rotation during a drag, detection-space coordinate conversion, completed-box
 placement after resize, mouse drawing, and landscape modal scrolling
 (`test_bbox_editor_browser.py`, 20 runs). `test_gallery_thumb_browser.py`
-(60 runs) covers the Classification Results gallery: the zoom never exceeds
+(72 runs) covers the Classification Results gallery: the zoom never exceeds
 `MAX_DEVICE_UPSCALE` (2.0 device pixels per source pixel) at device pixel ratio
 1 and 2, one larger thumbnail is requested only when the crop needs it (never
 wider than `min(960, largest step <= detection width)`, taken from the row's
