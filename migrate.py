@@ -39,6 +39,7 @@ _ALL_TABLES = [
     "sessions",
     "user_stats",
     "worker_heartbeat",
+    "worker_heartbeats",
     "service_status",
     "users",
 ]
@@ -472,6 +473,25 @@ _ALTER_MIGRATIONS = [
         f"ALTER TABLE projects MODIFY COLUMN distance_threshold FLOAT NOT NULL DEFAULT {DEFAULT_DISTANCE_THRESHOLD} "
         "COMMENT 'Cosine distance threshold for autonomous inference (provisional default)'",
     ),
+    (
+        "Add session_epoch to users",
+        "ALTER TABLE users ADD COLUMN session_epoch INT UNSIGNED NOT NULL DEFAULT 0 "
+        "COMMENT 'Bumped by Log out everywhere, logins holding an older value are rejected' "
+        "AFTER leaderboard_opt_out",
+    ),
+    (
+        "Create worker_heartbeats table",
+        "CREATE TABLE IF NOT EXISTS worker_heartbeats ("
+        "  worker_id VARCHAR(64) NOT NULL PRIMARY KEY,"
+        "  state ENUM('running', 'stopping') NOT NULL DEFAULT 'running',"
+        "  last_seen DATETIME NOT NULL,"
+        "  expected_back_until DATETIME NULL COMMENT 'Set with state stopping: the banner stays hidden until then',"
+        "  last_progress DATETIME NULL COMMENT 'When the main loop last reported progress',"
+        "  phase VARCHAR(64) NULL COMMENT 'What the main loop was doing at last_progress',"
+        "  started_at DATETIME NULL,"
+        "  version VARCHAR(32) NULL"
+        ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
+    ),
 ]
 
 
@@ -547,8 +567,8 @@ def _column_exists(cursor: Any, table: str, column: str) -> bool:
 def _wipe_derived_data(conn: Any, cursor: Any) -> None:
     """Delete every image, face and SDC claim, and reset per-project progress.
 
-    Keeps users, projects, project_members, user_stats and
-    worker_heartbeat. ``DELETE`` rather than ``TRUNCATE``: InnoDB refuses
+    Keeps users, projects, project_members, user_stats,
+    worker_heartbeat and worker_heartbeats. ``DELETE`` rather than ``TRUNCATE``: InnoDB refuses
     TRUNCATE on a table a foreign key references. Deleting images cascades to
     faces and from there to sdc_claims; the explicit sdc_claims delete is a
     belt-and-braces sweep. Safe on Commons: ``write_sdc_claims`` checks the file
@@ -637,6 +657,7 @@ def verify_tables() -> None:
         "faces",
         "user_stats",
         "worker_heartbeat",
+        "worker_heartbeats",
         "sdc_claims",
         "project_members",
         "service_status",

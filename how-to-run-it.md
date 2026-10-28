@@ -76,7 +76,30 @@ toolforge envvars create WIKIVISAGE_FACE_SERVICE_TOKEN "<same token as the face 
 # Commons metadata is sent — never image bytes. Calls are serialised and spaced
 # by a jittered minimum interval (default 2 s; WIKIVISAGE_LIFTWING_MIN_INTERVAL).
 # toolforge envvars create WIKIVISAGE_LIFTWING_API_TOKEN "<personal-api-token>"
+
+# Sessions (optional; the defaults are what production runs).
+# Idle lifetime is sliding: every response re-sends the cookie, so it only runs
+# down while the app is closed. The maximum age counts from login.
+# toolforge envvars create WIKIVISAGE_SESSION_IDLE_DAYS    "30"
+# toolforge envvars create WIKIVISAGE_SESSION_MAX_AGE_DAYS "90"
+# Sampled "session loss:" log line in the web logs (default on; 0 turns it off)
+# toolforge envvars create WIKIVISAGE_LOG_SESSION_LOSS     "0"
+
+# Worker liveness (optional; the defaults are what production runs).
+# Seconds without any worker progress before the heartbeat stops and Toolforge
+# restarts the worker (default 900).
+# toolforge envvars create WIKIVISAGE_WORKER_STALL_LIMIT   "900"
+# Seconds a planned stop (deploy, restart) keeps the offline banner away (default 1200).
+# toolforge envvars create WIKIVISAGE_WORKER_RESTART_GRACE "1200"
 ```
+
+> **Database connections.** ToolsDB allows 20 per user across every process of
+> the tool. The web app uses 2 gunicorn workers x 3 (`WIKIVISAGE_WEB_DB_POOL_SIZE`);
+> each of the two background workers uses a pool of at most 5
+> (`WIKIVISAGE_DB_POOL_SIZE`, default `min(max_projects x image_threads + 3, 5)`)
+> **plus one dedicated connection** for its heartbeat thread:
+> 2 x 3 + 2 x (5 + 1) = 18 of 20. Do not raise the pool sizes without lowering
+> something else.
 
 > The face service runs as a **second tool** — see
 > [Face Service Deployment](#face-service-deployment-second-tool) below. If
@@ -133,7 +156,7 @@ toolforge jobs run migrate \
   --mem 512Mi
 ```
 
-This creates all 9 tables (`users`, `projects`, `images`, `faces`, `user_stats`, `sdc_claims`, `project_members`, `worker_heartbeat`, `service_status`) and their indexes. Safe to re-run — migrations are idempotent.
+This creates all 10 tables (`users`, `projects`, `images`, `faces`, `user_stats`, `sdc_claims`, `project_members`, `worker_heartbeats`, `service_status`, and the legacy single-row `worker_heartbeat`, which nothing reads any more and a later release drops) and their indexes. Safe to re-run — migrations are idempotent.
 
 Check the migration completed:
 
@@ -175,6 +198,8 @@ toolforge jobs run ml-worker-2 \
 
 This starts two continuous jobs (`ml-worker` and `ml-worker-2`) that crawl Commons categories, download images, detect faces, and run the classification model. Each worker polls for new work every 60 seconds. `deploy.yml` starts them the same way.
 
+Each worker also runs a heartbeat thread: every 30 seconds it touches `$HOME/.wikivisage-worker-alive-<worker-id>` (what `healthcheck.sh` checks) and upserts its row in `worker_heartbeats` over its own database connection. If the worker makes no progress for 15 minutes (`WIKIVISAGE_WORKER_STALL_LIMIT`) the thread stops touching the file, so Toolforge restarts the stuck worker. A database outage alone no longer fails the health check.
+
 Check worker status:
 
 ```bash
@@ -187,7 +212,7 @@ toolforge jobs logs ml-worker-2
 
 ## 8. Verify Everything
 
-1. **Health check**: Visit `https://wikivisage.toolforge.org/health` — should return `"status": "healthy"`, `"database": "connected"` and `"face_service": "reachable"`
+1. **Health check**: Visit `https://wikivisage.toolforge.org/health` — should return `"status": "healthy"`, `"database": "connected"` and `"face_service": "reachable"`. `"workers"` shows `{"fresh": 2, "stopping": 0, "stale": 0}` once both workers have beaten (informational; it never makes the check `degraded`)
 2. **Login**: Click "Log in with Wikimedia" — should redirect to Meta for OAuth, then back to the dashboard
 3. **Create a project**: Enter a Wikidata Q-ID (e.g., `Q42` for Douglas Adams) and a Commons category
 4. **Worker activity**: Check `toolforge jobs logs ml-worker` — should show category traversal starting within 60 seconds
@@ -224,6 +249,15 @@ service is updated and proven healthy *before* the workers are allowed to start.
 If the preflight fails the deploy fails and the workers stay down. That is
 deliberate: workers running against a dead face service look healthy while
 processing nothing, whereas a failed deploy is visible.
+
+The deploy order does not change for the offline banner. Stopping the workers
+sends them SIGTERM; each one writes a "stopping" row with an
+`expected_back_until` 20 minutes ahead (`WIKIVISAGE_WORKER_RESTART_GRACE`)
+before it releases its claims, and the restarted worker's first beat clears it.
+Users therefore do not see "The background worker appears to be offline" during
+a normal deploy. If the workers stay down longer than the grace period (for
+example the preflight failed), the banner appears. A SIGKILL or OOM kill writes
+no marker, so the banner appears 5 minutes after the last beat.
 
 To deploy manually, use the **workflow_dispatch** trigger on the Actions tab
 with a git tag. The workflow also supports an optional database wipe (requires
@@ -443,7 +477,7 @@ toolforge jobs run ml-worker-2 --command 'python -u worker.py --worker-id ml-wor
 
 ### "The background worker appears to be offline" banner
 
-The web app checks if a worker has sent a heartbeat in the last 5 minutes. If you see this banner:
+The banner shows only when **none** of these is true: a worker row in `worker_heartbeats` was seen in the last 5 minutes; a worker announced a planned stop that has not run out (20 minutes); a project claim was refreshed in the last 5 minutes. An empty `worker_heartbeats` table (a fresh install, or the minutes between a deploy's migration and the workers' first beat) and an unreadable database do not count as an outage. If you see this banner:
 
 ```bash
 # Check if workers are running
@@ -460,6 +494,85 @@ toolforge jobs run ml-worker --command 'python -u worker.py --worker-id ml-worke
 toolforge jobs delete ml-worker-2 || true
 toolforge jobs run ml-worker-2 --command 'python -u worker.py --worker-id ml-worker-2' --image tool-wikivisage/tool-wikivisage:latest --continuous --mem 2Gi --cpu 2 --health-check-script './healthcheck.sh ml-worker-2'
 ```
+
+### Diagnosing "worker offline" reports
+
+When users report the banner (or workers seem to restart), find out whether the
+worker is down, restarting, or only failing to write its heartbeat:
+
+```bash
+become wikivisage
+
+# State, restarts and the job definition
+toolforge jobs list
+toolforge jobs show ml-worker
+
+# Restart count and node; then the reason for the last restart
+kubectl get pods -o wide
+kubectl describe pod <ml-worker-pod>      # look for OOMKilled or "Liveness probe failed"
+
+# What the worker itself logged
+toolforge jobs logs ml-worker | grep -E "Starting WikiVisage Worker|Database error in main loop|Pool exhausted|Heartbeat write failed|No worker progress for|Announced planned stop"
+```
+
+What the log lines mean:
+
+| Line | Meaning |
+|---|---|
+| `Starting WikiVisage Worker` | A (re)start. Many of them in a row = restart loop |
+| `Heartbeat write failed` | The heartbeat thread could not write its row (at most one warning per minute). The file is still touched, so Toolforge does not restart the worker; the banner may show if the project claims also go stale |
+| `No worker progress for ... (phase=...)` | Nothing reported progress for 15 minutes. It comes with the main thread's stack. The thread then stops touching the liveness file, and Toolforge restarts the worker about 5 minutes later |
+| `Announced planned stop` | SIGTERM arrived (deploy, restart, `jobs delete`); the banner stays hidden for the grace period |
+| `Database error in main loop` / `Pool exhausted` | The database is unreachable or the pool is full |
+
+What the database says (ToolsDB shell, see step 3):
+
+```sql
+SELECT worker_id, state, last_seen, expected_back_until, phase, version,
+       TIMESTAMPDIFF(SECOND, last_seen, NOW()) AS age
+FROM worker_heartbeats;
+```
+
+A healthy worker has `state = 'running'` and an `age` under about 35 seconds. `state = 'stopping'` with `expected_back_until` in the future is a planned stop. Also check what the web app reports:
+
+```bash
+curl -s https://wikivisage.toolforge.org/health | jq .workers
+```
+
+`fresh` counts rows seen in the last 5 minutes, `stopping` planned stops that are still within their grace, `stale` everything else.
+
+### Users report being logged out
+
+Sessions last 30 days of inactivity (90 days at most from login, sliding idle
+lifetime), the `session` cookie is persistent, and a database error shows a
+"temporarily unavailable" page instead of ending the session. Reasons that
+still end one: the user pressed "Log out everywhere" (account settings), the
+browser dropped the cookie, the 90-day cap, or a changed `FLASK_SECRET_KEY` (the
+default is random per start, so **set it**). To see which one, read the web
+log. Anonymous requests write a sampled (5 %) line:
+
+```
+session loss: reason=<no cookie sent|expired|bad signature|valid but empty> had_cookie=<bool> client=<ios|android|desktop|other> path=<path>
+```
+
+```bash
+toolforge webservice logs | grep "session loss"
+```
+
+| `reason` | Usually means |
+|---|---|
+| `no cookie sent` | The browser sent no `session` cookie: it was never set, was cleared, or was dropped by the client. Also counts first-time visitors and bots, so compare counts over time (per `client`) instead of reading single lines |
+| `expired` | A valid cookie older than the idle lifetime |
+| `bad signature` | The cookie is not signed with the current `FLASK_SECRET_KEY` (key changed, or a forged cookie) |
+| `valid but empty` | A valid cookie with no user in it (for example after logout) |
+
+`WIKIVISAGE_LOG_SESSION_LOSS=0` turns the line off.
+
+**Known platform caveat (unverified).** iOS home-screen apps keep their own
+cookie jar and open the Wikimedia OAuth page outside the app shell, so logging
+in from inside the installed app may not return into it. This has not been
+checked on a real device; the platform matrix in TESTING.md lists every client to
+test, and TESTING.md §10 describes the check.
 
 ### OAuth login fails
 
@@ -506,4 +619,4 @@ become wikivisage-face && toolforge jobs logs face-service | tail -50
 
 - Verify credentials: `toolforge envvars list`
 - Verify the database exists: `mariadb --defaults-file=$HOME/replica.my.cnf -h tools.db.svc.wikimedia.cloud -e "SHOW DATABASES LIKE '%wikiface%'"`
-- Check that migration has run: look for 9 tables in the database
+- Check that migration has run: look for 10 tables in the database (`worker_heartbeats` among them)

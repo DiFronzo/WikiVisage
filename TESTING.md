@@ -260,7 +260,8 @@ unreachable. `/health` also reports it:
 ```bash
 curl -s http://localhost:8000/health | python3 -m json.tool
 # {"status":"healthy","database":"connected","limiter":"...",
-#  "face_service":"reachable","degraded":false}
+#  "face_service":"reachable","liftwing":"disabled",
+#  "workers":{"fresh":1,"stopping":0,"stale":0},"degraded":false}
 ```
 
 ### Client configuration
@@ -467,16 +468,19 @@ build context, so it ends up in the image.
 
 ---
 
-## 9. Bbox editor browser regressions
+## 9. Browser regressions (bbox editor, gallery thumbnails and session persistence)
 
-These tests render the real project page and exercise its mouse/touch handlers
-and layout in Chromium and WebKit. Flask queries and thumbnail/gallery responses
-are mocked; no database, face service or Commons connection is needed.
+The first two files render the real project page and exercise its mouse/touch
+handlers and layout in Chromium and WebKit. Flask queries and thumbnail/gallery
+responses are mocked; no database, face service or Commons connection is needed.
+`test_session_persistence_browser.py` instead starts the app on a loopback socket
+and loads its pages in a persistent browser profile, so the browser's own cookie
+jar accepts the cookie and carries the session across a full restart.
 
 ```bash
 pip install -r requirements-browser.txt
 python -m playwright install chromium webkit
-WIKIVISAGE_BROWSER_TESTS=1 pytest tests/test_bbox_editor_browser.py -v
+WIKIVISAGE_BROWSER_TESTS=1 pytest tests/test_bbox_editor_browser.py tests/test_gallery_thumb_browser.py tests/test_session_persistence_browser.py -v
 ```
 
 On Linux, use `python -m playwright install --with-deps chromium webkit` to
@@ -486,7 +490,60 @@ enabled, and Playwright is not a production dependency.
 
 Coverage includes touch identity and multi-touch cancellation, `touchcancel`,
 rotation during a drag, detection-space coordinate conversion, completed-box
-placement after resize, mouse drawing, and landscape modal scrolling.
+placement after resize, mouse drawing, and landscape modal scrolling
+(`test_bbox_editor_browser.py`, 20 runs). `test_gallery_thumb_browser.py`
+(52 runs) covers the Classification Results gallery: the zoom never exceeds
+`MAX_DEVICE_UPSCALE` (2.0 device pixels per source pixel) at device pixel ratio
+1 and 2, one larger thumbnail is requested only when the crop needs it (never
+wider than `min(960, largest step <= detection width)`, taken from the row's
+server-supplied direct `thumb_urls` and never through the `/commons-thumb`
+proxy; none for a card that stays uncropped; no second request after a resize)
+and a failed larger
+thumbnail falls back to the 330 px one, the `.face-marker` outline (hidden when
+the box covers over 70 % of the card, decorative), bootstrap faces outlined but
+not zoomed, rows with no detection size or an aspect mismatch showing the plain
+image, and the relayout on resize. `test_session_persistence_browser.py`
+(2 runs) loads `/login` in the browser (the redirect to the OAuth provider stays on
+loopback), checks the `session` cookie's `Expires`, `HttpOnly` and
+`SameSite=Lax` attributes as the browser stored them, closes and relaunches the
+browser on the same profile, and verifies the callback still reads `oauth_state`
+from the restored cookie. A session-scoped cookie or a lost OAuth state fails the test.
+
+---
+
+## 10. Manual platform checks (sessions)
+
+`test_session_persistence_browser.py` covers the browser mechanics: a persistent
+`session` cookie survives a full Chromium/WebKit restart, and the OAuth callback
+still reads `oauth_state` afterwards. It cannot reproduce how a phone treats
+cookies, so the session changes (30-day idle lifetime, 90-day cap, "Log out
+everywhere") and the OAuth return still need a check on real clients. The client
+list and expected results are the matrix in the "Platform matrix" section of
+this file (below). The risky one is the iOS home-screen app: it keeps its own
+cookie jar and opens the Wikimedia OAuth page outside the app shell, so logging
+in from inside the installed app may not return into it. **This is unverified;
+test it on a real device** and record the result in the matrix. While testing, the web log shows why anonymous
+requests arrived without a session (sampled 5 %, `WIKIVISAGE_LOG_SESSION_LOSS`):
+
+```
+session loss: reason=<no cookie sent|expired|bad signature|valid but empty> had_cookie=<bool> client=<ios|android|desktop|other> path=<path>
+```
+
+### Platform matrix
+
+For each client: sign in, close the app or tab completely, reopen it, and check that you are still signed in. Then accept or decline the cookie banner and check that the choice sticks. Note the result in the last column.
+
+| Client | Sign in and stay signed in | Banner choice survives reopen | Result |
+|---|---|---|---|
+| iOS Safari (tab) | | | |
+| iOS home-screen app | | | |
+| Android Chrome (tab) | | | |
+| Android home-screen app | | | |
+| Desktop Chrome | | | |
+| Desktop Safari | | | |
+| Desktop Firefox | | | |
+
+Also check **Log out everywhere** from `/account/settings` on one device: the other devices must be signed out on their next page load. A plain **Log out** signs out only the device it is pressed on.
 
 ---
 

@@ -128,7 +128,7 @@ WikiVisage/
 │   └── requirements.txt # kserve, onnxruntime, opencv-python-headless
 ├── token_crypto.py      # Fernet encrypt/decrypt helpers for OAuth tokens at rest
 ├── database.py          # MariaDB connection pool with retry logic
-├── schema.sql           # Database schema (9 tables + indices)
+├── schema.sql           # Database schema (10 tables + indices)
 ├── migrate.py           # Idempotent migration script with --reset flag
 ├── templates/           # Jinja2 templates (10 files, all extend base.html)
 ├── static/              # Logos, icons + service worker
@@ -272,7 +272,9 @@ Each project has a couple of tunables:
 | `WIKIVISAGE_WORKER_MAX_PROJECTS` | `4` | Max projects processed concurrently per worker |
 | `WIKIVISAGE_WORKER_IMAGE_THREADS` | `4` | Parallel image download/detection threads per project |
 | `WIKIVISAGE_WORKER_BATCH_SIZE` | `50` | Images per processing batch |
-| `WIKIVISAGE_DB_POOL_SIZE` | auto | DB connection pool size (auto = `min(max_projects × image_threads + 3, 6)`) |
+| `WIKIVISAGE_DB_POOL_SIZE` | auto | DB connection pool size (auto = `min(max_projects × image_threads + 3, 5)`; each worker also holds one extra connection for its heartbeat thread) |
+| `WIKIVISAGE_WORKER_STALL_LIMIT` | `900` | Seconds without worker progress before the heartbeat stops, so Toolforge restarts a stuck worker |
+| `WIKIVISAGE_WORKER_RESTART_GRACE` | `1200` | Seconds a planned worker stop (deploy, restart) keeps the offline banner hidden |
 | `COMMONS_DOWNLOAD_THROTTLE_SECONDS` | `0` | Delay between image downloads (seconds) |
 
 ### 🧩 Face service variables

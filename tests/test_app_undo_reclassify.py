@@ -1419,7 +1419,9 @@ def test_api_reclassify_reject_nonbootstrap_token_expired(monkeypatch):
     resp = client.post("/api/reclassify", data={"csrf_token": "testtoken", "face_id": "1", "is_target": "0"})
 
     assert resp.status_code == 401
-    assert "OAuth token expired" in resp.get_json()["error"]
+    body = resp.get_json()
+    assert "re-authorize" in body["error"]
+    assert body["reauth_url"] == "/login?reauth=1"
     tx_mock.assert_not_called()
 
 

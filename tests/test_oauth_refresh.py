@@ -354,3 +354,108 @@ def test_the_lock_is_named_per_user() -> None:
         )
 
     assert seen == ["oauth-refresh:42"]
+
+
+# -- permanent versus transient failures -----------------------------------
+
+
+class _Http400(Exception):
+    """What ``requests`` raises for a refused refresh: an HTTP error carrying the response."""
+
+    def __init__(self, status: int, body: Any) -> None:
+        super().__init__(f"HTTP {status}")
+        self.response = MagicMock(status_code=status)
+        if isinstance(body, Exception):
+            self.response.json.side_effect = body
+        else:
+            self.response.json.return_value = body
+
+
+def _failure_of(db: FakeDb, exchange: MagicMock, **kwargs: Any) -> list[bool]:
+    reports: list[bool] = []
+    assert run(db, exchange, on_failure=reports.append, **kwargs) is None
+    return reports
+
+
+def test_a_revoked_refresh_token_is_a_permanent_failure(caplog: pytest.LogCaptureFixture) -> None:
+    from oauthlib.oauth2.rfc6749.errors import InvalidGrantError
+
+    exchange = MagicMock(side_effect=InvalidGrantError())
+
+    with caplog.at_level(logging.WARNING, logger="oauth_refresh"):
+        reports = _failure_of(FakeDb(selects=[[row(SOON)]]), exchange, current=TokenSet("a", "r", SOON))
+
+    assert reports == [True]
+    assert "refresh token of user 1 was refused" in caplog.text
+
+
+@pytest.mark.parametrize("status", [400, 401])
+def test_a_plain_http_invalid_grant_is_permanent_too(status: int) -> None:
+    """The worker talks to the endpoint with plain requests, which has no InvalidGrantError."""
+    exchange = MagicMock(side_effect=_Http400(status, {"error": "invalid_grant"}))
+
+    assert _failure_of(FakeDb(selects=[[row(SOON)]]), exchange, current=TokenSet("a", "r", SOON)) == [True]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        RuntimeError("HTTP 500"),
+        TimeoutError("slow"),
+        _Http400(500, {"error": "invalid_grant"}),
+        _Http400(400, {"error": "invalid_request"}),
+        _Http400(400, ValueError("not json")),
+        _Http400(429, ["rate limited"]),
+    ],
+)
+def test_other_endpoint_failures_are_transient(error: Exception) -> None:
+    exchange = MagicMock(side_effect=error)
+
+    assert _failure_of(FakeDb(selects=[[row(SOON)]]), exchange, current=TokenSet("a", "r", SOON)) == [False]
+
+
+def test_a_reply_without_an_access_token_is_transient() -> None:
+    reports = _failure_of(FakeDb(selects=[[row(SOON)]]), exchange_ok({"oops": 1}), current=TokenSet("a", "r", SOON))
+
+    assert reports == [False]
+
+
+def test_a_store_failure_is_transient() -> None:
+    db = FakeDb(selects=[[row(SOON)]], updates=[DatabaseError("deadlock")])
+
+    assert _failure_of(db, exchange_ok(), current=TokenSet("a", "r", SOON)) == [False]
+
+
+def test_a_missing_user_or_refresh_token_is_permanent() -> None:
+    assert _failure_of(FakeDb(selects=[[]]), exchange_ok()) == [True]
+    assert _failure_of(FakeDb(), exchange_ok(), current=TokenSet("a", "", SOON)) == [True]
+
+
+def test_a_vanished_user_after_the_lock_or_after_a_peer_is_permanent() -> None:
+    assert _failure_of(FakeDb(selects=[[]]), exchange_ok(), current=TokenSet("a", "r", SOON)) == [True]
+    with lock_held_by_peer():
+        assert _failure_of(FakeDb(selects=[[]]), exchange_ok(), current=TokenSet("a", "r", SOON)) == [True]
+
+
+def test_the_failure_is_reported_once_even_when_a_peer_retry_fails() -> None:
+    db = FakeDb(selects=[[row(SOON)], [row(SOON)]])
+    exchange = MagicMock(side_effect=TimeoutError("slow"))
+    passes = iter([False, True])
+
+    @contextlib.contextmanager
+    def single_flight(*_args: Any, **_kwargs: Any):
+        yield next(passes)
+
+    reports: list[bool] = []
+    with patch.object(oauth_refresh, "single_flight", single_flight), patch.object(oauth_refresh.time, "sleep"):
+        assert run(db, exchange, current=TokenSet("a", "r", SOON), on_failure=reports.append) is None
+
+    assert reports == [False]
+
+
+def test_success_never_reports_a_failure() -> None:
+    reports: list[bool] = []
+    db = FakeDb(selects=[[row(SOON)]], updates=[1])
+
+    assert run(db, exchange_ok(), current=TokenSet("a", "r", SOON), on_failure=reports.append) is not None
+    assert reports == []

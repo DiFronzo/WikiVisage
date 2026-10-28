@@ -66,6 +66,40 @@ def test_health_endpoint(integration_client):
     assert isinstance(payload["degraded"], bool)
 
 
+@pytest.mark.integration
+def test_worker_banner_queries_against_a_real_database(integration_app, db_conn, seed_project):
+    """The banner and /health SQL, which every other test mocks away, run against MariaDB."""
+    _, app_mod = integration_app
+    insert = (
+        "INSERT INTO worker_heartbeats (worker_id, state, last_seen, expected_back_until) "
+        "VALUES (%s, %s, NOW() - INTERVAL %s SECOND, {deadline})"
+    )
+    rows = [
+        ("fresh-running", "running", 10, "NULL"),
+        ("stale-running", "running", 3600, "NULL"),
+        ("announced-stop", "stopping", 3600, "NOW() + INTERVAL 600 SECOND"),
+        ("expired-stop", "stopping", 3600, "NOW() - INTERVAL 600 SECOND"),
+    ]
+    with db_conn.cursor() as cur:
+        for worker_id, state, age, deadline in rows:
+            cur.execute(insert.format(deadline=deadline), (worker_id, state, age))
+
+    assert app_mod._worker_heartbeat_counts() == {"fresh": 1, "stopping": 1, "stale": 2, "total": 4}
+    assert app_mod._workers_health_value() == {"fresh": 1, "stopping": 1, "stale": 2}
+    assert app_mod._workers_alive() is True
+
+    with db_conn.cursor() as cur:
+        cur.execute("DELETE FROM worker_heartbeats WHERE worker_id IN ('fresh-running', 'announced-stop')")
+
+    assert app_mod._worker_heartbeat_counts() == {"fresh": 0, "stopping": 0, "stale": 2, "total": 2}
+    assert app_mod._workers_alive() is False  # only stale rows and no recent project claim
+
+    with db_conn.cursor() as cur:
+        cur.execute("UPDATE projects SET worker_claimed_at = NOW() WHERE id = %s", (seed_project["id"],))
+
+    assert app_mod._workers_alive() is True  # a refreshed project claim still proves work is going on
+
+
 def test_inject_i18n_helpers_ltr_locale(monkeypatch):
     monkeypatch.setattr(app_module, "get_locale", lambda: "en")
     data = app_module.inject_i18n_helpers()
@@ -82,39 +116,68 @@ def test_inject_i18n_helpers_rtl_locale(monkeypatch):
     assert data["text_direction"] == "rtl"
 
 
-def test_inject_worker_status_stale_heartbeat(monkeypatch):
-    monkeypatch.setattr(app_module, "execute_query", lambda *_a, **_kw: [{"is_stale": 1}])
-    assert app_module.inject_worker_status() == {"worker_down": True}
+def _worker_status_db(*, fresh=0, stopping=0, stale=0, claim=False, calls=None):
+    """Fake execute_query for the worker banner: counts row, then (only if needed) the claim check."""
+
+    def _query(sql, params=None, *_a, **_kw):
+        if calls is not None:
+            calls.append((sql, params))
+        if "FROM worker_heartbeats" in sql:
+            return [{"fresh": fresh, "stopping": stopping, "total": fresh + stopping + stale}]
+        if "FROM projects WHERE worker_claimed_at" in sql:
+            return [{"ok": 1}] if claim else []
+        raise AssertionError(f"unexpected query: {sql}")
+
+    return _query
 
 
-def test_inject_worker_status_fresh_heartbeat(monkeypatch):
-    monkeypatch.setattr(app_module, "execute_query", lambda *_a, **_kw: [{"is_stale": 0}])
+def test_inject_worker_status_fresh_heartbeat_is_not_down(monkeypatch):
+    calls = []
+    monkeypatch.setattr(app_module, "execute_query", _worker_status_db(fresh=1, calls=calls))
+    assert app_module.inject_worker_status() == {"worker_down": False}
+    assert len(calls) == 1  # a healthy worker never costs the second query
+
+
+def test_inject_worker_status_one_of_two_workers_fresh_is_not_down(monkeypatch):
+    monkeypatch.setattr(app_module, "execute_query", _worker_status_db(fresh=1, stale=1))
     assert app_module.inject_worker_status() == {"worker_down": False}
 
 
-def test_inject_worker_status_missing_row_table_exists(monkeypatch):
-    calls = {"count": 0}
+def test_inject_worker_status_planned_stop_within_grace_is_not_down(monkeypatch):
+    # Both workers got SIGTERM from a deploy: stale heartbeats, but they announced they will be back.
+    calls = []
+    monkeypatch.setattr(app_module, "execute_query", _worker_status_db(stopping=2, calls=calls))
+    assert app_module.inject_worker_status() == {"worker_down": False}
+    assert len(calls) == 1
 
-    def _query(*_args, **_kwargs):
-        calls["count"] += 1
-        if calls["count"] == 1:
-            return []
-        return [{"1": 1}]
 
-    monkeypatch.setattr(app_module, "execute_query", _query)
+def test_inject_worker_status_recent_claim_is_not_down(monkeypatch):
+    # The heartbeat write may be failing while the worker is plainly busy: its claim refresh proves it.
+    monkeypatch.setattr(app_module, "execute_query", _worker_status_db(stale=2, claim=True))
+    assert app_module.inject_worker_status() == {"worker_down": False}
+
+
+def test_inject_worker_status_all_signals_gone_is_down(monkeypatch):
+    # Stale rows, no unexpired planned stop, no recent claim: the only case that shows the banner.
+    monkeypatch.setattr(app_module, "execute_query", _worker_status_db(stale=2, claim=False))
     assert app_module.inject_worker_status() == {"worker_down": True}
 
 
-def test_inject_worker_status_missing_row_table_missing(monkeypatch):
-    calls = {"count": 0}
+def test_inject_worker_status_expired_grace_counts_as_stale(monkeypatch):
+    # An expired planned stop is neither fresh nor "stopping": the SQL excludes it, so it is stale.
+    monkeypatch.setattr(app_module, "execute_query", _worker_status_db(stopping=0, stale=1))
+    assert app_module.inject_worker_status() == {"worker_down": True}
 
-    def _query(*_args, **_kwargs):
-        calls["count"] += 1
-        if calls["count"] == 1:
-            return []
-        return []
 
-    monkeypatch.setattr(app_module, "execute_query", _query)
+def test_inject_worker_status_nothing_recorded_yet_is_not_down(monkeypatch):
+    calls = []
+    monkeypatch.setattr(app_module, "execute_query", _worker_status_db(calls=calls))
+    assert app_module.inject_worker_status() == {"worker_down": False}
+    assert len(calls) == 1  # no rows: no evidence of an outage, so no claim lookup either
+
+
+def test_inject_worker_status_no_result_row_is_not_down(monkeypatch):
+    monkeypatch.setattr(app_module, "execute_query", lambda *_a, **_kw: [])
     assert app_module.inject_worker_status() == {"worker_down": False}
 
 
@@ -124,6 +187,49 @@ def test_inject_worker_status_exception_returns_not_down(monkeypatch):
 
     monkeypatch.setattr(app_module, "execute_query", _raise)
     assert app_module.inject_worker_status() == {"worker_down": False}
+
+
+def test_inject_worker_status_queries_use_the_shared_window(monkeypatch):
+    calls = []
+    monkeypatch.setattr(app_module, "execute_query", _worker_status_db(stale=1, calls=calls))
+    app_module.inject_worker_status()
+    window = app_module.WORKER_STALE_SECONDS
+    assert window == 300
+    assert calls[0][1] == (window, window)
+    assert calls[1][1] == (window,)
+
+
+def test_health_reports_worker_states_without_degrading(monkeypatch):
+    def _query(sql, params=None, *_a, **_kw):
+        if sql.startswith("SELECT 1 AS ok"):
+            return [{"ok": 1}]
+        return _worker_status_db(fresh=1, stopping=1, stale=2)(sql, params)
+
+    monkeypatch.setattr(app_module, "execute_query", _query)
+    monkeypatch.setattr(app_module.face_client, "is_healthy", lambda *a, **k: True)
+    monkeypatch.setattr(app_module, "_LIMITER_REDIS_OK", True)
+
+    flask_app.config["TESTING"] = True
+    payload = flask_app.test_client().get("/health").get_json()
+
+    assert payload["workers"] == {"fresh": 1, "stopping": 1, "stale": 2}
+    assert payload["degraded"] is False  # stale workers are information, never a hard error
+
+
+def test_health_workers_unknown_when_the_status_cannot_be_read(monkeypatch):
+    def _query(sql, params=None, *_a, **_kw):
+        if sql.startswith("SELECT 1 AS ok"):
+            return [{"ok": 1}]
+        raise RuntimeError("table missing")
+
+    monkeypatch.setattr(app_module, "execute_query", _query)
+    monkeypatch.setattr(app_module.face_client, "is_healthy", lambda *a, **k: True)
+
+    flask_app.config["TESTING"] = True
+    response = flask_app.test_client().get("/health")
+
+    assert response.status_code == 200
+    assert response.get_json()["workers"] == "unknown"
 
 
 def test_inject_csrf_token_exposes_callable():
@@ -306,6 +412,39 @@ def test_service_worker_route_sets_required_headers():
     assert response.headers["Cache-Control"] == "no-cache"
 
 
+def test_service_worker_serves_scripts_network_first():
+    """A page and the shared script it calls ship together; a cached script served first
+    pairs a new page with an old script after every update (the gallery lost its zoom and
+    face outline until a second reload because computeFaceView was missing)."""
+    flask_app.config["TESTING"] = True
+    source = flask_app.test_client().get("/sw.js").get_data(as_text=True)
+
+    script_rule = source.index('url.pathname.endsWith(".js")')
+    stale_rule = source.index("stale-while-revalidate */")
+    assert script_rule < stale_rule  # scripts are handled before the generic static rule
+    assert ".catch(() => caches.match(event.request))" in source[script_rule:stale_rule]
+    # Not precached, and the cache name moved on so browsers drop the old copy they hold.
+    precache = source[source.index("PRECACHE_URLS") : source.index("]", source.index("PRECACHE_URLS"))]
+    assert "wikivisage-common.js" not in precache
+    assert 'CACHE_NAME = "wikivisage-v1"' not in source
+
+
+def test_templates_version_the_shared_script_url():
+    """Each release must request a new URL for static scripts, so no cache can hold a stale one."""
+    import re
+    from pathlib import Path
+
+    templates = Path(__file__).resolve().parent.parent / "templates"
+    tags = [
+        (path.name, tag)
+        for path in templates.glob("*.html")
+        for tag in re.findall(r"<script[^>]*wikivisage-common\.js[^>]*>", path.read_text(encoding="utf-8"))
+    ]
+    assert tags, "no template loads wikivisage-common.js any more - update this guard"
+    for name, tag in tags:
+        assert "v=app_version" in tag, f"{name} loads wikivisage-common.js without a version: {tag}"
+
+
 def test_chrome_devtools_json_returns_empty_json():
     flask_app.config["TESTING"] = True
     client = flask_app.test_client()
@@ -323,6 +462,14 @@ def test_main_guard_runs_app_on_loopback_in_debug(monkeypatch):
     assert kwargs["debug"] is True
     assert kwargs["host"] == "127.0.0.1"
     assert kwargs["port"] == 8765
+
+
+def test_main_guard_warns_that_debug_keeps_lan_mode_on_loopback(monkeypatch, caplog):
+    with caplog.at_level("WARNING"):
+        kwargs = _run_main_guard({"PORT": "8767", "FLASK_DEBUG": "1", "WIKIVISAGE_INSECURE_HTTP": "1"})
+
+    assert kwargs["host"] == "127.0.0.1"
+    assert any("still binds to 127.0.0.1" in record.getMessage() for record in caplog.records)
 
 
 def test_main_guard_binds_all_interfaces_without_debug(monkeypatch):
@@ -345,9 +492,27 @@ def test_robots_txt_returns_plain_text():
     assert "User-agent: *" in body
     assert "Allow: /$" in body
     assert "Allow: /leaderboard" in body
+    assert "Allow: /llms.txt" in body
     assert "Disallow: /" in body
     assert "Sitemap:" in body
     assert "sitemap.xml" in body
+
+
+def test_llms_txt_describes_the_tool_and_links_the_public_pages():
+    flask_app.config["TESTING"] = True
+    client = flask_app.test_client()
+
+    response = client.get("/llms.txt")
+
+    assert response.status_code == 200
+    assert response.content_type == "text/plain; charset=utf-8"
+    body = response.data.decode()
+    assert body.startswith("# WikiVisage\n")
+    assert "\n> " in body  # the one-line summary llms.txt readers expect
+    assert "P180" in body
+    assert "(http://localhost/)" in body
+    assert "(http://localhost/leaderboard)" in body
+    assert "github.com/DiFronzo/WikiVisage" in body
 
 
 def test_sitemap_xml_returns_valid_xml():

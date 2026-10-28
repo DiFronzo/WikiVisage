@@ -18,6 +18,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 import worker
+from config import SDC_AUTH_EXPIRED_MESSAGE, SDC_AUTH_UNAVAILABLE_MESSAGE, SDC_REAUTH_MESSAGES
 from database import DatabaseError
 
 QID = "Q42"
@@ -115,7 +116,6 @@ class World:
             patch.object(worker, "_api_request", side_effect=self.api),
             patch.object(worker, "_refresh_worker_token", side_effect=self.refresh),
             patch.object(worker, "_get_csrf_token", side_effect=self.csrf),
-            patch.object(worker, "_touch_heartbeat_file"),
             patch.object(worker.time, "sleep", side_effect=self.sleeps.append),
             patch.object(worker, "shutdown_requested", False),
         ):
@@ -162,7 +162,102 @@ def test_no_valid_token_aborts_before_any_api_call(world: World) -> None:
     assert world.run() == 0
 
     assert world.api_calls == []
-    assert world.project_updates() == ["Token expired or user not found. Please log in again."]
+    assert world.project_updates() == [SDC_AUTH_EXPIRED_MESSAGE]
+
+
+def _run_with_the_real_token_refresh(world: World, user_rows: list[dict[str, Any]], exchange: Any) -> int:
+    """write_sdc_claims with ``_refresh_worker_token`` itself in play; only the token endpoint is scripted."""
+
+    def db(sql: str, params: Any = None, fetch: bool = True) -> Any:
+        if "FROM users WHERE id" in sql:
+            return user_rows
+        return world.db(sql, params, fetch)
+
+    with (
+        patch.object(worker, "execute_query", side_effect=db),
+        patch.object(worker, "_api_request", side_effect=world.api),
+        patch.object(worker, "_get_csrf_token", side_effect=world.csrf),
+        patch.object(worker, "_get_redis_client", return_value=None),
+        patch.object(worker, "_oauth_exchange", side_effect=exchange),
+        patch("oauth_refresh.decrypt_token", side_effect=lambda token: token),
+        patch.object(worker, "shutdown_requested", False),
+    ):
+        return worker.write_sdc_claims(world.project)
+
+
+def _expired_user() -> dict[str, Any]:
+    from datetime import UTC, datetime, timedelta
+
+    return {
+        "access_token": "old-access",
+        "refresh_token": "old-refresh",
+        "token_expires_at": datetime.now(UTC) - timedelta(hours=1),
+    }
+
+
+def test_a_refused_refresh_token_stores_the_reauthorize_message(world: World) -> None:
+    from oauthlib.oauth2.rfc6749.errors import InvalidGrantError
+
+    assert _run_with_the_real_token_refresh(world, [_expired_user()], InvalidGrantError()) == 0
+
+    assert world.api_calls == []
+    assert world.project_updates() == [SDC_AUTH_EXPIRED_MESSAGE]
+
+
+def test_a_login_service_timeout_stores_the_try_again_message_without_a_reauthorize_button(world: World) -> None:
+    import requests
+
+    assert _run_with_the_real_token_refresh(world, [_expired_user()], requests.Timeout("slow")) == 0
+
+    assert world.api_calls == []
+    assert world.project_updates() == [SDC_AUTH_UNAVAILABLE_MESSAGE]
+    assert SDC_AUTH_UNAVAILABLE_MESSAGE not in SDC_REAUTH_MESSAGES
+
+
+def test_a_login_service_5xx_is_transient_too(world: World) -> None:
+    import requests
+
+    response = requests.Response()
+    response.status_code = 503
+
+    exc = requests.HTTPError("503", response=response)
+    _run_with_the_real_token_refresh(world, [_expired_user()], exc)
+
+    assert world.project_updates() == [SDC_AUTH_UNAVAILABLE_MESSAGE]
+
+
+def test_an_invalid_grant_http_reply_is_permanent(world: World) -> None:
+    import requests
+
+    response = requests.Response()
+    response.status_code = 400
+    response._content = b'{"error": "invalid_grant"}'
+
+    _run_with_the_real_token_refresh(world, [_expired_user()], requests.HTTPError("400", response=response))
+
+    assert world.project_updates() == [SDC_AUTH_EXPIRED_MESSAGE]
+
+
+def test_a_missing_user_row_or_refresh_token_counts_as_permanent(world: World) -> None:
+    _run_with_the_real_token_refresh(world, [], RuntimeError("never called"))
+    assert world.project_updates() == [SDC_AUTH_EXPIRED_MESSAGE]
+
+    world.calls.clear()
+    no_refresh_token = {**_expired_user(), "refresh_token": ""}
+    _run_with_the_real_token_refresh(world, [no_refresh_token], RuntimeError("never called"))
+    assert world.project_updates() == [SDC_AUTH_EXPIRED_MESSAGE]
+
+
+def test_an_earlier_transient_failure_does_not_leak_into_the_next_run(world: World) -> None:
+    import requests
+
+    _run_with_the_real_token_refresh(world, [_expired_user()], requests.Timeout("slow"))
+    world.calls.clear()
+
+    world.token_script = [None]  # a patched refresh that fails without saying why
+    world.run()
+
+    assert world.project_updates() == [SDC_AUTH_EXPIRED_MESSAGE]
 
 
 def test_csrf_failure_at_start_aborts(world: World) -> None:
@@ -246,7 +341,7 @@ def test_stop_button_is_noticed_within_five_faces(world: World) -> None:
     assert world.run() == 4
 
     assert world.actions().count("wbeditentity") == 4
-    assert len(world.sql_like("REPLACE INTO worker_heartbeat")) == 1
+    assert len(world.sql_like("worker_claimed_at = NOW()")) == 1
     assert world.project_updates() == []
 
 
@@ -634,7 +729,7 @@ def test_removals_refresh_liveness_for_every_page(world: World) -> None:
 
     world.run()
 
-    assert len(world.sql_like("REPLACE INTO worker_heartbeat")) == 2
+    assert len(world.sql_like("worker_claimed_at = NOW()")) == 2
 
 
 def test_shutdown_during_removals_stops_the_loop(world: World) -> None:
@@ -719,9 +814,21 @@ def test_waiting_keeps_the_worker_alive_and_stops_on_shutdown(world: World) -> N
             patch.object(worker, "_api_request", side_effect=world.api),
             patch.object(worker, "_refresh_worker_token", side_effect=world.refresh),
             patch.object(worker, "_get_csrf_token", side_effect=world.csrf),
-            patch.object(worker, "_touch_heartbeat_file"),
             patch.object(worker, "shutdown_requested", False),
         ):
             assert worker.write_sdc_claims(world.project) == 0
 
     assert len(world.sleeps) == 1  # it did not keep sleeping after the shutdown signal
+
+
+@pytest.mark.parametrize("code", ["notloggedin", "badtoken", "mwoauth-invalid-authorization"])
+def test_authorization_failures_store_the_message_the_web_app_turns_into_a_reauthorize_button(code: str) -> None:
+    message = worker._sdc_error_message(code, "ignored")
+
+    assert message == SDC_AUTH_EXPIRED_MESSAGE
+    assert message in SDC_REAUTH_MESSAGES  # app.api_sdc_status keys the button on this set
+
+
+def test_a_missing_edit_permission_is_not_offered_as_a_reauthorize() -> None:
+    # That one is fixed by the tool's OAuth consumer registration, not by the user signing in again.
+    assert worker._sdc_error_message("permissiondenied", "") not in SDC_REAUTH_MESSAGES

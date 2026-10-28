@@ -28,6 +28,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from oauthlib.oauth2.rfc6749.errors import InvalidGrantError
+
 from database import DatabaseError
 from redis_lock import single_flight
 from token_crypto import TokenDecryptionError, decrypt_token, encrypt_token
@@ -47,6 +49,11 @@ DEFAULT_LIFETIME_SECONDS = 14400
 _DB_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 Query = Callable[..., Any]
+# Told, once, why a refresh returned None: True when retrying cannot help (the refresh token
+# is revoked or expired, missing, or unreadable), False when it was a transient failure
+# (timeout, 5xx, database hiccup). It runs in the calling thread, so a request handler can
+# record the answer on its own request without any shared state.
+OnFailure = Callable[[bool], None]
 
 
 @dataclass
@@ -71,6 +78,25 @@ def as_utc(value: datetime | str | None) -> datetime | None:
 def is_fresh(expires_at: datetime | None) -> bool:
     """True while the access token has more than TOKEN_REFRESH_BUFFER seconds left."""
     return expires_at is not None and (expires_at - datetime.now(UTC)).total_seconds() > TOKEN_REFRESH_BUFFER
+
+
+def is_permanent_refresh_error(exc: BaseException) -> bool:
+    """True when the token endpoint refused the refresh token itself (``invalid_grant``).
+
+    oauthlib raises ``InvalidGrantError`` for that; a plain ``requests`` client (the worker)
+    surfaces it as an HTTP error whose JSON body says ``invalid_grant``. Everything else
+    (network errors, 5xx, rate limits, malformed replies) may succeed on a later attempt.
+    """
+    if isinstance(exc, InvalidGrantError):
+        return True
+    response = getattr(exc, "response", None)
+    if response is None or getattr(response, "status_code", 0) not in (400, 401):
+        return False
+    try:
+        body = response.json()
+    except Exception:
+        return False
+    return isinstance(body, dict) and body.get("error") == "invalid_grant"
 
 
 def _text(value: Any) -> str:
@@ -141,6 +167,7 @@ def refresh_tokens(
     exchange: Callable[[str], Mapping[str, Any]],
     current: TokenSet | None = None,
     keep_on_store_failure: bool = False,
+    on_failure: OnFailure | None = None,
 ) -> TokenSet | None:
     """Return valid credentials for the user, refreshing them first when they are about to expire.
 
@@ -154,10 +181,13 @@ def refresh_tokens(
     use the new access token for the work in hand); otherwise it counts as a failure.
 
     Returns None when the user cannot be refreshed (no row, no refresh token, endpoint error).
+    *on_failure*, when given, is then called with ``permanent`` (see ``OnFailure``).
     """
     credentials = current if current is not None else read_user_tokens(query, user_id, label=label)
     credentials = _usable_credentials(credentials, label=label)
-    if credentials is None or is_fresh(credentials.expires_at):
+    if credentials is None:
+        return _failed(on_failure, permanent=True)
+    if is_fresh(credentials.expires_at):
         return credentials
 
     with single_flight(get_redis(), f"oauth-refresh:{user_id}", ttl_seconds=LOCK_TTL_SECONDS) as got_lock:
@@ -167,7 +197,9 @@ def refresh_tokens(
                 # refresh token: exchanging the old one fails and logs the user out. Use the
                 # row that is current now.
                 credentials = _usable_credentials(read_user_tokens(query, user_id, label=label), label=label)
-                if credentials is None or is_fresh(credentials.expires_at):
+                if credentials is None:
+                    return _failed(on_failure, permanent=True)
+                if is_fresh(credentials.expires_at):
                     return credentials
             return _exchange_and_store(
                 user_id,
@@ -176,6 +208,7 @@ def refresh_tokens(
                 query=query,
                 exchange=exchange,
                 keep_on_store_failure=keep_on_store_failure,
+                on_failure=on_failure,
             )
         # Another process is mid-refresh. Give it a moment to commit, then use its result.
         logger.info(f"Token refresh in flight for {label} — waiting on peer")
@@ -183,7 +216,7 @@ def refresh_tokens(
         peer = read_user_tokens(query, user_id, label=label)
 
     if peer is None:
-        return None
+        return _failed(on_failure, permanent=True)
     if is_fresh(peer.expires_at):
         return peer
     # The peer did not finish (its UPDATE may have failed): try ourselves, outside the lock.
@@ -196,7 +229,15 @@ def refresh_tokens(
         exchange=exchange,
         current=peer,
         keep_on_store_failure=keep_on_store_failure,
+        on_failure=on_failure,
     )
+
+
+def _failed(on_failure: OnFailure | None, *, permanent: bool) -> TokenSet | None:
+    """Report why a refresh failed (when anyone listens) and return the failure value, None."""
+    if on_failure is not None:
+        on_failure(permanent)
+    return None
 
 
 def _exchange_and_store(
@@ -207,6 +248,7 @@ def _exchange_and_store(
     query: Query,
     exchange: Callable[[str], Mapping[str, Any]],
     keep_on_store_failure: bool,
+    on_failure: OnFailure | None,
 ) -> TokenSet | None:
     logger.info(f"Refreshing access token for {label}")
     try:
@@ -214,7 +256,7 @@ def _exchange_and_store(
         access_token = reply.get("access_token")
         if not access_token:
             logger.error(f"Token refresh response missing access_token for {label}")
-            return None
+            return _failed(on_failure, permanent=False)
         refreshed = TokenSet(
             access_token,
             reply.get("refresh_token", credentials.refresh_token),
@@ -230,8 +272,13 @@ def _exchange_and_store(
             return refreshed
         if updated == 0 and credentials.expires_at is not None:
             logger.info(f"Token already refreshed by another process for {label}")
-            return read_user_tokens(query, user_id, label=label)
+            winner = read_user_tokens(query, user_id, label=label)
+            return winner if winner is not None else _failed(on_failure, permanent=True)
         return refreshed
-    except Exception:
-        logger.exception(f"Failed to refresh access token for {label}")
-        return None
+    except Exception as exc:
+        permanent = is_permanent_refresh_error(exc)
+        if permanent:
+            logger.warning(f"The refresh token of {label} was refused (revoked or expired); login required")
+        else:
+            logger.exception(f"Failed to refresh access token for {label}")
+        return _failed(on_failure, permanent=permanent)

@@ -13,6 +13,7 @@ import requests
 
 import face_client
 import liftwing_client
+from config import SDC_AUTH_EXPIRED_MESSAGE
 
 with patch("database.init_db"):
     import worker as _worker_module
@@ -1950,7 +1951,6 @@ def test_write_sdc_no_such_entity_on_removal_skips_and_clears_flag():
         patch("worker._refresh_worker_token", return_value="fake-token"),
         patch("worker._get_csrf_token", return_value="fake-csrf"),
         patch("worker._api_request", side_effect=mock_api_side_effect),
-        patch("worker._touch_heartbeat_file"),
         patch("worker.shutdown_requested", False),
     ):
         result = write_sdc_claims(project)
@@ -3485,7 +3485,7 @@ def test_write_sdc_no_access_token_sets_error():
     assert result == 0
     error_updates = [(s, p) for s, p in db_calls if "sdc_write_error" in s and "UPDATE projects" in s]
     assert len(error_updates) == 1
-    assert "Token expired" in error_updates[0][1][0]
+    assert error_updates[0][1][0] == SDC_AUTH_EXPIRED_MESSAGE
 
 
 def test_write_sdc_csrf_failure_sets_error():
@@ -4083,8 +4083,8 @@ def test_write_sdc_skips_face_when_state_recheck_fails():
     assert flag_updates[-1][1][0] is not None
 
 
-def test_keepalive_sdc_write_refreshes_heartbeat_and_claim():
-    """The SDC-run keepalive touches the live signals the healthcheck and claim watch."""
+def test_keepalive_sdc_write_reports_progress_and_refreshes_the_claim():
+    """The SDC-run keepalive tells the heartbeat thread it is alive and keeps the project claim."""
     db_calls = []
 
     def mock_execute_query(sql, params=None, fetch=True):
@@ -4093,12 +4093,14 @@ def test_keepalive_sdc_write_refreshes_heartbeat_and_claim():
 
     with (
         patch("worker.execute_query", side_effect=mock_execute_query),
-        patch("worker._touch_heartbeat_file") as heartbeat,
+        patch("worker._touch_heartbeat_file") as touch,
+        patch("worker._mark_progress") as mark,
     ):
         _worker_module._keepalive_sdc_write(7)
 
-    heartbeat.assert_called_once()
-    assert any("REPLACE INTO worker_heartbeat" in sql for sql, _ in db_calls)
+    mark.assert_called_once_with("sdc_keepalive")
+    touch.assert_not_called()  # the file is the heartbeat thread's job now
+    assert not any("worker_heartbeat" in sql for sql, _ in db_calls)
     claim_updates = [
         (sql, p) for sql, p in db_calls if "worker_claimed_at = NOW()" in sql and "worker_claimed_by" in sql
     ]
@@ -4107,7 +4109,7 @@ def test_keepalive_sdc_write_refreshes_heartbeat_and_claim():
 
 
 def test_write_sdc_keepalive_runs_every_five_faces():
-    """A long write run refreshes its heartbeat and claim every 5 faces."""
+    """A long write run reports progress and refreshes its claim every 5 faces."""
     project = {"id": 5, "user_id": 1, "wikidata_qid": "Q42"}
     faces = [{"face_id": 100 + i, "image_id": 200, "commons_page_id": 9999} for i in range(5)]
     mock_eq, _ = _mock_write_batch_query(faces, [{"is_target": 0, "superseded_by": None}])

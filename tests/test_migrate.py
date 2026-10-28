@@ -302,6 +302,7 @@ def test_all_tables_exist(test_db: str, db_conn) -> None:
         "images",
         "faces",
         "worker_heartbeat",
+        "worker_heartbeats",
     }
 
     assert expected_tables.issubset(existing_tables)
@@ -963,6 +964,32 @@ def test_schema_sql_defines_faces_aligned_column():
 
 def test_all_tables_include_service_status():
     assert "service_status" in _ALL_TABLES
+
+
+def test_all_tables_include_worker_heartbeats():
+    assert "worker_heartbeats" in _ALL_TABLES
+    assert "worker_heartbeat" in _ALL_TABLES
+
+
+def test_schema_sql_defines_session_epoch_and_worker_heartbeats():
+    statements = load_schema(str(Path(__file__).resolve().parent.parent / "schema.sql"))
+    users = next(stmt for stmt in statements if "CREATE TABLE IF NOT EXISTS users" in stmt)
+    heartbeats = next(stmt for stmt in statements if "CREATE TABLE IF NOT EXISTS worker_heartbeats" in stmt)
+
+    assert "session_epoch" in users
+    assert "INT UNSIGNED" in users.split("session_epoch", 1)[1].split(",", 1)[0]
+    for column in ("worker_id", "state", "last_seen", "expected_back_until", "last_progress", "phase", "started_at"):
+        assert column in heartbeats
+    assert "'running'" in heartbeats and "'stopping'" in heartbeats
+
+
+def test_alter_migrations_add_session_epoch_and_worker_heartbeats():
+    by_description = dict(_ALTER_MIGRATIONS)
+    epoch = by_description["Add session_epoch to users"]
+    assert "ADD COLUMN session_epoch" in epoch
+    assert "AFTER leaderboard_opt_out" in epoch  # keeps the column order identical to schema.sql
+    table = by_description["Create worker_heartbeats table"]
+    assert "CREATE TABLE IF NOT EXISTS worker_heartbeats" in table  # idempotent by construction
 
 
 def test_schema_sql_defines_liftwing_prefilter_objects():

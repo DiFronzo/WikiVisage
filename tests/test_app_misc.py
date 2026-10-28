@@ -184,7 +184,7 @@ def test_wake_file_path_consistent():
 
     # app.py must import WAKE_FILE_PATH from config (not define its own)
     app_source = inspect.getsource(app_module)
-    assert re.search(r"^from config import .*\bWAKE_FILE_PATH\b", app_source, re.M), (
+    assert re.search(r"^from config import (?:[^\n(]*|\([^)]*)\bWAKE_FILE_PATH\b", app_source, re.M), (
         "app.py must import WAKE_FILE_PATH from config"
     )
 

@@ -65,7 +65,7 @@ export OAUTHLIB_INSECURE_TRANSPORT=1
 python migrate.py
 ```
 
-This creates all 9 tables (`users`, `projects`, `images`, `faces`, `user_stats`, `sdc_claims`, `project_members`, `worker_heartbeat`, `service_status`) and their indexes. Safe to re-run.
+This creates all 10 tables (`users`, `projects`, `images`, `faces`, `user_stats`, `sdc_claims`, `project_members`, `worker_heartbeats`, `service_status`, and the legacy `worker_heartbeat`, which nothing reads any more) and their indexes. Safe to re-run.
 
 ## 5. Run the Web App
 
@@ -75,6 +75,25 @@ python app.py
 ```
 
 The landing page and health check (`/health`) will work immediately. OAuth login won't work without real credentials.
+
+### Testing from another device (phone, tablet, second laptop)
+
+`python app.py` binds to `127.0.0.1` when `FLASK_DEBUG` is on, so only this machine can reach it. To open the app from a phone on the same network:
+
+```bash
+# FLASK_DEBUG must be off: the debug server stays on loopback on purpose (the Werkzeug
+# debugger allows code execution). Shell variables win over .env because load_dotenv()
+# does not override what is already set.
+FLASK_DEBUG=0 WIKIVISAGE_INSECURE_HTTP=1 \
+OAUTH_REDIRECT_URI="http://192.168.1.126:3001/auth/callback" \
+PORT=3001 python app.py
+```
+
+- `WIKIVISAGE_INSECURE_HTTP=1` drops `Secure` from the `session` and `locale` cookies. Without it, browsers discard them over plain http and login bounces straight back to signed out.
+- `OAUTH_REDIRECT_URI` must point at the same host the phone uses, and that exact URL must be registered on the OAuth consumer. `localhost` on the phone is the phone, not your laptop.
+- Find your address with `ipconfig getifaddr en0`, then open `http://192.168.1.126:3001/`.
+- macOS may ask whether to allow incoming connections for Python; accept it.
+- Never set `WIKIVISAGE_INSECURE_HTTP` outside local development: anyone on the network can read the cookies.
 
 ## 6. Run the Worker (separate terminal)
 
@@ -178,7 +197,7 @@ ruff format .             # Auto-format
 
 | What | How | Works without OAuth? |
 |---|---|---|
-| Health check | `curl http://localhost:8000/health` | Yes |
+| Health check | `curl http://localhost:8000/health` (`workers` shows the heartbeat rows of running local workers) | Yes |
 | Landing page | Browser → `http://localhost:8000` | Yes |
 | Migration | `python migrate.py` (check exit code) | Yes |
 | Category traversal | Insert test project, run worker, check `images` table | Yes |
@@ -189,4 +208,7 @@ ruff format .             # Auto-format
 | Leaderboard | Browser → `http://localhost:8000/leaderboard` | Yes |
 | Classification UI | Needs a logged-in session (use OAuth or hack the session) | No |
 | Model Results / validation | Needs a logged-in session with classified faces | No |
+| Gallery face zoom and marker | Same; the cards zoom into the classified face and outline it; the zoom never exceeds 2 device pixels per source pixel | No |
+| Log out everywhere | Account settings → Sessions; a second browser logged in as the same user is logged out on its next request | No |
+| Cookie banner | Landing page; Accept/Decline posts `/cookie-consent`, footer "Cookie settings" shows it again | Yes |
 | SDC writes | Needs real OAuth token | No |

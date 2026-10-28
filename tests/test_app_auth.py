@@ -1,5 +1,7 @@
 """Tests for the web app: auth."""
 
+import re
+import time
 from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock
 
@@ -143,7 +145,9 @@ def test_before_request_without_session_user_id_sets_no_user():
         assert g.user is None
 
 
-def test_before_request_handles_database_error_and_clears_session(monkeypatch):
+def test_before_request_database_error_keeps_session(monkeypatch):
+    """A ToolsDB hiccup must not log the user out: the session survives, g.user is just unavailable."""
+
     def _raise_db(*_args, **_kwargs):
         raise app_module.DatabaseError("db failure")
 
@@ -152,7 +156,8 @@ def test_before_request_handles_database_error_and_clears_session(monkeypatch):
         session["user_id"] = 7
         app_module.before_request()
         assert g.user is None
-        assert "user_id" not in session
+        assert g.user_load_failed is True
+        assert session["user_id"] == 7
 
 
 def test_before_request_normalizes_bytes_tokens(monkeypatch):
@@ -343,14 +348,14 @@ def test_get_valid_token_returns_none_without_user():
         assert app_module._get_valid_token() is None
 
 
-def test_get_valid_token_clears_session_when_refresh_fails(monkeypatch):
+def test_get_valid_token_keeps_session_when_refresh_fails(monkeypatch):
     with flask_app.test_request_context("/"):
         g.user = {"access_token": "old"}
         session["user_id"] = 1
         monkeypatch.setattr(app_module, "_refresh_access_token", lambda _user: None)
 
         assert app_module._get_valid_token() is None
-        assert "user_id" not in session
+        assert session["user_id"] == 1
 
 
 def test_get_valid_token_updates_g_user_and_returns_token(monkeypatch):
@@ -423,6 +428,29 @@ def test_set_language_invalid_lang_falls_back_to_en(monkeypatch):
     resp = client.get("/set-language/zz", headers={"Referer": "http://localhost/dashboard"})
     assert resp.status_code == 302
     assert "locale=en" in resp.headers.get("Set-Cookie", "")
+
+
+def test_reauth_login_url_points_back_at_the_page_being_rendered():
+    with flask_app.test_request_context("/project/1/classify?skip_image_id=5&skip_reviewing=1"):
+        url = app_module.inject_reauth_login_url()["reauth_login_url"]
+    assert url == "/login?reauth=1&next=/project/1/classify?skip_image_id%3D5%26skip_reviewing%3D1"
+    with flask_app.test_request_context("/"):
+        assert app_module.inject_reauth_login_url()["reauth_login_url"] == "/login?reauth=1&next=/"
+    # Outside a request (a template rendered from a script) there is no page to come back to.
+    assert app_module.inject_reauth_login_url() == {"reauth_login_url": ""}
+
+
+def test_locale_cookie_values_match_the_supported_languages():
+    assert set(app_module._COOKIE_LOCALES) == set(app_module.LANGUAGES)
+
+
+def test_locale_cookie_helper_coerces_unknown_values_at_the_sink():
+    """Callers validate first, but the helper must never write request text into the cookie."""
+    response = Response()
+    app_module._set_locale_cookie(response, "zz; Domain=evil.example", persistent=True)
+    cookie = response.headers["Set-Cookie"]
+    assert cookie.startswith("locale=en;")
+    assert "evil.example" not in cookie
 
 
 def test_set_language_nocookie_uses_session_scoped_cookie(monkeypatch):
@@ -510,6 +538,66 @@ def test_login_redirects_to_dashboard_when_already_authenticated(monkeypatch):
 
     assert response.status_code == 302
     assert response.headers["Location"].endswith("/dashboard")
+
+
+def test_login_with_reauth_runs_the_oauth_flow_even_when_logged_in(monkeypatch):
+    """One-click re-authorize: the browser login is fine, Wikimedia no longer accepts the token."""
+    _reset_rate_limit()
+    client, _ = _make_authenticated_client(monkeypatch)
+    oauth = MagicMock()
+    oauth.authorization_url.return_value = ("https://oauth.example/authorize", "state-reauth")
+    monkeypatch.setattr(app_module, "_make_oauth_session", lambda *_a, **_kw: oauth)
+
+    response = client.get("/login?reauth=1&next=/project/12")
+
+    assert response.status_code == 302
+    assert response.headers["Location"] == "https://oauth.example/authorize"  # not the dashboard
+    with client.session_transaction() as sess:
+        assert sess["oauth_state"] == "state-reauth"
+        assert sess["login_next"] == "/project/12"
+        assert sess["user_id"] == 1  # still logged in until the callback replaces the session
+
+
+def test_login_with_reauth_from_another_site_goes_to_the_dashboard(monkeypatch):
+    """The state-changing GET must not be triggerable by a link on a third-party page."""
+    _reset_rate_limit()
+    client, _ = _make_authenticated_client(monkeypatch)
+    oauth = MagicMock()
+    oauth.authorization_url.return_value = ("https://oauth.example/authorize", "state-x")
+    monkeypatch.setattr(app_module, "_make_oauth_session", lambda *_a, **_kw: oauth)
+
+    response = client.get("/login?reauth=1", headers={"Sec-Fetch-Site": "cross-site"})
+
+    assert response.status_code == 302
+    assert response.headers["Location"].endswith("/dashboard")
+    with client.session_transaction() as sess:
+        assert "oauth_state" not in sess
+
+
+def test_login_with_reauth_from_the_same_site_or_a_typed_url_runs_oauth(monkeypatch):
+    oauth = MagicMock()
+    oauth.authorization_url.return_value = ("https://oauth.example/authorize", "state-y")
+    monkeypatch.setattr(app_module, "_make_oauth_session", lambda *_a, **_kw: oauth)
+
+    for site in ("same-origin", "none"):
+        _reset_rate_limit()
+        client, _ = _make_authenticated_client(monkeypatch)
+
+        response = client.get("/login?reauth=1", headers={"Sec-Fetch-Site": site})
+
+        assert response.headers["Location"] == "https://oauth.example/authorize", site
+
+
+def test_login_with_reauth_is_still_blocked_while_the_database_is_down(monkeypatch):
+    _reset_rate_limit()
+    monkeypatch.setattr(
+        app_module, "execute_query", lambda *a, **k: (_ for _ in ()).throw(app_module.DatabaseError("x"))
+    )
+    client = flask_app.test_client()
+    with client.session_transaction() as sess:
+        sess["user_id"] = 1
+
+    assert client.get("/login?reauth=1").status_code == 503
 
 
 def test_login_starts_oauth_flow_and_stores_state_and_next(monkeypatch):
@@ -629,7 +717,7 @@ def test_oauth_callback_existing_user_updates_and_sets_session(monkeypatch):
 
     def fake_execute_query(sql, params=None, fetch=True):
         calls.append((sql, params, fetch))
-        if sql.startswith("SELECT id FROM users WHERE wiki_user_id"):
+        if sql.startswith("SELECT id, session_epoch FROM users WHERE wiki_user_id"):
             return [{"id": 77}]
         return 1
 
@@ -649,6 +737,81 @@ def test_oauth_callback_existing_user_updates_and_sets_session(monkeypatch):
         assert isinstance(sess["csrf_token"], str) and len(sess["csrf_token"]) >= 32
 
 
+def _run_callback_as(monkeypatch, client, resolved_user_id):
+    oauth = MagicMock()
+    oauth.fetch_token.return_value = {"access_token": "a", "refresh_token": "r", "expires_in": 3600}
+    monkeypatch.setattr(app_module, "_make_oauth_session", lambda *_a, **_kw: oauth)
+    monkeypatch.setattr(
+        app_module.requests, "get", lambda *_a, **_kw: _MockResponse({"sub": 123, "username": "tester"})
+    )
+
+    def fake_execute_query(sql, params=None, fetch=True):
+        if sql.startswith("SELECT id, session_epoch FROM users WHERE wiki_user_id"):
+            return [{"id": resolved_user_id}]
+        if "FROM users WHERE id = %s" in sql:  # the signed-in user the old session belongs to
+            return [
+                {
+                    "id": params[0],
+                    "wiki_username": "tester",
+                    "access_token": "t",
+                    "refresh_token": "r",
+                    "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
+                }
+            ]
+        return 1
+
+    monkeypatch.setattr(app_module, "execute_query", fake_execute_query)
+    return client.get("/auth/callback?code=x")
+
+
+def _seed_work_state(client, user_id):
+    with client.session_transaction() as sess:
+        sess["user_id"] = user_id
+        sess["auth_at"] = int(time.time()) - 1000
+        sess["csrf_token"] = "keep"
+        sess["last_classify"] = {"action": "yes", "project_id": 5, "image_id": 9, "manual_face_ids": [3]}
+        sess["skipped_images_5"] = [1]
+        sess["skipped_images_review_5"] = [2]
+        sess["manual_faces_9"] = [3]
+        sess["something_else"] = "dropped"
+    _set_oauth_state(client)
+
+
+def test_oauth_callback_reauth_same_user_keeps_undo_skips_and_csrf(monkeypatch):
+    _reset_rate_limit()
+    client = flask_app.test_client()
+    _seed_work_state(client, 77)
+
+    response = _run_callback_as(monkeypatch, client, 77)
+
+    assert response.status_code == 302
+    with client.session_transaction() as sess:
+        assert sess["user_id"] == 77
+        assert sess["csrf_token"] == "keep"
+        assert sess["last_classify"]["image_id"] == 9
+        assert sess["skipped_images_5"] == [1]
+        assert sess["skipped_images_review_5"] == [2]
+        assert sess["manual_faces_9"] == [3]
+        assert sess["auth_at"] > int(time.time()) - 500  # refreshed
+        assert "something_else" not in sess  # only the work state is carried over
+
+
+def test_oauth_callback_as_another_account_drops_state_and_rotates_csrf(monkeypatch):
+    _reset_rate_limit()
+    client = flask_app.test_client()
+    _seed_work_state(client, 77)
+
+    response = _run_callback_as(monkeypatch, client, 88)
+
+    assert response.status_code == 302
+    with client.session_transaction() as sess:
+        assert sess["user_id"] == 88
+        assert sess["csrf_token"] != "keep"
+        assert "last_classify" not in sess
+        assert "skipped_images_5" not in sess
+        assert "manual_faces_9" not in sess
+
+
 def test_oauth_callback_new_user_inserts_and_reads_back_id(monkeypatch):
     _reset_rate_limit()
     client = flask_app.test_client()
@@ -665,9 +828,9 @@ def test_oauth_callback_new_user_inserts_and_reads_back_id(monkeypatch):
 
     def fake_execute_query(sql, params=None, fetch=True):
         calls.append((sql, params, fetch))
-        if sql.startswith("SELECT id FROM users WHERE wiki_user_id") and len(calls) == 1:
+        if sql.startswith("SELECT id, session_epoch FROM users WHERE wiki_user_id") and len(calls) == 1:
             return []
-        if sql.startswith("SELECT id FROM users WHERE wiki_user_id") and len(calls) == 3:
+        if sql.startswith("SELECT id, session_epoch FROM users WHERE wiki_user_id") and len(calls) == 3:
             return [{"id": 88}]
         return 1
 
@@ -798,6 +961,50 @@ def test_logout_valid_csrf_clears_session_and_redirects(monkeypatch):
     with client.session_transaction() as sess:
         assert "user_id" not in sess
         assert "some_key" not in sess
+
+
+def _database_down(monkeypatch):
+    def boom(*_a, **_kw):
+        raise app_module.DatabaseError("db down")
+
+    monkeypatch.setattr(app_module, "execute_query", boom)
+
+
+def test_logout_still_works_while_the_database_is_down(monkeypatch):
+    _reset_rate_limit()
+    _database_down(monkeypatch)
+    client = flask_app.test_client()
+    with client.session_transaction() as sess:
+        sess["user_id"] = 1
+        sess["csrf_token"] = "tok"
+
+    response = client.post("/logout", data={"csrf_token": "tok"})
+
+    assert response.status_code == 302
+    with client.session_transaction() as sess:
+        assert "user_id" not in sess
+
+
+def test_logout_without_a_session_just_redirects(monkeypatch):
+    _reset_rate_limit()
+    monkeypatch.setattr(app_module, "execute_query", lambda *_a, **_kw: [])
+
+    response = flask_app.test_client().post("/logout", data={"csrf_token": "x"})
+
+    assert response.status_code == 302
+    assert response.headers["Location"].endswith("/")
+
+
+def test_landing_page_answers_503_while_the_signed_in_user_cannot_be_loaded(monkeypatch):
+    _reset_rate_limit()
+    _database_down(monkeypatch)
+    client = flask_app.test_client()
+    with client.session_transaction() as sess:
+        sess["user_id"] = 1
+
+    response = client.get("/")
+
+    assert response.status_code == 503
 
 
 def test_index_not_logged_in_renders_index_template(monkeypatch):
@@ -937,3 +1144,614 @@ def test_is_safe_url_empty_string():
 def test_is_safe_url_double_slash():
     with flask_app.test_request_context("/"):
         assert _is_safe_url("//evil.com/path") is False
+
+
+# ---------------------------------------------------------------------------
+# Session persistence, revocation and transient failures
+# ---------------------------------------------------------------------------
+
+
+def _session_cookies(response):
+    return [h for h in response.headers.getlist("Set-Cookie") if h.startswith("session=")]
+
+
+def _days_until_expiry(set_cookie: str) -> float:
+    from email.utils import parsedate_to_datetime
+
+    match = re.search(r"Expires=([^;]+)", set_cookie)
+    assert match, f"no Expires in {set_cookie!r}"
+    return (parsedate_to_datetime(match.group(1)) - datetime.now(UTC)).total_seconds() / 86400
+
+
+def _assert_persistent(response):
+    cookies = _session_cookies(response)
+    assert cookies, "response sent no session cookie"
+    for cookie in cookies:
+        assert "Expires=" in cookie or "Max-Age=" in cookie, cookie
+
+
+class _FakeUsers:
+    """A one-user table: serves the before_request SELECT and counts epoch UPDATEs."""
+
+    def __init__(self, epoch=0):
+        self.epoch = epoch
+        self.statements = []
+        self.fail_updates = False
+
+    def __call__(self, sql, params=None, fetch=True):
+        self.statements.append(sql)
+        if sql.startswith("SELECT id, wiki_user_id"):
+            return [
+                {
+                    "id": 1,
+                    "wiki_user_id": 123,
+                    "wiki_username": "tester",
+                    "access_token": "token",
+                    "refresh_token": "refresh",
+                    "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
+                    "session_epoch": self.epoch,
+                }
+            ]
+        if sql.startswith("UPDATE users SET session_epoch"):
+            if self.fail_updates:
+                raise app_module.DatabaseError("db down")
+            self.epoch += 1
+            return 1
+        return []
+
+    def epoch_updates(self):
+        return [s for s in self.statements if "session_epoch" in s and s.startswith("UPDATE")]
+
+
+def _logged_in_client(epoch=0, csrf="tok", auth_at=None):
+    client = flask_app.test_client()
+    with client.session_transaction() as sess:
+        sess.permanent = True
+        sess["user_id"] = 1
+        sess["csrf_token"] = csrf
+        sess["auth_at"] = int(time.time()) if auth_at is None else auth_at
+        sess["epoch"] = epoch
+    return client
+
+
+def _is_logged_in(client) -> bool:
+    """/login bounces a logged-in user to the dashboard, everyone else to the OAuth server."""
+    response = client.get("/login")
+    return response.status_code == 302 and response.headers["Location"].endswith("/dashboard")
+
+
+def test_oauth_callback_sets_permanent_session_with_auth_at_and_epoch(monkeypatch):
+    _reset_rate_limit()
+    client = flask_app.test_client()
+    _set_oauth_state(client)
+    oauth = MagicMock()
+    oauth.fetch_token.return_value = {"access_token": "tok", "refresh_token": "ref", "expires_in": 3600}
+    monkeypatch.setattr(app_module, "_make_oauth_session", lambda *_a, **_kw: oauth)
+    monkeypatch.setattr(
+        app_module.requests, "get", lambda *_a, **_kw: _MockResponse({"sub": 123, "username": "tester"})
+    )
+
+    def fake_execute_query(sql, params=None, fetch=True):
+        if sql.startswith("SELECT id, session_epoch FROM users WHERE wiki_user_id"):
+            return [{"id": 77, "session_epoch": 4}]
+        return 1
+
+    monkeypatch.setattr(app_module, "execute_query", fake_execute_query)
+
+    before = int(time.time())
+    response = client.get("/auth/callback?code=x")
+
+    assert response.status_code == 302
+    _assert_persistent(response)
+    assert 29 < _days_until_expiry(_session_cookies(response)[-1]) < 31  # the idle lifetime, 30 days
+    with client.session_transaction() as sess:
+        assert sess.permanent is True
+        assert before <= sess["auth_at"] <= int(time.time())
+        assert sess["epoch"] == 4
+
+
+def test_login_sends_a_persistent_pre_login_cookie():
+    """iOS home-screen apps reset session-scoped cookies, which would drop oauth_state mid-login."""
+    _reset_rate_limit()
+    client = flask_app.test_client()
+
+    response = client.get("/login")
+
+    assert response.status_code == 302
+    assert "oauth2/authorize" in response.headers["Location"]
+    _assert_persistent(response)
+    with client.session_transaction() as sess:
+        assert sess["oauth_state"]
+
+
+def test_anonymous_csrf_cookie_is_persistent(monkeypatch):
+    """The banner only asks for a token once a language cookie exists; that cookie must be persistent."""
+    monkeypatch.setattr(app_module, "execute_query", lambda *_a, **_kw: [])
+    client = flask_app.test_client()
+    client.set_cookie("locale", "nb")
+
+    response = client.get("/")
+
+    assert response.status_code == 200
+    _assert_persistent(response)
+    with client.session_transaction() as sess:
+        assert sess["csrf_token"]
+
+
+def test_flash_only_session_cookie_is_persistent():
+    """A login_required bounce flashes into an anonymous session: that cookie must be persistent too."""
+    client = flask_app.test_client()
+
+    response = client.get("/dashboard")
+
+    assert response.status_code == 302
+    _assert_persistent(response)
+
+
+def test_logout_keeps_its_flash_cookie_persistent(monkeypatch):
+    _reset_rate_limit()
+    monkeypatch.setattr(app_module, "execute_query", _FakeUsers())
+    client = _logged_in_client()
+
+    response = client.post("/logout", data={"csrf_token": "tok"})
+
+    assert response.status_code == 302
+    _assert_persistent(response)
+
+
+def test_session_survives_more_than_the_old_eight_hours(monkeypatch):
+    monkeypatch.setattr(app_module, "execute_query", _FakeUsers())
+    client = _logged_in_client(auth_at=int(time.time()) - 20 * 86400)
+
+    assert _is_logged_in(client)
+
+
+def test_before_request_epoch_mismatch_clears_session(monkeypatch):
+    monkeypatch.setattr(app_module, "execute_query", _FakeUsers(epoch=2))
+    with flask_app.test_request_context("/"):
+        session["user_id"] = 1
+        session["auth_at"] = int(time.time())
+        session["epoch"] = 1
+        app_module.before_request()
+        assert g.user is None
+        assert "user_id" not in session
+
+
+def test_before_request_missing_epoch_matches_row_epoch_zero(monkeypatch):
+    """Sessions created before the epoch existed carry no key and must survive."""
+    monkeypatch.setattr(app_module, "execute_query", _FakeUsers(epoch=0))
+    with flask_app.test_request_context("/"):
+        session["user_id"] = 1
+        app_module.before_request()
+        assert g.user is not None
+        assert session["user_id"] == 1
+
+
+def test_before_request_user_row_without_epoch_key_counts_as_zero(monkeypatch):
+    monkeypatch.setattr(
+        app_module,
+        "execute_query",
+        lambda *_a, **_kw: [
+            {
+                "id": 1,
+                "wiki_user_id": 1,
+                "wiki_username": "t",
+                "access_token": "a",
+                "refresh_token": "r",
+                "token_expires_at": None,
+            }
+        ],
+    )
+    with flask_app.test_request_context("/"):
+        session["user_id"] = 1
+        session["epoch"] = 0
+        app_module.before_request()
+        assert g.user is not None
+
+
+def test_before_request_backfills_missing_auth_at(monkeypatch):
+    monkeypatch.setattr(app_module, "execute_query", _FakeUsers())
+    with flask_app.test_request_context("/"):
+        session["user_id"] = 1
+        before = int(time.time())
+        app_module.before_request()
+        assert g.user is not None
+        assert before <= session["auth_at"] <= int(time.time())
+
+
+def test_before_request_session_older_than_max_age_is_cleared_with_a_flash(monkeypatch):
+    monkeypatch.setattr(app_module, "execute_query", _FakeUsers())
+    too_old = int(time.time()) - app_module._SESSION_MAX_AGE_SECONDS - 60
+    with flask_app.test_request_context("/"):
+        session["user_id"] = 1
+        session["auth_at"] = too_old
+        app_module.before_request()
+        assert g.user is None
+        assert "user_id" not in session
+        assert ("warning", "Your session has expired. Please log in again.") in session["_flashes"]
+
+
+def test_before_request_session_just_inside_max_age_is_kept(monkeypatch):
+    monkeypatch.setattr(app_module, "execute_query", _FakeUsers())
+    with flask_app.test_request_context("/"):
+        session["user_id"] = 1
+        session["auth_at"] = int(time.time()) - app_module._SESSION_MAX_AGE_SECONDS + 3600
+        app_module.before_request()
+        assert g.user is not None
+
+
+def test_database_error_answers_503_page_and_keeps_the_session(monkeypatch):
+    def _raise_db(*_a, **_kw):
+        raise app_module.DatabaseError("db failure")
+
+    monkeypatch.setattr(app_module, "execute_query", _raise_db)
+    client = _logged_in_client()
+
+    response = client.get("/dashboard")
+
+    assert response.status_code == 503
+    assert "temporarily unavailable" in response.get_data(as_text=True)
+    assert response.headers["Retry-After"]
+    with client.session_transaction() as sess:
+        assert sess["user_id"] == 1
+
+
+def test_database_error_answers_503_json_on_api_routes(monkeypatch):
+    def _raise_db(*_a, **_kw):
+        raise app_module.DatabaseError("db failure")
+
+    monkeypatch.setattr(app_module, "execute_query", _raise_db)
+    client = _logged_in_client()
+
+    response = client.get("/api/progress/1")
+
+    assert response.status_code == 503
+    assert "temporarily unavailable" in response.get_json()["error"]
+    with client.session_transaction() as sess:
+        assert sess["user_id"] == 1
+
+
+def test_database_error_does_not_start_a_login_round_trip(monkeypatch):
+    def _raise_db(*_a, **_kw):
+        raise app_module.DatabaseError("db failure")
+
+    monkeypatch.setattr(app_module, "execute_query", _raise_db)
+    client = _logged_in_client()
+
+    assert client.get("/login").status_code == 503
+
+
+def test_plain_logout_is_this_device_only(monkeypatch):
+    _reset_rate_limit()
+    db = _FakeUsers()
+    monkeypatch.setattr(app_module, "execute_query", db)
+    first = _logged_in_client()
+    second = _logged_in_client()
+
+    response = first.post("/logout", data={"csrf_token": "tok"})
+
+    assert response.status_code == 302
+    assert db.epoch_updates() == []
+    assert not _is_logged_in(first)
+    assert _is_logged_in(second)
+
+
+def test_logout_everywhere_requires_login(monkeypatch):
+    _reset_rate_limit()
+    db = _FakeUsers()
+    monkeypatch.setattr(app_module, "execute_query", db)
+    client = flask_app.test_client()
+
+    response = client.post("/account/logout-everywhere", data={"csrf_token": "x"})
+
+    assert response.status_code == 302
+    assert "/login" in response.headers["Location"]
+    assert db.epoch_updates() == []
+
+
+def test_logout_everywhere_requires_csrf(monkeypatch):
+    _reset_rate_limit()
+    db = _FakeUsers()
+    monkeypatch.setattr(app_module, "execute_query", db)
+    client = _logged_in_client()
+
+    assert client.post("/account/logout-everywhere", data={"csrf_token": "wrong"}).status_code == 400
+    assert client.post("/account/logout-everywhere").status_code == 400
+    assert db.epoch_updates() == []
+    assert _is_logged_in(client)
+
+
+def test_logout_everywhere_ends_every_session(monkeypatch):
+    _reset_rate_limit()
+    db = _FakeUsers()
+    monkeypatch.setattr(app_module, "execute_query", db)
+    here = _logged_in_client()
+    elsewhere = _logged_in_client()
+
+    response = here.post("/account/logout-everywhere", data={"csrf_token": "tok"})
+
+    assert response.status_code == 302
+    assert response.headers["Location"].endswith("/")
+    assert len(db.epoch_updates()) == 1
+    assert db.epoch == 1
+    _assert_persistent(response)
+    with here.session_transaction() as sess:
+        assert "user_id" not in sess
+        assert any("all devices" in msg for _cat, msg in sess["_flashes"])
+    assert not _is_logged_in(here)
+    assert not _is_logged_in(elsewhere)  # its cookie still says epoch 0
+
+
+def test_session_created_after_logout_everywhere_carries_the_new_epoch(monkeypatch):
+    _reset_rate_limit()
+    db = _FakeUsers(epoch=1)
+    monkeypatch.setattr(app_module, "execute_query", db)
+
+    assert _is_logged_in(_logged_in_client(epoch=1))
+
+
+def test_logout_everywhere_database_failure_keeps_the_session(monkeypatch):
+    _reset_rate_limit()
+    db = _FakeUsers()
+    db.fail_updates = True
+    monkeypatch.setattr(app_module, "execute_query", db)
+    client = _logged_in_client()
+
+    response = client.post("/account/logout-everywhere", data={"csrf_token": "tok"})
+
+    assert response.status_code == 302
+    assert response.headers["Location"].endswith("/account/settings")
+    with client.session_transaction() as sess:
+        assert sess["user_id"] == 1
+        assert any(cat == "error" for cat, _msg in sess["_flashes"])
+    assert _is_logged_in(client)
+
+
+def test_logout_everywhere_is_rate_limited(monkeypatch):
+    db = _FakeUsers()
+    monkeypatch.setattr(app_module, "execute_query", db)
+    limiters = [lim for lim in flask_app.extensions["limiter"]]
+    for lim in limiters:
+        lim.enabled = True
+        lim.reset()
+    try:
+        client = _logged_in_client()
+        statuses = [client.post("/account/logout-everywhere", data={"csrf_token": "bad"}).status_code for _ in range(6)]
+    finally:
+        for lim in limiters:
+            lim.reset()
+            lim.enabled = False
+
+    assert statuses == [400] * 5 + [429]
+
+
+def test_account_settings_page_offers_log_out_everywhere(monkeypatch):
+    monkeypatch.setattr(app_module, "execute_query", _FakeUsers())
+    client = _logged_in_client()
+
+    response = client.get("/account/settings")
+
+    html = response.get_data(as_text=True)
+    assert response.status_code == 200
+    assert 'action="/account/logout-everywhere"' in html
+    assert "data-confirm=" in html
+
+
+def test_token_refresh_failure_keeps_session_and_records_whether_to_retry(monkeypatch):
+    from oauthlib.oauth2.rfc6749.errors import InvalidGrantError
+
+    user = {
+        "id": 1,
+        "wiki_username": "tester",
+        "access_token": "old",
+        "refresh_token": "ref",
+        "token_expires_at": datetime.now(UTC) - timedelta(hours=1),
+    }
+    monkeypatch.setattr(app_module, "redis_client", None)
+    monkeypatch.setattr(app_module, "execute_query", lambda *_a, **_kw: [dict(user)])
+
+    def run(exc):
+        def _exchange(_refresh):
+            raise exc
+
+        monkeypatch.setattr(app_module, "_oauth_exchange", _exchange)
+        with flask_app.test_request_context("/"):
+            session["user_id"] = 1
+            g.user = dict(user)
+            assert app_module._get_valid_token() is None
+            assert session["user_id"] == 1
+            return g.token_refresh_transient
+
+    assert run(InvalidGrantError()) is False  # revoked: log in again
+    assert run(TimeoutError("slow")) is True  # transient: just retry
+
+
+def test_token_unavailable_error_distinguishes_permanent_from_transient():
+    with flask_app.test_request_context("/"):
+        g.token_refresh_transient = False
+        permanent = app_module._token_unavailable_error()
+        g.token_refresh_transient = True
+        transient = app_module._token_unavailable_error()
+    assert permanent.status == 401
+    assert transient.status == 503
+    assert permanent.message != transient.message
+    assert permanent.extra == {"reauth_url": "/login?reauth=1"}
+    assert transient.extra == {}
+
+
+def _write_sdc_with_refresh_failure(monkeypatch, *, transient):
+    _reset_rate_limit()
+
+    def execute(sql, params=None, fetch=True):
+        if sql.startswith("SELECT id, wiki_user_id"):
+            return _FakeUsers()(sql, params, fetch)
+        if "FROM projects p LEFT JOIN project_members" in sql:
+            return [{"id": 1, "user_id": 1, "status": "active", "sdc_write_requested": 0}]
+        if "AS write_cnt" in sql:
+            return [{"write_cnt": 3, "removal_cnt": 0}]
+        raise AssertionError(f"Unexpected SQL: {sql}")
+
+    def failing_token():
+        g.token_refresh_transient = transient
+        return None
+
+    monkeypatch.setattr(app_module, "execute_query", execute)
+    monkeypatch.setattr(app_module, "_get_valid_token", failing_token)
+    client = _logged_in_client()
+    response = client.post("/api/write-sdc/1", data={"csrf_token": "tok"})
+    with client.session_transaction() as sess:
+        assert sess["user_id"] == 1  # neither outcome logs the user out
+    return response
+
+
+def test_write_sdc_asks_for_a_new_login_only_when_the_grant_is_gone(monkeypatch):
+    response = _write_sdc_with_refresh_failure(monkeypatch, transient=False)
+
+    assert response.status_code == 401
+    body = response.get_json()
+    assert "re-authorize" in body["error"]
+    assert body["reauth_url"] == "/login?reauth=1"  # only says "offer the button"; the page renders the link
+
+
+def test_write_sdc_answers_503_for_a_transient_refresh_failure(monkeypatch):
+    response = _write_sdc_with_refresh_failure(monkeypatch, transient=True)
+
+    assert response.status_code == 503
+    body = response.get_json()
+    assert "try again" in body["error"]
+    assert "reauth_url" not in body  # re-authorizing would not help while Wikimedia is unreachable
+
+
+# ---------------------------------------------------------------------------
+# Session-loss log line
+# ---------------------------------------------------------------------------
+
+
+def _session_loss_records(caplog):
+    return [r.getMessage() for r in caplog.records if r.getMessage().startswith("session loss:")]
+
+
+def test_session_loss_logged_when_no_cookie_was_sent(monkeypatch, caplog):
+    monkeypatch.setattr(app_module, "_SESSION_LOSS_SAMPLE_RATE", 1.0)
+    monkeypatch.setattr(app_module, "_LOG_SESSION_LOSS", True)
+    _reset_rate_limit()
+    client = flask_app.test_client()
+
+    with caplog.at_level("INFO"):
+        client.get("/login", headers={"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X)"})
+
+    [line] = _session_loss_records(caplog)
+    assert "reason=no cookie sent" in line
+    assert "had_cookie=False" in line
+    assert "client=ios" in line
+
+
+def test_session_loss_logged_when_the_cookie_holds_no_user(monkeypatch, caplog):
+    monkeypatch.setattr(app_module, "_SESSION_LOSS_SAMPLE_RATE", 1.0)
+    monkeypatch.setattr(app_module, "_LOG_SESSION_LOSS", True)
+    _reset_rate_limit()
+    client = flask_app.test_client()
+    with client.session_transaction() as sess:
+        sess["csrf_token"] = "abc"
+
+    with caplog.at_level("INFO"):
+        client.get("/login")
+
+    [line] = _session_loss_records(caplog)
+    assert "reason=valid but empty" in line
+    assert "had_cookie=True" in line
+
+
+def test_session_loss_reasons_for_expired_and_forged_cookies(monkeypatch):
+    serializer = app_module.app.session_interface.get_signing_serializer(app_module.app)
+    cookie = serializer.dumps({"csrf_token": "abc"})
+
+    with flask_app.test_request_context("/", headers={"Cookie": "session=not-a-valid-cookie"}):
+        assert app_module._session_loss_reason() == "bad signature"
+
+    monkeypatch.setitem(flask_app.config, "PERMANENT_SESSION_LIFETIME", timedelta(seconds=-5))
+    with flask_app.test_request_context("/", headers={"Cookie": f"session={cookie}"}):
+        assert app_module._session_loss_reason() == "expired"
+
+
+def test_session_loss_not_logged_for_static_health_and_service_worker(monkeypatch, caplog):
+    monkeypatch.setattr(app_module, "_SESSION_LOSS_SAMPLE_RATE", 1.0)
+    monkeypatch.setattr(app_module, "_LOG_SESSION_LOSS", True)
+
+    with caplog.at_level("INFO"):
+        for path in ("/static/app.js", "/health", "/sw.js", "/robots.txt", "/commons-thumb/x"):
+            with flask_app.test_request_context(path):
+                app_module._log_session_loss()
+
+    assert _session_loss_records(caplog) == []
+
+
+def test_session_loss_can_be_switched_off_and_is_sampled(monkeypatch, caplog):
+    monkeypatch.setattr(app_module, "_SESSION_LOSS_SAMPLE_RATE", 1.0)
+    with caplog.at_level("INFO"):
+        monkeypatch.setattr(app_module, "_LOG_SESSION_LOSS", False)
+        with flask_app.test_request_context("/login"):
+            app_module._log_session_loss()
+        monkeypatch.setattr(app_module, "_LOG_SESSION_LOSS", True)
+        monkeypatch.setattr(app_module, "_SESSION_LOSS_SAMPLE_RATE", 0.0)
+        with flask_app.test_request_context("/login"):
+            app_module._log_session_loss()
+
+    assert _session_loss_records(caplog) == []
+
+
+def test_session_loss_not_logged_for_a_logged_in_request(monkeypatch, caplog):
+    monkeypatch.setattr(app_module, "_SESSION_LOSS_SAMPLE_RATE", 1.0)
+    monkeypatch.setattr(app_module, "_LOG_SESSION_LOSS", True)
+    monkeypatch.setattr(app_module, "execute_query", _FakeUsers())
+    client = _logged_in_client()
+
+    with caplog.at_level("INFO"):
+        client.get("/login")
+
+    assert _session_loss_records(caplog) == []
+
+
+def test_client_bucket():
+    assert app_module._client_bucket("Mozilla/5.0 (iPhone; CPU iPhone OS 17_5)") == "ios"
+    assert app_module._client_bucket("Mozilla/5.0 (Linux; Android 14; Pixel 8)") == "android"
+    assert app_module._client_bucket("Mozilla/5.0 (Windows NT 10.0; Win64; x64)") == "desktop"
+    assert app_module._client_bucket("Mozilla/5.0 (X11; Linux x86_64)") == "desktop"
+    assert app_module._client_bucket("Googlebot/2.1 (+http://www.google.com/bot.html)") == "other"
+    assert app_module._client_bucket("") == "other"
+
+
+def test_requests_that_never_touch_the_session_get_no_cookie():
+    """The persistence safety net must not hand a cookie to every crawler."""
+    response = flask_app.test_client().get("/robots.txt")
+
+    assert response.status_code == 200
+    assert _session_cookies(response) == []
+
+
+def test_anonymous_landing_page_and_leaderboard_get_no_cookie(monkeypatch):
+    monkeypatch.setattr(app_module, "execute_query", lambda *_a, **_kw: [])
+
+    for path in ("/", "/leaderboard"):
+        response = flask_app.test_client().get(path)
+
+        assert response.status_code == 200, path
+        assert _session_cookies(response) == [], path
+
+
+def test_after_request_makes_any_non_empty_session_persistent():
+    """The safety net behind the explicit session.permanent calls: no writer can leave a session cookie."""
+    with flask_app.test_request_context("/"):
+        session["written_by_a_path_that_forgot"] = 1
+        assert session.permanent is False
+
+        app_module._keep_session_cookie_persistent(Response())
+
+        assert session.permanent is True
+
+
+def test_after_request_leaves_an_empty_session_alone():
+    with flask_app.test_request_context("/"):
+        app_module._keep_session_cookie_persistent(Response())
+
+        assert not session

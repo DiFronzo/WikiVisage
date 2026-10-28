@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS users (
     refresh_token   VARBINARY(2048) NOT NULL,
     token_expires_at DATETIME       NOT NULL,
     leaderboard_opt_out TINYINT(1)   NOT NULL DEFAULT 0 COMMENT '1=user opted out of leaderboard',
+    session_epoch   INT UNSIGNED    NOT NULL DEFAULT 0 COMMENT 'Bumped by Log out everywhere, logins holding an older value are rejected',
     created_at      DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at      DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
 
@@ -198,12 +199,30 @@ CREATE TABLE IF NOT EXISTS project_members (
 
 
 -- Worker heartbeat table: single-row table tracking when the background worker last ran.
--- Used by the web app to detect worker downtime and display a banner.
+-- Superseded by worker_heartbeats below, nothing reads it any more. It stays so existing
+-- databases and migrate.py --reset keep working, and is dropped in a later release.
 CREATE TABLE IF NOT EXISTS worker_heartbeat (
     id          INT             NOT NULL DEFAULT 1 PRIMARY KEY,
     last_seen   DATETIME        NOT NULL,
 
     CONSTRAINT single_row CHECK (id = 1)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+
+-- Per-worker heartbeats. Each worker process keeps its own row, written by a dedicated
+-- heartbeat thread. The web app shows its offline banner only when no row is fresh, no
+-- worker announced a planned stop that has not run out yet, and no project claim was
+-- refreshed recently. A worker that gets SIGTERM (deploy, restart) writes state
+-- 'stopping' with expected_back_until, so a planned restart never shows the banner.
+CREATE TABLE IF NOT EXISTS worker_heartbeats (
+    worker_id           VARCHAR(64)     NOT NULL PRIMARY KEY,
+    state               ENUM('running', 'stopping') NOT NULL DEFAULT 'running',
+    last_seen           DATETIME        NOT NULL,
+    expected_back_until DATETIME        NULL COMMENT 'Set with state stopping: the banner stays hidden until then',
+    last_progress       DATETIME        NULL COMMENT 'When the main loop last reported progress',
+    phase               VARCHAR(64)     NULL COMMENT 'What the main loop was doing at last_progress',
+    started_at          DATETIME        NULL,
+    version             VARCHAR(32)     NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 

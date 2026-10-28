@@ -41,8 +41,18 @@
         /* JS sets position: absolute, width, height, top, left to zoom into face */
         object-fit: unset;
     }
+    .result-thumb .face-marker {
+        /* Outline of the classified face, positioned by cropToFace(). */
+        position: absolute;
+        box-sizing: border-box;
+        pointer-events: none;
+        border: 2px solid var(--primary);
+        box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.6);
+        z-index: 1;
+    }
     .result-actions {
         position: absolute;
+        z-index: 2;
         top: 0.5rem;
         right: 0.5rem;
         display: flex;
@@ -510,7 +520,7 @@
         .modal-actions { margin-top: 0.75rem; }
     }
 </style>
-<script nonce="{{ csp_nonce }}" src="{{ url_for('static', filename='wikivisage-common.js') }}"></script>
+<script nonce="{{ csp_nonce }}" src="{{ url_for('static', filename='wikivisage-common.js', v=app_version) }}"></script>
 {% endblock %}
 
 {% block content %}
@@ -818,6 +828,9 @@
     <div id="sdcResult" class="sdc-result-area"{% if project.sdc_write_error and not project.sdc_write_requested %} style="display: block;"{% endif %}>
         {% if project.sdc_write_error and not project.sdc_write_requested %}
         <p style="color: var(--danger); font-weight: 700;">{{ _('Worker error: {error}').replace('{error}', project.sdc_write_error) }}</p>
+        {% if sdc_needs_reauth %}
+        <a class="btn btn-primary btn-sm" style="margin-top: 0.5rem;" href="{{ reauth_login_url }}">{{ _('Re-authorize') }}</a>
+        {% endif %}
         {% endif %}
     </div>
     <div class="sdc-actions">
@@ -1015,7 +1028,7 @@
                     });
                 }
             } else {
-                showInlineAlert(data.error || i18nReclassify.saveError);
+                showInlineAlert(data.error || i18nReclassify.saveError, reauthHref(data));
                 card.dataset.reclassifyInFlight = '0';
             }
         }).catch(function(e) {
@@ -1026,7 +1039,7 @@
             // message (e.g. "This face was already classified by X") instead
             // of the generic saveError fallback.
             var msg = (e && e.data && e.data.error) || (e && e.message) || i18nReclassify.saveError;
-            showInlineAlert(msg);
+            showInlineAlert(msg, reauthHref(e && e.data));
         });
     }
 
@@ -1038,80 +1051,127 @@
     var currentOldBbox = null;
     var bboxTriggerElement = null;
 
+    var FACE_MARKER_MIN_PX = 10;
+
     /**
-     * Crop a gallery thumbnail to show just the face bounding box region.
-     * Positions the img absolutely inside the overflow-hidden .result-thumb
-     * container, scaling it so the face region (with padding) fills the view.
-     * Skips legacy images where detection_width/detection_height are 0.
+     * Lay out one gallery thumbnail: zoom into the classified face (never past
+     * MAX_DEVICE_UPSCALE) and outline it with a marker. All geometry comes from
+     * computeFaceView() in wikivisage-common.js; this only reads the dataset and
+     * applies the result. Idempotent: called again on resize and after the
+     * higher-resolution source loads. When the geometry cannot be trusted
+     * (legacy rows, rotated originals) the plain contained image is shown.
+     * Bootstrap-classified faces are never zoomed but are still outlined.
      */
     function cropToFace(img) {
         var thumb = img.parentElement;
         if (!thumb || !thumb.classList.contains('result-thumb')) return;
-
-        var detW = parseInt(thumb.dataset.detectionWidth) || 0;
-        var detH = parseInt(thumb.dataset.detectionHeight) || 0;
-        if (detW === 0 || detH === 0) return;  // Legacy image — no crop
-
-        var bboxTop = parseInt(thumb.dataset.bboxTop) || 0;
-        var bboxRight = parseInt(thumb.dataset.bboxRight) || 0;
-        var bboxBottom = parseInt(thumb.dataset.bboxBottom) || 0;
-        var bboxLeft = parseInt(thumb.dataset.bboxLeft) || 0;
-
-        var faceW = bboxRight - bboxLeft;
-        var faceH = bboxBottom - bboxTop;
-        if (faceW <= 0 || faceH <= 0) return;  // Invalid bbox
-
-        // Add 80% padding around the face (clamped to image bounds in detection space)
-        var padX = faceW * 0.8;
-        var padY = faceH * 0.8;
-        var cropLeft = Math.max(0, bboxLeft - padX);
-        var cropTop = Math.max(0, bboxTop - padY);
-        var cropRight = Math.min(detW, bboxRight + padX);
-        var cropBottom = Math.min(detH, bboxBottom + padY);
-        var cropW = cropRight - cropLeft;
-        var cropH = cropBottom - cropTop;
-        if (cropW <= 0 || cropH <= 0) return;
-
-        // Container dimensions
-        var containerW = thumb.clientWidth;
-        var containerH = thumb.clientHeight;
-        if (containerW === 0 || containerH === 0) return;
+        var card = thumb.closest('.result-card');
+        var noZoom = !!card && card.dataset.source === 'bootstrap';
 
         var natW = img.naturalWidth;
         var natH = img.naturalHeight;
-        if (natW === 0 || natH === 0) return;
+        if (!natW || !natH) return;  // not loaded yet; the load listener calls us again
 
-        // Convert crop region from detection space to natural image pixel space
-        var scaleX = natW / detW;
-        var scaleY = natH / detH;
-        var srcLeft = cropLeft * scaleX;
-        var srcTop = cropTop * scaleY;
-        var srcW = cropW * scaleX;
-        var srcH = cropH * scaleY;
+        var bbox = {
+            top: parseInt(thumb.dataset.bboxTop) || 0,
+            right: parseInt(thumb.dataset.bboxRight) || 0,
+            bottom: parseInt(thumb.dataset.bboxBottom) || 0,
+            left: parseInt(thumb.dataset.bboxLeft) || 0
+        };
+        var detW = parseInt(thumb.dataset.detectionWidth) || 0;
+        var detH = parseInt(thumb.dataset.detectionHeight) || 0;
+        var view = computeFaceView(bbox, detW, detH, natW, natH, thumb.clientWidth, thumb.clientHeight,
+                                   window.devicePixelRatio || 1, { zoom: !noZoom });
 
-        // Scale image so crop region fills the container (cover — no empty space)
-        var displayScale = Math.max(containerW / srcW, containerH / srcH);
+        var marker = thumb.querySelector('.face-marker');
+        if (view && view.mode === 'crop') {
+            img.classList.add('face-cropped');
+            img.style.width = view.imgWidth + 'px';
+            img.style.height = view.imgHeight + 'px';
+            img.style.left = view.imgLeft + 'px';
+            img.style.top = view.imgTop + 'px';
+        } else {
+            img.classList.remove('face-cropped');
+            img.style.width = '';
+            img.style.height = '';
+            img.style.left = '';
+            img.style.top = '';
+        }
 
-        // Skip if the face already fills most of the image (zoom < 1.1x)
-        var fullImgScale = Math.max(containerW / natW, containerH / natH);
-        if (displayScale / fullImgScale < 1.1) return;
+        if (view && view.markerVisible) {
+            if (!marker) {
+                marker = document.createElement('div');
+                marker.className = 'face-marker';
+                marker.setAttribute('aria-hidden', 'true');
+                thumb.appendChild(marker);
+            }
+            // A face only a few pixels wide still gets a visible marker, around the same centre.
+            var markerW = Math.max(view.box.width, FACE_MARKER_MIN_PX);
+            var markerH = Math.max(view.box.height, FACE_MARKER_MIN_PX);
+            marker.style.left = (view.box.left + view.box.width / 2 - markerW / 2) + 'px';
+            marker.style.top = (view.box.top + view.box.height / 2 - markerH / 2) + 'px';
+            marker.style.width = markerW + 'px';
+            marker.style.height = markerH + 'px';
+        } else if (marker) {
+            marker.remove();
+        }
 
-        // Rendered full-image dimensions at this scale
-        var renderedW = natW * displayScale;
-        var renderedH = natH * displayScale;
+        // Progressive source: the 330 px thumbnail is too small for this crop,
+        // so fetch one larger thumbnail (once) and lay out again when it loads.
+        // The URL comes from the server (direct Commons URL, like the 330 px one):
+        // the /commons-thumb proxy is login-gated and rate limited per hour.
+        if (view && !img.dataset.hiresRequested) {
+            var w = faceViewSourceWidth(view.needNatW, natW, detW);
+            if (w) {
+                var hires = {};
+                try { hires = JSON.parse(img.dataset.thumbUrls || '{}'); } catch (e) { hires = {}; }
+                var hiresUrl = hires[String(w)];
+                if (hiresUrl) {
+                    img.dataset.hiresRequested = '1';
+                    img.src = hiresUrl;
+                }
+            }
+        }
+    }
 
-        // Position: offset so the crop center aligns with container center
-        var cropCenterX = (srcLeft + srcW / 2) * displayScale;
-        var cropCenterY = (srcTop + srcH / 2) * displayScale;
-        var offsetX = containerW / 2 - cropCenterX;
-        var offsetY = containerH / 2 - cropCenterY;
+    /** Wire the load/error listeners of a gallery img once, then lay it out if already loaded. */
+    function bindFaceLayout(img) {
+        if (!img.dataset.faceLayoutBound) {
+            img.dataset.faceLayoutBound = '1';
+            img.addEventListener('load', function() { cropToFace(img); });
+            img.addEventListener('error', function() {
+                // A failed larger thumbnail falls back to the one we had.
+                var base = img.dataset.baseSrc;
+                if (img.dataset.hiresRequested === '1' && base && img.getAttribute('src') !== base) {
+                    img.src = base;
+                }
+            });
+        }
+        if (img.complete && img.naturalWidth > 0) cropToFace(img);
+    }
 
-        img.classList.add('face-cropped');
-        img.style.position = 'absolute';
-        img.style.width = renderedW + 'px';
-        img.style.height = renderedH + 'px';
-        img.style.left = offsetX + 'px';
-        img.style.top = offsetY + 'px';
+    var galleryResizeWatcher = null;
+    var galleryResizeFrame = 0;
+
+    function relayoutGalleryThumbs() {
+        if (galleryResizeFrame) return;
+        galleryResizeFrame = window.requestAnimationFrame(function() {
+            galleryResizeFrame = 0;
+            document.querySelectorAll('#resultsGallery .result-thumb img').forEach(cropToFace);
+        });
+    }
+
+    /** Re-run the layout when the gallery width changes (resize, rotation, zoom). */
+    function watchGalleryResize(gallery) {
+        if (galleryResizeWatcher) return;
+        if (window.ResizeObserver) {
+            galleryResizeWatcher = new ResizeObserver(relayoutGalleryThumbs);
+            galleryResizeWatcher.observe(gallery);
+        } else {
+            galleryResizeWatcher = true;
+            window.addEventListener('resize', relayoutGalleryThumbs);
+            window.addEventListener('orientationchange', relayoutGalleryThumbs);
+        }
     }
 
     function openBboxModal(btn) {
@@ -1420,7 +1480,7 @@
                 closeBboxModal();
                 loadGalleryPage(currentPage);
             } else {
-                showInlineAlert(data.error || i18nReclassify.bboxError);
+                showInlineAlert(data.error || i18nReclassify.bboxError, reauthHref(data));
                 loading.classList.remove('active');
             }
         }).catch(function(e) {
@@ -1429,7 +1489,7 @@
             // Surface the server's actual error message (postForm() throws
             // on non-2xx) instead of the generic bboxError fallback.
             var msg = (e && e.data && e.data.error) || (e && e.message) || i18nReclassify.bboxError;
-            showInlineAlert(msg);
+            showInlineAlert(msg, reauthHref(e && e.data));
         });
     }
 
@@ -1468,6 +1528,8 @@
         thumb.dataset.detectionHeight = face.detection_height;
 
         var img = document.createElement('img');
+        img.dataset.baseSrc = face.thumb_url;
+        img.dataset.thumbUrls = JSON.stringify(face.thumb_urls || {});
         img.src = face.thumb_url;
         img.alt = face.file_title;
         img.loading = 'lazy';
@@ -1614,19 +1676,10 @@
                     updateFilterCounts(data.counts);
                 }
                 
-                // Apply face cropping to newly rendered cards
-                // Skip bootstrap-classified faces — those were auto-matched without
-                // verifying which face is the target person, so show the full image.
-                var thumbs = gallery.querySelectorAll('.result-thumb img');
-                thumbs.forEach(function(img) {
-                    var card = img.closest('.result-card');
-                    if (card && card.dataset.source === 'bootstrap') return;
-                    if (img.complete && img.naturalWidth > 0) {
-                        cropToFace(img);
-                    } else {
-                        img.addEventListener('load', function() { cropToFace(img); });
-                    }
-                });
+                // Zoom + outline the classified face on the new cards (and keep
+                // them laid out when the gallery is resized).
+                gallery.querySelectorAll('.result-thumb img').forEach(bindFaceLayout);
+                watchGalleryResize(gallery);
             })
             .catch(function(e) {
                 if (e.name === 'AbortError') return;
@@ -1887,13 +1940,23 @@
     }
 
     // Helper: safely set message text without innerHTML
-    function sdcShowMessage(container, text, color) {
+    function sdcShowMessage(container, text, color, reauthUrl) {
         container.innerHTML = '';
         var p = document.createElement('p');
         p.style.color = color;
         p.style.fontWeight = '700';
         p.textContent = text;
         container.appendChild(p);
+        if (reauthUrl) {
+            var href = sameOriginHref(reauthUrl);
+            if (!href) return;
+            var a = document.createElement('a');
+            a.className = 'btn btn-primary btn-sm';
+            a.style.marginTop = '0.5rem';
+            a.href = href;
+            a.textContent = REAUTH_LABEL;
+            container.appendChild(a);
+        }
     }
 
     function startSdcWrite() {
@@ -1925,7 +1988,7 @@
         }).then(function(data) {
             if (data.error) {
                 result.style.display = 'block';
-                sdcShowMessage(result, data.error, 'var(--danger)');
+                sdcShowMessage(result, data.error, 'var(--danger)', reauthHref(data));
                 btn.disabled = false;
                 btn.textContent = i18nSdc.btnLabel;
                 return;
@@ -1953,7 +2016,7 @@
         }).catch(function(e) {
             console.error(e);
             result.style.display = 'block';
-            sdcShowMessage(result, (e && e.error) ? e.error : i18nSdc.sendError, 'var(--danger)');
+            sdcShowMessage(result, (e && e.error) ? e.error : i18nSdc.sendError, 'var(--danger)', reauthHref(e));
             btn.disabled = false;
             btn.textContent = i18nSdc.btnLabel;
         });
@@ -2037,7 +2100,7 @@
                 stopSdcPolling();
                 progress.style.display = 'none';
                 result.style.display = 'block';
-                sdcShowMessage(result, data.error, 'var(--danger)');
+                sdcShowMessage(result, data.error, 'var(--danger)', reauthHref(data));
                 btn.disabled = false;
                 btn.textContent = i18nSdc.btnLabel;
                 stopBtn.style.display = 'none';
@@ -2100,7 +2163,7 @@
                     progressBar.style.width = pct + '%';
                     progressText.textContent = i18nSdc.workerError.replace('{error}', data.error);
                     result.style.display = 'block';
-                    sdcShowMessage(result, i18nSdc.workerError.replace('{error}', data.error), 'var(--danger)');
+                    sdcShowMessage(result, i18nSdc.workerError.replace('{error}', data.error), 'var(--danger)', reauthHref(data));
                     btn.disabled = false;
                     btn.textContent = i18nSdc.btnLabel;
                 } else if (pending === 0 && removalPending === 0) {

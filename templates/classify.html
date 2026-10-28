@@ -576,7 +576,7 @@
 <div class="loading-overlay" id="loadingOverlay" role="status" aria-live="polite">{{ _('Saving...') }}</div>
 
 {% if image %}
-<script nonce="{{ csp_nonce }}" src="{{ url_for('static', filename='wikivisage-common.js') }}"></script>
+<script nonce="{{ csp_nonce }}" src="{{ url_for('static', filename='wikivisage-common.js', v=app_version) }}"></script>
 <script nonce="{{ csp_nonce }}">
     var csrfToken = {{ csrf_token()|tojson }};
     var i18n = {
@@ -776,7 +776,10 @@
         })
         .catch(function(error) {
             console.error('Error:', error);
-            showInlineAlert(i18n.errorUndo);
+            // The server's message says what went wrong (and an authorization failure also gets
+            // the one-click re-authorize); the generic text covers errors without a body.
+            var reauth = reauthHref(error && error.data);
+            showInlineAlert((error && error.data && error.data.error) || i18n.errorUndo, reauth);
             overlay.style.display = 'none';
             overlay.textContent = i18n.saving;
             inFlight = false;
