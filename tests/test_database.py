@@ -579,3 +579,181 @@ def test_get_connection_from_pool_evicts_dead_connection(monkeypatch):
     result = database._get_connection_from_pool(timeout=1.0)
     assert result is fresh_pc
     assert dead_conn._closed
+
+
+# ---------------------------------------------------------------------------
+# Dedicated connection (outside the pool)
+# ---------------------------------------------------------------------------
+
+
+class _FakeCursor:
+    def __init__(self, conn):
+        self.conn = conn
+        self.rowcount = 1
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def execute(self, sql, params=None):
+        self.conn.statements.append((sql, params))
+        if self.conn.fail_with is not None:
+            error, self.conn.fail_with = self.conn.fail_with, None
+            raise error
+
+
+class _DedicatedFakeConn:
+    def __init__(self, config):
+        self.config = config
+        self.open = True
+        self.statements = []
+        self.fail_with = None
+        self.closed = False
+
+    def cursor(self):
+        return _FakeCursor(self)
+
+    def close(self):
+        self.closed = True
+        self.open = False
+
+
+@pytest.fixture
+def fake_connect(monkeypatch, monkeypatch_env):
+    created = []
+
+    def connect(**config):
+        conn = _DedicatedFakeConn(config)
+        created.append(conn)
+        return conn
+
+    monkeypatch.setattr(database.pymysql, "connect", connect)
+    return created
+
+
+def test_open_dedicated_connection_is_lazy_and_outside_the_pool(fake_connect):
+    pool_before = database._pool
+
+    handle = database.open_dedicated_connection()
+
+    assert isinstance(handle, database.DedicatedConnection)
+    assert fake_connect == []  # nothing connects until the first statement
+    assert database._pool is pool_before
+
+
+def test_dedicated_connection_uses_the_pool_config_with_autocommit(fake_connect):
+    handle = database.open_dedicated_connection()
+
+    assert handle.execute("UPDATE t SET a = %s", (1,)) == 1
+
+    config = fake_connect[0].config
+    expected = {**database._get_db_config(), "autocommit": True}
+    assert config == expected
+    assert config["autocommit"] is True
+    assert fake_connect[0].statements == [("UPDATE t SET a = %s", (1,))]
+
+
+def test_dedicated_connection_is_reused_while_young(fake_connect):
+    handle = database.open_dedicated_connection()
+
+    handle.execute("SELECT 1")
+    handle.execute("SELECT 2")
+
+    assert len(fake_connect) == 1
+
+
+def test_dedicated_connection_is_replaced_when_older_than_the_max_age(fake_connect, monkeypatch):
+    handle = database.open_dedicated_connection()
+    handle.execute("SELECT 1")
+    handle._created_at -= database.MAX_CONNECTION_AGE + 1
+
+    handle.execute("SELECT 2")
+
+    assert len(fake_connect) == 2
+    assert fake_connect[0].closed is True
+
+
+def test_dedicated_connection_is_replaced_when_it_was_closed(fake_connect):
+    handle = database.open_dedicated_connection()
+    handle.execute("SELECT 1")
+    fake_connect[0].open = False
+
+    handle.execute("SELECT 2")
+
+    assert len(fake_connect) == 2
+
+
+def test_dedicated_connection_reconnects_once_after_a_broken_statement(fake_connect):
+    handle = database.open_dedicated_connection()
+    handle.execute("SELECT 1")
+    fake_connect[0].fail_with = OperationalError(2013, "Lost connection")
+
+    assert handle.execute("SELECT 2") == 1
+
+    assert len(fake_connect) == 2
+    assert fake_connect[0].closed is True
+    assert fake_connect[1].statements == [("SELECT 2", None)]
+
+
+def test_dedicated_connection_gives_up_after_a_second_failure(fake_connect, monkeypatch):
+    handle = database.open_dedicated_connection()
+    handle.execute("SELECT 1")
+    real_connect = database.pymysql.connect
+
+    def failing_connect(**config):
+        conn = real_connect(**config)
+        conn.fail_with = OperationalError(2013, "Lost connection")
+        return conn
+
+    fake_connect[0].fail_with = OperationalError(2013, "Lost connection")
+    monkeypatch.setattr(database.pymysql, "connect", failing_connect)
+
+    with pytest.raises(database.DatabaseError):
+        handle.execute("SELECT 2")
+
+    # The first connection plus exactly one reconnect for the retry; both are closed afterwards.
+    assert len(fake_connect) == 2
+    assert fake_connect[0].closed is True
+    assert fake_connect[1].closed is True
+    assert fake_connect[0].statements == [("SELECT 1", None), ("SELECT 2", None)]
+    assert fake_connect[1].statements == [("SELECT 2", None)]
+
+
+def test_dedicated_connection_does_not_retry_a_bad_statement(fake_connect):
+    handle = database.open_dedicated_connection()
+    handle.execute("SELECT 1")
+    fake_connect[0].fail_with = database.pymysql.ProgrammingError(1146, "no such table")
+
+    with pytest.raises(database.DatabaseError):
+        handle.execute("SELECT * FROM nope")
+
+    assert len(fake_connect) == 1
+
+
+def test_dedicated_connection_connect_failure_is_a_database_error(monkeypatch, monkeypatch_env):
+    def connect(**_config):
+        raise OperationalError(2003, "refused")
+
+    monkeypatch.setattr(database.pymysql, "connect", connect)
+
+    with pytest.raises(database.DatabaseError):
+        database.open_dedicated_connection().execute("SELECT 1")
+
+
+def test_dedicated_connection_without_configuration_raises_configuration_error(monkeypatch):
+    monkeypatch.delenv("TOOL_TOOLSDB_USER", raising=False)
+
+    with pytest.raises(database.ConfigurationError):
+        database.open_dedicated_connection().execute("SELECT 1")
+
+
+def test_closing_a_dedicated_connection_is_idempotent(fake_connect):
+    handle = database.open_dedicated_connection()
+    handle.execute("SELECT 1")
+
+    handle.close()
+    handle.close()
+
+    assert fake_connect[0].closed is True

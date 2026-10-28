@@ -85,8 +85,8 @@ The landing page and `/health` endpoint work without OAuth. See [test-local.md](
 | `model-server/` | Face detection service (KServe + SCRFD/ArcFace on ONNX Runtime). The only place ML runs |
 | `scripts/` | `fetch_weights.sh` (re-create/verify the weights), `check_no_lfs.sh` (CI guard), `eval_prefilter.py` (pre-filter readout) |
 | `token_crypto.py` | Fernet encrypt/decrypt helpers for OAuth tokens at rest |
-| `database.py` | MariaDB connection pool with retry logic |
-| `schema.sql` | DDL for 9 tables + indexes |
+| `database.py` | MariaDB connection pool with retry logic, plus the dedicated connection of the worker's heartbeat thread |
+| `schema.sql` | DDL for 10 tables + indexes |
 | `migrate.py` | Idempotent schema migrations with `--reset` flag |
 | `templates/` | Jinja2 templates (10 files, all extend `base.html`) |
 | `translations/` | i18n files (en, nb, es, fr) |
@@ -178,7 +178,7 @@ gated on `faces.embedding_model`. Never run `migrate.py` against a database you 
 about without a dump, and do not add further one-time destructive steps without a
 similar guard and tests for both the first run and a re-run.
 
-Currently 9 tables: `users`, `projects`, `images`, `faces`, `user_stats`, `sdc_claims`, `project_members`, `worker_heartbeat`, `service_status`.
+Currently 10 tables: `users`, `projects`, `images`, `faces`, `user_stats`, `sdc_claims`, `project_members`, `worker_heartbeats`, `service_status`, and the legacy single-row `worker_heartbeat` (still created, no longer written or read; it is dropped in a later release).
 
 ## Testing
 
@@ -200,6 +200,8 @@ WIKIVISAGE_TEST_DB=1 pytest tests/ --cov=. --cov-report=term-missing
 ```
 
 Integration tests are marked with `@pytest.mark.integration` and require a running MariaDB (see setup above). They use a separate `wikiface_test` database that is created and dropped automatically.
+
+Browser tests (`tests/test_bbox_editor_browser.py`, `tests/test_gallery_thumb_browser.py`) need the optional `requirements-browser.txt` and `WIKIVISAGE_BROWSER_TESTS=1`; the plain suite skips them — see [TESTING.md](TESTING.md).
 
 Face-service tests need extra dependencies or a live service: `tests/test_face_service_backend.py` and `tests/test_face_service_model.py` import the ML stack (`onnxruntime`, `opencv`, `kserve`), and `tests/test_face_service_contract.py` runs against a running service — see [TESTING.md](TESTING.md).
 

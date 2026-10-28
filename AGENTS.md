@@ -11,16 +11,16 @@ Face detection and 512D embedding (SCRFD-500M + ArcFace MobileFaceNet on ONNX Ru
 
 ```
 WikiVisage/
-├── app.py              # Flask web app: OAuth (PKCE), routes, classification API, CSP (~4700 lines; the big routes are thin orchestration over named helpers)
-├── worker.py           # Background pipeline: crawl, remote detect, infer (~3700 lines). `write_sdc_claims` is a thin entry over `_SdcRun`; `main` is a sequence of small functions (see Worker)
+├── app.py              # Flask web app: OAuth (PKCE), routes, classification API, CSP (~4900 lines; the big routes are thin orchestration over named helpers)
+├── worker.py           # Background pipeline: crawl, remote detect, infer (~3900 lines). `write_sdc_claims` is a thin entry over `_SdcRun`; `main` is a sequence of small functions (see Worker)
 ├── face_client.py      # HTTP client for the face service. ZERO ML deps — shared by app.py + worker.py
 ├── liftwing_client.py  # Experimental LiftWing Qwen metadata pre-filter client (fail-open, circuit breaker, completion probe, optional bearer token) — worker-only
-├── config.py           # Shared config: WAKE_FILE_PATH, HEARTBEAT_FILE_DIR, COMMONS_THUMB_STEPS, DETECTION_WIDTH, LIFTWING_PROBE_INTERVAL, PROJECT_VERSION
+├── config.py           # Shared config: WAKE_FILE_PATH, HEARTBEAT_FILE_DIR, COMMONS_THUMB_STEPS, DETECTION_WIDTH, LIFTWING_PROBE_INTERVAL, SESSION_IDLE_DAYS, SESSION_MAX_AGE_DAYS, WORKER_STALE_SECONDS, WORKER_RESTART_GRACE_SECONDS, PROJECT_VERSION
 ├── token_crypto.py     # Fernet encrypt/decrypt helpers for OAuth tokens at rest (~125 lines)
 ├── redis_lock.py       # Best-effort Redis single-flight lock; used to serialize OAuth refresh (~100 lines)
 ├── oauth_refresh.py    # The OAuth refresh-token protocol shared by app.py and worker.py: Redis single-flight lock, DB compare-and-swap, re-read after a lost race. DB access and the token exchange are passed in as callables
 ├── api_errors.py       # `ApiError`: how JSON routes reject a request (status + body). Its own module on purpose: the Flask handler matches by class identity, and test fixtures reload `app`
-├── database.py         # MariaDB connection pool with retry logic (~510 lines)
+├── database.py         # MariaDB connection pool with retry logic, plus `open_dedicated_connection()` for the worker's heartbeat thread (~570 lines)
 ├── model-server/       # Face detection service — the ONLY place ML runs
 │   ├── model.py        # KServe V1 predictor: WikiVisageModel(kserve.Model), async predict, box_space scaling
 │   ├── backend.py      # FaceBackend protocol + SCRFD-500M/ArcFace-MBF on ONNX Runtime; weight SHA-256 pins. No KServe dependency
@@ -39,8 +39,8 @@ WikiVisage/
 │   ├── fetch_weights.sh   # Re-create/verify model-server/weights/ from the official InsightFace release (zip SHA, then both file SHAs)
 │   ├── check_no_lfs.sh    # CI guard: no .gitmodules, no LFS filter on the weights, no LFS pointer files
 │   └── eval_prefilter.py  # Offline readout for the LiftWing shadow verdicts (keep recall, skip rate, detector signal, sample reasons)
-├── healthcheck.sh      # Toolforge liveness health check script (per-worker heartbeat file age check)
-├── schema.sql          # DDL for 9 tables: users, projects, images, faces, user_stats, sdc_claims, project_members, worker_heartbeat, service_status
+├── healthcheck.sh      # Toolforge liveness health check script (per-worker heartbeat file age check; the file is touched by the worker's heartbeat thread)
+├── schema.sql          # DDL for 10 tables: users, projects, images, faces, user_stats, sdc_claims, project_members, worker_heartbeats, service_status, plus the legacy single-row worker_heartbeat (still created, no longer written or read; dropped in a later release)
 ├── migrate.py          # Idempotent schema migration with --reset flag; one-time embedding-model wipe (apply_embedding_model_upgrade)
 ├── pyproject.toml      # Project config: Ruff linter/formatter rules, pytest config, markers, version
 ├── requirements.in     # Top-level web/worker requirements; the source of requirements.txt
@@ -67,6 +67,9 @@ WikiVisage/
 │   ├── test_oauth_refresh.py # The refresh protocol: lock, compare-and-swap, peer wait, retry
 │   ├── test_worker_sdc.py # write_sdc_claims end to end through a scripted DB + Commons API (every error path, the removal phase, the blocked-page back-off)
 │   ├── test_worker_loop.py # The worker's main loop pieces: startup, supervisor, inference drain, sleep, shutdown
+│   ├── test_worker_heartbeat.py # Heartbeat thread: per-worker row upsert, progress watchdog, planned-stop marker, shutdown order (one integration test against the real table)
+│   ├── test_cookie_consent.py # `POST /cookie-consent`, the `locale` cookie flags, the cookie banner/footer markup
+│   ├── test_gallery_thumb_browser.py # Chromium/WebKit tests of the gallery thumbnails (zoom cap, face marker, hi-res swap and its fallback, resize relayout)
 │   ├── test_bbox_editor_browser.py # Chromium/WebKit tests of the rendered bbox editor (touch identity, cancel, resize, scrolling)
 │   ├── test_database.py # Unit + integration tests
 │   ├── test_face_client.py # Unit tests for the face service client (dim/model_id validation, box_space, startup probe)
@@ -84,7 +87,7 @@ WikiVisage/
 ├── static/             # Static assets
 │   ├── wikivisage-logo.svg        # Full logo with text
 │   ├── wikivisage-logo-notext.svg # Logo icon only
-│   ├── wikivisage-common.js       # Shared JS helpers: snapThumbWidth(), commonsThumbUrl()
+│   ├── wikivisage-common.js       # Shared JS helpers: snapThumbWidth(), commonsThumbUrl(), bbox geometry, gallery face view (computeFaceView())
 │   └── view-it-tool.png           # View it! Tool icon (local copy)
 ├── .github/
 │   ├── dependabot.yml  # Weekly update PRs: root uv, model-server uv (grouped), github-actions
@@ -218,7 +221,10 @@ token-protected `GET /v1/models`, so a missing or wrong token fails the
 preflight. An unreachable face service is deliberately
 *not* a hard error in the worker (images stay `pending` so a restart cannot
 mass-error them), so without that preflight a bad deploy would look green while
-silently processing nothing.
+silently processing nothing. The order is unchanged by the worker heartbeat
+work: the offline banner stays hidden during a deploy because each worker writes
+a planned-stop marker on SIGTERM (see *Worker heartbeat & downtime banner*), not
+because the workers stay up.
 
 **Security posture.** Detection used to run in a subprocess hardened with
 scrubbed env vars plus `RLIMIT_AS` / `RLIMIT_CPU` / `RLIMIT_FSIZE`, because
@@ -315,8 +321,8 @@ rejects it and the worker treats any non-`off` value as shadow).
   passes across projects, and the shared
   `worker_claimed_by`/`worker_claimed_at` columns mean two worker instances
   never sweep the same project at once. The thread exists because a pass can
-  take minutes, which would otherwise stall the heartbeat refreshes the
-  Toolforge health check watches; `main()` keeps its handle and joins it
+  take minutes, which would otherwise stall the main loop's progress marks and
+  claim refreshes (the heartbeat thread would read that as a stall); `main()` keeps its handle and joins it
   (bounded by `SWEEP_JOIN_TIMEOUT`) before releasing claims and closing the
   DB pool and HTTP session.
 - **Probe and status (`service_status`):** the worker probes only while at
@@ -329,7 +335,7 @@ rejects it and the worker treats any non-`off` value as shadow).
   would show a green banner during an outage. Real filter outcomes feed the same
   hysteresis (`_record_liftwing_failure` / `_record_liftwing_success`): `down`
   after 3 consecutive failures, `up` after one success. It is called from the
-  outer poll loop **and** the two 60 s heartbeat loops, so a long project cycle
+  outer poll loop **and** the two 60 s keep-alive loops (`_keep_alive_during_cycle`, `_supervise`), so a long project cycle
   does not starve it.
 - **Auth and rate limits:** anonymous calls are rate limited per IP (observed
   header: `x-wmf-ratelimit-class: anon-browser`). Setting
@@ -371,18 +377,20 @@ Flask app served by gunicorn (2 `gthread` workers x 4 threads, `app:app`; the mo
 - Open redirect protection on login (`_is_safe_url()`)
 - CSRF protection on all POST routes (per-request CSRF token stored in Flask's signed session cookie)
 - PKCE (RFC 7636, S256) on the OAuth authorization code flow as defense-in-depth against intercepted authorization codes
+- Sessions: signed cookies, revocable per user through `users.session_epoch`, 30-day sliding idle lifetime, 90-day absolute cap, always persistent cookies (see *Sessions are signed cookies, revocable per user* under Known Issues)
 - Rate limiting via Flask-Limiter (global 200/hour default, 10/min on bbox endpoints)
 - Security headers: `Content-Security-Policy` (`script-src 'self' 'nonce-<per-request nonce>'` with **no** `'unsafe-inline'` for scripts, `script-src-attr 'none'`, plus `object-src 'none'`, `base-uri 'none'`, `frame-ancestors 'none'`; `style-src` keeps `'unsafe-inline'` for the remaining `style=""` attributes). The nonce is generated by `_generate_csp_nonce()` (`g.csp_nonce`), exposed to templates as `{{ csp_nonce }}` and emitted by `set_security_headers()`, so header and tags always carry the same value. `X-Content-Type-Options`, `X-Frame-Options`, `X-XSS-Protection`, `Referrer-Policy`, `Permissions-Policy`
 - OAuth refresh single-flight via Redis lock (`redis_lock.single_flight()`, 15s TTL, key `wikivisage:lock:oauth-refresh:<user_id>`) — prevents concurrent token-refresh requests from invalidating each other's freshly rotated refresh tokens. Degrades to no-op if Redis is unreachable; DB-level CAS on `token_expires_at` remains as a second line of defense.
 
-**Routes (37 total):**
+**Routes (40 total):**
 | Route | Method | Purpose |
 |-------|--------|---------|
 | `/` | GET | Landing page |
 | `/set-language/<lang>` | GET | Set locale cookie, redirect back |
-| `/login` | GET | OAuth 2.0 redirect to Wikimedia |
-| `/auth/callback` | GET | OAuth token exchange |
-| `/logout` | POST | End session (CSRF protected) |
+| `/cookie-consent` | POST | Apply the cookie banner choice (`choice=accepted\|declined`, CSRF, rate limit 20/min) to an existing `locale` cookie: Accept makes it a 1-year cookie, Decline session-scoped. Answers 204; an invalid choice is 400. No `locale` cookie, nothing to change |
+| `/login` | GET | OAuth 2.0 redirect to Wikimedia. A logged-in user is sent to the dashboard unless `?reauth=1` is given (the one-click re-authorize: the OAuth round trip runs again and the callback replaces the stored tokens; `next` is honoured). `?reauth=1` is honoured only when `Sec-Fetch-Site` is absent, `same-origin` or `none`: a link from another site gets the dashboard instead, because the GET changes state. Answers 503 (not a redirect) while the signed-in user could not be loaded from the database |
+| `/auth/callback` | GET | OAuth token exchange. Clears the session (session fixation), except after a same-account re-authorize (the old session's `user_id` equals the resolved id): then `csrf_token`, `last_classify`, `skipped_images_*` and `manual_faces_*` are carried over, so the pending undo and other open tabs survive the round trip |
+| `/logout` | POST | End this device's session only: clears the cookie, leaves `session_epoch` alone, so other browsers stay logged in (CSRF protected). Not `login_required`, so it also works while the database is down; without a `user_id` in the session it just redirects |
 | `/dashboard` | GET | User's project list (paginated), includes collaborator count badges |
 | `/api/category-info` | GET | Return total file count for a Commons category (BFS subcategory traversal) |
 | `/project/new` | GET/POST | Create project (QID + Commons category, validates P31=Q5 and category existence). Detects cross-user duplicates and offers join option |
@@ -395,7 +403,7 @@ Flask app served by gunicorn (2 `gthread` workers x 4 threads, `app:app`; the mo
 | `/api/manual-face` | POST | Manually draw face bounding box (rate limited: 10/min) |
 | `/api/update-face-bbox` | POST | Redraw face bounding box from Model Results (rate limited: 10/min) |
 | `/api/write-sdc/<id>` | POST | Queue P180 depicts claims for writing by background worker (sets flag, returns immediately) |
-| `/api/sdc-status/<id>` | GET | Poll SDC write progress (written/pending counts, in_progress flag) |
+| `/api/sdc-status/<id>` | GET | Poll SDC write progress (written/pending counts, in_progress flag, the worker's `error`, and `reauth_url` when that error is an authorization failure, i.e. in `config.SDC_REAUTH_MESSAGES`) |
 | `/api/stop-sdc/<id>` | POST | Cancel an in-progress SDC write (clears sdc_write_requested flag) |
 | `/api/project/<id>/gallery` | GET | Paginated JSON API for Classification Results gallery (filter by result/source/sdc) |
 | `/api/progress/<id>` | GET | Poll image processing progress (processed/total/pending counts, `face_stats`, `inference_eligible`, `complete`); feeds the progress card and the live inference-status card |
@@ -407,16 +415,22 @@ Flask app served by gunicorn (2 `gthread` workers x 4 threads, `app:app`; the mo
 | `/join` | POST | Join a project via invite code |
 | `/project/<id>/rerun-inference` | POST | Reset model-classified faces to re-run inference with current settings (owner-only). The paused / active-SDC-write / `min_confirmed` checks and the reset run in one transaction under the project-row lock; refuses without resetting in those states, otherwise wakes the worker even if no model face needed a reset |
 | `/project/<id>/delete` | POST | Delete project |
-| `/account/settings` | GET/POST | User account settings (leaderboard opt-out) |
+| `/account/settings` | GET/POST | User account settings (leaderboard opt-out). GET also shows a Sessions card with the "Log out everywhere" button |
+| `/account/logout-everywhere` | POST | Bump `users.session_epoch` and clear the session, which ends every session of the user on every device (CSRF, rate limit 5/hour; `data-confirm` on the form). On a database error the session is kept and an error is flashed |
 | `/leaderboard` | GET | Top classifiers |
 | `/sw.js` | GET | Serve service worker from root scope |
 | `/.well-known/appspecific/com.chrome.devtools.json` | GET | Silence Chrome DevTools auto-request |
-| `/health` | GET | Health check (JSON: `status`, `database`, `limiter` (`redis`/`memory`), `face_service` (`reachable`/`unreachable`), `liftwing` (`reachable`/`unreachable`/`disabled`), `degraded` boolean). `liftwing` never affects `degraded` |
+| `/health` | GET | Health check (JSON: `status`, `database`, `limiter` (`redis`/`memory`), `face_service` (`reachable`/`unreachable`), `liftwing` (`reachable`/`unreachable`/`disabled`), `workers` (`{"fresh": n, "stopping": k, "stale": m}` from `worker_heartbeats`, or `"unknown"` when unreadable), `degraded` boolean). `liftwing` and `workers` are informational and never affect `degraded` |
 | `/robots.txt` | GET | Custom robots.txt (overrides Toolforge default Disallow: /) |
 | `/sitemap.xml` | GET | XML sitemap for search engines |
+| `/llms.txt` | GET | Plain-text site description for LLM crawlers ([llmstxt.org](https://llmstxt.org/)); robots.txt allows it through the `Disallow: /` |
 | `/commons-thumb/<path>` | GET | Redirect to Commons thumbnail URL (standard step sizes enforced) |
 
-**Error handlers:** 400, 403, 404, 429, 500 — all render `error.html` (429 returns "Rate limit exceeded").
+**Error handlers:** 400, 403, 404, 429, 503, 500 — all render `error.html` (429 returns "Rate limit exceeded"; 503 is the "temporarily unavailable" page, sent with `Retry-After: 5`).
+
+**Database trouble does not end sessions.** A `DatabaseError` while `before_request` loads the user leaves the session alone and sets `g.user = None`, `g.user_load_failed = True`; `login_required` then answers **503** (a JSON body for `/api/*` and JSON requests, otherwise the 503 page) instead of redirecting to `/login`, and `/login` and `/` answer 503 too (the landing page would otherwise show a "Log in" button that 503s). Only a `TokenDecryptionError`, a `session_epoch` mismatch or a session past the absolute age clear the session (`_end_session()`). `_get_valid_token()` never clears it: a failed refresh leaves `g.token_refresh_transient` set, and `_token_unavailable_error()` returns **401** "Your Wikimedia authorization has expired or was revoked. Please re-authorize to continue." with `reauth_url` (`/login?reauth=1`) only for a permanent refusal (revoked or expired refresh token, `invalid_grant`) and a retryable **503** without it otherwise. Undo, reclassify and `/api/write-sdc` use it.
+
+**One-click re-authorize.** The browser login can stay valid while Wikimedia no longer accepts the stored token (revoked grant, expired refresh token). Instead of telling the user to log out and in, every such answer carries `reauth_url`, and the page shows a **Re-authorize** button that goes to `/login?reauth=1&next=<current page>` (`reauthHref(data)` in `base.html` appends `next`). Paths: the JSON errors above (`showInlineAlert(message, reauthHref(data))`, used by reject/approve, bbox edit and the classify undo), the send-edits request, and the worker's stored `sdc_write_error` through `/api/sdc-status` (`sdcShowMessage(..., reauthUrl)`). The worker stores `config.SDC_AUTH_EXPIRED_MESSAGE` for `notloggedin`, `badtoken`, `mwoauth-invalid-authorization` and a token that cannot be refreshed at the start of a run **because the grant was refused** (revoked/expired refresh token, missing user row or refresh token; `_refresh_worker_token` records `permanent` from `on_failure` in a thread-local read by `_refresh_failure_was_permanent()`); a transient refresh failure (login-service timeout, 5xx, database error) stores `config.SDC_AUTH_UNAVAILABLE_MESSAGE` ("...try sending the edits again in a moment"), which is deliberately **not** in `SDC_REAUTH_MESSAGES`; `config.SDC_REAUTH_MESSAGES` also lists the wordings older releases stored, so existing rows get the button too (the project page renders the button next to a stored `sdc_write_error` on load, through `sdc_needs_reauth`, since the status poller only runs during a write). A row an older release stored as `"mwoauth-invalid-authorization: <info>"` is not in the set and gets no button; that is accepted. A missing edit permission (`permissiondenied`) is deliberately not offered as a re-authorize: it is fixed in the OAuth consumer registration. Transient failures (Wikimedia unreachable) never show the button. `oauth_refresh.refresh_tokens()` takes an optional `on_failure(permanent: bool)` callback (the web app uses it to set the flag; the worker uses it to pick the stored message) and `is_permanent_refresh_error()` classifies the exception.
 
 **Access control helpers (membership-aware):**
 - `get_project_for_actor(project_id, user_id)` — Fetches a project if the user is the owner OR a member via `project_members`. Used by `project_detail`, `classify`, `api_sdc_status`, `api_gallery`, `api_progress`. Returns project dict or `None` (→ 404).
@@ -437,13 +451,17 @@ Long-running background process with concurrent execution. Polls DB every 60s (`
 
 **Multi-instance**: Two worker instances (`ml-worker-1`, `ml-worker-2`) run in production. Each takes a `--worker-id` CLI argument used for per-worker heartbeat files and distributed project claiming via `SELECT ... FOR UPDATE`.
 
-**Liveness health check**: Each worker periodically touches `$HOME/.wikivisage-worker-alive-{worker_id}` (via `_touch_heartbeat_file()`). Toolforge runs `healthcheck.sh {worker_id}` every 10s; 3 consecutive failures (file missing or >5 min old) trigger automatic restart. The heartbeat directory is configured in `config.py` as `HEARTBEAT_FILE_DIR`.
+**Liveness (heartbeat thread)**: a dedicated daemon thread, `_heartbeat_loop()` (started in `main()` right after `init_db`, before the face-service startup check), ticks every `HEARTBEAT_INTERVAL` (30 s, waiting in 1 s slices). Each tick first touches `$HOME/.wikivisage-worker-alive-{worker_id}` (`_touch_heartbeat_file()`), then upserts this worker's row in `worker_heartbeats` through its **own** DB connection (`database.open_dedicated_connection()`), so an exhausted pool or a slow main loop cannot make a busy worker look dead, and a DB failure never blocks the file touch (a `Heartbeat write failed` warning is logged at most once per `HEARTBEAT_WARN_INTERVAL` = 60 s). **Startup gate**: until `main()` has passed the face-service check and `_log_project_diagnostics()` it sets `_startup_done`; before that a tick only touches the file and writes **no** row, so a worker that crash-loops in startup (e.g. `FaceServiceModelMismatch` exits 1) never writes a fresh `running` row and the offline banner can appear. Each tick runs under its own `try/except` (`Heartbeat tick failed`), so one unexpected error does not end the thread. Right after `_startup_done.set()`, `_delete_retired_worker_rows()` removes `worker_heartbeats` rows silent for `RETIRED_WORKER_ROW_DAYS` (7) other than its own (best effort), so a renamed worker does not show as `stale` in `/health` for ever. The worker id is the `VARCHAR(64)` primary key, so `_parse_worker_id` refuses an id longer than 64 characters and truncates the hostname part of the default `<hostname>-<pid>` to 50. Toolforge runs `healthcheck.sh {worker_id}` every 10s; 3 consecutive failures (file missing or >5 min old) trigger automatic restart. A database outage therefore no longer fails the health check. The heartbeat directory is configured in `config.py` as `HEARTBEAT_FILE_DIR`.
+
+**Progress watchdog**: `_mark_progress(phase)` (no I/O, callable from any thread) is called in the main loop, `_supervise`, `_sleep_until_next_cycle`, `_keepalive_sdc_write`, the `_api_request` retry sleeps, around `_purge_deleted_projects` and at the start of each pipeline stage. If nothing reports progress for `STALL_LIMIT` (900 s, `WIKIVISAGE_WORKER_STALL_LIMIT`), the heartbeat thread logs **one** error (`No worker progress for ...`) with the phase and the main thread's stack, then stops touching the file and writing the row, so `healthcheck.sh` restarts a genuinely stuck worker (about 15 min after the last progress plus the 5 min file age). Progress marks from project threads count too; the logged stack is always the main thread's. The shadow-sweep thread does **not** count as progress (`_progress_exempt` thread-local, set by `_shadow_prefilter_loop`): it reports every minute while a shadow-mode project has unchecked files and would otherwise hide a hung main loop.
+
+**Planned stop**: on SIGTERM (`toolforge jobs delete`, deploy, restart) the signal handler only sets `shutdown_requested`; the heartbeat thread then upserts `state='stopping'` with `expected_back_until = NOW() + WORKER_RESTART_GRACE_SECONDS` (config.py, 1200 s, `WIKIVISAGE_WORKER_RESTART_GRACE`). `_release_resources(sweep_thread, heartbeat_thread=None)` joins it (`HEARTBEAT_JOIN_TIMEOUT` = 10 s) **first**, before the sweep join, claim release and `close_pool()`, because the sweep join can take 100 s+ (the thread writes the marker on its own within about a second of SIGTERM; the join only keeps the interpreter from killing the daemon thread mid-write). The marker is an upsert, so a SIGTERM before the first tick still writes a row, but **only once startup finished** (before that the worker was never "running") and **not after a reported stall** (`Not announcing a planned stop: the worker was stalled`: Toolforge killing a stuck worker is not a planned stop, so the banner shows). The first `running` tick of the restarted worker clears the deadline and resets `started_at`. SIGKILL/OOM writes nothing, so the banner shows after `WORKER_STALE_SECONDS`. Log lines to grep: `Heartbeat write failed`, `No worker progress for`, `Announced planned stop`, `Heartbeat thread still running`.
 
 Two query paths:
 1. **Active projects** → full pipeline: early `run_autonomous_inference` when candidates already exist (so a re-run does not wait for discovery) → `traverse_category` → `bootstrap_from_sparql` → `prefilter_images` (experimental, shadow) → `process_images` → final `run_autonomous_inference`
 2. **Active or completed projects with unclassified faces and enough human-confirmed targets** → inference-only: `run_autonomous_inference`
 
-**Scheduling:** the inference-only queue is drained **before** the active batch each cycle (waves of `MAX_CONCURRENT_PROJECTS`), and the wake handler plus the 60 s heartbeat checks of the running loops call `_run_new_inference_projects()` so a project whose classifications just crossed `min_confirmed` is picked up mid-cycle (measured: 31 s from gate crossing to classification while the active batch was mid-run). Inference costs ~1 s per project while an active project can hold all slots for a long time looping its image backlog, so the original order (one inference batch *after* the active batch) left ready projects showing "Model inference in progress" at a standstill. `seen_ids` bounds the cycle-start drain: a project that stays eligible (e.g. faces with unusable encodings) is only attempted once per cycle there.
+**Scheduling:** the inference-only queue is drained **before** the active batch each cycle (waves of `MAX_CONCURRENT_PROJECTS`), and the wake handler plus the 60 s keep-alive checks of the running loops call `_run_new_inference_projects()` so a project whose classifications just crossed `min_confirmed` is picked up mid-cycle (measured: 31 s from gate crossing to classification while the active batch was mid-run). Inference costs ~1 s per project while an active project can hold all slots for a long time looping its image backlog, so the original order (one inference batch *after* the active batch) left ready projects showing "Model inference in progress" at a standstill. `seen_ids` bounds the cycle-start drain: a project that stays eligible (e.g. faces with unusable encodings) is only attempted once per cycle there.
 
 **Inference writes:** `_persist_inference_batch` takes the project-row lock used by human classifications and re-reads candidate eligibility and sibling targets before each batch UPDATE. Per-image deduplication is computed from distance alone; the locked write, not the candidate snapshot, decides whether a live sibling target vetoes a match. A target approved after the snapshot forces its remaining siblings to non-matches, while a sibling undone after the snapshot lets the closest candidate become a match. Faces with a new human edit, queued P180 removal, or superseded box are left untouched. Paused/deleted projects receive no batch writes. Counts report rows actually updated.
 
@@ -469,7 +487,7 @@ Two query paths:
 | `_liftwing_service_down` | True when `service_status` says LiftWing is down; the pre-filter skips the project entirely |
 | `_record_liftwing_failure` | Increments `consecutive_failures`; flips to `down` at `LIFTWING_FAIL_THRESHOLD` (3). A real failed pre-filter batch lands here too |
 | `_record_liftwing_success` | Resets `consecutive_failures`, sets `status='up'`, stamps `last_ok`; called after each stored pre-filter batch and by the probe |
-| `_probe_liftwing_if_due` | Atomic once-per-`LIFTWING_PROBE_INTERVAL` claim + real probe; runs only while a project uses the filter. Called from the outer poll loop and both 60 s heartbeat loops |
+| `_probe_liftwing_if_due` | Atomic once-per-`LIFTWING_PROBE_INTERVAL` claim + real probe; runs only while a project uses the filter. Called from the outer poll loop and both 60 s keep-alive loops |
 | `_claim_shadow_project` | Atomic claim of one project the active/inference paths leave alone (non-deleted, mode on, unchecked non-bootstrapped backlog; skips projects with a pending SDC write); least-recently-claimed first, so sweeps rotate |
 | `_sweep_shadow_prefilter` | One `prefilter_images()` pass (≤ 250 files) on a swept project, releasing the claim afterwards; skipped while LiftWing is marked down |
 | `_shadow_prefilter_loop` | Daemon sweep thread started by `main()`: sweep, then sleep `LIFTWING_SWEEP_INTERVAL` in 1 s slices |
@@ -479,7 +497,9 @@ Two query paths:
 | `_persist_inference_batch` | Takes the project-row lock, re-checks candidate eligibility and sibling targets, then applies model decisions in one transaction. Returns actual classified and match counts |
 | `run_autonomous_inference` | Cosine-distance classification on unclassified faces against the renormalised mean centroid (needs >= `min_confirmed` target faces). Only reads faces whose `embedding_model` equals `face_client.EXPECTED_MODEL_ID`, and skips faces with `sdc_removal_pending = 1` so a model guess can never re-target a face whose claim a human asked to remove (the removal phase would then strip the claim of a fresh match). A candidate on an image that already has a confirmed target (`image_has_target`) is always resolved as a non-match, so a re-run cannot promote a second face after the human approved one of several model faces on the same image |
 | `write_sdc_claims` | Thin entry over `_SdcRun` (`begin` → `write_phase` → `removal_phase` → `finish`; each Commons call site, the token-refresh retry, the abort and the cancel check exist once). A page held by another project's fresh claim is `BLOCKED`: the run backs off `_SDC_BLOCKED_BACKOFF_SECONDS` between fully blocked passes and ends after `_SDC_BLOCKED_MAX_PASSES` with a notice, instead of re-selecting it in a tight loop. Writes P180 claims to Commons SDC via Wikibase API (idempotent). Triggered by `sdc_write_requested` flag set from web UI. Before every write it re-reads the face's live `is_target`/`superseded_by` and skips faces that were rejected, undone or replaced while the batch was in flight (the web side queues a removal for those too; a whole unverifiable batch stops the run instead of looping). Re-checks `sdc_write_requested` every 5 faces (`_PER_FACE_CANCEL_CHECK_EVERY`) so the user can stop a running batch quickly, and calls `_keepalive_sdc_write` on the same cadence. Treats `no-such-entity` / `no-such-claim` / `no-such-statement` / `notfound` as already-gone successes (`_ALREADY_GONE_CODES`). |
-| `_keepalive_sdc_write` | Refreshes the DB heartbeat row, the heartbeat file and `projects.worker_claimed_at` (only for this worker's claim) while a long SDC run blocks the main loop — otherwise a run over 5 minutes trips `healthcheck.sh` and a run over `CLAIM_EXPIRY_MINUTES` lets the other worker claim the same project. Best-effort: every statement is wrapped in its own `try/except DatabaseError`. Called every 5 written faces and once per removal page. |
+| `_keepalive_sdc_write` | Calls `_mark_progress("sdc_keepalive")` (so the heartbeat thread does not read a long run as a stall) and refreshes `projects.worker_claimed_at` (only for this worker's claim) while a long SDC run blocks the main loop — otherwise a run over `CLAIM_EXPIRY_MINUTES` lets the other worker claim the same project. The claim refresh is best-effort (`try/except DatabaseError`). Called every 5 written faces and once per removal page. |
+| `_heartbeat_loop` | Heartbeat thread body (see Liveness above): 30 s ticks, file touch then `worker_heartbeats` upsert on a dedicated connection, stall watchdog, planned-stop marker on shutdown |
+| `_mark_progress` | Records the current phase and a monotonic timestamp; I/O free, safe from any thread |
 | `_api_request` | Wrapper for Commons/Wikidata API calls with maxlag, retry, and User-Agent |
 | `_get_csrf_token` | Fetches CSRF token for Wikibase API writes |
 
@@ -488,15 +508,16 @@ Two query paths:
 Both processes import from `database.py`. Thread-safe connection pool (`Queue`-based) with exponential backoff retry (3 attempts).
 
 **Exports:**
-- `init_db(pool_size)` — Initialize connection pool. The web app calls it at import with `WEB_DB_POOL_SIZE` (`WIKIVISAGE_WEB_DB_POOL_SIZE`, default 3) per gunicorn worker; the worker passes `WIKIVISAGE_DB_POOL_SIZE` when set, else `min(MAX_CONCURRENT_PROJECTS * IMAGE_THREADS + 3, 6)`.
+- `init_db(pool_size)` — Initialize connection pool. The web app calls it at import with `WEB_DB_POOL_SIZE` (`WIKIVISAGE_WEB_DB_POOL_SIZE`, default 3) per gunicorn worker; the worker passes `WIKIVISAGE_DB_POOL_SIZE` when set, else `min(MAX_CONCURRENT_PROJECTS * IMAGE_THREADS + 3, 5)`.
 - `execute_query(sql, params, fetch)` — Universal read/write. Returns `List[Dict]` (fetch=True) or `int` rowcount (fetch=False).
 - `execute_insert(sql, params)` — INSERT with `cursor.lastrowid` return (race-free).
 - `execute_transaction(queries)` — Atomic multi-statement transaction. Takes list of `(sql, params)` tuples.
 - `get_connection(timeout)` — Context manager for raw connection access.
 - `close_pool()` — Drain and close all connections.
+- `open_dedicated_connection()` — Returns a `DedicatedConnection` outside the pool, used only by the worker's heartbeat thread. `execute(sql, params)` runs one autocommit statement (rowcount returned); `close()` drops it. Same config as the pool; it connects on first use, reconnects when older than `MAX_CONNECTION_AGE`, closed, or broken mid-statement (one retry), and raises `DatabaseError`. Not thread-safe (one per thread) and **not counted in the pool size**, so it needs one extra ToolsDB connection.
 - `DatabaseError`, `PoolExhaustedError`, `ConfigurationError` — Custom exception hierarchy.
 
-Pool size configurable via `WIKIVISAGE_DB_POOL_SIZE` env var. The worker uses that env var when set; otherwise it computes `min(MAX_CONCURRENT_PROJECTS * IMAGE_THREADS + 3, 6)` and warns above 6, because Toolforge ToolsDB enforces `max_user_connections=20` across every process sharing the DB user (gunicorn + all workers).
+Pool size configurable via `WIKIVISAGE_DB_POOL_SIZE` env var. The worker uses that env var when set; otherwise it computes `min(MAX_CONCURRENT_PROJECTS * IMAGE_THREADS + 3, 5)` and warns above 5, because Toolforge ToolsDB enforces `max_user_connections=20` across every process sharing the DB user (gunicorn + all workers). Budget: 2 web workers x 3 + 2 background workers x (5 pooled + 1 dedicated heartbeat connection) = 18 of 20.
 
 ## Data Model
 
@@ -518,6 +539,10 @@ users 1──N projects 1──N images 1──N faces
                                 images:
                                        +-- bootstrapped: 1=image found via P180 bootstrap
 
+users.session_epoch INT UNSIGNED NOT NULL DEFAULT 0
+  +-- Bumped by POST /account/logout-everywhere; session["epoch"] (set at login) must equal it,
+      a mismatch ends the session. A session without "epoch" counts as 0
+
 project_members (project_id, user_id, role, joined_at)
   +-- Tracks additional collaborators beyond the project owner
   +-- role: 'owner' | 'member' (default 'member')
@@ -530,7 +555,15 @@ sdc_claims (commons_page_id, wikidata_qid, project_id, face_id, claimed_at, writ
   +-- Worker does INSERT IGNORE — first project to claim wins
   +-- written_at set when API write succeeds
 
-worker_heartbeat (single-row: id=1, last_seen DATETIME)
+worker_heartbeats (worker_id PK, state ENUM('running','stopping'), last_seen, expected_back_until,
+                   last_progress, phase, started_at, version)
+  +-- One row per worker process, written by the worker's heartbeat thread every 30 s
+  +-- state 'stopping' + expected_back_until = announced planned stop (deploy, restart)
+  +-- Read by the web app only (offline banner, /health `workers`)
+
+worker_heartbeat (legacy single-row: id=1, last_seen DATETIME)
+  +-- No longer written or read; still created by schema.sql/migrate.py and dropped by
+      --reset, to be removed in a later release
 
 service_status (name PK, status ENUM('up','down','unknown'), consecutive_failures,
                 last_checked, last_ok, last_error)
@@ -570,6 +603,10 @@ images.prefilter_checked_at DATETIME NULL  -- when the verdict was stored
 | `MAX_BBOX_PX` | 10000 | Maximum bounding box coordinate value |
 | `MIN_BBOX_AREA` | 100 | Minimum bounding box area in pixels |
 | `_LIFTWING_STALE_SECONDS` | `config.LIFTWING_PROBE_INTERVAL * 3` = 900 | A `service_status` row older than this reads as `unknown` (no banner) |
+| `PERMANENT_SESSION_LIFETIME` | `config.SESSION_IDLE_DAYS` = 30 days | Sliding idle lifetime of the `session` cookie (`SESSION_REFRESH_EACH_REQUEST = True`: every response re-sends it) |
+| `_SESSION_MAX_AGE_SECONDS` | `config.SESSION_MAX_AGE_DAYS` = 90 days | Absolute session age measured from `session["auth_at"]` (set at login) |
+| `LOCALE_COOKIE_MAX_AGE` | 1 year | `locale` cookie lifetime when the visitor accepted cookies |
+| `_SESSION_LOSS_SAMPLE_RATE` | 0.05 | Fraction of anonymous requests that get the `session loss:` log line (`WIKIVISAGE_LOG_SESSION_LOSS` turns it off) |
 
 ### worker.py
 | Constant | Value | Purpose |
@@ -591,6 +628,19 @@ images.prefilter_checked_at DATETIME NULL  -- when the verdict was stored
 | `LIFTWING_SWEEP_INTERVAL` | 60 s | Pause between background shadow-sweep passes; `0` disables the sweep (`WIKIVISAGE_LIFTWING_SWEEP_INTERVAL`) |
 | `SWEEP_JOIN_TIMEOUT` | `REQUEST_TIMEOUT + 15` (105 s) | Shutdown join window for the sweep thread before claims and the DB pool / HTTP session are closed |
 | `LIFTWING_FAIL_THRESHOLD` | 3 | Consecutive probe **or filter-batch** failures before `service_status.status` flips to `down` (`WIKIVISAGE_LIFTWING_FAIL_THRESHOLD`) |
+| `HEARTBEAT_INTERVAL` | 30 s | Heartbeat thread tick (file touch + `worker_heartbeats` upsert) |
+| `STALL_LIMIT` | 900 s | No `_mark_progress` for this long = stuck: the heartbeat thread logs once and stops touching the file/row so Toolforge restarts the worker (`WIKIVISAGE_WORKER_STALL_LIMIT`) |
+| `HEARTBEAT_WARN_INTERVAL` | 60 s | At most one `Heartbeat write failed` warning per this interval |
+| `HEARTBEAT_JOIN_TIMEOUT` | 10 s | Shutdown waits this long for the heartbeat thread to write the planned-stop row |
+
+### config.py (shared)
+| Constant | Default | Purpose |
+|----------|---------|---------|
+| `SESSION_IDLE_DAYS` | 30 | Sliding idle session lifetime in days (`WIKIVISAGE_SESSION_IDLE_DAYS`) |
+| `SESSION_MAX_AGE_DAYS` | 90 | Absolute session age cap in days from login (`WIKIVISAGE_SESSION_MAX_AGE_DAYS`) |
+| `WORKER_STALE_SECONDS` | 300 | A `worker_heartbeats` row (or a project claim) older than this no longer counts as alive; the web banner needs every signal stale |
+| `WORKER_RESTART_GRACE_SECONDS` | 1200 | How long a worker's `stopping` row keeps the offline banner away (`WIKIVISAGE_WORKER_RESTART_GRACE`) |
+| `SDC_AUTH_EXPIRED_MESSAGE` / `SDC_REAUTH_MESSAGES` | text / set | What the worker stores in `projects.sdc_write_error` when the user's authorization is refused, and the set (it plus older wordings) the web app turns into a `reauth_url` |
 
 ### liftwing_client.py (worker-only, experimental)
 | Constant | Default | Purpose |
@@ -658,12 +708,18 @@ images.prefilter_checked_at DATETIME NULL  -- when the verdict was stored
 **Optional:**
 - `TOOL_TOOLSDB_HOST` — Default: `tools.db.svc.wikimedia.cloud`
 - `FLASK_SECRET_KEY` — Default: random hex (regenerates on restart — sessions lost)
+- `WIKIVISAGE_SESSION_IDLE_DAYS` — Default: `30` (sliding idle lifetime of the `session` cookie; read by `config.py`)
+- `WIKIVISAGE_SESSION_MAX_AGE_DAYS` — Default: `90` (absolute session age from login; a session past it is cleared with a flash)
+- `WIKIVISAGE_LOG_SESSION_LOSS` — Default: on (`0`/`false`/`no`/`off` disables the sampled `session loss:` INFO line, see Cookies)
+- `WIKIVISAGE_INSECURE_HTTP` — Unset by default. Local development only: `1` drops `Secure` from the `session` and `locale` cookies so a phone or another device can use the app over plain http on the LAN. Run with `FLASK_DEBUG` unset (debug always binds `127.0.0.1` because of the Werkzeug debugger) and set `OAUTH_REDIRECT_URI` to the LAN address registered on the OAuth consumer. Never set it in production: `_insecure_http_enabled()` ignores it (and logs an error) when `TOOL_TOOLFORGE_API_URL` is set, because Toolforge envvars are tool-wide. The cookie `Secure` flag comes from `_SessionInterface.get_cookie_secure()` / `_cookie_secure()` per request, not from a config mutation
 - `PORT` — Default: `8000`
-- `WIKIVISAGE_WEB_DB_POOL_SIZE` — Default: `3` (connections per gunicorn web worker; 2 workers x 3 + 2 background workers x 6 = 18 of ToolsDB's 20). Separate from the next variable because Toolforge envvars are tool-wide.
-- `WIKIVISAGE_DB_POOL_SIZE` — Background worker pool size. The worker reads it; when unset it computes `min(MAX_CONCURRENT_PROJECTS * IMAGE_THREADS + 3, 6)` and warns above 6 (ToolsDB shares a 20-connection cap across all processes).
+- `WIKIVISAGE_WEB_DB_POOL_SIZE` — Default: `3` (connections per gunicorn web worker; 2 workers x 3 + 2 background workers x (5 pooled + 1 dedicated heartbeat connection) = 18 of ToolsDB's 20). Separate from the next variable because Toolforge envvars are tool-wide.
+- `WIKIVISAGE_DB_POOL_SIZE` — Background worker pool size. The worker reads it; when unset it computes `min(MAX_CONCURRENT_PROJECTS * IMAGE_THREADS + 3, 5)` and warns above 5 (ToolsDB shares a 20-connection cap across all processes; each worker also holds one extra, unpooled connection for its heartbeat thread).
 - `WIKIVISAGE_WORKER_POLL_INTERVAL` — Default: `60` seconds
 - `WIKIVISAGE_WORKER_BATCH_SIZE` — Default: `50` (images per processing batch)
 - `WIKIVISAGE_WORKER_MAX_PROJECTS` — Default: `4` (concurrent projects processed by worker)
+- `WIKIVISAGE_WORKER_STALL_LIMIT` — Default: `900` (seconds without `_mark_progress` before the heartbeat thread stops touching the liveness file so Toolforge restarts the worker)
+- `WIKIVISAGE_WORKER_RESTART_GRACE` — Default: `1200` (seconds a worker's planned-stop row keeps the offline banner away; read by `config.py`)
 - `WIKIVISAGE_WORKER_IMAGE_THREADS` — Default: `4` (parallel image download/detection threads per project)
 - `WIKIVISAGE_TOKEN_KEY` — Fernet key for encrypting OAuth tokens at rest. If unset, tokens are stored as plaintext (backward compatible). Generate with: `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`
 - `WIKIVISAGE_REDIS_URL` — Redis URL for shared rate limiter storage. Default: `redis://redis.svc.tools.eqiad1.wikimedia.cloud:6379`. Falls back to `memory://` if Redis is unreachable. Key prefix: `wikivisage:`.
@@ -727,8 +783,8 @@ images.prefilter_checked_at DATETIME NULL  -- when the verdict was stored
 - All templates extend `base.html`. Three blocks: `title`, `extra_head` (CSS/JS), `content`.
 - CSS is embedded in `base.html` `<style>` tag (CSS custom properties) + per-page `{% block extra_head %}`. No external CSS files.
 - Reusable CSS classes live in `base.html`: `.decorated-card` (scanline + corner overlay pattern, accent color via `--card-accent` CSS variable), unified pagination styles (`.pagination a, .pagination button`).
-- Shared JS helpers are in `static/wikivisage-common.js` (thumbnail snapping, Commons URL building). Templates that need them add `<script src="{{ url_for('static', filename='wikivisage-common.js') }}">` in `{% block extra_head %}`.
-- No JavaScript build system. Inline `<script>` tags in templates for page-specific logic. **Every inline `<script>` must carry `nonce="{{ csp_nonce }}"`** (the CSP has no `'unsafe-inline'` for scripts) and **inline event-handler attributes (`onclick=`, `onsubmit=`, `onchange=` …) and `javascript:` URLs are forbidden** (`script-src-attr 'none'` blocks them silently). Wire behaviour with `addEventListener` from the nonce'd script, using ids or `data-*` attributes, and delegate for markup built at runtime (build DOM with `createElement`/`textContent`, not `innerHTML` with handlers). Page-wide helpers live in the first script of `base.html`: `<button data-dismiss-parent>` removes its parent (banners, flashes), `<form data-confirm="message">` asks `confirm()` before submitting (put the message in an autoescaped attribute, e.g. `data-confirm="{{ _('...') }}"`; interpolate names with `.replace('{username}', name)`), and `showInlineAlert(message)` fills the `role="alert"` region (`#inline-alert`) instead of `window.alert()`. `tests/test_security_round2.py::TestTemplatesAreCSPClean` fails on a handler attribute, an un-nonced `<script>`, a `javascript:` URL or an `alert(` call.
+- Shared JS helpers are in `static/wikivisage-common.js` (thumbnail snapping, Commons URL building, gallery face view). Templates that need them add `<script nonce="{{ csp_nonce }}" src="{{ url_for('static', filename='wikivisage-common.js', v=app_version) }}">`: the `v=app_version` query is required (see *Shared scripts and the service worker* under Known Issues) and `test_templates_version_the_shared_script_url` fails without it.
+- No JavaScript build system. Inline `<script>` tags in templates for page-specific logic. **Every inline `<script>` must carry `nonce="{{ csp_nonce }}"`** (the CSP has no `'unsafe-inline'` for scripts) and **inline event-handler attributes (`onclick=`, `onsubmit=`, `onchange=` …) and `javascript:` URLs are forbidden** (`script-src-attr 'none'` blocks them silently). Wire behaviour with `addEventListener` from the nonce'd script, using ids or `data-*` attributes, and delegate for markup built at runtime (build DOM with `createElement`/`textContent`, not `innerHTML` with handlers). Page-wide helpers live in the first script of `base.html`: `<button data-dismiss-parent>` removes its parent (banners, flashes), `<form data-confirm="message">` asks `confirm()` before submitting (put the message in an autoescaped attribute, e.g. `data-confirm="{{ _('...') }}"`; interpolate names with `.replace('{username}', name)`), and `showInlineAlert(message, actionUrl, actionLabel)` fills the `role="alert"` region (`#inline-alert`) instead of `window.alert()` (an `actionUrl` shows the action button, `#inline-alert-action`, default label `REAUTH_LABEL`; `.btn` sets its own `display`, so hidden children of the alert need the `.inline-alert [hidden]` rule). `tests/test_security_round2.py::TestTemplatesAreCSPClean` fails on a handler attribute, an un-nonced `<script>`, a `javascript:` URL or an `alert(` call.
 - Title format: `Page Name - WikiVisage BETA`
 - Dark brutalist/industrial theme with CSS variables: `--bg: #090e17`, `--surface: #141f33`, `--primary: #14b8a6`, etc.
 
@@ -742,7 +798,8 @@ images.prefilter_checked_at DATETIME NULL  -- when the verdict was stored
 ### Security
 - Open redirect protection: `_is_safe_url()` validates all redirect targets. Additional `urlparse` guard in `set_language` rejects referrers with scheme/netloc/`//` prefix.
 - Rate limiting: Global 200/hour default. `10/min` on `api_manual_face` and `api_update_face_bbox`. Uses Redis for shared storage across gunicorn workers (`WIKIVISAGE_REDIS_URL`). Falls back to `memory://` if Redis is unreachable.
-- CSRF: All POST routes protected via Flask-Session tokens.
+- CSRF: All POST routes protected via Flask-Session tokens (`POST /cookie-consent` and `POST /account/logout-everywhere` included; the token is generated once per session, never rotated per request).
+- Sessions: signed cookie, persistent, 30-day sliding idle lifetime + 90-day absolute cap, revocable per user via `users.session_epoch` ("Log out everywhere"); see *Sessions are signed cookies, revocable per user*.
 - Bbox validation: All face bounding box inputs validated against `MAX_BBOX_PX` and `MIN_BBOX_AREA`.
 - Security headers set on all responses: `Content-Security-Policy`, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `X-XSS-Protection: 1; mode=block`.
 - Token encryption at rest: OAuth access/refresh tokens can be Fernet-encrypted in the DB via `WIKIVISAGE_TOKEN_KEY` env var (opt-in). Handled by `token_crypto.py`. Decryption gracefully falls back to plaintext for legacy tokens.
@@ -750,7 +807,7 @@ images.prefilter_checked_at DATETIME NULL  -- when the verdict was stored
 - Commons thumbnail proxy: URL validated via `urlparse` (scheme must be `https`, netloc must be `upload.wikimedia.org`).
 
 ### Error handling
-- `app.py`: Custom error handlers for 400/403/404/500 render `error.html`. Route handlers use try/except returning flash + redirect.
+- `app.py`: Custom error handlers for 400/403/404/429/503/500 render `error.html`. Route handlers use try/except returning flash + redirect.
 - `database.py`: Custom exceptions (`DatabaseError`, `PoolExhaustedError`, `ConfigurationError`). Retry with exponential backoff on `OperationalError`/`InterfaceError`.
 - `worker.py`: Each pipeline stage catches its own exceptions, logs, and returns 0 on failure (no crash propagation). Main loop catches `DatabaseError` and sleeps 10s.
 
@@ -760,6 +817,7 @@ images.prefilter_checked_at DATETIME NULL  -- when the verdict was stored
 - JavaScript: `snapThumbWidth(w)` mirrors the same logic in `static/wikivisage-common.js`.
 - All thumbnail URL generation must go through these snapping functions.
 - Standard steps: 20, 40, 60, 120, 250, 330, 500, 960, 1280, 1920, 3840px.
+- Gallery cards: the server still sends 330 px as `thumb_url`, plus `thumb_urls` (`{"500": url, "960": url}`, built by `_gallery_hires_steps()` in `app.py` as direct `upload.wikimedia.org` URLs, like `thumb_url`; `{}` when the detection width is unknown). A card may swap its thumbnail **once** to one of those, at most `min(960, largest step <= detection width)` (Commons rejects thumbnails wider than the original, and a detection width below 960 is the original's width), and only when the face crop needs it (`faceViewSourceWidth()`). The swap looks the width up in the card's `data-thumb-urls` and never builds a URL itself: it must not go through `/commons-thumb`, which is login-gated and counts against the 200/hour limit (a gallery page used to cost one proxy hit per card). A missing width keeps the 330 px source, and a failed swap reverts to it. `_GALLERY_HIRES_MAX` (`app.py`) and `FACE_VIEW_MAX_SOURCE_WIDTH` (`wikivisage-common.js`) must stay equal (a test pins it).
 
 ### Shared Helpers
 
@@ -772,6 +830,12 @@ Extracted common patterns to reduce duplication across routes, templates, and JS
 | `_wikimedia_api_get` | `(url, params, timeout=10) → dict` | Standardizes User-Agent header, `raise_for_status()`, `.json()` parsing for Wikimedia API GET requests | 10: `_is_human_entity`, `_commons_category_exists`, `_commons_category_has_files`, `_check_p180_exists`, `_fetch_p18_thumb_url`, `_fetch_wikidata_label`, + 4 calls in `api_category_info` |
 | `_validate_bbox` | `(top, right, bottom, left) → str \| None` | Validates bounding box coordinates against `MAX_BBOX_PX` and `MIN_BBOX_AREA`. Returns error message or `None` | 2: `api_manual_face`, `api_update_face_bbox` |
 | `_get_face_stats` | `(project_id) → dict[str, Any]` | Single SQL query returning 13-column face/image stats (including `model_matches`) with NULL→0 coercion | 2: `project_detail`, `api_progress` |
+| `_end_session` | `(message=None) → None` | Clears the session, keeps the cookie persistent (so the flash survives on iOS home-screen apps), optionally flashes why | 4: `before_request` (absolute age), `_load_session_user` (epoch mismatch, token decryption failure), `account_logout_everywhere` |
+| `_set_locale_cookie` | `(resp, lang, *, persistent) → None` | Writes the `HttpOnly`, `SameSite=Lax`, `Secure` (not in debug) `locale` cookie; 1-year lifetime only when `persistent` | 2: `set_language`, `cookie_consent` |
+| `_token_unavailable_error` | `() → ApiError` | 401 "re-authorize" with `reauth_url` for a permanent refresh failure, retryable 503 for a transient one (reads `g.token_refresh_transient`) | 3: `_remove_claims_before_undo`, `_settle_claim_for_rejection`, `api_write_sdc` |
+| `_reauth_url` | `() → str` | `url_for("login", reauth=1)`: the one-click re-authorize target put into `reauth_url` (the page appends `&next=`) | 2: `_token_unavailable_error`, `api_sdc_status` |
+| `_service_unavailable` | `() → response` | 503 JSON body for `/api/*` and JSON requests, else `abort(503)` (the 503 page) | 2: `login_required`, `login` |
+| `_log_session_loss` | `() → None` | Sampled INFO line `session loss: reason=... had_cookie=... client=... path=...` for anonymous requests | 1: `before_request` |
 
 **CSS (base.html):**
 
@@ -790,6 +854,10 @@ Extracted common patterns to reduce duplication across routes, templates, and JS
 | `postForm(url, csrfToken, fields)` | CSRF-enabled POST helper — builds FormData, returns parsed JSON Promise |
 | `bboxToDisplayRect(bbox, scaleX, scaleY, offsetX, offsetY)` | Converts detection-space bbox `{top,right,bottom,left}` to display-space `{left,top,width,height}` |
 | `displayRectToDetectionBbox(rect, scaleX, scaleY, offsetX, offsetY)` | Inverse of `bboxToDisplayRect` — display rect to rounded detection bbox |
+| `MAX_DEVICE_UPSCALE` | `2.0`: the single tuning knob, the most device pixels per source pixel the zoom into the face may magnify a gallery thumbnail to (an original so small that it is shown whole, in contain mode, can still be magnified past it to fill the card). Companion `FACE_VIEW_*` constants: `FACE_VIEW_PAD` 0.8 (crop = box + 0.8 x box size per side), `FACE_VIEW_MIN_ZOOM` 1.1 (below it show the whole image), `FACE_VIEW_MAX_ASPECT_DRIFT` 0.03, `FACE_VIEW_MARKER_MAX_COVER` 0.7, `FACE_VIEW_MAX_SOURCE_WIDTH` 960 (equal to `_GALLERY_HIRES_MAX` in `app.py`) |
+| `computeFaceView(bbox, detW, detH, natW, natH, cW, cH, dpr, opts)` | Pure (no DOM) geometry of a gallery thumbnail: `{mode: 'crop'\|'contain', imgLeft, imgTop, imgWidth, imgHeight, box, markerVisible, needNatW}`, or `null` when the geometry cannot be trusted (missing detection size, degenerate box, natural vs detection aspect off by more than 3 %). `opts.zoom === false` forces `contain`; `opts.maxDeviceUpscale` overrides the cap. `needNatW` is the natural source width the crop needs at the capped upscale (from the crop's width **and** height), `0` when zoom is off or the crop would be below `FACE_VIEW_MIN_ZOOM` (a larger source would not change that) |
+| `faceViewSourceWidth(needNatW, natW, detW)` | Width of a larger Commons thumbnail worth requesting, or `0` to keep the current one; never above `min(960, largestThumbStepAtMost(detW))`. The caller then looks the width up in the server-supplied `thumb_urls`; `commonsThumbUrl()` (the `/commons-thumb` proxy) is only used by the bbox editor's 1280 px image |
+| `largestThumbStepAtMost(w)` | Largest standard Commons thumbnail step <= `w` (`0` when none) |
 
 ## Known Issues & Gotchas
 
@@ -850,6 +918,9 @@ SDC writes require the `editpage` OAuth grant. The access token is stored per-us
 ### Worker must be restarted after code changes
 The worker is a long-running `python worker.py` process. Code changes require manual restart. On Toolforge, redeploy the continuous job. The face service is a separate container with its own lifecycle — changing `model-server/model.py` requires rebuilding and restarting *it*, not the worker.
 
+### Shared scripts and the service worker
+A page template and `static/wikivisage-common.js` are released together, but a browser can hold an old copy of the script. `static/sw.js` used to serve every `/static/*` file stale-while-revalidate, so the first page load after an update paired the **new** template with the **old** cached script: the gallery lost its zoom and face outline (`computeFaceView is not defined`) until a second reload. Three rules prevent it: (1) templates load shared scripts with `v=app_version`, so every release asks for a new URL that no cache can hold; (2) `sw.js` serves `/static/*.js` network-first (cache only as a fallback when the network fails or answers 5xx) and does not precache scripts, which also covers local development where the version does not change; (3) the cache name moves on (`wikivisage-v2`) whenever the service worker's caching rules change, because `activate` deletes every other cache. The browser tests cannot see this class of bug (they block service workers and route requests through the Flask test client), so it is covered by `test_service_worker_serves_scripts_network_first` and `test_templates_version_the_shared_script_url`, and was verified by planting the old script in both caches of a real Chromium and reloading.
+
 ### Commons thumbnail proxy
 `/commons-thumb/<path>` redirects to Commons thumbnail URLs server-side. This exists because Commons thumbnails can't be directly embedded due to referrer policies on Toolforge. The route enforces standard thumbnail step sizes to avoid 429 errors from Commons.
 
@@ -860,7 +931,9 @@ Commons enforces `$wgThumbnailSteps` — only standard sizes (20, 40, 60, 120, 2
 Worker uses `signal.SIGTERM`/`SIGINT` handlers setting `shutdown_requested = True`. Each pipeline stage and the main loop check this flag for graceful shutdown.
 
 ### Worker heartbeat & downtime banner
-The worker writes `REPLACE INTO worker_heartbeat (id, last_seen) VALUES (1, NOW())` at the start of each poll cycle. The web app checks `last_seen < NOW() - INTERVAL 5 MINUTE` via a context processor (`inject_worker_status`). If stale, `base.html` displays an amber banner: "The background worker appears to be offline." The banner is hidden on the landing page and leaderboard (not relevant there). Graceful on fresh installs — returns `worker_down=False` if no heartbeat row exists.
+Each worker's heartbeat thread upserts its own row in `worker_heartbeats` every 30 s (see Worker). The old single-row `worker_heartbeat` table is no longer written or read; it stays in `schema.sql`/`migrate.py` for existing databases and `--reset` and is dropped in a later release. The web app's `inject_worker_status()` sets `worker_down` from `_workers_alive()`, and `base.html` shows the amber "The background worker appears to be offline." banner only when **none** of these holds: (1) a worker row has `last_seen` newer than `WORKER_STALE_SECONDS` (300 s); (2) a worker row has an unexpired `expected_back_until` (announced planned stop); (3) a project claim (`projects.worker_claimed_at`) was refreshed within the same 300 s (checked only when (1) and (2) fail; it still proves work is going on when heartbeat writes fail). An empty `worker_heartbeats` table (a fresh install, or the minutes between a deploy's migration and the workers' first beat) and any error while checking also count as "not down", so an unreadable database never paints the banner. Helpers: `_worker_heartbeat_counts()`, `_recent_project_claim()`, `_workers_alive()`, `_workers_health_value()`. `/health` reports `"workers": {"fresh": n, "stopping": k, "stale": m}` (`"unknown"` when unreadable); it is informational and never sets `degraded`. The banner is hidden on the landing page and leaderboard (not relevant there).
+
+**Deploys do not show the banner, and the deploy order is unchanged.** `deploy.yml` still stops the workers before migrating and starts them only after `/health` reports `face_service: reachable` (that order is a documented safety property). What keeps the banner away is the planned-stop marker: `toolforge jobs delete` sends SIGTERM, the worker writes `state='stopping'` with `expected_back_until` 20 minutes ahead, and the restarted worker's first beat clears it. A SIGKILL or OOM kill writes nothing, so the banner appears after 5 minutes. The same holds for a worker that dies before `_startup_done` (no `running` row is written during startup, so a crash loop shows the banner) and for a worker the stall watchdog stopped (no marker after a reported stall). `/health` reports rows of retired workers as `stale` until the next worker start deletes rows older than 7 days.
 
 The LiftWing pre-filter has its own status path: the worker's probe writes `service_status`, and the web app's `inject_liftwing_status` context processor reads it (no network call). `base.html` shows a dismissible banner on the project detail/settings pages when the filter is down **and** the project uses it; the settings page also renders `reachable`/`unreachable`/`unknown` with the last check time. A row older than 3 probe intervals reads as `unknown`.
 
@@ -868,7 +941,7 @@ The LiftWing pre-filter has its own status path: the worker's probe writes `serv
 `project_detail.html`'s `#inferenceBanner` tracks the whole processing → inference lifecycle. It used to be a page-load snapshot. The card renders whenever inference can still happen: the viewer crossed `min_confirmed` and (eligible faces > 0 or the project is still processing images), or the page came from a re-run (`?inference_triggered=1`). With nothing eligible at render time it starts hidden (`style="display:none"`), and the `/api/progress` poller is what makes it live: it reveals the card when a model cycle begins, hides it again between cycles, and shows "Model inference complete — N new matches found" only once `complete` **and** `pending_images == 0`, then stops. `N` is the growth of `model_matches` (target faces classified by the model); `by_model` also counts non-matches. A quiescent page stops after the first poll. Do not re-gate the card or its poller on "running right now". A page loaded while nothing was eligible used to show no live status at all, and once `images_processed == images_total` the progress poller is off too. The poller's live `SDC Pending` update must add `sdc_removal_pending_faces` to match the server-rendered combined figure. Two review-driven rules: the poller stops itself the moment the banner element is gone (a dismissed card must not leave a 5 s `/api/progress` loop), and the observed-work marker persists across the hidden gaps (eligible faces seen in any poll, or `by_model` growth since page load), so a cycle that finishes between two polls still finalizes the card instead of stopping silently.
 
 ### Toolforge health check (file-based liveness)
-Separate from the DB heartbeat above, each worker also writes a per-worker file at `$HOME/.wikivisage-worker-alive-{worker_id}` via `_touch_heartbeat_file()`. The `healthcheck.sh` script accepts a worker ID as `$1`, checks the file exists and was modified within 5 minutes (`find -mmin +5`). Toolforge's `--health-check-script` runs this every 10s; 3 consecutive failures trigger automatic pod restart. Per-worker files are critical because `$HOME` is shared NFS on Toolforge — a single file would be kept fresh by any surviving worker, hiding a dead one.
+Separate from the DB heartbeat above (though written by the same thread), each worker also touches a per-worker file at `$HOME/.wikivisage-worker-alive-{worker_id}` via `_touch_heartbeat_file()` on every 30 s tick, **before** the database write. The `healthcheck.sh` script accepts a worker ID as `$1`, checks the file exists and was modified within 5 minutes (`find -mmin +5`). Toolforge's `--health-check-script` runs this every 10s; 3 consecutive failures trigger automatic pod restart. Because the file no longer depends on the database or the main loop, a DB outage does not restart workers; a worker with no progress for `STALL_LIMIT` (15 min) stops touching the file and is restarted. Per-worker files are critical because `$HOME` is shared NFS on Toolforge — a single file would be kept fresh by any surviving worker, hiding a dead one.
 
 ### Image download limits
 Both `app.py` and `worker.py` enforce a 50MB download size cap (`MAX_IMAGE_DOWNLOAD_BYTES`) via streaming download with early abort. The worker additionally validates image pixel dimensions before shipping bytes to the face service (`MAX_IMAGE_PIXELS = 100M pixels`), so oversized images are rejected before they are base64-inflated and sent over the wire. The service enforces its own independent ceilings.
@@ -884,7 +957,7 @@ Rejections and undos must never leave a stale P180 claim behind, including when 
 - The web side queues `sdc_removal_pending=1` for every rejection where no sibling target confirms the image (bootstrap faces and `sdc_written=0` faces included) and removes on-record claims for non-bootstrap written faces immediately (502 if that removal fails, so the rejection is not recorded).
 - Any transition back to `is_target = 1` (classify target, review approve, bbox redraw, worker bootstrap auto-classify and reconciliation) clears `sdc_removal_pending`, so a queued removal cannot strip the claim of a face that has become a target again. Model inference never creates such a transition: `run_autonomous_inference` skips faces with a queued removal, so a pending face stays unclassified until the queue is resolved and only then becomes eligible.
 - Undo removes the claim for faces with one on record (queueing on failure), queues unwritten targets only while a write run is active (`sdc_write_requested=1`, the only window where a claim can be in flight), and refuses to delete a manual face whose claim could not be removed first. Undoing a rejection ("none") is the opposite case and never deletes a claim: it cancels the removal the rejection queued (rejections only set the flag on bootstrapped images; on other images a queued flag predates the rejection — an earlier undo racing a write run — so it is kept for the worker to verify). Accepted residual: a manual face deleted in the same sub-second window between the worker's re-check and its `wbeditentity` call can still strand one claim; the re-check closes the realistic window.
-- A long write run keeps itself alive: `_keepalive_sdc_write` refreshes the DB heartbeat, the heartbeat file and the project claim every 5 faces and once per removal page, so runs longer than 5 minutes do not trip `healthcheck.sh` and runs longer than `CLAIM_EXPIRY_MINUTES` are not picked up by the other worker.
+- A long write run keeps itself alive: `_keepalive_sdc_write` reports progress (so the heartbeat thread does not see a stall and `healthcheck.sh` stays green) and refreshes the project claim every 5 faces and once per removal page, so runs longer than `CLAIM_EXPIRY_MINUTES` are not picked up by the other worker.
 
 ### Model Results validation UI
 The project detail page includes approve/reject/edit-bbox controls on each Model Results gallery card. Key behaviors:
@@ -892,14 +965,24 @@ The project detail page includes approve/reject/edit-bbox controls on each Model
 - **Reject** (X): Sets `is_target=0, classified_by='human'`. If the face had `sdc_written=1`, also removes the P180 depicts claim from Commons via `_remove_sdc_claim()` (uses `wbgetclaims` -> `wbremoveclaims`).
 - **Edit bbox** (pencil): Opens a modal with a 1280px image. User draws a new bounding box. Old face is kept; a new face row is inserted via `/api/update-face-bbox` (face encoding recomputed server-side; `faces.aligned` records whether the detector confirmed the box or the embedding fell back to an unaligned resize). Drawing works with mouse **and touch**: the drawing area listens to `touchstart`/`touchmove`/`touchend` on top of the mouse handlers and sets `touch-action: none`, so a finger drag draws instead of scrolling the page (it was desktop-only before); the geometry (scale + offsets) is measured from the live layout on every event and re-placed on `resize`/`orientationchange`, so rotating the phone mid-modal does not skew the box. `touchcancel` aborts the drag and restores the previous box instead of committing a partial one. The modal body scrolls and the image is capped at 50vh below 600px so the image, hint and Save button fit on a phone.
 - **Unreadable image**: if the face service rejects the image itself (`FaceServiceRejected` with `error_code: invalid_image`, which `encode_known_face` re-raises), both `/api/manual-face` and `/api/update-face-bbox` return **422** with "This image could not be read by the face detection service." (retryable service failures stay 503; box-level rejections still answer "draw a slightly larger box").
+- **Gallery thumbnails** (`cropToFace()` in `project_detail.html`, geometry from `computeFaceView()`): cards zoom into the classified face but the zoom never exceeds `MAX_DEVICE_UPSCALE` (2.0) device pixels per source pixel — when the 330 px source is too small, more surroundings are shown instead of a blurry close-up, or one larger thumbnail is requested (see Thumbnail URLs; no larger thumbnail is requested when the card stays uncropped anyway: `needNatW` is `0` below `FACE_VIEW_MIN_ZOOM`). The classified face is outlined by `.face-marker` (decorative, `aria-hidden`, at least 10 px, hidden when the box covers over 70 % of the card). Bootstrap faces are not zoomed but are outlined. Rows with no detection size, or whose thumbnail aspect differs from the detection aspect by more than 3 % (rotated small originals), show the plain image with no marker. The layout re-runs on resize through a `ResizeObserver` on `#resultsGallery` (`resize`/`orientationchange` listeners when it is missing).
 - **Filter interaction**: After reclassification, `data-source` is NOT changed — the card remains visible under its original source filter (Model/Bootstrap). Only the visible method label updates to "human".
 - **State sync**: the reclassify success handler refreshes `data-sdc-written` from the response's `sdc_written` (the authoritative post-action value — reject always clears it, approve may set it when the P180 check finds the claim already on Commons) and computes the "send pending" badge from it, so a reject-then-approve cannot keep a stale written flag. The removal counter is decremented only when the card actually carried a queued removal; a synchronous removal (`sdc_removed`) shows the note without touching the counters, which keeps them consistent with the server stats between reloads.
 
-### Sessions are signed cookies only
-The unused `sessions` table (reserved for server-side sessions that were never built) was dropped: `schema.sql` no longer creates it and `_ALTER_MIGRATIONS` runs `DROP TABLE IF EXISTS sessions` on existing databases (`_ALL_TABLES` still lists it so `--reset` cleans older databases). Consequence: logout only clears the browser's cookie, so a stolen signed cookie stays valid until `PERMANENT_SESSION_LIFETIME` (8 h). Deleting the user row does revoke it, because `before_request` loads the user from the database on every request.
+### Sessions are signed cookies, revocable per user
+Sessions are still Flask signed cookies, with no server-side session store (the unused `sessions` table was dropped: `schema.sql` no longer creates it and `_ALTER_MIGRATIONS` runs `DROP TABLE IF EXISTS sessions` on existing databases; `_ALL_TABLES` still lists it so `--reset` cleans older databases). What changed is revocation and lifetime:
+- **Lifetime.** Idle lifetime is 30 days (`WIKIVISAGE_SESSION_IDLE_DAYS`, was 8 h), sliding: `SESSION_REFRESH_EACH_REQUEST = True` is explicit, so every response re-sends the cookie. The absolute cap is 90 days from login (`WIKIVISAGE_SESSION_MAX_AGE_DAYS`): `session["auth_at"]` is set at login, a session without it (created before this change) is backfilled with "now" so nobody is logged out on deploy, and one past the cap is cleared with a flash (`_session_within_max_age()`, `_end_session()`).
+- **`users.session_epoch`** (INT UNSIGNED, default 0). Login stores `session["epoch"]`; `before_request` compares it with the user's row (a missing key counts as 0 on both sides) and a mismatch clears the session. `POST /logout` ends **this device only** (clears the cookie, epoch untouched). `POST /account/logout-everywhere` bumps the epoch and clears the session, which ends the user's sessions on every browser and device.
+- **Residual.** A stolen signed cookie stays valid until the idle lifetime or the 90-day cap runs out unless the user presses "Log out everywhere" (which makes it invalid at once); a plain logout does not revoke a copy of the cookie. Deleting the user row also revokes it, because `before_request` loads the user on every request.
+- **Every `session` cookie is persistent** (`session.permanent = True` in `login()`, `_csrf_token()` and after each `session.clear()`, plus an `after_request` safety net `_keep_session_cookie_persistent` that makes any non-empty session persistent; an empty session gets no cookie). An anonymous page view creates no session: `base.html` renders a CSRF token for the cookie banner only when the visitor is logged in or already has a `locale` cookie (the only case where `POST /cookie-consent` has anything to change), and the banner skips the POST without one. Reason: iOS home-screen apps reset session-scoped cookies (WebKit bug 272325), which dropped `oauth_state`, the CSRF token and flashes. The CSRF token is never rotated per request.
+- **Database errors keep the session**: see the 503 handling under Routes.
 
 ### Cookies
-Only 2 cookies: `session` (strictly necessary, managed by Flask's built-in signed session cookie mechanism) and `locale` (functional, language preference). No tracking cookies. A non-blocking consent banner is shown. Without consent the `locale` cookie is session-scoped: switching language still works, but the choice is only persisted (1 year) once the visitor accepts the banner.
+Only 2 cookies: `session` (strictly necessary, managed by Flask's built-in signed session cookie mechanism, persistent, `HttpOnly`, `SameSite=Lax`, `Secure` unless debug) and `locale` (functional, language preference, `HttpOnly`, `SameSite=Lax`, `Secure` unless debug; set by `_set_locale_cookie()`). No tracking cookies. The old `jimmy_pet` cookie is gone: the mascot preference lives in `localStorage` only and `base.html` copies a leftover cookie's value into `localStorage` (when none is set) before deleting it by script. A non-blocking consent banner is shown; the choice lives in `localStorage.cookie_consent`. Without consent the `locale` cookie is session-scoped: switching language still works (`/set-language/<lang>?nocookie=1`), but the choice is only persisted (1 year) once the visitor accepts. Because the cookie is `HttpOnly`, JS cannot change it, so the banner buttons `POST /cookie-consent` (fire and forget): Accept upgrades an existing `locale` cookie to 1 year, Decline downgrades it to session-scoped. The footer "Cookie settings" button clears `localStorage.cookie_consent` and shows the banner again; the banner text describes what is stored. The banner is a `role="region"` labelled "Cookie consent", and "Cookie settings" moves focus to its Accept button.
+
+**Session-loss log line.** To make "I have to log in again" countable, `before_request` writes a sampled INFO line for anonymous requests: `session loss: reason=<no cookie sent|expired|bad signature|valid but empty> had_cookie=<bool> client=<ios|android|desktop|other> path=<path>`. `_SESSION_LOSS_SAMPLE_RATE = 0.05`; `WIKIVISAGE_LOG_SESSION_LOSS=0` disables it; it skips `/static/`, `/health`, `/sw.js`, `/robots.txt`, `/sitemap.xml`, `/llms.txt`, `/commons-thumb/` and `/.well-known/`. `no cookie sent` also counts first-time visitors and bots, so compare counts over time rather than reading single lines. iPadOS sends a Macintosh user agent, so iPads land in `client=desktop`. Helpers: `_log_session_loss()`, `_session_loss_reason()`, `_client_bucket()`.
+
+**Unverified platform risk:** iOS home-screen apps keep their own cookie jar and open the Wikimedia OAuth page outside the app shell, so a login started inside the installed app may not return into it. This has not been checked on a real device; the platform matrix in TESTING.md lists every client to test.
 
 ### Worker memory is bounded by DETECTION_WAVE_SIZE, not BATCH_SIZE
 `process_images` works in waves. A wave's downloaded image bytes are all resident at once while its detection request is in flight, so `DETECTION_WAVE_SIZE` (8) is what caps peak memory — not `BATCH_SIZE` (50). Downloading a whole batch up front would be 50 x 50 MB worst case. Inference itself is cheap: each encoding is 2048 bytes, so even 10K faces is ~20 MB.
@@ -926,7 +1009,7 @@ Hybrid test suite: unit tests (run in CI), integration tests (require local Dock
 
 ### Test files
 
-`test_app.py`, `test_database.py`, `test_face_client.py`, `test_face_service_backend.py`, `test_face_service_model.py`, `test_face_service_contract.py`, `test_face_service_guard.py`, `test_liftwing_client.py`, `test_migrate.py`, `test_security_round2.py`, `test_token_crypto.py`, `test_translations.py`, `test_worker.py`. Counts are not tracked here: run `pytest tests/ -q` for the current numbers (unit tests that need the ML stack or a database show as skipped in the plain environment).
+The `test_app_*.py` files (`auth`, `classify_api`, `commons`, `face_drawing`, `gallery_thumbs`, `helpers`, `membership`, `misc`, `project_pages`, `sdc`, `system`, `undo_reclassify`), `test_config.py`, `test_gallery_filter.py`, `test_oauth_refresh.py`, `test_worker_loop.py`, `test_worker_sdc.py`, `test_bbox_editor_browser.py`, `test_gallery_thumb_browser.py`, `test_database.py`, `test_face_client.py`, `test_face_service_backend.py`, `test_face_service_model.py`, `test_face_service_contract.py`, `test_face_service_guard.py`, `test_liftwing_client.py`, `test_migrate.py`, `test_security_round2.py`, `test_token_crypto.py`, `test_translations.py`, `test_worker.py`, `test_worker_heartbeat.py`, `test_cookie_consent.py`. Counts are not tracked here: run `pytest tests/ -q` for the current numbers (unit tests that need the ML stack or a database show as skipped in the plain environment).
 
 `test_security_round2.py` no longer contains the `TestSubprocessHardening` tests, which covered `_harden_face_detect_subprocess()`; those guarantees are now container-level (see Architecture) and are not unit-testable.
 
@@ -936,7 +1019,7 @@ The follow-up round added: `test_eval_prefilter.py` (the readout math under mock
 
 The Copilot-review round added: `test_run_migration_upgrades_a_legacy_faces_schema_end_to_end` (full migration entry point against a simulated 0.10.x `faces` table), the `encode` rejection-classification tests (`invalid_image` re-raised vs an unusable region staying `None`) in `test_face_client.py`, both bbox routes (through the real client parsing path — only `_post` stubbed) and the live contract suite, `error_code` assertions on per-instance error entries in `test_face_service_model.py` (plus a parity check against `face_client`'s constant), and the LiftWing breaker-serialization (`test_queued_calls_see_the_breaker_the_running_call_opens`) and 429-deadline probe tests.
 
-The inference-card round added: four real-template `test_project_detail_inference_banner_*` cases in `test_app.py` — hidden while processing (banner present with `style="display:none"` plus the poller), absent when idle, visible while running (with the combined `sdc_removal_pending_faces` stat expression pinned), and the `?inference_triggered=1` completion state.
+The inference-card round added: four real-template `test_project_detail_inference_banner_*` cases in `test_app_project_pages.py` — hidden while processing (banner present with `style="display:none"` plus the poller), absent when idle, visible while running (with the combined `sdc_removal_pending_faces` stat expression pinned), and the `?inference_triggered=1` completion state.
 
 The stale-claim round added: worker tests for the pre-write live-state re-check (face rejected / superseded / vanished / unreadable, and the whole-batch guard), `_keepalive_sdc_write` statement coverage, the every-5-faces keepalive cadence, and the removal pass clearing `sdc_written`; app tests for undo claim handling (immediate removal, removal failure queues, missing token queues, sibling guard, in-flight write queues, no-in-flight does not queue, manual-face deletion blocked on failed removal and allowed after removal) and the reclassify `sdc_written=0` queue path.
 
@@ -945,6 +1028,8 @@ The review-follow-up round added: the reclassify `sdc_written` echo test (approv
 The undo-semantics round added: undo-of-rejection tests (a `sdc_removal_pending=1` state row cancels the queue instead of removing the claim; the written marker is preserved; a non-bootstrapped pre-existing queue is kept for the worker) and the model-inference exclusion test (`run_autonomous_inference`'s candidate query requires `sdc_removal_pending = 0`, plus an integration case proving a pending face is left unclassified).
 
 The DevOps-follow-up round added: `test_translations.py` (the committed `.mo` catalogs must serve exactly what their `.po` sources declare — catches a forgotten `pybabel compile` locally and in CI) and a pinned Ruff (`ruff==0.17.2`) in the CI lint job so a new Ruff release cannot turn it red on unchanged code.
+
+The session/heartbeat/thumbnail round (0.12.0) added: `tests/test_cookie_consent.py` (27: `POST /cookie-consent` choices, CSRF, invalid choice, rate limit, `locale` cookie flags incl. `Secure` off in debug and in the LAN dev mode, no session cookie for anonymous page views, banner and footer markup); `tests/test_app_auth.py` grew to 104 (same-account re-authorize keeps the classify state, a different account drops it, `Sec-Fetch-Site` on `?reauth=1`, logout and `/` during a database outage, session lifetime and `auth_at` backfill/cap, `session_epoch` mismatch, "Log out everywhere" vs plain logout, 503 instead of a login redirect on `DatabaseError`, 401 vs 503 from `_token_unavailable_error()`, session-loss log reasons and sampling); `tests/test_oauth_refresh.py` is now 44 (the `on_failure` callback and `is_permanent_refresh_error()`); `tests/test_worker_heartbeat.py` (36: tick order file-then-row, DB failure never blocks the file, the stall watchdog, the startup gate, the exempt sweep thread, no planned stop after a stall, the planned-stop upsert, plus integration tests against the real `worker_heartbeats` table); rewritten heartbeat assertions in `test_worker.py`/`test_worker_loop.py`/`test_worker_sdc.py` (incl. the heartbeat joined first in `_release_resources` and the pool of 5 + 1 connection budget) and `DedicatedConnection` tests in `test_database.py`; `_worker_status_db`-based banner tests in `test_app_system.py` (one per signal and combination: fresh, stale, stopping, recent claim, empty table, error) and the `/health` `workers` field; `worker_heartbeats` in the `conftest.py` truncation list and the schema/migration assertions in `test_migrate.py`; and `tests/test_gallery_thumb_browser.py` (Chromium + WebKit, 48 runs: zoom cap, face marker, bootstrap outline, aspect-mismatch fallback, the hi-res swap from server-supplied direct URLs and its fallback, no swap for a card that stays uncropped, resize relayout, the Re-authorize button) and `tests/test_app_gallery_thumbs.py` (16: `thumb_urls` per detection width and file type, the 960 limit pinned against the JS constant, the service worker's 5xx fallback in node). The review-fix round added a rendered-HTML guard that `#sdcResult` is closed before the action buttons (a missing `</div>` once nested them inside the area `sdcShowMessage` empties). The full suite was 1573 passed / 30 skipped with the database at 93.9 % coverage, all 11 per-module floors unchanged (1506 passed / 97 skipped without it).
 
 ### Commands
 
@@ -956,7 +1041,7 @@ WIKIVISAGE_TEST_DB=1 pytest tests/ -v
 pytest tests/ -v
 
 # Single test file
-pytest tests/test_app.py -v
+pytest tests/test_app_auth.py -v
 
 # With coverage
 WIKIVISAGE_TEST_DB=1 pytest tests/ --cov=. --cov-report=term-missing
@@ -985,7 +1070,7 @@ test_db (session) → creates/drops wikiface_test DB
 - **DB connection**: `host=127.0.0.1, user=root, password=devpass, port=3306`.
 - **Assertion gotcha**: `execute_query()` returns empty **tuple** `()` not `[]` — use `len(result) == 0` not `result == []`.
 - **Integration test isolation**: Each `db_conn` fixture truncates all tables after the test via `SET FOREIGN_KEY_CHECKS=0`, then re-inserts the `service_status` seed row (`liftwing`) that `schema.sql` created.
-- **Rate limiting is disabled in tests**: `tests/test_app.py` disables the limiter at import, and `tests/conftest.py` disables it in both the `flask_app` and `integration_app` fixtures (each reloads the module, so each needs its own disable). The limiter keys on the client address, which is always `127.0.0.1`, so a full run would exhaust the global 200/hour quota half-way through and turn unrelated assertions into 429s. Limiting itself is covered by `test_error_handler_429` (which fakes the abort, so it needs no limiter).
+- **Rate limiting is disabled in tests**: `tests/_app_preamble.py` disables the limiter at import, and `tests/conftest.py` disables it in both the `flask_app` and `integration_app` fixtures (each reloads the module, so each needs its own disable). The limiter keys on the client address, which is always `127.0.0.1`, so a full run would exhaust the global 200/hour quota half-way through and turn unrelated assertions into 429s. Limiting itself is covered by `test_error_handler_429` (which fakes the abort, so it needs no limiter).
 - **App auth simulation**: Set `session["user_id"]` in test client session transaction.
 
 ## CI/CD
@@ -1000,7 +1085,7 @@ Runs on push/PR to `main`. Seven jobs:
 4. **Face service (backend + model unit tests)** (`face-service-unit`): verifies `model-server/weights/SHA256SUMS`, installs `model-server/requirements.txt` + dev requirements on Python 3.12, and runs `test_face_service_backend.py` and `test_face_service_model.py` with `WIKIVISAGE_REQUIRE_SAMPLE=1`.
 5. **Face service** (`face-service`): verifies `SHA256SUMS`, builds `model-server/` with buildx (gha layer cache), starts the container **with a random token**, waits for readiness, runs the contract tests through the guard, and fails if the service log contains ONNX Runtime `VerifyOutputSizes` warnings. It builds the Dockerfile.
 6. **Face service (Toolforge buildpack)** (`face-service-buildpack`): verifies `SHA256SUMS`, builds `model-server/` with `pack` and Toolforge's own builder (`tools-harbor.wmcloud.org/toolforge/heroku-builder:24_20261023`, buildpacks `heroku/python` + `heroku/procfile` only — no deb packages are needed; keep the builder tag in step with Toolforge's current default, published at `Module:Toolforge images/buildpack data.json`) — the production image — starts it via the `web` Procfile entry on port 8000 with `TOOL_TOOLFORGE_API_URL` set (so the fail-closed token check is live), and runs the same contract tests and log check. Catches `requirements.txt` / `Procfile` breakage that only affects the buildpack path.
-7. **Bbox editor** (`browser`): installs the optional `requirements-browser.txt` and Chromium/WebKit, then runs `test_bbox_editor_browser.py` with `WIKIVISAGE_BROWSER_TESTS=1`. It renders the real Flask page with mocked DB/gallery/thumbnail responses and exercises the DOM events and layout, including multi-touch cancellation, rotation and landscape scrolling. The plain suite skips these tests; production never installs Playwright.
+7. **Browser regressions** (`browser`): installs the optional `requirements-browser.txt` and Chromium/WebKit, then runs `test_bbox_editor_browser.py` (20 runs) and `test_gallery_thumb_browser.py` (48 runs, across Chromium and WebKit) with `WIKIVISAGE_BROWSER_TESTS=1`. They render the real Flask page with mocked DB/gallery/thumbnail responses and exercise the DOM events and layout, including multi-touch cancellation, rotation and landscape scrolling for the bbox editor and the zoom cap, face marker and hi-res thumbnail swap for the gallery. The plain suite skips these tests; production never installs Playwright.
 
 The contract tests need `tests/data/portrait_sample.jpg` (CI sets `WIKIVISAGE_REQUIRE_SAMPLE=1`). The sample is committed, so the three face-service jobs run the real-face tests rather than failing by design.
 
@@ -1065,7 +1150,7 @@ WikiVisage/
 ### How It Works
 
 - **Locale selection**: Cookie (`locale`) -> `Accept-Language` header -> default (`en`).
-- **Language picker**: Dropdown in nav bar. Sets cookie via `/set-language/<lang>` route.
+- **Language picker**: Dropdown in nav bar. Sets the (`Secure` unless debug) cookie via `/set-language/<lang>` route; the cookie is session-scoped until the visitor accepts cookies, and `POST /cookie-consent` upgrades (Accept) or downgrades (Decline) an existing one.
 - **RTL support**: `<html dir="{{ text_direction }}">` set by context processor. `RTL_LANGUAGES = {"ar", "he", "fa", "ur"}` in `app.py`.
 - **Config**: `LANGUAGES = {"en": "English", "nb": "Norsk bokmal", "es": "Espanol", "fr": "Francais"}` in `app.py`. `BABEL_DEFAULT_LOCALE = "en"`.
 

@@ -11,6 +11,7 @@ import socket
 import sys
 import threading
 import time
+import traceback
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from typing import Any, Self
@@ -38,8 +39,26 @@ from requests.packages.urllib3.util.retry import Retry
 import face_client
 import liftwing_client
 import oauth_refresh
-from config import DETECTION_WIDTH, HEARTBEAT_FILE_DIR, LIFTWING_PROBE_INTERVAL, USER_AGENT, WAKE_FILE_PATH
-from database import DatabaseError, close_pool, execute_query, execute_transaction, init_db
+from config import (
+    DETECTION_WIDTH,
+    HEARTBEAT_FILE_DIR,
+    LIFTWING_PROBE_INTERVAL,
+    PROJECT_VERSION,
+    SDC_AUTH_EXPIRED_MESSAGE,
+    SDC_AUTH_UNAVAILABLE_MESSAGE,
+    USER_AGENT,
+    WAKE_FILE_PATH,
+    WORKER_RESTART_GRACE_SECONDS,
+)
+from database import (
+    DatabaseError,
+    DedicatedConnection,
+    close_pool,
+    execute_query,
+    execute_transaction,
+    init_db,
+    open_dedicated_connection,
+)
 from face_client import FaceServiceError, FaceServiceModelMismatch, FaceServiceRejected
 
 # Configure Logging
@@ -253,6 +272,160 @@ def _touch_heartbeat_file() -> None:
         pass
 
 
+# Liveness. A dedicated thread (``_heartbeat_loop``) writes the per-worker ``worker_heartbeats``
+# row and touches the health-check file, so a slow main loop or an exhausted DB pool can no longer
+# make a busy worker look dead. Every slow code path calls ``_mark_progress``; when nothing has
+# reported progress for STALL_LIMIT the thread stops writing, so Toolforge restarts a stuck worker.
+HEARTBEAT_INTERVAL = 30  # seconds between heartbeat ticks
+STALL_LIMIT = int(os.environ.get("WIKIVISAGE_WORKER_STALL_LIMIT", 900))  # seconds without progress = stuck
+HEARTBEAT_WARN_INTERVAL = 60  # at most one heartbeat-failure warning per this many seconds
+HEARTBEAT_JOIN_TIMEOUT = 10  # shutdown waits this long for the planned-stop row to be written
+RETIRED_WORKER_ROW_DAYS = 7  # heartbeat rows of workers silent for this long are deleted at startup
+
+_last_progress: float = time.monotonic()
+_current_phase: str = "startup"
+
+# Set by main() once the startup checks passed. Until then the heartbeat thread only touches the
+# liveness file: a worker that crash-loops in startup must not write fresh ``running`` rows (they
+# would keep the offline banner away), and a SIGTERM during startup is not a planned stop.
+_startup_done = threading.Event()
+
+# The shadow-sweep thread marks itself exempt: it reports progress every minute whenever a
+# shadow-mode project has unchecked files, which would hide a hung main loop from the watchdog.
+_progress_exempt = threading.local()
+
+
+def _mark_progress(phase: str) -> None:
+    """Record that the worker is alive and doing *phase*. Cheap and I/O free, safe from any thread."""
+    global _last_progress, _current_phase
+    if getattr(_progress_exempt, "on", False):
+        return
+    _current_phase = phase
+    _last_progress = time.monotonic()
+
+
+_HEARTBEAT_UPSERT_SQL = (
+    "INSERT INTO worker_heartbeats "
+    "(worker_id, state, last_seen, expected_back_until, last_progress, phase, started_at, version) "
+    "VALUES (%s, 'running', NOW(), NULL, NOW() - INTERVAL %s SECOND, %s, NOW(), %s) "
+    "ON DUPLICATE KEY UPDATE state = 'running', last_seen = NOW(), expected_back_until = NULL, "
+    "last_progress = VALUES(last_progress), phase = VALUES(phase), version = VALUES(version), "
+    "started_at = IF(%s, VALUES(started_at), started_at)"
+)
+
+_PLANNED_STOP_SQL = (
+    "INSERT INTO worker_heartbeats "
+    "(worker_id, state, last_seen, expected_back_until, last_progress, phase, started_at, version) "
+    "VALUES (%s, 'stopping', NOW(), NOW() + INTERVAL %s SECOND, NULL, %s, NULL, %s) "
+    "ON DUPLICATE KEY UPDATE state = 'stopping', last_seen = NOW(), "
+    "expected_back_until = VALUES(expected_back_until), phase = VALUES(phase)"
+)
+
+
+class _Heartbeat:
+    """One heartbeat thread's state: the dedicated connection and what it already reported."""
+
+    def __init__(self, conn: DedicatedConnection) -> None:
+        self.conn = conn
+        self.first_write = True  # the first successful row write of this process also sets started_at
+        self.stall_reported = False
+        self.failing = False
+        self.last_warning = float("-inf")
+
+    def tick(self) -> None:
+        idle = time.monotonic() - _last_progress
+        if idle > STALL_LIMIT:
+            self._report_stall(idle)
+            return
+        if self.stall_reported:
+            self.stall_reported = False
+            logger.info("Worker progress resumed (phase=%s)", _current_phase)
+        # The file first: a database problem must never make Toolforge restart a worker that works.
+        _touch_heartbeat_file()
+        if not _startup_done.is_set():
+            return
+        try:
+            self.conn.execute(
+                _HEARTBEAT_UPSERT_SQL,
+                (_worker_id, int(idle), _current_phase[:64], PROJECT_VERSION[:32], 1 if self.first_write else 0),
+            )
+        except Exception as exc:
+            self._warn_write_failed(exc)
+            return
+        self.first_write = False
+        if self.failing:
+            self.failing = False
+            logger.info("Heartbeat writes recovered")
+
+    def _warn_write_failed(self, exc: Exception) -> None:
+        self.failing = True
+        now = time.monotonic()
+        if now - self.last_warning >= HEARTBEAT_WARN_INTERVAL:
+            self.last_warning = now
+            logger.warning("Heartbeat write failed (will retry in %ss): %s", HEARTBEAT_INTERVAL, exc)
+
+    def _report_stall(self, idle: float) -> None:
+        if self.stall_reported:
+            return
+        self.stall_reported = True
+        frame = sys._current_frames().get(threading.main_thread().ident or 0)
+        stack = "".join(traceback.format_stack(frame)) if frame is not None else "(main thread stack unavailable)"
+        logger.error(
+            "No worker progress for %ds (limit %ds, phase=%s): heartbeat paused so Toolforge can restart this "
+            "worker. Main thread stack:\n%s",
+            int(idle),
+            STALL_LIMIT,
+            _current_phase,
+            stack,
+        )
+
+    def announce_planned_stop(self) -> None:
+        """Say this worker stops on purpose and is expected back, so the offline banner stays hidden.
+
+        Does nothing when startup never finished: that worker was never "running".
+        """
+        if not _startup_done.is_set():
+            logger.info("Not announcing a planned stop: startup had not finished")
+            return
+        try:
+            self.conn.execute(
+                _PLANNED_STOP_SQL,
+                (_worker_id, WORKER_RESTART_GRACE_SECONDS, _current_phase[:64], PROJECT_VERSION[:32]),
+            )
+            logger.info("Announced planned stop (expected back within %ds)", WORKER_RESTART_GRACE_SECONDS)
+        except Exception as exc:
+            logger.warning("Could not announce the planned stop: %s", exc)
+
+
+def _heartbeat_loop() -> None:
+    """Heartbeat thread body: tick every HEARTBEAT_INTERVAL, announce the planned stop on shutdown.
+
+    Waits in one-second slices so ``shutdown_requested`` (set by the signal handler, which does no
+    database work itself) is noticed at once. A SIGKILL or crash never reaches the announcement, so
+    a worker that really died still shows the banner.
+    """
+    beat = _Heartbeat(open_dedicated_connection())
+    try:
+        while not shutdown_requested:
+            try:
+                beat.tick()
+            except Exception:
+                logger.exception("Heartbeat tick failed")
+            for _ in range(HEARTBEAT_INTERVAL):
+                if shutdown_requested:
+                    break
+                time.sleep(1)
+        if beat.stall_reported:
+            # Toolforge's liveness probe killing a stuck worker is not a planned stop.
+            logger.info("Not announcing a planned stop: the worker was stalled")
+        else:
+            beat.announce_planned_stop()
+    except Exception:
+        logger.exception("Heartbeat thread crashed")
+    finally:
+        beat.conn.close()
+
+
 def _create_session() -> requests.Session:
     """Create a requests session with exponential backoff retries and connection pooling."""
     session = requests.Session()
@@ -301,6 +474,7 @@ def _api_request(
         headers["User-Agent"] = USER_AGENT
 
     for _ in range(3):
+        _mark_progress("api_request")
         if shutdown_requested:
             raise InterruptedError("Worker shutting down")
 
@@ -323,6 +497,7 @@ def _api_request(
                     retry_after = 5.0
                 logger.warning(f"Maxlag encountered (503). Sleeping for {retry_after} seconds.")
                 resp.close()
+                _mark_progress("api_maxlag_sleep")
                 time.sleep(retry_after)
                 continue
 
@@ -340,6 +515,7 @@ def _api_request(
                             retry_after = 5.0
                         logger.warning(f"Maxlag encountered (200). Sleeping for {retry_after} seconds.")
                         resp.close()
+                        _mark_progress("api_maxlag_sleep")
                         time.sleep(retry_after)
                         continue
                 except ValueError:
@@ -348,6 +524,7 @@ def _api_request(
             return resp
         except requests.exceptions.RequestException as e:
             logger.error(f"HTTP Request failed: {e}")
+            _mark_progress("api_retry_sleep")
             time.sleep(5)
 
     raise Exception(f"Failed to execute API request after 3 attempts: {url}")
@@ -474,13 +651,27 @@ def _oauth_exchange(refresh_token: str) -> dict[str, Any]:
         resp.close()
 
 
+_token_refresh_state = threading.local()
+
+
+def _refresh_failure_was_permanent() -> bool:
+    """Why the last ``_refresh_worker_token`` in this thread returned None (default: permanent)."""
+    return getattr(_token_refresh_state, "permanent", True)
+
+
 def _refresh_worker_token(user_id: int) -> str | None:
     """Return a valid access token for SDC writes, refreshing it first if it is about to expire.
 
     The refresh protocol (Redis single-flight lock, DB compare-and-swap, re-read after a
     lost race) lives in ``oauth_refresh`` and is shared with the web app. The worker
     keeps a refreshed token it could not save: the batch in hand can still finish with it.
+    On failure, ``_refresh_failure_was_permanent()`` tells whether re-authorizing is the fix
+    (revoked or expired grant, no refresh token) or a retry is (timeout, 5xx, database error).
     """
+
+    def _remember(permanent: bool) -> None:
+        _token_refresh_state.permanent = permanent
+
     tokens = oauth_refresh.refresh_tokens(
         user_id,
         label=f"user {user_id}",
@@ -488,12 +679,14 @@ def _refresh_worker_token(user_id: int) -> str | None:
         get_redis=_get_redis_client,
         exchange=_oauth_exchange,
         keep_on_store_failure=True,
+        on_failure=_remember,
     )
     return tokens.access_token if tokens else None
 
 
 def traverse_category(project: dict[str, Any]) -> int:
     """Fetch all files in the project's Commons category (including subcategories) and insert them as pending."""
+    _mark_progress("traverse_category")
     logger.info(f"Traversing category for project {project['id']}")
 
     # Check how many images this project already has
@@ -793,12 +986,13 @@ def _process_image_wave(wave: list[dict[str, Any]], project_id: int) -> tuple[in
     2. Detect in batches — one round trip per batch instead of per image. The
        client splits further on whichever of its count/byte budgets is hit
        first.
-    3. Persist serially — the DB pool is small (<= 6 connections per worker
+    3. Persist serially — the DB pool is small (<= 5 connections per worker
        against Toolforge's shared 20-connection ceiling) and these are short
        writes, so fanning them out would only contend for connections.
 
     Returns ``(processed_count, (download_seconds, detect_seconds, db_seconds))``.
     """
+    _mark_progress("image_wave")
     t_start = time.monotonic()
 
     rows_by_key: dict[str, dict[str, Any]] = {}
@@ -883,6 +1077,7 @@ def process_images(project: dict[str, Any]) -> int:
     database (subject to the global MAX_IMAGES_PER_PROJECT cap and file-type
     filtering) for correct SDC-pending bookkeeping.
     """
+    _mark_progress("process_images")
     project_id = project["id"]
     logger.info(f"Processing images for project {project_id}")
 
@@ -1022,6 +1217,7 @@ def bootstrap_from_sparql(project: dict[str, Any]) -> int:
     Already-processed single-face images are auto-classified as target matches.
     Multi-face images (pending or processed) are left for manual classification.
     """
+    _mark_progress("bootstrap")
     logger.info(f"Attempting bootstrap for project {project['id']} with QID {project['wikidata_qid']}")
 
     # Enforce global image cap (same as traverse_category)
@@ -1341,6 +1537,7 @@ def prefilter_images(project: dict[str, Any]) -> int:
     worker too; a failed refresh stops the pass, leaving the remaining files
     for a later pass. Returns the number of images whose verdicts were stored.
     """
+    _mark_progress("prefilter")
     if project.get("prefilter_mode", "off") == "off":
         return 0
     if _liftwing_service_down():
@@ -1541,15 +1738,19 @@ def _shadow_prefilter_loop() -> None:
         f"Shadow pre-filter sweep started (pause {LIFTWING_SWEEP_INTERVAL}s between "
         f"passes, up to {LIFTWING_MAX_IMAGES} files per project per pass)"
     )
-    while not shutdown_requested:
-        try:
-            _sweep_shadow_prefilter()
-        except Exception:
-            logger.exception("Shadow pre-filter: unexpected sweep error")
-        for _ in range(LIFTWING_SWEEP_INTERVAL):
-            if shutdown_requested:
-                break
-            time.sleep(1)
+    _progress_exempt.on = True  # this thread's activity must not hide a stuck main loop
+    try:
+        while not shutdown_requested:
+            try:
+                _sweep_shadow_prefilter()
+            except Exception:
+                logger.exception("Shadow pre-filter: unexpected sweep error")
+            for _ in range(LIFTWING_SWEEP_INTERVAL):
+                if shutdown_requested:
+                    break
+                time.sleep(1)
+    finally:
+        _progress_exempt.on = False
 
 
 def _persist_inference_batch(project_id: int, batch: list[tuple[int, int, float]]) -> tuple[int, int]:
@@ -1647,6 +1848,7 @@ def run_autonomous_inference(project: dict[str, Any]) -> int:
     ...     execute_query = _real_execute_query
     0
     """
+    _mark_progress("inference")
     t_start = time.monotonic()
     min_confirmed = project.get("min_confirmed", 5)
 
@@ -1835,8 +2037,9 @@ def run_autonomous_inference(project: dict[str, Any]) -> int:
 # Map Wikimedia API error codes to user-friendly messages
 _SDC_ERROR_MESSAGES: dict[str, str] = {
     "permissiondenied": "Your account lacks edit permissions. Please re-register the OAuth consumer with the 'Edit existing pages' grant.",
-    "notloggedin": "Your session has expired. Please log in again.",
-    "badtoken": "Authentication token expired. Please try again or log in again.",
+    "notloggedin": SDC_AUTH_EXPIRED_MESSAGE,
+    "badtoken": SDC_AUTH_EXPIRED_MESSAGE,
+    "mwoauth-invalid-authorization": SDC_AUTH_EXPIRED_MESSAGE,
     "protectedpage": "This page is protected and cannot be edited.",
     "ratelimited": "Too many edits in a short period. Please wait and try again.",
     "readonly": "The Wikimedia database is currently in read-only mode. Please try again later.",
@@ -1869,23 +2072,14 @@ def _clear_sdc_dedup_row(commons_page_id: int, qid: str) -> None:
 
 
 def _keepalive_sdc_write(project_id: int) -> None:
-    """Refresh liveness signals during a long SDC write run.
+    """Report progress and refresh the project claim during a long SDC write run.
 
-    ``write_sdc_claims`` runs synchronously on the main thread, so the heartbeat
-    blocks in the main loop cannot run while it works. Without this, a run
-    longer than five minutes would let ``healthcheck.sh`` see a stale heartbeat
-    file (Toolforge restarts the pod mid-write), and a run longer than
-    ``CLAIM_EXPIRY_MINUTES`` would let the other worker claim the same project
-    and write the same queue concurrently. All three refreshes are best-effort.
+    ``write_sdc_claims`` runs synchronously on the main thread. The progress mark keeps the
+    heartbeat thread from reading the long run as a stall, and a run longer than
+    ``CLAIM_EXPIRY_MINUTES`` would otherwise let the other worker claim the same project and
+    write the same queue concurrently. The claim refresh is best-effort.
     """
-    try:
-        execute_query(
-            "REPLACE INTO worker_heartbeat (id, last_seen) VALUES (1, NOW())",
-            fetch=False,
-        )
-    except DatabaseError:
-        pass
-    _touch_heartbeat_file()
+    _mark_progress("sdc_keepalive")
     try:
         execute_query(
             "UPDATE projects SET worker_claimed_at = NOW() WHERE id = %s AND worker_claimed_by = %s",
@@ -2034,10 +2228,16 @@ class _SdcRun:
         user_id = project.get("sdc_write_user_id") or project["user_id"]
         logger.info(f"Starting SDC writes for project {project_id}")
 
+        _token_refresh_state.permanent = True
         access_token = _refresh_worker_token(user_id)
         if not access_token:
             logger.error(f"Cannot obtain valid token for user {user_id}, aborting SDC writes")
-            _abort_sdc_run(project_id, "Token expired or user not found. Please log in again.")
+            # Only a refused grant (or a missing user / refresh token) calls for re-authorizing;
+            # a login-service timeout or 5xx is fixed by sending the edits again.
+            _abort_sdc_run(
+                project_id,
+                SDC_AUTH_EXPIRED_MESSAGE if _refresh_failure_was_permanent() else SDC_AUTH_UNAVAILABLE_MESSAGE,
+            )
             return None
 
         try:
@@ -2619,6 +2819,7 @@ def write_sdc_claims(project: dict[str, Any]) -> int:
     flag when done (or sets ``sdc_write_error`` on failure). Returns the number of
     claims written (or recorded as already present).
     """
+    _mark_progress("sdc_write")
     run = _SdcRun.begin(project)
     if run is None:
         return 0
@@ -2818,6 +3019,7 @@ def _process_sdc_writes() -> int:
     Safe to call from any point in the main loop (top-of-cycle,
     mid-cycle wake handler, inference loop).
     """
+    _mark_progress("sdc_requests")
     sdc_projects, pre_claimed_ids = _claim_sdc_projects()
     if not sdc_projects:
         return 0
@@ -3150,6 +3352,7 @@ def process_project(project: dict[str, Any], *, skip_discovery: bool = False) ->
         project: Project row dict from DB (must include 'id', 'wikidata_qid', etc.).
         skip_discovery: If True, skip traverse_category and bootstrap_from_sparql.
     """
+    _mark_progress("process_project")
     t_project_start = time.monotonic()
     project_id = project["id"]
     logger.info(f"--- Processing project {project_id} ({project['wikidata_qid']}) ---")
@@ -3341,16 +3544,21 @@ def _probe_liftwing_if_due() -> None:
 
 
 def _parse_worker_id(argv: list[str]) -> str:
-    """Worker id from ``--worker-id`` (used by deploy.yml), else ``<hostname>-<pid>``."""
+    """Worker id from ``--worker-id`` (used by deploy.yml), else ``<hostname>-<pid>``.
+
+    The id is the primary key of ``worker_heartbeats`` (VARCHAR(64)), so it is capped at 64 characters.
+    """
     wid = None
     if "--worker-id" in argv:
         idx = argv.index("--worker-id")
         if idx + 1 < len(argv):
             wid = argv[idx + 1]
-    worker_id = wid or f"{socket.gethostname()}-{os.getpid()}"
+    worker_id = wid or f"{socket.gethostname()[:50]}-{os.getpid()}"
     # The id becomes part of the heartbeat file path: refuse anything that could traverse.
     if not re.fullmatch(r"[a-zA-Z0-9._-]+", worker_id):
         raise SystemExit(f"Invalid worker ID (must be alphanumeric/dot/hyphen/underscore): {worker_id!r}")
+    if len(worker_id) > 64:
+        raise SystemExit(f"Worker ID longer than 64 characters: {worker_id!r}")
     return worker_id
 
 
@@ -3359,17 +3567,18 @@ def _db_pool_size() -> int:
 
     Toolforge ToolsDB enforces max_user_connections=20 across ALL processes sharing the DB user
     (gunicorn + every worker instance). The web app uses 2 workers x 3 connections, so each of
-    the two background workers is capped at 6 to stay at or below 20.
+    the two background workers is capped at 5 pooled connections plus 1 dedicated heartbeat
+    connection (``database.open_dedicated_connection``): 2 x 3 + 2 x (5 + 1) = 18 of 20.
     """
     db_pool_env = os.environ.get("WIKIVISAGE_DB_POOL_SIZE")
     if db_pool_env:
         pool_size = int(db_pool_env)
     else:
-        pool_size = min(MAX_CONCURRENT_PROJECTS * IMAGE_THREADS + 3, 6)
-    if pool_size > 6:
+        pool_size = min(MAX_CONCURRENT_PROJECTS * IMAGE_THREADS + 3, 5)
+    if pool_size > 5:
         logger.warning(
             "DB pool size %d may exceed Toolforge max_user_connections (20 shared across all processes). "
-            "With 2 workers + gunicorn, keep each worker's pool <= 6.",
+            "With 2 workers + gunicorn, keep each worker's pool <= 5 (each also holds one heartbeat connection).",
             pool_size,
         )
     return pool_size
@@ -3390,6 +3599,23 @@ def _check_face_service_at_startup() -> None:
             face_client.FACE_SERVICE_URL,
             face_client.FACE_SERVICE_MODEL,
         )
+
+
+def _delete_retired_worker_rows() -> None:
+    """Best effort: drop heartbeat rows of workers that have not reported for a week (renamed or retired).
+
+    They would otherwise show up as ``stale`` in ``/health`` for ever. The banner ignores them anyway.
+    """
+    try:
+        removed = execute_query(
+            "DELETE FROM worker_heartbeats WHERE last_seen < NOW() - INTERVAL %s DAY AND worker_id <> %s",
+            (RETIRED_WORKER_ROW_DAYS, _worker_id),
+            fetch=False,
+        )
+        if removed:
+            logger.info("Removed %s retired worker heartbeat row(s)", removed)
+    except DatabaseError as exc:
+        logger.warning("Could not remove retired worker heartbeat rows: %s", exc)
 
 
 def _log_project_diagnostics() -> None:
@@ -3463,12 +3689,8 @@ def _consume_wake_signal() -> bool:
 
 
 def _keep_alive_during_cycle() -> None:
-    """Once a minute while projects run: heartbeat, claims, LiftWing probe, newly inference-ready projects."""
-    try:
-        execute_query("REPLACE INTO worker_heartbeat (id, last_seen) VALUES (1, NOW())", fetch=False)
-        _touch_heartbeat_file()
-    except Exception:
-        pass
+    """Once a minute while projects run: claims, LiftWing probe, newly inference-ready projects."""
+    _mark_progress("keepalive")
     _refresh_claims()
     _probe_liftwing_if_due()
     _run_new_inference_projects(1)
@@ -3482,14 +3704,15 @@ def _supervise(
 ) -> None:
     """Wait for *futures* while keeping this worker alive and responsive.
 
-    The project threads can run for a long time. Meanwhile this loop refreshes the
-    heartbeat and claims every minute, services SDC write requests (on a wake-up
+    The project threads can run for a long time. Meanwhile this loop reports progress every
+    iteration (the heartbeat thread depends on it), refreshes the claims every minute, services SDC write requests (on a wake-up
     signal, and every 10 s because the wake file does not cross pods), and hands each
     finished future to *on_done*. *on_wake* runs when the web app asked for an
     immediate check; it may add futures to the dict.
     """
     last_heartbeat = last_sdc_check = time.time()
     while futures:
+        _mark_progress("supervise")
         if shutdown_requested:
             break
 
@@ -3605,12 +3828,13 @@ def _process_active_projects(active_projects: list[dict[str, Any]], seen_ids: se
 
 
 def _run_cycle() -> None:
-    """One poll cycle: heartbeat, purge, SDC writes, inference, active projects."""
-    execute_query("REPLACE INTO worker_heartbeat (id, last_seen) VALUES (1, NOW())", fetch=False)
-    _touch_heartbeat_file()
+    """One poll cycle: purge, SDC writes, inference, active projects."""
+    _mark_progress("cycle")
     _probe_liftwing_if_due()
 
+    _mark_progress("purge_deleted")
     _purge_deleted_projects()
+    _mark_progress("purge_deleted_done")
 
     # User-triggered SDC writes come before the active pipeline, so users do not wait
     # minutes through crawl/detect/infer before "Send Edits to Wikimedia Commons" is serviced.
@@ -3632,6 +3856,7 @@ def _sleep_until_next_cycle() -> None:
     """
     last_sdc_check = time.time()
     for _ in range(POLL_INTERVAL + random.randint(0, 15)):
+        _mark_progress("sleep")
         if shutdown_requested:
             break
         if _consume_wake_signal():
@@ -3645,14 +3870,22 @@ def _sleep_until_next_cycle() -> None:
         time.sleep(1)
 
 
-def _release_resources(sweep_thread: threading.Thread) -> None:
-    """Shutdown: stop the sweep, give back claims, close pools. Order matters."""
+def _release_resources(sweep_thread: threading.Thread, heartbeat_thread: threading.Thread | None = None) -> None:
+    """Shutdown: announce the planned stop, stop the sweep, give back claims, close pools. Order matters."""
     global shutdown_requested
     logger.info("Worker %s shutting down, releasing claims and closing resources.", _worker_id)
+    # First: the heartbeat thread writes the "stopping" row that keeps the offline banner away for a
+    # planned restart. The thread does that within about a second of SIGTERM on its own; this join
+    # only keeps the interpreter from killing the daemon thread mid-write, and the sweep join below
+    # can take over 100 s, so it must not queue behind it.
+    shutdown_requested = True
+    if heartbeat_thread is not None:
+        heartbeat_thread.join(timeout=HEARTBEAT_JOIN_TIMEOUT)
+        if heartbeat_thread.is_alive():
+            logger.warning(f"Heartbeat thread still running after {HEARTBEAT_JOIN_TIMEOUT}s; going on anyway")
     # Signal the sweep and let it leave its batch before the claims and the DB/HTTP resources
     # go away: it checks shutdown_requested between batches, but an in-flight LiftWing request
     # can still outlive the bounded join. After that the daemon thread dies with the process.
-    shutdown_requested = True
     sweep_thread.join(timeout=SWEEP_JOIN_TIMEOUT)
     if sweep_thread.is_alive():
         logger.warning(f"Shadow pre-filter sweep still running after {SWEEP_JOIN_TIMEOUT}s; closing resources anyway")
@@ -3679,9 +3912,15 @@ def main():
         logger.error(f"Database initialization failed: {e}")
         sys.exit(1)
 
+    # Liveness thread first, before the face-service check (which can block on a slow service).
+    _mark_progress("startup")
+    heartbeat_thread = threading.Thread(target=_heartbeat_loop, name="worker-heartbeat", daemon=True)
+    heartbeat_thread.start()
+
     _check_face_service_at_startup()
     _log_project_diagnostics()
-
+    _startup_done.set()
+    _delete_retired_worker_rows()
     # Background shadow sweep: records LiftWing verdicts for projects the processing pipelines
     # never claim (completed, paused or fully processed). Own daemon thread: one pass can take
     # minutes, and an inline call would stall the heartbeat refreshes the Toolforge health check
@@ -3701,7 +3940,7 @@ def main():
                 logger.error(f"Unexpected error in main loop: {e}")
                 time.sleep(10)
     finally:
-        _release_resources(sweep_thread)
+        _release_resources(sweep_thread, heartbeat_thread)
 
 
 if __name__ == "__main__":

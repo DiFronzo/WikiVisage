@@ -92,4 +92,13 @@
         </div>
     </form>
 </div>
+
+<div class="card settings-card" style="margin-top: 1.5rem;">
+    <h2 style="margin-top: 0;">{{ _('Sessions') }}</h2>
+    <p class="toggle-desc" id="logout_everywhere_desc">{{ _('Log out on every browser and device where you are signed in, including this one.') }}</p>
+    <form method="POST" action="{{ url_for('account_logout_everywhere') }}" data-confirm="{{ _('Log out on all devices?') }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <button type="submit" class="btn" style="width: 100%; margin-top: 1rem;" aria-describedby="logout_everywhere_desc">{{ _('Log out everywhere') }}</button>
+    </form>
+</div>
 {% endblock %}

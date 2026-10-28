@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import requests
 
+from config import SDC_REAUTH_MESSAGES
 from tests._app_preamble import (
     app_module,
 )
@@ -416,7 +417,35 @@ def test_api_sdc_status_success(monkeypatch, fake_user):
         "removal_pending": 1,
         "in_progress": True,
         "error": None,
+        "reauth_url": None,
     }
+
+
+@pytest.mark.parametrize(
+    ("stored_error", "expect_reauth"),
+    [(message, True) for message in sorted(SDC_REAUTH_MESSAGES)]
+    + [
+        ("Your account lacks edit permissions. Please re-register the OAuth consumer.", False),
+        ("The Wikimedia servers are busy. Please try again later.", False),
+        (None, False),
+    ],
+)
+def test_api_sdc_status_offers_reauthorize_only_for_authorization_failures(
+    monkeypatch, fake_user, stored_error, expect_reauth
+):
+    def route_execute(sql, _params, _fetch):
+        if "FROM projects p LEFT JOIN project_members" in sql:
+            return [
+                {"id": 1, "user_id": 1, "status": "active", "sdc_write_requested": 0, "sdc_write_error": stored_error}
+            ]
+        return [{"written": 0, "pending": 3, "removal_pending": 0}]
+
+    client = _make_authed_client(monkeypatch, fake_user, route_execute)
+
+    payload = client.get("/api/sdc-status/1").get_json()
+
+    assert payload["error"] == stored_error
+    assert payload["reauth_url"] == ("/login?reauth=1" if expect_reauth else None)
 
 
 def test_api_sdc_status_project_query_db_error(monkeypatch, fake_user):

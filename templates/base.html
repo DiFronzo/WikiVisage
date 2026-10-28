@@ -242,6 +242,9 @@
             gap: 1rem;
         }
         .inline-alert[hidden] { display: none; }
+        /* .btn sets its own display, which would otherwise win over the hidden attribute */
+        .inline-alert [hidden] { display: none; }
+        #inline-alert-action { white-space: nowrap; flex-shrink: 0; }
         .flash.success { border-color: var(--success); color: var(--success); }
         .flash.error { border-color: var(--danger); color: var(--danger); }
         .flash.warning { border-color: var(--warning); color: var(--warning); }
@@ -604,12 +607,31 @@
 
             /* Accessible replacement for window.alert(): fills the role="alert"
                region declared below the flash messages. */
-            function showInlineAlert(message) {
+            function showInlineAlert(message, actionUrl, actionLabel) {
                 var box = document.getElementById('inline-alert');
                 var text = document.getElementById('inline-alert-text');
+                var action = document.getElementById('inline-alert-action');
                 if (!box || !text) return;
                 text.textContent = message;
+                if (action) {
+                    action.hidden = !actionUrl;
+                    if (actionUrl) {
+                        action.href = actionUrl;
+                        action.textContent = actionLabel || REAUTH_LABEL;
+                    }
+                }
                 box.hidden = false;
+            }
+
+            /* One-click re-authorize. The server answers "Wikimedia no longer accepts your
+               authorization" with a reauth_url (the login route with ?reauth=1); this adds the
+               page to come back to, so the user lands where they were after the OAuth round trip. */
+            var REAUTH_LABEL = {{ _('Re-authorize')|tojson }};
+            function reauthHref(data) {
+                if (!data || !data.reauth_url) return null;
+                var u = new URL(data.reauth_url, location.href);
+                u.searchParams.set('next', location.pathname + location.search);
+                return u.pathname + u.search;
             }
         </script>
     </nav>
@@ -632,6 +654,7 @@
         </div>
         <div class="inline-alert" id="inline-alert" role="alert" aria-live="assertive" aria-atomic="true" hidden>
             <span id="inline-alert-text"></span>
+            <a class="btn btn-primary btn-sm" id="inline-alert-action" href="#" hidden></a>
             <button class="flash-close" id="inline-alert-close" type="button" aria-label="{{ _('Close') }}">&times;</button>
         </div>
 
@@ -641,13 +664,14 @@
     <footer>
         <div class="container">
             <p><a href="https://github.com/DiFronzo/WikiVisage" target="_blank" rel="noopener">WikiVisage v{{ app_version }}</a> &mdash; &copy; 2026 User:Premeditated <a href="#" id="re-egg" style="display:none;text-decoration:none" title="{{ _('Bring back the pet') }}" aria-label="{{ _('Bring back the pet') }}">&#x1F423;</a></p>
+            <p><button type="button" id="cookieSettings" class="footer-link-button">{{ _('Cookie settings') }}</button></p>
             <img src="{{ url_for('static', filename='powered-by-toolforge.svg') }}" alt="Powered by Toolforge" width="155" height="50" style="margin-top: 0.75rem; height: 50px;">
         </div>
     </footer>
 
-    <div id="cookie-consent" class="cookie-banner" style="display:none;">
+    <div id="cookie-consent" class="cookie-banner" role="region" aria-label="{{ _('Cookie consent') }}" style="display:none;">
         <div class="cookie-banner-inner">
-            <p class="cookie-text">{{ _('This site uses a cookie to remember your language preference. The session cookie is required for the site to function.') }}</p>
+            <p class="cookie-text">{{ _('This site uses two cookies. The session cookie is required: it keeps you logged in and protects forms. The language cookie remembers your language for a year, but only if you accept. Mascot and install-banner preferences are kept in local storage in your browser, not in a cookie.') }}</p>
             <div class="cookie-actions">
                 <button class="btn btn-primary btn-sm" id="cookieAccept" type="button">{{ _('Accept') }}</button>
                 <button class="btn btn-sm" id="cookieDecline" type="button">{{ _('Decline') }}</button>
@@ -687,6 +711,17 @@
             gap: 0.75rem;
             flex-shrink: 0;
         }
+        .footer-link-button {
+            background: none;
+            border: none;
+            padding: 0;
+            font: inherit;
+            letter-spacing: inherit;
+            color: var(--text-muted);
+            text-decoration: underline;
+            cursor: pointer;
+        }
+        .footer-link-button:hover { color: var(--primary); }
     </style>
     <div id="pwa-install" class="pwa-banner" style="display:none;">
         <button class="pwa-close" id="pwa-close" type="button" aria-label="{{ _('Close') }}">&times;</button>
@@ -768,21 +803,51 @@
 
     <script nonce="{{ csp_nonce }}">
         (function() {
-            var consent = localStorage.getItem('cookie_consent');
-            if (!consent) {
-                document.getElementById('cookie-consent').style.display = 'block';
+            var banner = document.getElementById('cookie-consent');
+            var csrfToken = {{ (csrf_token() if (g.user or request.cookies.get('locale')) else '')|tojson }};
+            var consentUrl = {{ url_for('cookie_consent')|tojson }};
+
+            /* Older versions kept the pet preference in a cookie (now local storage only):
+               carry an existing choice over to local storage, then delete the cookie. */
+            try {
+                var oldPet = document.cookie.match(/(?:^|; )jimmy_pet=([^;]*)/);
+                if (oldPet && oldPet[1] && !localStorage.getItem('jimmy_pet')) {
+                    localStorage.setItem('jimmy_pet', decodeURIComponent(oldPet[1]));
+                }
+            } catch (e) {}
+            document.cookie = 'jimmy_pet=; path=/; max-age=0';
+
+            function readConsent() {
+                try { return localStorage.getItem('cookie_consent'); } catch (e) { return null; }
             }
+            function rememberChoice(choice) {
+                try { localStorage.setItem('cookie_consent', choice); } catch (e) {}
+                banner.style.display = 'none';
+                /* The language cookie is HttpOnly, so the server has to upgrade or
+                   downgrade it. Fire and forget: the banner never waits for this.
+                   Without a token (no session, no language cookie) there is nothing to change. */
+                if (!csrfToken) return;
+                try {
+                    fetch(consentUrl, {
+                        method: 'POST',
+                        credentials: 'same-origin',
+                        headers: { 'X-CSRFToken': csrfToken },
+                        body: new URLSearchParams({ choice: choice })
+                    }).catch(function() {});
+                } catch (e) {}
+            }
+
+            if (!readConsent()) {
+                banner.style.display = 'block';
+            }
+            document.getElementById('cookieAccept').addEventListener('click', function() { rememberChoice('accepted'); });
+            document.getElementById('cookieDecline').addEventListener('click', function() { rememberChoice('declined'); });
+            document.getElementById('cookieSettings').addEventListener('click', function() {
+                try { localStorage.removeItem('cookie_consent'); } catch (e) {}
+                banner.style.display = 'block';
+                document.getElementById('cookieAccept').focus();
+            });
         })();
-        function acceptCookies() {
-            localStorage.setItem('cookie_consent', 'accepted');
-            document.getElementById('cookie-consent').style.display = 'none';
-        }
-        function declineCookies() {
-            localStorage.setItem('cookie_consent', 'declined');
-            document.getElementById('cookie-consent').style.display = 'none';
-        }
-        document.getElementById('cookieAccept').addEventListener('click', acceptCookies);
-        document.getElementById('cookieDecline').addEventListener('click', declineCookies);
         document.getElementById('pwa-close').addEventListener('click', function() {
             localStorage.setItem('pwa_dismissed', new Date().toDateString());
             document.getElementById('pwa-install').style.display = 'none';
@@ -1025,38 +1090,21 @@
             var reEgg = document.getElementById("re-egg");
             if (!initPet) return;
 
-            function hasCookieConsent() {
-                // Respect global "no cookies" flag used elsewhere (e.g., "?nocookie=1").
+            /* The pet preference lives only in localStorage, never in a cookie. */
+            function getPetPref() {
                 try {
-                    return !/[?&]nocookie=1(?:&|$)/.test(window.location.search);
+                    return window.localStorage ? window.localStorage.getItem("jimmy_pet") : null;
                 } catch (e) {
-                    return true;
+                    return null;
                 }
             }
 
-            function getPetCookie() {
-                if (hasCookieConsent()) {
-                    var m = document.cookie.match(/(?:^|; )jimmy_pet=([^;]*)/);
-                    return m ? m[1] : null;
-                }
-                if (window.localStorage) {
-                    return window.localStorage.getItem("jimmy_pet");
-                }
-                return null;
-            }
-
-            function setPetCookie(val) {
-                if (hasCookieConsent()) {
-                    document.cookie = "jimmy_pet=" + val + ";path=/;max-age=31536000;SameSite=Lax";
-                    return;
-                }
-                if (window.localStorage) {
-                    if (val === null) {
-                        window.localStorage.removeItem("jimmy_pet");
-                    } else {
+            function setPetPref(val) {
+                try {
+                    if (window.localStorage) {
                         window.localStorage.setItem("jimmy_pet", val);
                     }
-                }
+                } catch (e) {}
             }
 
             function removeAllPets() {
@@ -1086,7 +1134,7 @@
             if (reEgg) {
                 reEgg.addEventListener("click", function(e) {
                     e.preventDefault();
-                    setPetCookie("on");
+                    setPetPref("on");
                     reEgg.style.display = "none";
                     removeAllPets();
                     showInitPet();
@@ -1095,7 +1143,7 @@
                 });
             }
 
-            if (getPetCookie() === "off") {
+            if (getPetPref() === "off") {
                 if (reEgg) reEgg.style.display = "inline";
                 return;
             }
@@ -1103,7 +1151,7 @@
 
             closeBtn.addEventListener("click", function(e) {
                 e.stopPropagation();
-                setPetCookie("off");
+                setPetPref("off");
                 removeAllPets();
                 if (reEgg) reEgg.style.display = "inline";
             });

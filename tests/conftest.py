@@ -235,11 +235,14 @@ def db_conn(test_db):
             cur.execute("SET FOREIGN_KEY_CHECKS = 0")
             for table in (
                 "faces",
+                "sdc_claims",
+                "project_members",
                 "images",
                 "projects",
                 "user_stats",
                 "users",
                 "worker_heartbeat",
+                "worker_heartbeats",
                 "service_status",
             ):
                 cur.execute(f"TRUNCATE TABLE `{table}`")

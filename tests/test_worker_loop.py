@@ -52,6 +52,23 @@ def test_worker_id_defaults_to_hostname_and_pid() -> None:
         assert worker._parse_worker_id(["worker.py", "--worker-id"]) == "pod-1-7"
 
 
+def test_a_long_hostname_is_truncated_so_the_default_id_fits_the_column() -> None:
+    with (
+        patch.object(worker.socket, "gethostname", return_value="h" * 70),
+        patch.object(worker.os, "getpid", return_value=4194304),
+    ):
+        worker_id = worker._parse_worker_id(["worker.py"])
+
+    assert len(worker_id) <= 64
+    assert worker_id.endswith("-4194304")
+
+
+def test_a_worker_id_longer_than_the_column_is_refused() -> None:
+    assert worker._parse_worker_id(["worker.py", "--worker-id", "a" * 64]) == "a" * 64
+    with pytest.raises(SystemExit, match="64"):
+        worker._parse_worker_id(["worker.py", "--worker-id", "a" * 65])
+
+
 @pytest.mark.parametrize("bad", ["../etc", "a/b", "id with space", "x;rm"])
 def test_worker_id_that_could_traverse_the_heartbeat_path_is_refused(bad: str) -> None:
     with pytest.raises(SystemExit):
@@ -64,10 +81,32 @@ def test_pool_size_comes_from_the_environment(monkeypatch: pytest.MonkeyPatch) -
     assert worker._db_pool_size() == 4
 
 
-def test_pool_size_is_derived_and_capped_at_six(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_pool_size_is_derived_and_capped_at_five(monkeypatch: pytest.MonkeyPatch) -> None:
+    """2 web x 3 + 2 workers x (5 pooled + 1 dedicated heartbeat connection) = 18 of ToolsDB's 20."""
     monkeypatch.delenv("WIKIVISAGE_DB_POOL_SIZE", raising=False)
 
-    assert worker._db_pool_size() == min(worker.MAX_CONCURRENT_PROJECTS * worker.IMAGE_THREADS + 3, 6)
+    assert worker._db_pool_size() == min(worker.MAX_CONCURRENT_PROJECTS * worker.IMAGE_THREADS + 3, 5)
+    assert worker._db_pool_size() == 5
+
+
+def test_a_pool_of_five_is_within_the_budget(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    monkeypatch.setenv("WIKIVISAGE_DB_POOL_SIZE", "5")
+
+    with caplog.at_level(logging.WARNING, logger="worker"):
+        assert worker._db_pool_size() == 5
+
+    assert "max_user_connections" not in caplog.text
+
+
+def test_a_pool_of_six_is_warned_about_because_of_the_heartbeat_connection(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setenv("WIKIVISAGE_DB_POOL_SIZE", "6")
+
+    with caplog.at_level(logging.WARNING, logger="worker"):
+        assert worker._db_pool_size() == 6
+
+    assert "heartbeat" in caplog.text
 
 
 def test_a_pool_above_the_toolsdb_budget_is_allowed_but_warned(
@@ -319,16 +358,19 @@ def test_sdc_requests_are_polled_every_ten_seconds(quiet_cycle: dict[str, MagicM
     quiet_cycle["_process_sdc_writes"].assert_called_once_with()
 
 
-def test_keep_alive_survives_a_database_hiccup() -> None:
+def test_keep_alive_reports_progress_and_writes_no_heartbeat() -> None:
     with (
-        patch.object(worker, "execute_query", side_effect=DatabaseError("flapped")),
+        patch.object(worker, "execute_query", side_effect=DatabaseError("flapped")) as query,
         patch.object(worker, "_touch_heartbeat_file") as touch,
+        patch.object(worker, "_mark_progress") as mark,
         patch.object(worker, "_refresh_claims") as refresh,
         patch.object(worker, "_probe_liftwing_if_due") as probe,
         patch.object(worker, "_run_new_inference_projects") as infer,
     ):
         worker._keep_alive_during_cycle()
 
+    mark.assert_called_once_with("keepalive")
+    query.assert_not_called()  # the heartbeat is the dedicated thread's job
     touch.assert_not_called()
     refresh.assert_called_once_with()
     probe.assert_called_once_with()
@@ -514,8 +556,7 @@ def test_a_cycle_runs_its_stages_in_order() -> None:
         return MagicMock(side_effect=lambda *a, **k: order.append(name) or result)
 
     with (
-        patch.object(worker, "execute_query", stage("heartbeat")),
-        patch.object(worker, "_touch_heartbeat_file", stage("touch")),
+        patch.object(worker, "_mark_progress", stage("progress")),
         patch.object(worker, "_probe_liftwing_if_due", stage("probe")),
         patch.object(worker, "_purge_deleted_projects", stage("purge")),
         patch.object(worker, "_process_sdc_writes", stage("sdc")),
@@ -525,14 +566,30 @@ def test_a_cycle_runs_its_stages_in_order() -> None:
     ):
         worker._run_cycle()
 
-    assert order == ["heartbeat", "touch", "probe", "purge", "sdc", "claim", "inference", "active"]
+    assert order == [
+        "progress",
+        "probe",
+        "progress",
+        "purge",
+        "progress",
+        "sdc",
+        "claim",
+        "inference",
+        "active",
+    ]
     active_ids, seen_ids = drain.call_args.args
     assert active_ids == {4}
     assert process.call_args.args == ([{"id": 4}], seen_ids)  # the same set, so inference and active share it
 
 
 def test_the_cycle_lets_a_database_error_reach_the_main_loop() -> None:
-    with patch.object(worker, "execute_query", side_effect=DatabaseError("down")), pytest.raises(DatabaseError):
+    with (
+        patch.object(worker, "_probe_liftwing_if_due"),
+        patch.object(worker, "_purge_deleted_projects"),
+        patch.object(worker, "_process_sdc_writes"),
+        patch.object(worker, "_claim_active_projects", side_effect=DatabaseError("down")),
+        pytest.raises(DatabaseError),
+    ):
         worker._run_cycle()
 
 
@@ -586,11 +643,14 @@ def test_sleep_returns_at_once_after_shutdown(monkeypatch: pytest.MonkeyPatch) -
     sleeper.assert_not_called()
 
 
-def test_shutdown_stops_the_sweep_before_releasing_claims_and_pools() -> None:
+def test_shutdown_announces_the_stop_then_stops_the_sweep_before_releasing_claims_and_pools() -> None:
     order: list[str] = []
     sweep = MagicMock()
     sweep.join.side_effect = lambda timeout: order.append("join")
     sweep.is_alive.return_value = False
+    heartbeat = MagicMock()
+    heartbeat.join.side_effect = lambda timeout: order.append("heartbeat")
+    heartbeat.is_alive.return_value = False
 
     with (
         patch.object(worker, "_release_all_claims", side_effect=lambda: order.append("claims")),
@@ -598,11 +658,31 @@ def test_shutdown_stops_the_sweep_before_releasing_claims_and_pools() -> None:
         patch.object(worker.liftwing_client, "reset_client", side_effect=lambda: order.append("liftwing")),
         patch.object(worker, "close_pool", side_effect=lambda: order.append("pool")),
     ):
-        worker._release_resources(sweep)
+        worker._release_resources(sweep, heartbeat)
 
-    assert order == ["join", "claims", "face", "liftwing", "pool"]
+    assert order == ["heartbeat", "join", "claims", "face", "liftwing", "pool"]
     assert worker.shutdown_requested is True
+    heartbeat.join.assert_called_once_with(timeout=worker.HEARTBEAT_JOIN_TIMEOUT)
     sweep.join.assert_called_once_with(timeout=worker.SWEEP_JOIN_TIMEOUT)
+
+
+def test_a_heartbeat_thread_that_outlives_its_join_is_warned_about(caplog: pytest.LogCaptureFixture) -> None:
+    sweep = MagicMock()
+    sweep.is_alive.return_value = False
+    heartbeat = MagicMock()
+    heartbeat.is_alive.return_value = True
+
+    with (
+        patch.object(worker, "_release_all_claims") as claims,
+        patch.object(worker.face_client, "reset_session"),
+        patch.object(worker.liftwing_client, "reset_client"),
+        patch.object(worker, "close_pool"),
+        caplog.at_level(logging.WARNING, logger="worker"),
+    ):
+        worker._release_resources(sweep, heartbeat)
+
+    assert "Heartbeat thread still running" in caplog.text
+    claims.assert_called_once_with()  # shutdown goes on regardless
 
 
 def test_a_sweep_that_outlives_its_join_is_warned_about(caplog: pytest.LogCaptureFixture) -> None:
@@ -627,16 +707,18 @@ def main_env(monkeypatch: pytest.MonkeyPatch) -> dict[str, MagicMock]:
         "init_db": MagicMock(),
         "_check_face_service_at_startup": MagicMock(),
         "_log_project_diagnostics": MagicMock(),
+        "_delete_retired_worker_rows": MagicMock(),
         "_sleep_until_next_cycle": MagicMock(),
         "_release_resources": MagicMock(),
         "_shadow_prefilter_loop": MagicMock(),
+        "_heartbeat_loop": MagicMock(),
     }
     for name, mock in mocks.items():
         monkeypatch.setattr(worker, name, mock)
     monkeypatch.setattr(worker.signal, "signal", MagicMock())
     monkeypatch.setattr(worker.time, "sleep", MagicMock())
     monkeypatch.setattr(worker.sys, "argv", ["worker.py", "--worker-id", "ml-worker-1"])
-    monkeypatch.setattr(worker, "_db_pool_size", lambda: 6)
+    monkeypatch.setattr(worker, "_db_pool_size", lambda: 5)
     return mocks
 
 
@@ -655,7 +737,7 @@ def test_main_runs_cycles_until_shutdown_then_releases_everything(
     worker.main()
 
     assert worker._worker_id == "ml-worker-1"
-    main_env["init_db"].assert_called_once_with(pool_size=6)
+    main_env["init_db"].assert_called_once_with(pool_size=5)
     main_env["_check_face_service_at_startup"].assert_called_once_with()
     assert cycles["n"] == 2
     assert main_env["_sleep_until_next_cycle"].call_count == 2
@@ -701,3 +783,127 @@ def test_main_releases_resources_even_if_a_cycle_is_interrupted(
         worker.main()
 
     main_env["_release_resources"].assert_called_once()
+
+
+def test_main_starts_the_heartbeat_thread_before_the_face_service_check_and_hands_it_to_shutdown(
+    main_env: dict[str, MagicMock], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    order: list[str] = []
+    threads: dict[str, MagicMock] = {}
+
+    def make_thread(*, target: Any, name: str, daemon: bool) -> MagicMock:
+        thread = MagicMock(name=name)
+        thread.start.side_effect = lambda: order.append(f"start {name}")
+        thread.target, thread.daemon = target, daemon
+        threads[name] = thread
+        return thread
+
+    main_env["init_db"].side_effect = lambda **_: order.append("init_db")
+    main_env["_check_face_service_at_startup"].side_effect = lambda: order.append("face_check")
+    monkeypatch.setattr(worker.threading, "Thread", make_thread)
+    monkeypatch.setattr(worker, "_run_cycle", lambda: monkeypatch.setattr(worker, "shutdown_requested", True))
+
+    worker.main()
+
+    assert order == ["init_db", "start worker-heartbeat", "face_check", "start shadow-prefilter-sweep"]
+    assert threads["worker-heartbeat"].target is main_env["_heartbeat_loop"]
+    assert threads["worker-heartbeat"].daemon is True
+    main_env["_release_resources"].assert_called_once_with(
+        threads["shadow-prefilter-sweep"], threads["worker-heartbeat"]
+    )
+
+
+def test_main_does_not_start_a_heartbeat_when_the_database_is_unavailable(main_env: dict[str, MagicMock]) -> None:
+    main_env["init_db"].side_effect = RuntimeError("no credentials")
+
+    with pytest.raises(SystemExit):
+        worker.main()
+
+    main_env["_heartbeat_loop"].assert_not_called()
+
+
+# --------------------------------------------------------------------------
+# Progress reporting for the heartbeat thread's watchdog
+# --------------------------------------------------------------------------
+
+
+def test_the_supervisor_reports_progress_on_every_iteration(quiet_cycle: dict[str, MagicMock]) -> None:
+    pending: Future[Any] = Future()
+    sleeps = {"n": 0}
+
+    def sleep(_seconds: float) -> None:
+        sleeps["n"] += 1
+        if sleeps["n"] == 3:
+            pending.set_result(None)
+
+    with (
+        patch.object(worker, "_mark_progress") as mark,
+        patch.object(worker.time, "sleep", side_effect=sleep),
+    ):
+        worker._supervise({pending: 1}, on_wake=lambda _f: None, on_done=lambda *_: None)
+
+    assert mark.call_args_list == [call("supervise")] * 4  # three waits and the iteration that sees it done
+
+
+def test_the_sleep_between_cycles_reports_progress_every_second() -> None:
+    with (
+        patch.object(worker, "POLL_INTERVAL", 5),
+        patch.object(worker.random, "randint", return_value=0),
+        patch.object(worker, "_consume_wake_signal", return_value=False),
+        patch.object(worker, "_process_sdc_writes", return_value=0),
+        patch.object(worker, "_mark_progress") as mark,
+        patch.object(worker.time, "time", return_value=0.0),
+        patch.object(worker.time, "sleep"),
+    ):
+        worker._sleep_until_next_cycle()
+
+    assert mark.call_args_list == [call("sleep")] * 5
+
+
+def test_a_cycle_brackets_the_purge_with_progress_marks() -> None:
+    order: list[str] = []
+
+    with (
+        patch.object(worker, "_mark_progress", side_effect=lambda phase: order.append(f"mark:{phase}")),
+        patch.object(worker, "_probe_liftwing_if_due"),
+        patch.object(worker, "_purge_deleted_projects", side_effect=lambda: order.append("purge")),
+        patch.object(worker, "_process_sdc_writes"),
+        patch.object(worker, "_claim_active_projects", return_value=[]),
+        patch.object(worker, "_drain_inference_queue"),
+        patch.object(worker, "_process_active_projects"),
+    ):
+        worker._run_cycle()
+
+    assert order == ["mark:cycle", "mark:purge_deleted", "purge", "mark:purge_deleted_done"]
+
+
+def test_a_long_maxlag_sleep_is_announced_as_progress() -> None:
+    response = MagicMock(status_code=503, headers={"Retry-After": "2"})
+    ok = MagicMock(status_code=200, headers={})
+    session = MagicMock()
+    session.get.side_effect = [response, ok]
+
+    with (
+        patch.object(worker, "_get_session", return_value=session),
+        patch.object(worker, "_mark_progress") as mark,
+        patch.object(worker.time, "sleep") as sleeper,
+    ):
+        assert worker._api_request("https://commons.wikimedia.org/w/api.php") is ok
+
+    sleeper.assert_called_once_with(2.0)
+    assert call("api_maxlag_sleep") in mark.call_args_list
+
+
+def test_a_failed_request_is_announced_before_the_retry_sleep() -> None:
+    session = MagicMock()
+    session.get.side_effect = worker.requests.exceptions.ConnectionError("boom")
+
+    with (
+        patch.object(worker, "_get_session", return_value=session),
+        patch.object(worker, "_mark_progress") as mark,
+        patch.object(worker.time, "sleep"),
+        pytest.raises(Exception, match="after 3 attempts"),
+    ):
+        worker._api_request("https://commons.wikimedia.org/w/api.php")
+
+    assert mark.call_args_list.count(call("api_retry_sleep")) == 3

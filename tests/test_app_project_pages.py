@@ -35,9 +35,7 @@ def _user_aware_execute(fake_user, route_handler):
         if "FROM users WHERE id = %s" in sql:
             return [fake_user]
         if "FROM worker_heartbeat" in sql:
-            return [{"is_stale": 0}]
-        if "SHOW TABLES LIKE 'worker_heartbeat'" in sql:
-            return [{"1": 1}]
+            return [{"fresh": 1, "stopping": 0, "total": 1}]
         return route_handler(sql, params, fetch)
 
     return _execute_query
@@ -1606,6 +1604,74 @@ def test_project_detail_inference_eligible_db_error_defaults_zero(monkeypatch):
     assert captured["context"]["inference_eligible"] == 0
 
 
+_PERMISSION_DENIED_MESSAGE = (
+    "Your account lacks edit permissions. Please re-register the OAuth consumer with the 'Edit existing pages' grant."
+)
+
+
+def _project_detail_with_worker_error(monkeypatch, error):
+    eq = _project_detail_banner_eq(project_overrides={"sdc_write_error": error, "sdc_write_requested": 0})
+    client, _ = _auth_client_chunk4(monkeypatch, eq)
+    response = client.get("/project/1")
+    assert response.status_code == 200
+    return response.get_data(as_text=True)
+
+
+def test_project_detail_offers_reauthorize_for_a_stored_authorization_error(monkeypatch):
+    """The status poller only runs during a write, so the stored error itself needs the button."""
+    from config import SDC_AUTH_EXPIRED_MESSAGE
+
+    body = _project_detail_with_worker_error(monkeypatch, SDC_AUTH_EXPIRED_MESSAGE)
+
+    assert "Worker error: " in body
+    assert "login?reauth=1" in body
+    assert 'login?reauth=1&amp;next=/project/1"' in body
+
+
+@pytest.mark.parametrize(
+    "error",
+    [None, "The Wikimedia servers are busy. Please try again later.", _PERMISSION_DENIED_MESSAGE],
+)
+def test_sdc_result_area_is_closed_before_the_action_buttons(monkeypatch, error):
+    """A missing </div> once nested the buttons inside #sdcResult, which sdcShowMessage empties."""
+    from html.parser import HTMLParser
+
+    class Nesting(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.stack = []
+            self.inside_result = {}
+
+        def handle_starttag(self, tag, attrs):
+            attr = dict(attrs)
+            if tag not in ("br", "img", "input", "meta", "link", "hr"):
+                self.stack.append((tag, attr.get("id")))
+            if attr.get("id") in ("sdcWriteBtn", "sdcStopBtn"):
+                self.inside_result[attr["id"]] = any(i == "sdcResult" for _t, i in self.stack[:-1])
+
+        def handle_endtag(self, tag):
+            for index in range(len(self.stack) - 1, -1, -1):
+                if self.stack[index][0] == tag:
+                    del self.stack[index:]
+                    break
+
+    parser = Nesting()
+    parser.feed(_project_detail_with_worker_error(monkeypatch, error))
+
+    assert parser.inside_result == {"sdcWriteBtn": False, "sdcStopBtn": False}
+
+
+@pytest.mark.parametrize(
+    "error",
+    ["The Wikimedia servers are busy. Please try again later.", _PERMISSION_DENIED_MESSAGE],
+)
+def test_project_detail_offers_no_reauthorize_for_other_worker_errors(monkeypatch, error):
+    body = _project_detail_with_worker_error(monkeypatch, error)
+
+    assert "Worker error: " in body
+    assert "login?reauth=1" not in body
+
+
 def test_project_detail_inference_banner_hidden_while_processing(monkeypatch):
     """Queued image work with no eligible faces → banner exists hidden so the poller can reveal it."""
     eq = _project_detail_banner_eq(
@@ -2369,7 +2435,7 @@ def test_leaderboard_success_with_rows(monkeypatch):
 
     def execute_query_mock(sql, _params=None, _fetch=True):
         if "FROM worker_heartbeat" in sql:
-            return [{"is_stale": 0}]
+            return [{"fresh": 1, "stopping": 0, "total": 1}]
         if "FROM users u" in sql and "LEFT JOIN faces f" in sql:
             return rows
         return []
@@ -2390,7 +2456,7 @@ def test_leaderboard_success_with_rows(monkeypatch):
 def test_leaderboard_db_error(monkeypatch):
     def boom(sql, _params=None, _fetch=True):
         if "FROM worker_heartbeat" in sql:
-            return [{"is_stale": 0}]
+            return [{"fresh": 1, "stopping": 0, "total": 1}]
         raise app_module.DatabaseError("boom")
 
     monkeypatch.setattr(app_module, "execute_query", boom)
@@ -2406,7 +2472,7 @@ def test_leaderboard_db_error(monkeypatch):
 def test_leaderboard_empty_results(monkeypatch):
     def execute_query_mock(sql, _params=None, _fetch=True):
         if "FROM worker_heartbeat" in sql:
-            return [{"is_stale": 0}]
+            return [{"fresh": 1, "stopping": 0, "total": 1}]
         return []
 
     monkeypatch.setattr(app_module, "execute_query", execute_query_mock)
@@ -2426,7 +2492,7 @@ def test_leaderboard_period_month(monkeypatch):
 
     def execute_query_mock(sql, params=None, _fetch=True):
         if "FROM worker_heartbeat" in sql:
-            return [{"is_stale": 0}]
+            return [{"fresh": 1, "stopping": 0, "total": 1}]
         if "FROM users u" in sql and "LEFT JOIN faces f" in sql:
             captured["sql"] = sql
             captured["params"] = params
@@ -2454,7 +2520,7 @@ def test_leaderboard_period_daily(monkeypatch):
 
     def execute_query_mock(sql, params=None, _fetch=True):
         if "FROM worker_heartbeat" in sql:
-            return [{"is_stale": 0}]
+            return [{"fresh": 1, "stopping": 0, "total": 1}]
         if "FROM users u" in sql and "LEFT JOIN faces f" in sql:
             captured["sql"] = sql
             captured["params"] = params
@@ -2481,7 +2547,7 @@ def test_leaderboard_period_all_includes_user_stats(monkeypatch):
 
     def execute_query_mock(sql, params=None, _fetch=True):
         if "FROM worker_heartbeat" in sql:
-            return [{"is_stale": 0}]
+            return [{"fresh": 1, "stopping": 0, "total": 1}]
         if "FROM users u" in sql and "LEFT JOIN faces f" in sql:
             captured["sql"] = sql
             captured["params"] = params
@@ -2507,7 +2573,7 @@ def test_leaderboard_invalid_period_defaults_to_all(monkeypatch):
 
     def execute_query_mock(sql, params=None, _fetch=True):
         if "FROM worker_heartbeat" in sql:
-            return [{"is_stale": 0}]
+            return [{"fresh": 1, "stopping": 0, "total": 1}]
         if "FROM users u" in sql and "LEFT JOIN faces f" in sql:
             captured["sql"] = sql
             captured["params"] = params
@@ -2531,7 +2597,7 @@ def test_leaderboard_filter_bar_active_state(monkeypatch):
 
     def execute_query_mock(sql, _params=None, _fetch=True):
         if "FROM worker_heartbeat" in sql:
-            return [{"is_stale": 0}]
+            return [{"fresh": 1, "stopping": 0, "total": 1}]
         return []
 
     monkeypatch.setattr(app_module, "execute_query", execute_query_mock)
@@ -2565,7 +2631,7 @@ def test_account_settings_get(monkeypatch, fake_user):
         if "FROM users WHERE id = %s" in sql:
             return [fake_user]
         if "FROM worker_heartbeat" in sql:
-            return [{"is_stale": 0}]
+            return [{"fresh": 1, "stopping": 0, "total": 1}]
         return [] if fetch else 0
 
     monkeypatch.setattr(app_module, "execute_query", execute_query_mock)
@@ -2590,7 +2656,7 @@ def test_account_settings_get_opted_out(monkeypatch, fake_user):
         if "FROM users WHERE id = %s" in sql:
             return [fake_user]
         if "FROM worker_heartbeat" in sql:
-            return [{"is_stale": 0}]
+            return [{"fresh": 1, "stopping": 0, "total": 1}]
         return [] if fetch else 0
 
     monkeypatch.setattr(app_module, "execute_query", execute_query_mock)
@@ -2682,7 +2748,7 @@ def test_account_settings_requires_login(monkeypatch):
 
     def execute_query_mock(sql, _params=None, _fetch=True):
         if "FROM worker_heartbeat" in sql:
-            return [{"is_stale": 0}]
+            return [{"fresh": 1, "stopping": 0, "total": 1}]
         return []
 
     monkeypatch.setattr(app_module, "execute_query", execute_query_mock)
@@ -2698,7 +2764,7 @@ def test_leaderboard_excludes_opted_out_users(monkeypatch):
 
     def execute_query_mock(sql, _params=None, _fetch=True):
         if "FROM worker_heartbeat" in sql:
-            return [{"is_stale": 0}]
+            return [{"fresh": 1, "stopping": 0, "total": 1}]
         if "FROM users u" in sql and "LEFT JOIN faces f" in sql:
             captured_sql["leaderboard"] = sql
             return [{"wiki_username": "visible", "classifications": 5, "sdc_tags": 2}]
@@ -2722,7 +2788,7 @@ def test_leaderboard_sdc_tags_attributed_to_classifier_not_project_owner(monkeyp
 
     def execute_query_mock(sql, _params=None, _fetch=True):
         if "FROM worker_heartbeat" in sql:
-            return [{"is_stale": 0}]
+            return [{"fresh": 1, "stopping": 0, "total": 1}]
         if "FROM users u" in sql and "LEFT JOIN faces f" in sql:
             captured_sql["leaderboard"] = sql
             return [{"wiki_username": "alice", "classifications": 3, "sdc_tags": 1}]

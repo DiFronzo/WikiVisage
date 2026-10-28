@@ -409,6 +409,72 @@ def execute_transaction(
         raise DatabaseError(f"Transaction execution failed: {e}") from e
 
 
+class DedicatedConnection:
+    """One autocommit connection that lives outside the shared pool.
+
+    The worker's heartbeat thread uses it so a busy or exhausted pool can never
+    delay the liveness write. It connects on the first statement and replaces
+    the connection when it is older than ``MAX_CONNECTION_AGE``, closed, or
+    breaks mid-statement (one retry on a fresh connection). Not thread-safe:
+    give each thread its own.
+    """
+
+    def __init__(self) -> None:
+        self._conn: pymysql.Connection | None = None
+        self._created_at = 0.0
+
+    def _drop(self) -> None:
+        conn, self._conn = self._conn, None
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def _ensure(self) -> pymysql.Connection:
+        conn = self._conn
+        if conn is not None and conn.open and (time.monotonic() - self._created_at) < MAX_CONNECTION_AGE:
+            return conn
+        self._drop()
+        config = {**_get_db_config(), "autocommit": True}
+        try:
+            conn = pymysql.connect(**config)
+        except Exception as e:
+            raise DatabaseError(f"Could not connect to database: {e}") from e
+        self._conn = conn
+        self._created_at = time.monotonic()
+        return conn
+
+    def execute(self, sql: str, params: tuple | dict | None = None) -> int:
+        """Run one statement (committed at once) and return the affected row count."""
+        for attempt in range(2):
+            conn = self._ensure()
+            try:
+                with conn.cursor() as cursor:
+                    cursor.execute(sql, params)
+                    return cursor.rowcount
+            except (OperationalError, InterfaceError) as e:
+                self._drop()
+                if attempt:
+                    raise DatabaseError(f"Dedicated connection failed: {e}") from e
+            except pymysql.MySQLError as e:
+                raise DatabaseError(f"Dedicated connection statement failed: {e}") from e
+        raise DatabaseError("Dedicated connection failed")  # pragma: no cover
+
+    def close(self) -> None:
+        self._drop()
+
+
+def open_dedicated_connection() -> DedicatedConnection:
+    """Return a connection handle outside the pool (see ``DedicatedConnection``).
+
+    It reads the same configuration as the pool (``_get_db_config``) but is not
+    counted in ``pool_size``, so callers must budget one extra ToolsDB
+    connection for it. The first statement opens the connection.
+    """
+    return DedicatedConnection()
+
+
 def init_db(pool_size: int | None = None) -> None:
     """
     Initialize the database connection pool and verify connectivity.

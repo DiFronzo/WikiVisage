@@ -37,6 +37,7 @@ load_dotenv()
 import requests
 from flask import (
     Flask,
+    Response,
     abort,
     flash,
     g,
@@ -48,16 +49,28 @@ from flask import (
     session,
     url_for,
 )
+from flask.sessions import SecureCookieSessionInterface
 from flask_babel import Babel
 from flask_babel import gettext as _
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
+from itsdangerous import BadSignature, SignatureExpired
 from requests_oauthlib import OAuth2Session
 
 import face_client
 import oauth_refresh
 from api_errors import ApiError
-from config import COMMONS_THUMB_STEPS, DETECTION_WIDTH, LIFTWING_PROBE_INTERVAL, USER_AGENT, WAKE_FILE_PATH
+from config import (
+    COMMONS_THUMB_STEPS,
+    DETECTION_WIDTH,
+    LIFTWING_PROBE_INTERVAL,
+    SDC_REAUTH_MESSAGES,
+    SESSION_IDLE_DAYS,
+    SESSION_MAX_AGE_DAYS,
+    USER_AGENT,
+    WAKE_FILE_PATH,
+    WORKER_STALE_SECONDS,
+)
 from database import (
     DatabaseError,
     execute_query,
@@ -88,6 +101,34 @@ if not _flask_secret:
 app.secret_key = _flask_secret
 app.debug = os.environ.get("FLASK_DEBUG", "").lower() in {"1", "true", "yes"}
 
+
+def _insecure_http_enabled() -> bool:
+    """Whether the LAN dev mode is on: the env flag, never on Toolforge (its envvars are tool-wide)."""
+    if os.environ.get("WIKIVISAGE_INSECURE_HTTP", "").strip().lower() not in {"1", "true", "yes"}:
+        return False
+    if os.environ.get("TOOL_TOOLFORGE_API_URL"):
+        logger.error("WIKIVISAGE_INSECURE_HTTP is set on Toolforge: ignoring it, cookies keep the Secure flag.")
+        return False
+    return True
+
+
+# Local-only escape hatch for testing from another device (a phone, a second laptop) over plain
+# http. Leave it unset everywhere else: with it on, the session and locale cookies lose the
+# Secure flag, so anyone on the same network can read them. Production runs HTTPS and never
+# sets it. The server binds beyond loopback when FLASK_DEBUG is off (see ``__main__``).
+INSECURE_HTTP = _insecure_http_enabled()
+if INSECURE_HTTP:
+    logger.warning(
+        "WIKIVISAGE_INSECURE_HTTP is set: cookies are sent without Secure and the app may be "
+        "reachable from the local network. Use this for local testing only."
+    )
+
+
+def _cookie_secure() -> bool:
+    """Whether cookies carry the Secure flag: off in debug and in the local-network dev mode."""
+    return not app.debug and not INSECURE_HTTP
+
+
 # Trust reverse-proxy headers (Toolforge nginx → gunicorn).
 # x_for=1, x_proto=1, x_host=1 so Flask sees the real client IP,
 # HTTPS scheme, and correct Host — required for secure cookies and
@@ -114,10 +155,33 @@ CATEGORY_API_TIMEOUT = 8  # Seconds for category info API calls
 COMMONS_API_LIMIT = "500"  # MediaWiki API cmlimit
 
 # Session configuration
-app.config["SESSION_COOKIE_SECURE"] = not app.debug
+app.config["SESSION_COOKIE_SECURE"] = _cookie_secure()
 app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
-app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(hours=8)
+# Sliding idle timeout: every response re-sends the (permanent) cookie, so the lifetime only
+# runs down while the app is closed. SESSION_MAX_AGE_DAYS is the absolute cap since login.
+app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=SESSION_IDLE_DAYS)
+app.config["SESSION_REFRESH_EACH_REQUEST"] = True
+_SESSION_MAX_AGE_SECONDS = SESSION_MAX_AGE_DAYS * 86400
+# Sampled INFO line explaining why an anonymous request arrived without a session.
+_LOG_SESSION_LOSS = os.environ.get("WIKIVISAGE_LOG_SESSION_LOSS", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+_SESSION_LOSS_SAMPLE_RATE = 0.05
+_SESSION_LOSS_SKIP_PREFIXES = (
+    "/static/",
+    "/health",
+    "/sw.js",
+    "/robots.txt",
+    "/sitemap.xml",
+    "/llms.txt",
+    "/commons-thumb/",
+    "/.well-known/",
+)
+LOCALE_COOKIE_MAX_AGE = 60 * 60 * 24 * 365
 
 # Rate limiter — uses Redis on Toolforge for shared state across gunicorn workers.
 # Falls back to memory:// for local development where Redis may not be available.
@@ -194,13 +258,41 @@ def set_language(lang: str):
     if parsed_ref.scheme or parsed_ref.netloc or referrer.startswith("//"):
         referrer = url_for("index")
     resp = redirect(referrer)
-    if request.args.get("nocookie"):
-        # No consent (yet): still honour the choice for this visit with a
-        # session-scoped cookie, so switching language works without having to
-        # accept the banner first. Nothing is remembered afterwards.
-        resp.set_cookie("locale", lang, httponly=True, samesite="Lax")
-    else:
-        resp.set_cookie("locale", lang, max_age=60 * 60 * 24 * 365, httponly=True, samesite="Lax")
+    # Without consent (?nocookie=1) the cookie is session-scoped, so switching language
+    # works without having to accept the banner first. Nothing is remembered afterwards.
+    _set_locale_cookie(resp, lang, persistent=not request.args.get("nocookie"))
+    return resp
+
+
+def _set_locale_cookie(resp: Any, lang: str, *, persistent: bool) -> None:
+    """Write the (HttpOnly) language cookie, kept for a year only when *persistent*."""
+    resp.set_cookie(
+        "locale",
+        lang,
+        max_age=LOCALE_COOKIE_MAX_AGE if persistent else None,
+        httponly=True,
+        samesite="Lax",
+        secure=_cookie_secure(),
+    )
+
+
+@app.route("/cookie-consent", methods=["POST"])
+@limiter.limit("20 per minute")
+def cookie_consent():
+    """Apply the visitor's cookie choice to the language cookie (HttpOnly, so JS cannot).
+
+    ``choice=accepted`` keeps an existing ``locale`` cookie for a year, ``declined`` turns it
+    back into a session-scoped one. Without a ``locale`` cookie there is nothing to change.
+    """
+    if not _validate_csrf():
+        abort(400, _("Invalid CSRF token"))
+    choice = request.form.get("choice", "")
+    if choice not in ("accepted", "declined"):
+        abort(400, _("Bad request"))
+    resp = Response(status=204)
+    locale = request.cookies.get("locale")
+    if locale in LANGUAGES:
+        _set_locale_cookie(resp, locale, persistent=choice == "accepted")
     return resp
 
 
@@ -248,28 +340,127 @@ MAX_IMAGE_DOWNLOAD_BYTES = 50 * 1024 * 1024
 def before_request() -> None:
     """Load current user from session into g.user before each request."""
     g.user = None
+    # Set when the user row could not be read (database trouble): the session is kept and
+    # login_required answers 503 instead of bouncing the user through a pointless login.
+    g.user_load_failed = False
+    # Set when a token refresh failed for a reason that retrying may fix (see _get_valid_token).
+    g.token_refresh_transient = False
     user_id = session.get("user_id")
-    if user_id:
-        try:
-            rows = execute_query(
-                "SELECT id, wiki_user_id, wiki_username, access_token, "
-                "refresh_token, token_expires_at FROM users WHERE id = %s",
-                (user_id,),
-            )
-            if rows:
-                g.user = rows[0]
-                # Normalize token types (PyMySQL may return BLOB columns as bytes)
-                for _tk in ("access_token", "refresh_token"):
-                    if isinstance(g.user.get(_tk), bytes):
-                        g.user[_tk] = g.user[_tk].decode("utf-8")
-                    g.user[_tk] = decrypt_token(g.user[_tk])
-        except TokenDecryptionError:
-            logger.warning("Token decryption failed for user %s — clearing session to force re-auth", user_id)
-            session.clear()
-            g.user = None
-        except DatabaseError:
-            logger.exception("Failed to load user from session")
-            session.clear()
+    if not user_id:
+        _log_session_loss()
+        return
+    if not _session_within_max_age():
+        _end_session(_("Your session has expired. Please log in again."))
+        return
+    _load_session_user(user_id)
+
+
+def _session_within_max_age() -> bool:
+    """Enforce the absolute session age; sessions that predate ``auth_at`` are stamped, not logged out."""
+    now = int(time.time())
+    auth_at = session.get("auth_at")
+    if not isinstance(auth_at, int):
+        session["auth_at"] = now
+        return True
+    return now - auth_at <= _SESSION_MAX_AGE_SECONDS
+
+
+def _end_session(message: str | None = None) -> None:
+    """Drop everything this browser holds in its session, optionally explaining why."""
+    session.clear()
+    session.permanent = True  # the flash below must not travel in a session-scoped cookie
+    if message:
+        flash(message, "warning")
+
+
+def _load_session_user(user_id: int) -> None:
+    """Fill g.user from the database; a revoked epoch or undecryptable tokens end the session."""
+    try:
+        rows = execute_query(
+            "SELECT id, wiki_user_id, wiki_username, access_token, "
+            "refresh_token, token_expires_at, session_epoch FROM users WHERE id = %s",
+            (user_id,),
+        )
+        if not rows:
+            return
+        user = rows[0]
+        # A missing key means 0 on both sides, so sessions created before the epoch existed survive.
+        if session.get("epoch", 0) != user.get("session_epoch", 0):
+            _end_session(_("Your session has expired. Please log in again."))
+            return
+        # Normalize token types (PyMySQL may return BLOB columns as bytes)
+        for _tk in ("access_token", "refresh_token"):
+            if isinstance(user.get(_tk), bytes):
+                user[_tk] = user[_tk].decode("utf-8")
+            user[_tk] = decrypt_token(user[_tk])
+        g.user = user
+    except TokenDecryptionError:
+        logger.warning("Token decryption failed for user %s — clearing session to force re-auth", user_id)
+        _end_session()
+    except DatabaseError:
+        # Transient: keep the session so a database hiccup does not log the user out.
+        logger.exception("Failed to load user from session")
+        g.user = None
+        g.user_load_failed = True
+
+
+def _client_bucket(user_agent: str) -> str:
+    """Coarse client class for the session-loss log line (an installed app looks like its browser)."""
+    ua = user_agent.lower()
+    if any(word in ua for word in ("bot", "crawler", "spider")):
+        return "other"
+    if any(word in ua for word in ("iphone", "ipad", "ipod")):
+        return "ios"
+    if "android" in ua:
+        return "android"
+    if any(word in ua for word in ("windows", "macintosh", "x11", "linux", "cros")):
+        return "desktop"
+    return "other"
+
+
+def _session_loss_reason() -> str:
+    """Why an anonymous request has no session: no cookie, expired, bad signature, or valid but empty."""
+    raw = request.cookies.get("session")
+    if not raw:
+        return "no cookie sent"
+    serializer = app.session_interface.get_signing_serializer(app)  # type: ignore[attr-defined]
+    if serializer is None:
+        return "bad signature"
+    try:
+        serializer.loads(raw, max_age=int(app.permanent_session_lifetime.total_seconds()))
+    except SignatureExpired:
+        return "expired"
+    except BadSignature:
+        return "bad signature"
+    return "valid but empty"
+
+
+def _log_session_loss() -> None:
+    """Sampled INFO line that makes "I have to log in again" a countable reason in the web logs."""
+    if not _LOG_SESSION_LOSS or request.path.startswith(_SESSION_LOSS_SKIP_PREFIXES):
+        return
+    if random.random() >= _SESSION_LOSS_SAMPLE_RATE:  # noqa: S311 - sampling, not security
+        return
+    logger.info(
+        "session loss: reason=%s had_cookie=%s client=%s path=%s",
+        _session_loss_reason(),
+        "session" in request.cookies,
+        _client_bucket(request.headers.get("User-Agent", "")),
+        request.path,
+    )
+
+
+@app.after_request
+def _keep_session_cookie_persistent(response: Response) -> Response:
+    """Make every session cookie we send persistent.
+
+    iOS home-screen apps reset session-scoped cookies (WebKit bug 272325), so even the
+    pre-login cookie (OAuth state, CSRF token, flashes) must carry an expiry. Runs before
+    Flask saves the session, so one check here covers every writer.
+    """
+    if session and not session.permanent:
+        session.permanent = True
+    return response
 
 
 def _is_safe_url(target: str) -> bool:
@@ -600,12 +791,21 @@ def _prefilter_stats_for(project: dict[str, Any]) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+def _service_unavailable():
+    """503 for a request whose user could not be loaded (the session itself is still fine)."""
+    if request.path.startswith("/api/") or request.is_json:
+        return jsonify({"error": _("The service is temporarily unavailable. Please try again in a moment.")}), 503
+    abort(503)
+
+
 def login_required(f):
     """Decorator to require authentication."""
 
     @wraps(f)
     def decorated_function(*args, **kwargs):
         if g.user is None:
+            if getattr(g, "user_load_failed", False):
+                return _service_unavailable()
             flash(_("Please log in to continue."), "warning")
             return redirect(url_for("login", next=request.full_path))
         return f(*args, **kwargs)
@@ -636,6 +836,12 @@ def _oauth_exchange(refresh_token: str) -> dict[str, Any]:
     )
 
 
+def _note_refresh_failure(permanent: bool) -> None:
+    """Remember on the current request whether a failed refresh is worth retrying."""
+    if has_request_context():
+        g.token_refresh_transient = not permanent
+
+
 def _refresh_access_token(user: dict[str, Any]) -> dict[str, Any] | None:
     """Refresh the user's access token if it is expired or about to expire.
 
@@ -651,14 +857,20 @@ def _refresh_access_token(user: dict[str, Any]) -> dict[str, Any] | None:
         user["refresh_token"],
         oauth_refresh.as_utc(user["token_expires_at"]),
     )
-    tokens = oauth_refresh.refresh_tokens(
-        user["id"],
-        label=f"user {user['wiki_username']}",
-        query=execute_query,
-        get_redis=lambda: redis_client,
-        exchange=_oauth_exchange,
-        current=current,
-    )
+    try:
+        tokens = oauth_refresh.refresh_tokens(
+            user["id"],
+            label=f"user {user['wiki_username']}",
+            query=execute_query,
+            get_redis=lambda: redis_client,
+            exchange=_oauth_exchange,
+            current=current,
+            on_failure=_note_refresh_failure,
+        )
+    except DatabaseError:
+        logger.exception("Database error while refreshing the token of %s", user["wiki_username"])
+        _note_refresh_failure(False)
+        return None
     if tokens is None:
         return None
     if tokens is not current:  # refreshed here, or taken over from a peer's refresh
@@ -668,14 +880,34 @@ def _refresh_access_token(user: dict[str, Any]) -> dict[str, Any] | None:
     return user
 
 
+def _token_unavailable_error() -> ApiError:
+    """The error for a missing token: log in again when the grant is gone, retry later otherwise."""
+    if g.get("token_refresh_transient"):
+        return ApiError(_("Could not reach the Wikimedia login service. Please try again in a moment."), 503)
+    return ApiError(
+        _("Your Wikimedia authorization has expired or was revoked. Please re-authorize to continue."),
+        401,
+        reauth_url=_reauth_url(),
+    )
+
+
+def _reauth_url() -> str:
+    """Where the front end sends the user to authorize again (the page appends ``&next=``)."""
+    return url_for("login", reauth=1)
+
+
 def _get_valid_token() -> str | None:
-    """Get a valid access token for the current user, refreshing if needed."""
+    """Get a valid access token for the current user, refreshing if needed.
+
+    Returns None when that is not possible. The session is left alone: the browser login is
+    still good, only the Commons write needs a fresh authorisation. ``g.token_refresh_transient``
+    tells callers whether to ask the user to log in again (False) or to simply retry (True).
+    """
     if g.user is None:
         return None
 
     refreshed = _refresh_access_token(g.user)
     if refreshed is None:
-        session.clear()
         return None
 
     g.user = refreshed
@@ -686,6 +918,7 @@ def _csrf_token() -> str:
     """Generate or return the current CSRF token for forms."""
     if "csrf_token" not in session:
         session["csrf_token"] = secrets.token_hex(32)
+        session.permanent = True  # an anonymous session-scoped cookie is dropped by iOS home-screen apps
     return session["csrf_token"]
 
 
@@ -702,6 +935,16 @@ def _validate_csrf() -> bool:
 def inject_csrf_token() -> dict[str, Any]:
     """Make csrf_token() available in all templates."""
     return {"csrf_token": _csrf_token}
+
+
+class _SessionInterface(SecureCookieSessionInterface):
+    """Secure flag from ``_cookie_secure()``, so debug and the LAN dev mode are honoured per request."""
+
+    def get_cookie_secure(self, app: Flask) -> bool:
+        return _cookie_secure()
+
+
+app.session_interface = _SessionInterface()
 
 
 @app.before_request
@@ -730,26 +973,69 @@ def inject_csp_nonce() -> dict[str, str]:
 
 @app.context_processor
 def inject_worker_status() -> dict[str, Any]:
-    """Check worker heartbeat and inject worker_down flag into all templates."""
+    """Inject the ``worker_down`` flag into all templates.
+
+    The banner is for a worker that is really gone, never for one that is working or being
+    restarted on purpose, so it needs every "alive" signal to be absent (see ``_workers_alive``).
+    A failing check means "not down": an unreadable database must not paint a scary banner.
+    """
     try:
-        rows = execute_query(
-            "SELECT last_seen < NOW() - INTERVAL 5 MINUTE AS is_stale FROM worker_heartbeat WHERE id = 1",
-        )
-        if rows and isinstance(rows, list):
-            worker_down = bool(rows[0]["is_stale"])
-        else:
-            # Row missing = worker never wrote a heartbeat since deploy.
-            # Check if the table exists at all (fresh install → not down).
-            table_check = execute_query(
-                "SELECT 1 FROM information_schema.tables "
-                "WHERE table_schema = DATABASE() "
-                "AND table_name = 'worker_heartbeat'",
-            )
-            worker_down = bool(table_check and isinstance(table_check, list))
+        worker_down = not _workers_alive()
     except Exception:
         app.logger.exception("Worker heartbeat check failed")
         worker_down = False
     return {"worker_down": worker_down}
+
+
+def _worker_heartbeat_counts() -> dict[str, int] | None:
+    """Count worker rows by state: ``fresh``, ``stopping`` (planned stop still within its grace),
+    ``stale`` and ``total``. None when the query returns no row (nothing to judge by)."""
+    rows = execute_query(
+        "SELECT COALESCE(SUM(last_seen >= NOW() - INTERVAL %s SECOND), 0) AS fresh, "
+        "COALESCE(SUM(last_seen < NOW() - INTERVAL %s SECOND AND expected_back_until > NOW()), 0) AS stopping, "
+        "COUNT(*) AS total FROM worker_heartbeats",
+        (WORKER_STALE_SECONDS, WORKER_STALE_SECONDS),
+    )
+    if not rows or not isinstance(rows, list):
+        return None
+    fresh, stopping, total = (int(rows[0][key]) for key in ("fresh", "stopping", "total"))
+    return {"fresh": fresh, "stopping": stopping, "stale": total - fresh - stopping, "total": total}
+
+
+def _recent_project_claim() -> bool:
+    """True when a worker refreshed a project claim lately (it does so every minute while busy)."""
+    rows = execute_query(
+        "SELECT 1 AS ok FROM projects WHERE worker_claimed_at > NOW() - INTERVAL %s SECOND LIMIT 1",
+        (WORKER_STALE_SECONDS,),
+    )
+    return bool(rows)
+
+
+def _workers_alive() -> bool:
+    """True unless every signal says the workers are gone.
+
+    Alive means any of: a worker heartbeat newer than ``WORKER_STALE_SECONDS``; a worker that
+    announced a planned stop (deploy, restart) whose grace period has not run out; a project
+    claim refreshed within the same window, which still proves work is going on when a
+    heartbeat write fails. Nothing recorded yet (a fresh install, or the minutes between a
+    deploy's migration and the workers' first beat) is not evidence of an outage either.
+    """
+    counts = _worker_heartbeat_counts()
+    if counts is None or counts["total"] == 0 or counts["fresh"] or counts["stopping"]:
+        return True
+    return _recent_project_claim()
+
+
+def _workers_health_value() -> dict[str, int] | str:
+    """Per-state worker counts for ``/health``; ``"unknown"`` when they cannot be read."""
+    try:
+        counts = _worker_heartbeat_counts()
+    except Exception:
+        logger.exception("Worker status for /health failed")
+        return "unknown"
+    if counts is None:
+        return "unknown"
+    return {key: counts[key] for key in ("fresh", "stopping", "stale")}
 
 
 # A LiftWing status older than three probe intervals reads as unknown, so a
@@ -1065,6 +1351,25 @@ def _snap_thumb_width(width: int) -> int:
     return _THUMB_STEPS[-1]
 
 
+# Widest thumbnail a gallery card may swap to. Keep equal to FACE_VIEW_MAX_SOURCE_WIDTH in
+# static/wikivisage-common.js, whose faceViewSourceWidth() applies the same limit in the browser.
+_GALLERY_HIRES_MAX = 960
+_GALLERY_BASE_WIDTH = 330
+
+
+def _gallery_hires_steps(detection_width: int) -> list[int]:
+    """Standard thumbnail steps above the gallery's 330 px thumbnail that a card may swap to.
+
+    Commons refuses thumbnails wider than the original and a detection width below 960 is the
+    original's width, so nothing above the largest step <= detection_width is offered. Unknown
+    detection widths (legacy rows) offer none.
+    """
+    if detection_width <= 0:
+        return []
+    limit = min(_GALLERY_HIRES_MAX, detection_width)
+    return [step for step in _THUMB_STEPS if _GALLERY_BASE_WIDTH < step <= limit]
+
+
 _MAX_INVITE_CODE_RETRIES = 5
 _INVITE_CODE_TTL_DAYS = 7
 
@@ -1157,8 +1462,16 @@ def login():
     on a misconfigured consumer), the attacker cannot exchange it for tokens
     without also knowing the per-flow `code_verifier` we keep in the session.
     """
-    if g.user:
+    if g.user and not request.args.get("reauth"):
+        # ``?reauth=1`` is the one-click re-authorize: the browser login is still good but
+        # Wikimedia no longer accepts the stored token, so run the OAuth round trip again.
         return redirect(url_for("dashboard"))
+    if g.user and request.headers.get("Sec-Fetch-Site") not in (None, "same-origin", "none"):
+        # A state-changing GET must not be triggerable by a link on another site.
+        return redirect(url_for("dashboard"))
+    if g.get("user_load_failed"):
+        # The session is fine, the database is not: a login round trip would not help.
+        return _service_unavailable()
 
     # Generate PKCE pair. The verifier MUST be 43-128 chars from the unreserved
     # URL set; secrets.token_urlsafe(64) yields ~86 chars from [A-Za-z0-9_-].
@@ -1173,6 +1486,9 @@ def login():
         code_challenge=code_challenge,
         code_challenge_method="S256",
     )
+    # Persistent from the first byte: iOS home-screen apps reset session-scoped cookies, which
+    # would drop oauth_state while the user is away at the OAuth page.
+    session.permanent = True
     session["oauth_state"] = state
     session["oauth_code_verifier"] = code_verifier
     session["login_next"] = request.args.get("next", "")
@@ -1234,7 +1550,7 @@ def oauth_callback():
 
     # Upsert user
     try:
-        existing = execute_query("SELECT id FROM users WHERE wiki_user_id = %s", (wiki_user_id,))
+        existing = execute_query("SELECT id, session_epoch FROM users WHERE wiki_user_id = %s", (wiki_user_id,))
 
         if existing:
             execute_query(
@@ -1250,6 +1566,7 @@ def oauth_callback():
                 fetch=False,
             )
             user_id = existing[0]["id"]
+            epoch = existing[0].get("session_epoch", 0)
         else:
             execute_query(
                 "INSERT INTO users (wiki_user_id, wiki_username, access_token, "
@@ -1263,8 +1580,9 @@ def oauth_callback():
                 ),
                 fetch=False,
             )
-            rows = execute_query("SELECT id FROM users WHERE wiki_user_id = %s", (wiki_user_id,))
+            rows = execute_query("SELECT id, session_epoch FROM users WHERE wiki_user_id = %s", (wiki_user_id,))
             user_id = rows[0]["id"]
+            epoch = rows[0].get("session_epoch", 0)
 
     except DatabaseError:
         logger.exception("Failed to upsert user")
@@ -1274,11 +1592,24 @@ def oauth_callback():
     # Prevent session fixation: clear old session data and regenerate the CSRF
     # token on login. Preserving the pre-login CSRF token would let an attacker
     # who fixated a session before login retain a valid CSRF token afterwards.
+    # The exception is a same-account re-authorize: that session was already
+    # authenticated as this user, so keeping its work state (undo record, skips,
+    # manual faces) and CSRF token is not fixation, and it keeps other open tabs working.
     login_next = session.pop("login_next", "")
+    carried: dict[str, Any] = {}
+    if session.get("user_id") == user_id:
+        carried = {
+            key: value
+            for key, value in session.items()
+            if key in ("csrf_token", "last_classify") or key.startswith(("skipped_images_", "manual_faces_"))
+        }
     session.clear()
-    session["csrf_token"] = secrets.token_hex(32)
+    session.update(carried)
+    session.setdefault("csrf_token", secrets.token_hex(32))
     session.permanent = True
     session["user_id"] = user_id
+    session["auth_at"] = int(time.time())
+    session["epoch"] = epoch
 
     next_url = login_next
     if not _is_safe_url(next_url):
@@ -1287,12 +1618,19 @@ def oauth_callback():
 
 
 @app.route("/logout", methods=["POST"])
-@login_required
 def logout():
-    """Clear session and log out."""
+    """Clear session and log out.
+
+    Not ``login_required``: it only clears the cookie, so it must keep working while the
+    database is down (``g.user`` could not be loaded then).
+    """
+    if "user_id" not in session:
+        return redirect(url_for("index"))
     if not _validate_csrf():
         abort(403)
+    # This device only: other sessions stay valid (see account_logout_everywhere).
     session.clear()
+    session.permanent = True  # keep the flash below out of a session-scoped cookie
     flash(_("You have been logged out."), "info")
     return redirect(url_for("index"))
 
@@ -1451,6 +1789,8 @@ def has_sibling_match(image_id: int, exclude_face_id: int) -> bool:
 @app.route("/")
 def index():
     """Landing page."""
+    if g.get("user_load_failed"):
+        return _service_unavailable()
     if g.user:
         return redirect(url_for("dashboard"))
     return render_template("index.html")
@@ -2014,6 +2354,7 @@ def project_detail(project_id: int):
         inference_eligible=inference_eligible,
         inference_triggered=inference_triggered,
         is_owner=is_owner,
+        sdc_needs_reauth=bool(project.get("sdc_write_error")) and project["sdc_write_error"] in SDC_REAUTH_MESSAGES,
     )
 
 
@@ -2459,7 +2800,7 @@ def _remove_claims_before_undo(
         removed = _remove_sdc_claim(claim["commons_page_id"], claim["wikidata_qid"], access_token)
     if not removed and any(face_id in manual_face_ids for face_id in claim_faces):
         if not access_token:
-            raise ApiError(_("OAuth token expired. Please log in again."), 401)
+            raise _token_unavailable_error()
         raise ApiError(_("Failed to remove SDC claim from Commons. The classification was not undone."), 502)
     return removed, not removed
 
@@ -2940,7 +3281,7 @@ def _settle_claim_for_rejection(face_row: dict[str, Any], face_id: int) -> tuple
 
     access_token = _get_valid_token()
     if not access_token:
-        raise ApiError(_("OAuth token expired. Please log in again."), 401)
+        raise _token_unavailable_error()
     if not _remove_sdc_claim(face_row["commons_page_id"], face_row["wikidata_qid"], access_token):
         raise ApiError(_("Failed to remove SDC claim from Commons. The face was not reclassified."), 502)
     return True, False
@@ -3303,7 +3644,8 @@ def api_write_sdc(project_id: int):
     # Refresh token now so the worker has a valid one for API calls
     token = _get_valid_token()
     if token is None:
-        return jsonify({"error": _("Your session has expired. Please log out and log in again to re-authorize.")}), 401
+        error = _token_unavailable_error()
+        return jsonify({"error": error.message, **error.extra}), error.status
 
     # Set the flag for the worker to pick up
     try:
@@ -3368,6 +3710,7 @@ def api_sdc_status(project_id: int):
             "removal_pending": removal_pending,
             "in_progress": bool(project["sdc_write_requested"]),
             "error": project["sdc_write_error"],
+            "reauth_url": _reauth_url() if project["sdc_write_error"] in SDC_REAUTH_MESSAGES else None,
         }
     )
 
@@ -3606,7 +3949,13 @@ def api_gallery(project_id: int):
                 "file_title": face["file_title"],
                 "detection_width": face["detection_width"] or 0,
                 "detection_height": face["detection_height"] or 0,
-                "thumb_url": commons_thumb_url(face["file_title"], 330),
+                "thumb_url": commons_thumb_url(face["file_title"], _GALLERY_BASE_WIDTH),
+                # Direct Commons URLs for the one-time hi-res swap, so the browser never goes
+                # through the rate-limited /commons-thumb proxy for it.
+                "thumb_urls": {
+                    str(step): commons_thumb_url(face["file_title"], step)
+                    for step in _gallery_hires_steps(face["detection_width"] or 0)
+                },
                 "result": result_type,
                 "sdc_pending": is_sdc_send or is_sdc_removal,
                 "sdc_removal": is_sdc_removal,
@@ -4330,6 +4679,28 @@ def account_settings():
     return render_template("account_settings.html", leaderboard_opt_out=opt_out)
 
 
+@app.route("/account/logout-everywhere", methods=["POST"])
+@limiter.limit("5 per hour")
+@login_required
+def account_logout_everywhere():
+    """End every session of this user, on all browsers and devices, including this one."""
+    if not _validate_csrf():
+        abort(400, _("Invalid CSRF token"))
+    try:
+        execute_query(
+            "UPDATE users SET session_epoch = session_epoch + 1 WHERE id = %s",
+            (g.user["id"],),
+            fetch=False,
+        )
+    except DatabaseError:
+        logger.exception("Failed to bump session_epoch for user %s", g.user["id"])
+        flash(_("Could not log you out on all devices. Please try again."), "error")
+        return redirect(url_for("account_settings"))
+    _end_session()
+    flash(_("You have been logged out on all devices."), "info")
+    return redirect(url_for("index"))
+
+
 @app.route("/leaderboard")
 def leaderboard():
     """Community leaderboard ranking users by classifications and SDC tags."""
@@ -4468,8 +4839,8 @@ def health():
     Reports degraded (200 OK with `degraded: true`) when the rate limiter fell
     back to per-process memory storage at startup or when the face service is
     unreachable. In both cases the database is still healthy, so we don't
-    return 503; ops can scrape `degraded` and alert. The ``liftwing`` field
-    reports the optional metadata pre-filter and never sets ``degraded``.
+    return 503, ops can scrape `degraded` and alert. The ``liftwing`` and ``workers``
+    fields are informational and never set ``degraded``.
     """
     try:
         rows = execute_query("SELECT 1 AS ok")
@@ -4481,6 +4852,7 @@ def health():
                 "limiter": "redis" if _LIMITER_REDIS_OK else "memory",
                 "face_service": "reachable" if face_service_ok else "unreachable",
                 "liftwing": _liftwing_health_value(),
+                "workers": _workers_health_value(),
                 "degraded": not _LIMITER_REDIS_OK or not face_service_ok,
             }
             return jsonify(payload), 200
@@ -4499,6 +4871,7 @@ def robots_txt():
         "User-agent: *",
         "Allow: /$",
         "Allow: /leaderboard",
+        "Allow: /llms.txt",
         "Disallow: /",
         "",
         f"Sitemap: {xml_escape(request.url_root)}sitemap.xml",
@@ -4520,6 +4893,51 @@ def sitemap_xml():
         "</urlset>"
     )
     return xml, 200, {"Content-Type": "application/xml; charset=utf-8"}
+
+
+@app.route("/llms.txt")
+@limiter.exempt
+def llms_txt():
+    """Serve llms.txt (https://llmstxt.org/): what this site is, for LLM crawlers."""
+    base = request.url_root.rstrip("/")
+    lines = [
+        "# WikiVisage",
+        "",
+        "> Active-learning facial recognition for Wikimedia Commons. Train a model on a person,",
+        "> review its matches, and add P180 (depicts) statements to the matching files' Structured",
+        "> Data on Commons.",
+        "",
+        "WikiVisage is an open-source Flask tool for Wikimedia Commons contributors. A project",
+        "pairs a Wikidata item (normally a person) with a Commons category. A background worker",
+        "detects faces in the category's images, and the contributor confirms or rejects candidates",
+        "in a yes/no interface. Once enough faces are confirmed, the tool classifies the remaining",
+        "faces with a centroid-distance model. Approved matches can then be written to Commons as",
+        "P180 (depicts) statements using the contributor's own Wikimedia OAuth authorization.",
+        "Edits are only made when the contributor asks for them; nothing is written automatically.",
+        "",
+        "Most of the site requires signing in with Wikimedia OAuth, so only the pages below are",
+        "publicly readable.",
+        "",
+        "## Pages",
+        "",
+        f"- [Home]({base}/): What the tool does and how to sign in.",
+        f"- [Leaderboard]({base}/leaderboard): Top contributors by classifications and P180 tags.",
+        f"- [Log in]({base}/login): Wikimedia OAuth 2.0 sign-in.",
+        f"- [Health]({base}/health): JSON status of the database and background services.",
+        "",
+        "## Source and documentation",
+        "",
+        "- [Source code](https://github.com/DiFronzo/WikiVisage): The Flask app, background worker",
+        "  and face service.",
+        "- [README](https://github.com/DiFronzo/WikiVisage/blob/main/README.md): Setup, architecture",
+        "  and screenshots.",
+        "- [Contributing](https://github.com/DiFronzo/WikiVisage/blob/main/CONTRIBUTING.md):",
+        "  Development conventions and tests.",
+        "- [License](https://github.com/DiFronzo/WikiVisage/blob/main/LICENSE): MIT (the bundled",
+        "  face-recognition weights have separate non-commercial terms).",
+        "",
+    ]
+    return "\n".join(lines), 200, {"Content-Type": "text/plain; charset=utf-8"}
 
 
 @app.route("/commons-thumb/<path:file_title>")
@@ -4592,6 +5010,20 @@ def rate_limited(e):
     )
 
 
+@app.errorhandler(503)
+def service_unavailable(e):
+    """Handle 503: the database (or another dependency) is briefly unavailable; the session is kept."""
+    return (
+        render_template(
+            "error.html",
+            code=503,
+            message=_("The service is temporarily unavailable. Please try again in a moment."),
+        ),
+        503,
+        {"Retry-After": "5"},
+    )
+
+
 @app.errorhandler(500)
 def internal_error(e):
     """Handle 500 errors."""
@@ -4623,6 +5055,11 @@ def create_app() -> Flask:
 
 
 if __name__ == "__main__":
+    if INSECURE_HTTP and app.debug:
+        logger.warning(
+            "FLASK_DEBUG is on, so the server still binds to 127.0.0.1 only. "
+            "Unset FLASK_DEBUG to reach it from another device."
+        )
     # The Werkzeug debugger allows code execution: never expose it beyond loopback.
     app.run(
         debug=app.debug,

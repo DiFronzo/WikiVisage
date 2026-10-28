@@ -52,3 +52,34 @@ def _detection_width() -> int:
 
 
 DETECTION_WIDTH = _detection_width()
+
+# Login sessions. The cookie is a sliding "idle" lifetime that every request renews, and
+# ``auth_at`` (set at login) enforces an absolute cap no matter how active the user is.
+SESSION_IDLE_DAYS = int(os.environ.get("WIKIVISAGE_SESSION_IDLE_DAYS", "30"))
+SESSION_MAX_AGE_DAYS = int(os.environ.get("WIKIVISAGE_SESSION_MAX_AGE_DAYS", "90"))
+
+# Worker liveness, shared by the worker (writes) and the web app (reads).
+# A worker row older than WORKER_STALE_SECONDS no longer counts as alive. A worker that is
+# stopped on purpose (SIGTERM on a deploy or restart) announces that it will be back within
+# WORKER_RESTART_GRACE_SECONDS, which keeps the offline banner hidden for planned restarts.
+WORKER_STALE_SECONDS = 300
+WORKER_RESTART_GRACE_SECONDS = int(os.environ.get("WIKIVISAGE_WORKER_RESTART_GRACE", "1200"))
+
+# What the worker stores in ``projects.sdc_write_error`` when a Commons write run ended because the
+# user's authorization is no longer accepted (token refused, revoked or expired). The web app
+# recognises it (and the wordings older releases stored) to offer a one-click re-authorize.
+SDC_AUTH_EXPIRED_MESSAGE = "Your Wikimedia authorization has expired or was revoked. Please re-authorize to continue."
+
+# Stored instead when the refresh failed for a transient reason (login service timeout, 5xx, database
+# trouble). Deliberately NOT in SDC_REAUTH_MESSAGES: sending the edits again is the fix, not re-authorizing.
+SDC_AUTH_UNAVAILABLE_MESSAGE = (
+    "Could not reach the Wikimedia login service. Please try sending the edits again in a moment."
+)
+SDC_REAUTH_MESSAGES = frozenset(
+    {
+        SDC_AUTH_EXPIRED_MESSAGE,
+        "Token expired or user not found. Please log in again.",
+        "Your session has expired. Please log in again.",
+        "Authentication token expired. Please try again or log in again.",
+    }
+)
