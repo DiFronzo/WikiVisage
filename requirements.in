@@ -1,0 +1,53 @@
+# WikiVisage face detection model server — top-level requirements (Python 3.12).
+#
+# Python 3.12 is the floor for the whole project: numpy 2.5 declares
+# Requires-Python >=3.12, and kserve 0.21 caps the face service at <3.14.
+#
+# This is the SOURCE for requirements.txt. Edit here, then regenerate the lock:
+#
+#     cd model-server
+#     uv pip compile --python-version 3.12 --python-platform x86_64-manylinux_2_28 requirements.in -o requirements.txt
+#
+# Without --upgrade, uv keeps the pins already in requirements.txt and only
+# changes what requirements.in demands. Add --upgrade to also refresh every
+# transitive pin to the newest version the constraints allow.
+#
+# requirements.txt is the fully pinned, transitive lock that the Dockerfile,
+# docker-compose, both CI jobs and the Toolforge buildpack install; never edit
+# it by hand, and never turn it into a top-level-only file again (that let
+# transitive versions drift under a "pinned" file).
+#
+# This is the ONLY place in the WikiVisage stack that runs ML. The lock must
+# stay installable with a plain `pip install -r requirements.txt` — no
+# --no-deps, no VCS URLs — and none of the packages may need a system package:
+# the Toolforge buildpack installs no debs.
+
+# --- KServe runtime -------------------------------------------------------
+# 0.21.x is the current Python SDK line (FastAPI/uvicorn), installable on
+# Python 3.12 (it requires >=3.10,<3.14). Do not downgrade to 0.8.x: it pins
+# numpy~=1.19 / ray 1.9 / protobuf 3.19, none of which build on Python 3.12.
+kserve==0.21.0
+# protobuf is deliberately not pinned here. kserve >=0.21 already requires
+# >=6.33.5,<7 (onnxruntime requires >=4.25.8), so the lock cannot leave the
+# 6.33.x line; an explicit `protobuf==` line only gave Dependabot a requirement
+# to rewrite to 7.x, which can never resolve and failed the weekly uv run with
+# an unsatisfiable kserve/protobuf conflict. The tested version stays pinned in
+# requirements.txt, and .github/dependabot.yml ignores 7.x as a second layer.
+
+# --- Face detection and embedding ----------------------------------------
+# SCRFD-500M + ArcFace MobileFaceNet run on ONNX Runtime (CPU). The weights are
+# not a Python dependency: they are committed under weights/ and verified by
+# SHA-256 at startup (see weights/LICENSE-NOTICE for their non-commercial terms).
+#
+# Stored embeddings depend on the weights and on backend.py's preprocessing and
+# alignment, not on these library versions, but pin them anyway: float32
+# results can shift in the last digits between ONNX Runtime releases.
+onnxruntime==1.31.0
+# Headless: no GUI/GL system libraries. Used only for resize and warpAffine.
+opencv-python-headless==5.0.0.93
+
+# --- Image handling -------------------------------------------------------
+Pillow==13.0.0
+# numpy 2.5 requires Python >=3.12 (and kserve allows numpy<3). This is the pin
+# that sets the interpreter floor for the whole face service.
+numpy==2.5.4
