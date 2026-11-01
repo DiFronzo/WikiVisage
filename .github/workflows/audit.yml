@@ -63,7 +63,7 @@ jobs:
       # output format and fail this check on unchanged dependencies. Bump both
       # together.
       - name: Install uv
-        uses: astral-sh/setup-uv@v10.3.2
+        uses: astral-sh/setup-uv@v10.3.3
         with:
           version: "0.13.5"
           enable-cache: true
