@@ -42,7 +42,7 @@ kserve==0.21.0
 # Stored embeddings depend on the weights and on backend.py's preprocessing and
 # alignment, not on these library versions, but pin them anyway: float32
 # results can shift in the last digits between ONNX Runtime releases.
-onnxruntime==1.31.0
+onnxruntime==1.31.1
 # Headless: no GUI/GL system libraries. Used only for resize and warpAffine.
 opencv-python-headless==5.0.0.93
 
