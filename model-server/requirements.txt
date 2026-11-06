@@ -91,7 +91,7 @@ numpy==2.5.4
     #   onnxruntime
     #   opencv-python-headless
     #   pandas
-oauthlib==4.0.0
+oauthlib==4.0.1
     # via requests-oauthlib
 onnxruntime==1.31.0
     # via -r requirements.in
@@ -159,8 +159,6 @@ requests==2.34.2
     #   requests-oauthlib
 requests-oauthlib==2.0.0
     # via kubernetes
-setuptools==84.2.1
-    # via grpcio-tools
 six==1.17.0
     # via
     #   kserve
@@ -197,7 +195,7 @@ urllib3==2.8.0
     #   kserve
     #   kubernetes
     #   requests
-uvicorn==0.54.0
+uvicorn[standard]==0.54.0
     # via kserve
 uvloop==0.23.0
     # via uvicorn
