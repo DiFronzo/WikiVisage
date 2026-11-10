@@ -58,9 +58,10 @@ numpy==2.5.4
     # via
     #   -c model-server/requirements.txt
     #   -r requirements.in
-oauthlib==4.0.0
+oauthlib==4.0.1
     # via
     #   -c model-server/requirements.txt
+    #   -r requirements.in
     #   requests-oauthlib
 ordered-set==4.1.0
     # via flask-limiter
