@@ -124,7 +124,7 @@ protobuf==6.33.6
     #   onnxruntime
 psutil==5.9.8
     # via kserve
-pyasn1==0.6.4
+pyasn1==0.6.5
     # via kserve
 pycparser==3.12
     # via cffi
