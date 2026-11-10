@@ -31,6 +31,7 @@ Werkzeug>=3.1.9
 
 # OAuth 2.0
 requests-oauthlib==2.0.0
+oauthlib>=4.0.1
 requests>=2.34.2
 
 # Database

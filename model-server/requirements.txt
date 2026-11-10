@@ -91,8 +91,10 @@ numpy==2.5.4
     #   onnxruntime
     #   opencv-python-headless
     #   pandas
-oauthlib==4.0.0
-    # via requests-oauthlib
+oauthlib==4.0.1
+    # via
+    #   -r requirements.in
+    #   requests-oauthlib
 onnxruntime==1.31.0
     # via -r requirements.in
 opencv-python-headless==5.0.0.93
