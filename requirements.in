@@ -35,7 +35,7 @@ oauthlib>=4.0.1
 requests>=2.34.2
 
 # Database
-PyMySQL==1.2.3
+PyMySQL==1.2.4
 cryptography>=50.0.2
 
 # Numerics
