@@ -29,6 +29,8 @@
 kserve==0.21.0
 # requests-oauthlib is pulled in transitively; keep its OAuthLib dependency patched.
 oauthlib>=4.0.1
+# FastAPI pulls this in transitively; keep it at the CVE-2026-126360 fixed version or newer.
+opentelemetry-api>=1.45.2
 # protobuf is deliberately not pinned here. kserve >=0.21 already requires
 # >=6.33.5,<7 (onnxruntime requires >=4.25.8), so the lock cannot leave the
 # 6.33.x line; an explicit `protobuf==` line only gave Dependabot a requirement
