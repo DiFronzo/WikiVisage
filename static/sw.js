@@ -12,7 +12,9 @@
  * designed for offline use (requires DB, OAuth, Commons API).
  */
 
-const CACHE_NAME = "wikivisage-v2";
+/* Bump this whenever the caching rules below change: activate deletes every other
+ * cache, so existing clients drop their stale copies instead of keeping them. */
+const CACHE_NAME = "wikivisage-v3";
 
 /* Not cached up front: shared scripts must always match the page that loads them. */
 const PRECACHE_URLS = [
@@ -29,7 +31,7 @@ self.addEventListener("install", (event) => {
   event.waitUntil(
     caches.open(CACHE_NAME).then((cache) => cache.addAll(PRECACHE_URLS))
   );
-  self.skipWaiting();
+  event.waitUntil(self.skipWaiting());
 });
 
 /* Activate — clean up old caches */
@@ -67,7 +69,24 @@ self.addEventListener("fetch", (event) => {
         .then((response) => {
           if (response && response.ok) {
             const copy = response.clone();
-            caches.open(CACHE_NAME).then((cache) => cache.put(event.request, copy));
+            /* Templates ask for a new ?v=<release> URL after every update, so the cache
+               would keep one copy per release for ever. Keep only the version just
+               fetched. waitUntil lets the worker finish the write after the response
+               has been handed to the page. */
+            event.waitUntil(
+              caches.open(CACHE_NAME).then(async (cache) => {
+                await cache.put(event.request, copy);
+                const keys = await cache.keys();
+                await Promise.all(
+                  keys
+                    .filter((key) => {
+                      const cachedUrl = new URL(key.url);
+                      return cachedUrl.pathname === url.pathname && key.url !== event.request.url;
+                    })
+                    .map((key) => cache.delete(key))
+                );
+              })
+            );
             return response;
           }
           if (response && response.status >= 500) {

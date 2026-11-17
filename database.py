@@ -50,6 +50,23 @@ class ConfigurationError(DatabaseError):
     """Raised when database configuration is invalid or missing."""
 
 
+def is_transient_error(error: BaseException) -> bool:
+    """True when *error* came from the server or the socket, not from our own code.
+
+    ``execute_transaction`` re-raises every failure as ``DatabaseError``, so a
+    caller that wants to retry a deadlock or a lost connection — and to treat a
+    genuine bug in its own callback as permanent — has to walk the cause chain.
+    A deadlock (1213), a lock-wait timeout (1205), a lost connection (2013) and
+    a dropped socket all arrive as ``OperationalError``/``InterfaceError``.
+    """
+    cause: BaseException | None = error
+    while cause is not None:
+        if isinstance(cause, (InterfaceError, OperationalError)):
+            return True
+        cause = cause.__cause__
+    return False
+
+
 def _get_db_config() -> dict[str, Any]:
     """
     Retrieve database configuration from environment variables.
@@ -100,6 +117,21 @@ class _PooledConnection:
         return (time.monotonic() - self.created_at) >= MAX_CONNECTION_AGE
 
 
+class _DeadSlot:
+    """Pool entry standing in for a connection that could not be replaced yet.
+
+    Evicting a dead connection frees a slot.  If the replacement cannot be
+    created right away (database outage), putting this sentinel back keeps the
+    capacity accounted for: the next caller that takes it tries again instead
+    of leaving the pool permanently smaller.
+    """
+
+    __slots__ = ()
+
+
+_DEAD_SLOT = _DeadSlot()
+
+
 def _create_connection() -> _PooledConnection:
     try:
         conn = pymysql.connect(**_db_config)
@@ -110,7 +142,9 @@ def _create_connection() -> _PooledConnection:
         raise DatabaseError(f"Could not connect to database: {e}") from e
 
 
-def _close_quietly(pc: _PooledConnection) -> None:
+def _close_quietly(pc: _PooledConnection | _DeadSlot) -> None:
+    if isinstance(pc, _DeadSlot):
+        return
     try:
         pc.conn.close()
     except Exception:
@@ -142,15 +176,39 @@ def _get_connection_from_pool(timeout: float = 30.0) -> _PooledConnection:
             f"Connection pool exhausted after {timeout}s timeout. Consider increasing pool size or reducing query time."
         )
 
+    if isinstance(pc, _DeadSlot):
+        # A previous caller evicted a dead connection and could not create a
+        # replacement.  Try again now; keep the slot reserved on failure so the
+        # pool can still recover later.
+        try:
+            return _create_connection()
+        except Exception:
+            _put_dead_slot_back()
+            raise
+
     if _is_connection_healthy(pc):
         return pc
 
-    # Connection is dead or expired — close it and create a fresh one.
-    # If creation fails, the pool shrinks by one slot.  This is intentional:
-    # re-pooling a dead connection just poisons the next caller.
+    # Connection is dead or expired — close it and create a fresh one.  When
+    # creation fails (outage), the slot stays reserved as a dead slot instead
+    # of shrinking the pool for the rest of the process lifetime.
     _close_quietly(pc)
     logger.warning("Evicted dead/expired connection from pool, creating replacement")
-    return _create_connection()
+    try:
+        return _create_connection()
+    except Exception:
+        _put_dead_slot_back()
+        raise
+
+
+def _put_dead_slot_back() -> None:
+    """Reserve an empty pool slot for a connection that could not be replaced."""
+    if _pool is None:
+        return
+    try:
+        _pool.put_nowait(_DEAD_SLOT)
+    except Full:
+        pass
 
 
 def _try_replenish_pool() -> None:
@@ -172,6 +230,8 @@ def _try_replenish_pool() -> None:
             _close_quietly(fresh)
     except Exception as e:
         logger.warning(f"Could not replenish pool after discarding connection: {e}")
+        # Keep the slot accounted for so the next caller retries creation.
+        _put_dead_slot_back()
 
 
 def _return_connection_to_pool(pc: _PooledConnection) -> None:
@@ -303,6 +363,11 @@ def execute_query(
     Raises:
         DatabaseError: If query execution fails.
 
+    Reads retry (up to ``MAX_RETRIES`` with backoff); writes do not. Replaying a
+    write whose reply was lost can duplicate an INSERT or bump a counter twice,
+    so a failed write surfaces as ``DatabaseError`` and the caller decides. Use
+    ``is_transient_error()`` to tell a server-side blip from a bug in the SQL.
+
     Example:
         # SELECT query
         users = execute_query("SELECT * FROM users WHERE id = %s", (user_id,))
@@ -330,7 +395,7 @@ def execute_query(
                 return affected
 
     try:
-        return _execute_with_retry(_execute)
+        return _execute_with_retry(_execute, allow_retry=fetch)
     except Exception as e:
         logger.error(f"Query execution failed: {sql[:100]}... Error: {e}")
         raise DatabaseError(f"Query execution failed: {e}") from e
@@ -562,6 +627,8 @@ def close_pool() -> None:
     while not _pool.empty():
         try:
             pc = _pool.get_nowait()
+            if isinstance(pc, _DeadSlot):
+                continue  # a placeholder for a discarded connection, not a live one
             _close_quietly(pc)
             closed_count += 1
         except Empty:

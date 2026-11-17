@@ -23,12 +23,17 @@ import os
 logger = logging.getLogger(__name__)
 
 
-class TokenDecryptionError(Exception):
-    """Raised when a Fernet-encrypted token cannot be decrypted.
+# Defined only on the first import: ``importlib.reload`` (tests do it to re-read the
+# key) re-executes this module in the same namespace, and a second class object would
+# no longer be caught by an ``except TokenDecryptionError`` bound before the reload.
+if "TokenDecryptionError" not in globals():
 
-    This indicates either a wrong/rotated key or corrupted ciphertext.
-    Callers should treat this as a fatal auth failure and trigger re-authentication.
-    """
+    class TokenDecryptionError(Exception):
+        """Raised when a Fernet-encrypted token cannot be decrypted.
+
+        This indicates either a wrong/rotated key or corrupted ciphertext.
+        Callers should treat this as a fatal auth failure and trigger re-authentication.
+        """
 
 
 _fernet = None

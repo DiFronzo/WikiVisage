@@ -386,7 +386,8 @@
                             {{ _('Category:') }} {{ project.commons_category }}
                         </p>
                         
-                        <span class="badge badge-{{ project.status }}">{{ project.status }}</span>
+                        {% set status_labels = {'active': _('Active'), 'paused': _('Paused'), 'completed': _('Completed')} %}
+                        <span class="badge badge-{{ project.status }}">{{ status_labels.get(project.status, project.status) }}</span>
                         {% if member_counts.get(project.id, 0) > 0 %}
                             <span class="badge" style="background: var(--surface); border: 1px solid var(--border); color: var(--text-muted); font-size: 0.7rem;">
                                 {{ ngettext('%(num)d collaborator', '%(num)d collaborators', member_counts[project.id], num=member_counts[project.id]) }}
@@ -406,7 +407,7 @@
                             <div class="dash-progress">
                                 <div class="dash-progress-bar" style="width: 100%;"></div>
                             </div>
-                            <span class="dash-progress-label dash-progress-complete">{{ _('Complete') }} &mdash; {{ _('%(num)d images processed', num=project.images_total) }}</span>
+                            <span class="dash-progress-label dash-progress-complete">{{ _('Complete') }} &mdash; {{ ngettext('%(num)d image processed', '%(num)d images processed', project.images_total, num=project.images_total) }}</span>
                         {% else %}
                             {% set pct = (project.images_processed / project.images_total * 100) %}
                             <div class="dash-progress">
@@ -443,7 +444,7 @@
     </div>
 
     {% if total_pages > 1 %}
-    <nav class="pagination">
+    <nav class="pagination" aria-label="{{ _('Pages') }}">
         {% if page > 1 %}
             <a href="{{ url_for('dashboard', page=page-1) }}">&laquo; {{ _('Prev') }}</a>
         {% else %}
@@ -452,7 +453,7 @@
 
         {% for p in range(1, total_pages + 1) %}
             {% if p == page %}
-                <span class="active">{{ p }}</span>
+                <span class="active" aria-current="page">{{ p }}</span>
             {% elif p == 1 or p == total_pages or (p >= page - 2 and p <= page + 2) %}
                 <a href="{{ url_for('dashboard', page=p) }}">{{ p }}</a>
             {% elif p == 2 and page > 4 %}

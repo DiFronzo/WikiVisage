@@ -58,6 +58,7 @@ from database import (
     execute_query,
     execute_transaction,
     init_db,
+    is_transient_error,
     open_dedicated_connection,
 )
 from face_client import FaceServiceError, FaceServiceModelMismatch, FaceServiceRejected
@@ -453,30 +454,40 @@ def _heartbeat_loop() -> None:
         beat.conn.close()
 
 
-def _create_session() -> requests.Session:
-    """Create a requests session with exponential backoff retries and connection pooling."""
+def _create_session(*, retry: bool = True) -> requests.Session:
+    """Create a requests session with connection pooling and optional retries.
+
+    ``retry=False`` is for writes: a ``wbeditentity`` POST that timed out may
+    already have been applied, so replaying it can add a duplicate claim. The
+    next run's ``wbgetclaims`` idempotency check recovers a lost response.
+    """
     session = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT})
-    retries = Retry(
-        total=5,
-        backoff_factor=2,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["HEAD", "GET", "OPTIONS", "POST"],
-        # Once the retries are used up, hand back the last response instead of raising RetryError, which
-        # carries no response: every caller calls raise_for_status(), so it sees the real status (a
-        # download that is still rate limited after the retries must stay recognisable as a 429).
-        raise_on_status=False,
-    )
+    if retry:
+        retries = Retry(
+            total=5,
+            backoff_factor=2,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["HEAD", "GET", "OPTIONS", "POST"],
+            # Once the retries are used up, hand back the last response instead of raising RetryError, which
+            # carries no response: every caller calls raise_for_status(), so it sees the real status (a
+            # download that is still rate limited after the retries must stay recognisable as a 429).
+            raise_on_status=False,
+        )
+    else:
+        retries = Retry(total=0)
     adapter = HTTPAdapter(max_retries=retries, pool_connections=10, pool_maxsize=20)
     session.mount("http://", adapter)
     session.mount("https://", adapter)
     return session
 
 
-# Module-level singleton session — reuses TCP connections and TLS state across all
+# Module-level singleton sessions — they reuse TCP connections and TLS state across all
 # HTTP requests, avoiding the ~100ms+ overhead of per-request Session creation.
 _http_session: requests.Session | None = None
 _http_session_lock = threading.Lock()
+_no_retry_session: requests.Session | None = None
+_no_retry_session_lock = threading.Lock()
 
 
 def _get_session() -> requests.Session:
@@ -489,6 +500,25 @@ def _get_session() -> requests.Session:
     return _http_session
 
 
+def _get_no_retry_session() -> requests.Session:
+    """Return the singleton session that never retries a request on its own."""
+    global _no_retry_session
+    if _no_retry_session is None:
+        with _no_retry_session_lock:
+            if _no_retry_session is None:
+                _no_retry_session = _create_session(retry=False)
+    return _no_retry_session
+
+
+def _sleep_unless_shutdown(seconds: float) -> None:
+    """Sleep in one-second slices, returning early when a shutdown is requested."""
+    remaining = max(0.0, seconds)
+    while remaining > 0 and not shutdown_requested:
+        step = min(1.0, remaining)
+        time.sleep(step)
+        remaining -= step
+
+
 def _api_request(
     url: str,
     params: dict[str, Any] | None = None,
@@ -496,15 +526,27 @@ def _api_request(
     method: str = "get",
     data: dict[str, Any] | None = None,
     timeout: int = 30,
+    retry: bool = True,
 ) -> requests.Response:
-    """Central HTTP request function with maxlag handling."""
-    session = _get_session()
+    """Central HTTP request function with maxlag handling.
+
+    ``retry=False`` is used for Commons writes (``wbeditentity``,
+    ``wbremoveclaims``): a POST whose response was lost may already have been
+    applied, so it is sent exactly once and the next run's ``wbgetclaims``
+    check recovers. A maxlag rejection is the server explicitly declining the
+    edit (never an applied write), so it is still waited out and retried.
+    """
+    session = _get_session() if retry else _get_no_retry_session()
 
     headers = headers or {}
     if "User-Agent" not in headers:
         headers["User-Agent"] = USER_AGENT
 
-    for _ in range(3):
+    attempts = 3 if retry else 1
+    attempts_left = attempts
+    maxlag_waits = 3
+    last_error: Exception | None = None
+    while attempts_left > 0:
         _mark_progress("api_request")
         if shutdown_requested:
             raise InterruptedError("Worker shutting down")
@@ -526,10 +568,15 @@ def _api_request(
                     retry_after = float(retry_after_header)
                 except (TypeError, ValueError):
                     retry_after = 5.0
+                maxlag_waits -= 1
+                if maxlag_waits <= 0:
+                    logger.error(f"Maxlag persisted for {attempts} request(s): {url}")
+                    resp.close()
+                    raise Exception(f"Repeated maxlag responses from {url}")
                 logger.warning(f"Maxlag encountered (503). Sleeping for {retry_after} seconds.")
                 resp.close()
                 _mark_progress("api_maxlag_sleep")
-                time.sleep(retry_after)
+                _sleep_unless_shutdown(retry_after)
                 continue
 
             resp.raise_for_status()
@@ -544,21 +591,29 @@ def _api_request(
                             retry_after = float(retry_after_header)
                         except (TypeError, ValueError):
                             retry_after = 5.0
+                        maxlag_waits -= 1
+                        if maxlag_waits <= 0:
+                            logger.error(f"Maxlag persisted for {attempts} request(s): {url}")
+                            resp.close()
+                            raise Exception(f"Repeated maxlag responses from {url}")
                         logger.warning(f"Maxlag encountered (200). Sleeping for {retry_after} seconds.")
                         resp.close()
                         _mark_progress("api_maxlag_sleep")
-                        time.sleep(retry_after)
+                        _sleep_unless_shutdown(retry_after)
                         continue
                 except ValueError:
                     pass
 
             return resp
         except requests.exceptions.RequestException as e:
+            last_error = e
             logger.error(f"HTTP Request failed: {e}")
-            _mark_progress("api_retry_sleep")
-            time.sleep(5)
+            attempts_left -= 1
+            if attempts_left > 0:
+                _mark_progress("api_retry_sleep")
+                _sleep_unless_shutdown(5)
 
-    raise Exception(f"Failed to execute API request after 3 attempts: {url}")
+    raise Exception(f"Failed to execute API request after {attempts} attempts: {url}") from last_error
 
 
 # Hosts a Commons media download may legitimately resolve to. Wikimedia splits
@@ -731,6 +786,30 @@ def _refresh_images_total(project_id: int) -> None:
         logger.warning(f"Could not update the image total of project {project_id}: {exc}")
 
 
+def _collect_category_page(
+    project_id: int,
+    members: list[dict[str, Any]],
+    visited_cats: set[str],
+    cat_queue: list[str],
+) -> list[tuple[int, int, str]]:
+    """Split one API page into subcategories to visit and image rows to insert."""
+    new_files: list[tuple[int, int, str]] = []
+    for member in members:
+        ns = member.get("ns", 0)
+        if ns == 14:
+            # Subcategory — queue for traversal
+            subcat_title = member["title"]
+            if subcat_title not in visited_cats:
+                cat_queue.append(subcat_title)
+        elif ns == 6:
+            # File — collect for batch insert (skip video/audio)
+            file_title = member["title"]
+            if os.path.splitext(file_title)[1].lower() in _SKIP_EXTENSIONS:
+                continue
+            new_files.append((project_id, member["pageid"], file_title))
+    return new_files
+
+
 def traverse_category(project: dict[str, Any]) -> int:
     """Fetch all files in the project's Commons category (including subcategories) and insert them as pending."""
     _mark_progress("traverse_category")
@@ -760,6 +839,7 @@ def traverse_category(project: dict[str, Any]) -> int:
     visited_cats = set()
     cat_queue = [root_category]
     max_categories = 200
+    fetched_any = False
 
     while cat_queue and not shutdown_requested:
         if added_count >= remaining:
@@ -798,24 +878,12 @@ def traverse_category(project: dict[str, Any]) -> int:
             try:
                 resp = _api_request(COMMONS_API_URL, params=params)
                 data = resp.json()
+                if "error" in data:
+                    raise RuntimeError(f"Commons API error: {data['error']}")
+                fetched_any = True
 
                 members = data.get("query", {}).get("categorymembers", [])
-                new_files = []  # Collect file tuples for batch insert
-                for member in members:
-                    ns = member.get("ns", 0)
-
-                    if ns == 14:
-                        # Subcategory — queue for traversal
-                        subcat_title = member["title"]
-                        if subcat_title not in visited_cats:
-                            cat_queue.append(subcat_title)
-                    elif ns == 6:
-                        # File — collect for batch insert (skip video/audio)
-                        file_title = member["title"]
-                        ext = os.path.splitext(file_title)[1].lower()
-                        if ext in _SKIP_EXTENSIONS:
-                            continue
-                        new_files.append((project["id"], member["pageid"], file_title))
+                new_files = _collect_category_page(project["id"], members, visited_cats, cat_queue)
 
                 # Trim batch to stay within per-project image limit
                 space_left = remaining - added_count
@@ -849,6 +917,7 @@ def traverse_category(project: dict[str, Any]) -> int:
 
             except Exception as e:
                 logger.error(f"Category traversal failed for {category}: {e}")
+                project["crawl_failed"] = True
                 break
 
         logger.info(
@@ -857,6 +926,12 @@ def traverse_category(project: dict[str, Any]) -> int:
         )
 
     _refresh_images_total(project["id"])
+
+    # A crawl that never got a single successful page (or lost a page part-way)
+    # must not let the project auto-complete as "no faces": the images are
+    # simply unknown.  process_project checks this flag before completing.
+    if not fetched_any or shutdown_requested:
+        project["crawl_failed"] = True
 
     return added_count
 
@@ -952,68 +1027,88 @@ def _persist_detection(
         detection_size = stored_size
 
     try:
-        # Batch-insert detected faces in chunks to stay within max_allowed_packet.
-        # All faces start unclassified (is_target=NULL). Classification
-        # happens via human confirmation or autonomous inference.
-        if face_locations:
-            FACE_INSERT_CHUNK = 100  # ~200KB per chunk (2048-byte embedding + ints)
-            for chunk_start in range(0, face_count, FACE_INSERT_CHUNK):
-                chunk_locs = face_locations[chunk_start : chunk_start + FACE_INSERT_CHUNK]
-                chunk_encs = encodings_bytes[chunk_start : chunk_start + FACE_INSERT_CHUNK]
-                chunk_scores = scores[chunk_start : chunk_start + FACE_INSERT_CHUNK]
-                chunk_size = len(chunk_locs)
-                placeholders = ", ".join(["(%s, %s, %s, %s, %s, %s, %s, %s)"] * chunk_size)
-                flat_params: list = []
-                for location, enc_bytes, score in zip(chunk_locs, chunk_encs, chunk_scores):
-                    top, right, bottom, left = location
-                    flat_params.extend([img_id, enc_bytes, result.model_id, score, top, right, bottom, left])
 
-                execute_query(
-                    f"INSERT INTO faces "
-                    f"(image_id, encoding, embedding_model, det_score, bbox_top, bbox_right, bbox_bottom, bbox_left) "
-                    f"VALUES {placeholders}",
-                    tuple(flat_params),
-                    fetch=False,
-                )
-
-        execute_query(
-            "UPDATE images SET status = 'processed', face_count = %s, "
-            "detection_width = %s, detection_height = %s WHERE id = %s",
-            (face_count, detection_size[0], detection_size[1], img_id),
-            fetch=False,
-        )
-
-        # Auto-classify single-face bootstrapped images as target matches.
-        # These images already have a P180 depicts claim on Commons, so the
-        # single detected face is overwhelmingly likely to be the target person.
-        # Multi-face bootstrapped images are left for manual classification.
-        if bootstrapped and face_count == 1 and project_id is not None:
-            auto_classified = execute_query(
-                "UPDATE faces SET is_target = 1, classified_by = 'bootstrap', "
-                "sdc_removal_pending = 0, classified_at = NOW() "
-                "WHERE image_id = %s AND is_target IS NULL AND superseded_by IS NULL",
+        def _store(conn: Any, cursor: Any) -> int:
+            # A retry after an ambiguous commit (the connection died while COMMIT
+            # was being acknowledged) must not double this image's faces. A
+            # pending image has no legitimate faces, so anything here is left
+            # over from the attempt that failed.
+            cursor.execute(
+                "DELETE f FROM faces f JOIN images i ON f.image_id = i.id WHERE i.id = %s AND i.status = 'pending'",
                 (img_id,),
-                fetch=False,
             )
-            if auto_classified:
-                execute_query(
-                    "UPDATE projects SET faces_confirmed = faces_confirmed + %s WHERE id = %s",
-                    (auto_classified, project_id),
-                    fetch=False,
-                )
-                # Mark as sdc_written — this image already has P180 on Commons,
-                # so there's nothing to write.  Prevents showing as SDC pending.
-                execute_query(
-                    "UPDATE faces SET sdc_written = 1 "
-                    "WHERE image_id = %s AND is_target = 1 AND classified_by = 'bootstrap' "
-                    "AND sdc_written = 0 AND superseded_by IS NULL",
+            # Batch-insert detected faces in chunks to stay within max_allowed_packet.
+            # All faces start unclassified (is_target=NULL). Classification
+            # happens via human confirmation or autonomous inference.
+            if face_locations:
+                FACE_INSERT_CHUNK = 100  # ~200KB per chunk (2048-byte embedding + ints)
+                for chunk_start in range(0, face_count, FACE_INSERT_CHUNK):
+                    chunk_locs = face_locations[chunk_start : chunk_start + FACE_INSERT_CHUNK]
+                    chunk_encs = encodings_bytes[chunk_start : chunk_start + FACE_INSERT_CHUNK]
+                    chunk_scores = scores[chunk_start : chunk_start + FACE_INSERT_CHUNK]
+                    chunk_size = len(chunk_locs)
+                    placeholders = ", ".join(["(%s, %s, %s, %s, %s, %s, %s, %s)"] * chunk_size)
+                    flat_params: list = []
+                    for location, enc_bytes, score in zip(chunk_locs, chunk_encs, chunk_scores):
+                        top, right, bottom, left = location
+                        flat_params.extend([img_id, enc_bytes, result.model_id, score, top, right, bottom, left])
+
+                    cursor.execute(
+                        f"INSERT INTO faces "
+                        f"(image_id, encoding, embedding_model, det_score, bbox_top, bbox_right, bbox_bottom, bbox_left) "
+                        f"VALUES {placeholders}",
+                        tuple(flat_params),
+                    )
+
+            cursor.execute(
+                "UPDATE images SET status = 'processed', face_count = %s, "
+                "detection_width = %s, detection_height = %s WHERE id = %s",
+                (face_count, detection_size[0], detection_size[1], img_id),
+            )
+
+            # Auto-classify single-face bootstrapped images as target matches.
+            # These images already have a P180 depicts claim on Commons, so the
+            # single detected face is overwhelmingly likely to be the target person.
+            # Multi-face bootstrapped images are left for manual classification.
+            auto_classified = 0
+            if bootstrapped and face_count == 1 and project_id is not None:
+                cursor.execute(
+                    "UPDATE faces SET is_target = 1, classified_by = 'bootstrap', "
+                    "sdc_removal_pending = 0, classified_at = NOW() "
+                    "WHERE image_id = %s AND is_target IS NULL AND superseded_by IS NULL",
                     (img_id,),
-                    fetch=False,
                 )
-                logger.info(f"Auto-classified {auto_classified} face(s) on bootstrapped image {img_id} as target")
+                auto_classified = cursor.rowcount
+                if auto_classified:
+                    cursor.execute(
+                        "UPDATE projects SET faces_confirmed = faces_confirmed + %s WHERE id = %s",
+                        (auto_classified, project_id),
+                    )
+                    # Mark as sdc_written — this image already has P180 on Commons,
+                    # so there's nothing to write.  Prevents showing as SDC pending.
+                    cursor.execute(
+                        "UPDATE faces SET sdc_written = 1 "
+                        "WHERE image_id = %s AND is_target = 1 AND classified_by = 'bootstrap' "
+                        "AND sdc_written = 0 AND superseded_by IS NULL",
+                        (img_id,),
+                    )
+            return auto_classified
+
+        # One transaction: a failure part-way cannot leave duplicate face rows
+        # behind while the image stays pending (a retry would insert them again).
+        auto_classified = execute_transaction(_store)
+        if auto_classified:
+            logger.info(f"Auto-classified {auto_classified} face(s) on bootstrapped image {img_id} as target")
 
         return True
     except Exception as e:
+        if is_transient_error(e):
+            # A deadlock, a lock-wait timeout or a dropped connection says nothing
+            # about the image. Leave it pending so the next cycle retries it:
+            # marking it 'error' would write off a perfectly good file for a
+            # database blip. No strike either — the image was never at fault.
+            logger.warning(f"Could not store faces for image {img_id}, leaving it pending: {e}")
+            return False
         logger.error(f"Error storing faces for image {img_id}: {e}")
         _mark_image_error(img_id, str(e))
         return False
@@ -1481,6 +1576,27 @@ def process_images(project: dict[str, Any]) -> int:
     return processed_count
 
 
+def _load_existing_images(project_id: int, page_ids: list[int]) -> dict[int, dict[str, Any]]:
+    """Load this project's image rows for *page_ids*, one query per 200 ids.
+
+    One lookup per search page instead of one SELECT per result: an established
+    project mostly revisits known images every cycle.
+    """
+    existing: dict[int, dict[str, Any]] = {}
+    for chunk_start in range(0, len(page_ids), 200):
+        chunk = page_ids[chunk_start : chunk_start + 200]
+        placeholders = ",".join(["%s"] * len(chunk))
+        rows = execute_query(
+            f"SELECT id, commons_page_id, status FROM images "
+            f"WHERE project_id = %s AND commons_page_id IN ({placeholders})",
+            (project_id, *chunk),
+            fetch=True,
+        )
+        for row in rows or ():
+            existing[row["commons_page_id"]] = row
+    return existing
+
+
 def bootstrap_from_sparql(project: dict[str, Any]) -> int:
     """Bootstrap a project using images already linked to the QID via P180.
 
@@ -1535,6 +1651,10 @@ def bootstrap_from_sparql(project: dict[str, Any]) -> int:
             if not results:
                 break
 
+            # One lookup per search page instead of one SELECT per result: an
+            # established project mostly revisits known images every cycle.
+            existing_by_page = _load_existing_images(project["id"], [r["pageid"] for r in results if r.get("pageid")])
+
             for result in results:
                 if shutdown_requested:
                     break
@@ -1551,15 +1671,11 @@ def bootstrap_from_sparql(project: dict[str, Any]) -> int:
                 if ext in _SKIP_EXTENSIONS:
                     continue
 
-                exists = execute_query(
-                    "SELECT id, status FROM images WHERE project_id = %s AND commons_page_id = %s",
-                    (project["id"], page_id),
-                    fetch=True,
-                )
+                exists = existing_by_page.get(page_id)
 
                 if exists:
-                    image_id = exists[0]["id"]
-                    img_status = exists[0]["status"]
+                    image_id = exists["id"]
+                    img_status = exists["status"]
 
                     # Flag as bootstrapped regardless of current status —
                     # ensures all P180 images are marked so they don't show
@@ -1702,31 +1818,60 @@ def _fetch_metadata(titles: list[str]) -> dict[str, dict[str, Any]]:
     """
     if not titles:
         return {}
-    try:
-        response = _api_request(
+    form = {
+        "action": "query",
+        "format": "json",
+        "formatversion": "2",
+        "prop": "imageinfo|categories",
+        "iiprop": "extmetadata|mime",
+        "cllimit": "50",
+        "maxlag": "5",
+        "titles": "|".join(titles),
+    }
+
+    def _request(extra: dict[str, Any] | None = None) -> dict[str, Any]:
+        return _api_request(
             COMMONS_API_URL,
             method="post",
-            data={
-                "action": "query",
-                "format": "json",
-                "formatversion": "2",
-                "prop": "imageinfo|categories",
-                "iiprop": "extmetadata|mime",
-                "cllimit": "50",
-                "maxlag": "5",
-                "titles": "|".join(titles),
-            },
+            data={**form, **(extra or {})},
             timeout=30,
-        )
-        data = response.json()
+        ).json()
+
+    try:
+        data = _request()
+        # Follow the category continuation (``clcontinue``): with 20 files a
+        # single page returns at most 50 categories in total, so well
+        # categorised files used to reach the model with only a prefix of
+        # their categories.
+        categories_by_title: dict[str, list[dict[str, Any]]] = {}
+        raw_pages = data.get("query", {}).get("pages") or []
+        if isinstance(raw_pages, dict):
+            raw_pages = list(raw_pages.values())
+        pages: list[dict[str, Any]] = list(raw_pages)
+        for page in pages:
+            if page.get("title"):
+                categories_by_title.setdefault(page["title"], []).extend(page.get("categories") or [])
+        for _ in range(5):
+            continuation = data.get("continue") or {}
+            if "clcontinue" not in continuation:
+                break
+            data = _request(continuation)
+            extra_pages = data.get("query", {}).get("pages") or []
+            if isinstance(extra_pages, dict):
+                extra_pages = list(extra_pages.values())
+            for page in extra_pages:
+                if page.get("title"):
+                    categories_by_title.setdefault(page["title"], []).extend(page.get("categories") or [])
     except Exception as exc:
         logger.warning(f"Pre-filter: Commons metadata request failed: {exc}")
         return {}
 
-    pages = data.get("query", {}).get("pages", [])
-    if isinstance(pages, dict):
-        pages = list(pages.values())
     by_title: dict[str, dict[str, Any]] = {page["title"]: page for page in pages if page.get("title")}
+    for title, categories in categories_by_title.items():
+        if title in by_title:
+            by_title[title]["categories"] = categories
+        else:
+            by_title[title] = {"title": title, "categories": categories}
 
     # The API answers under canonical titles (e.g. spaces instead of
     # underscores, first letter capitalised) and lists the corrections in
@@ -1965,6 +2110,10 @@ def _claim_shadow_project() -> dict[str, Any] | None:
             "UPDATE projects SET worker_claimed_by = %s, worker_claimed_at = NOW() WHERE id = %s",
             (_worker_id, project_id),
         )
+        # The sweep releases through _release_project, so it must hold a local
+        # reference too. Without one, an SDC request that arrives mid-sweep and
+        # sees this worker's claim would lose it when the sweep finished.
+        _retain_claim(project_id)
         cursor.execute("SELECT p.* FROM projects p WHERE p.id = %s", (project_id,))
         return dict(cursor.fetchone())
 
@@ -2343,11 +2492,24 @@ _SDC_ERROR_MESSAGES: dict[str, str] = {
     "readonly": "The Wikimedia database is currently in read-only mode. Please try again later.",
     "maxlag": "The Wikimedia servers are busy. Please try again later.",
     "no-such-entity": "A Commons file was deleted or its structured data entity does not exist. The file was skipped.",
+    "no-such-claim": "The P180 claim was already removed from the Commons file. The file was skipped.",
+    "no-such-statement": "The P180 statement was already removed from the Commons file. The file was skipped.",
+    "notfound": "The Commons file or claim was not found. The file was skipped.",
 }
 
-# Errors that affect a single entity (file/page) rather than the entire session.
-# These are skipped per-face instead of aborting the whole write batch.
-_SDC_PER_FACE_SKIP_ERRORS = frozenset({"no-such-entity"})
+# Errors that mean the page itself is gone. They affect a single entity rather
+# than the whole session, so they are skipped per-face instead of aborting the
+# batch: no claim can be written to or read from a deleted file, and retrying it
+# forever would hold the run open.
+_SDC_MISSING_PAGE_ERRORS = frozenset({"no-such-entity"})
+
+# The same, plus the claim-level codes. Only the removal phase may treat these as
+# success: there they mean the P180 claim this run wanted to delete is already
+# gone, which is the outcome the user asked for. On the write side
+# 'no-such-claim'/'no-such-statement'/'notfound' mean the claim the run tried to
+# create does not exist, so marking the face written would report a P180 claim
+# that is not on Commons and never retry it.
+_SDC_MISSING_CLAIM_ERRORS = _SDC_MISSING_PAGE_ERRORS | {"no-such-claim", "no-such-statement", "notfound"}
 
 
 def _sdc_error_message(error_code: str, error_info: str) -> str:
@@ -2610,8 +2772,16 @@ class _SdcRun:
         mid: str,
         step: str,
         on_skippable: Callable[[str], _Step],
+        skippable: frozenset[str] = _SDC_MISSING_PAGE_ERRORS,
     ) -> _Step | None:
-        """Classify an error reply from Commons; None when the reply holds no error."""
+        """Classify an error reply from Commons; None when the reply holds no error.
+
+        ``skippable`` is the set of error codes that mean "this entity is already
+        in the state the step wanted". The write phase passes only
+        ``_SDC_MISSING_PAGE_ERRORS``; the removal phase widens it to
+        ``_SDC_MISSING_CLAIM_ERRORS``, because there an already-removed claim is
+        the desired outcome.
+        """
         error = reply.get("error")
         if not error:
             return None
@@ -2619,7 +2789,7 @@ class _SdcRun:
         info = error.get("info", "Unknown error")
         if code in _SDC_AUTH_ERRORS:
             return _Step.SKIPPED if self._refresh_credentials(code, info, step, mid) else _Step.STOP
-        if code in _SDC_PER_FACE_SKIP_ERRORS:
+        if code in skippable:
             return on_skippable(code)
         logger.error(f"SDC {step} error for {mid}: {error}")
         self.abort(_sdc_error_message(code, info))
@@ -2940,6 +3110,10 @@ class _SdcRun:
             },
             headers=self._headers,
             method="post",
+            # Sent once on purpose: if the reply is lost after Commons stored the
+            # claim, a replay would add the same P180 claim a second time. The
+            # next run's wbgetclaims check adopts the claim instead.
+            retry=False,
         )
         return response.json()
 
@@ -3012,6 +3186,7 @@ class _SdcRun:
                 mid=mid,
                 step="removal idempotency check",
                 on_skippable=lambda code: self._settle_removal(page_id, f"{code} during idempotency check"),
+                skippable=_SDC_MISSING_CLAIM_ERRORS,
             )
             if failure is not None:
                 return failure
@@ -3028,6 +3203,7 @@ class _SdcRun:
                 mid=mid,
                 step="removal",
                 on_skippable=lambda code: self._settle_removal(page_id, f"{code} during claim removal"),
+                skippable=_SDC_MISSING_CLAIM_ERRORS,
             )
             if failure is not None:
                 return failure
@@ -3058,6 +3234,10 @@ class _SdcRun:
             },
             headers=self._headers,
             method="post",
+            # Retries are safe here and worth keeping: removing a claim that is
+            # already gone answers 'no-such-claim', which the removal phase treats
+            # as the wanted outcome. One timeout must not abort a whole run.
+            retry=True,
         )
         return response.json()
 
@@ -3191,6 +3371,8 @@ def _claim_active_projects(max_count: int) -> list[dict[str, Any]]:
     try:
         result = execute_transaction(_txn)
         if result:
+            for project in result:
+                _retain_claim(project["id"])
             logger.info(f"Claimed {len(result)} active project(s): {[p['id'] for p in result]}")
         return result
     except DatabaseError:
@@ -3258,6 +3440,8 @@ def _claim_inference_projects(max_count: int) -> list[dict[str, Any]]:
     try:
         result = execute_transaction(_txn)
         if result:
+            for project in result:
+                _retain_claim(project["id"])
             logger.info(f"Claimed {len(result)} inference project(s): {[p['id'] for p in result]}")
         return result
     except DatabaseError:
@@ -3271,9 +3455,10 @@ def _claim_sdc_projects() -> tuple[list[dict[str, Any]], set[int]]:
     Returns:
         A tuple of ``(projects, pre_claimed_ids)`` where *pre_claimed_ids* is
         the set of project IDs that were **already** claimed by this worker
-        before this call (i.e. for active/inference processing).  Callers must
-        **not** release those claims when SDC writing finishes, as another
-        thread may still be processing them.
+        before this call (i.e. for active/inference processing). It is
+        informational: every claimed project also gets a local reference
+        (``_retain_claim``), and the matching ``_release_project`` call only
+        clears the database claim once no local thread uses it.
     """
 
     def _txn(conn: Any, cursor: Any) -> tuple[list[dict[str, Any]], set[int]]:
@@ -3310,6 +3495,8 @@ def _claim_sdc_projects() -> tuple[list[dict[str, Any]], set[int]]:
     try:
         result, pre_claimed_ids = execute_transaction(_txn)
         if result:
+            for project in result:
+                _retain_claim(project["id"])
             logger.info(f"Claimed {len(result)} SDC project(s): {[p['id'] for p in result]}")
         return result, pre_claimed_ids
     except DatabaseError:
@@ -3325,7 +3512,7 @@ def _process_sdc_writes() -> int:
     mid-cycle wake handler, inference loop).
     """
     _mark_progress("sdc_requests")
-    sdc_projects, pre_claimed_ids = _claim_sdc_projects()
+    sdc_projects, _pre_claimed_ids = _claim_sdc_projects()
     if not sdc_projects:
         return 0
     logger.info(f"Claimed {len(sdc_projects)} SDC project(s) for writing")
@@ -3359,16 +3546,43 @@ def _process_sdc_writes() -> int:
             except DatabaseError:
                 pass
         finally:
-            # Only release the claim if it was newly acquired for SDC writing.
-            # Pre-existing claims (from active/inference processing) must not be
-            # cleared here, as another thread may still be using them.
-            if sdc_project["id"] not in pre_claimed_ids:
-                _release_project(sdc_project["id"])
+            # Release this call's local reference.  When another thread still
+            # uses the claim (pre-claimed for active/inference work), the
+            # reference count keeps it in the database until that thread is done.
+            _release_project(sdc_project["id"])
     return total_written
 
 
+_claim_refs: dict[int, int] = {}
+_claim_refs_lock = threading.Lock()
+
+
+def _retain_claim(project_id: int) -> None:
+    """Record that one more local thread uses this worker's claim on *project_id*."""
+    with _claim_refs_lock:
+        _claim_refs[project_id] = _claim_refs.get(project_id, 0) + 1
+
+
+def _drop_claim_ref(project_id: int) -> int:
+    """Drop one local use of a claim; return how many remain (0 = safe to release in the DB)."""
+    with _claim_refs_lock:
+        remaining = _claim_refs.get(project_id, 0) - 1
+        if remaining > 0:
+            _claim_refs[project_id] = remaining
+            return remaining
+        _claim_refs.pop(project_id, None)
+        return 0
+
+
 def _release_project(project_id: int) -> None:
-    """Release this worker's claim on a single project."""
+    """Release one local use of this worker's claim on a single project.
+
+    The claim is only cleared in the database when no other local thread still
+    uses it.  Without this, an SDC write finishing could release the claim an
+    active-project thread still holds (or the reverse).
+    """
+    if _drop_claim_ref(project_id) > 0:
+        return
     try:
         execute_query(
             "UPDATE projects SET worker_claimed_by = NULL WHERE id = %s AND worker_claimed_by = %s",
@@ -3381,6 +3595,8 @@ def _release_project(project_id: int) -> None:
 
 def _release_all_claims() -> None:
     """Release all claims held by this worker (shutdown cleanup)."""
+    with _claim_refs_lock:
+        _claim_refs.clear()
     try:
         released = execute_query(
             "UPDATE projects SET worker_claimed_by = NULL WHERE worker_claimed_by = %s",
@@ -3470,6 +3686,34 @@ def _has_inference_candidates(project_id: int) -> bool:
     except DatabaseError:
         logger.warning("Could not check inference candidates for project %s", project_id, exc_info=True)
         return False
+
+
+def _claim_still_ours(project_id: int) -> bool:
+    """True while this worker still holds the project's claim and the project exists.
+
+    Unlike :func:`_project_still_active` this does not require ``status = 'active'``: it guards
+    work that also runs on a project this cycle has just completed. A database error counts
+    as ours, so an unreadable row never drops work.
+    """
+    try:
+        row = execute_query(
+            "SELECT status, worker_claimed_by FROM projects WHERE id = %s",
+            (project_id,),
+            fetch=True,
+        )
+    except DatabaseError:
+        return True
+    if not row:
+        logger.info(f"Project {project_id} not found, skipping the rest of the cycle")
+        return False
+    if row[0]["status"] == "deleted":
+        logger.info(f"Project {project_id} was deleted, skipping the rest of the cycle")
+        return False
+    claimed_by = row[0].get("worker_claimed_by")
+    if claimed_by != _worker_id:
+        logger.info(f"Project {project_id} no longer claimed by us (claimed_by={claimed_by}), skipping")
+        return False
+    return True
 
 
 def _project_still_active(project_id: int) -> bool:
@@ -3600,14 +3844,33 @@ def _auto_complete_unusable_project(project: dict[str, Any]) -> bool:
     is recorded as a permanent "no faces in this category" verdict, and ``_claim_active_projects``
     only picks up status='active', so the remaining images would never be retried. Mirrors the
     guard in app.py.
+
+    A failed category crawl has the same shape and is refused too: ``traverse_category`` sets
+    ``crawl_failed`` when no page succeeded, so a Wikimedia API outage cannot turn an unread
+    category into a permanent "no faces" verdict. A crawl that completed and still recorded no
+    images is *not* refused: it is a real answer (every file was a video, or the category only
+    holds subcategories that are empty), and retrying it every poll would never change it.
     """
     project_id = project["id"]
-    pending_row = execute_query(
-        "SELECT COUNT(*) AS cnt FROM images WHERE project_id = %s AND status = 'pending'",
+    if project.get("crawl_failed"):
+        logger.warning(
+            f"Project {project_id}: category traversal failed, NOT auto-completing — "
+            f"the project stays active and will retry next cycle."
+        )
+        return False
+
+    image_row = execute_query(
+        "SELECT COUNT(*) AS total, SUM(status = 'pending') AS pending FROM images WHERE project_id = %s",
         (project_id,),
         fetch=True,
     )
-    pending_images = pending_row[0]["cnt"] if pending_row else 0
+    total_images = int(image_row[0]["total"] or 0) if image_row else 0
+    pending_images = int(image_row[0]["pending"] or 0) if image_row else 0
+    if total_images == 0:
+        logger.info(
+            f"Project {project_id}: the category crawl completed and recorded no images "
+            f"(every file may be a video or audio); auto-completing as no_faces"
+        )
 
     face_count_row = execute_query(
         "SELECT COUNT(*) AS cnt FROM faces f "
@@ -3668,6 +3931,25 @@ def _run_final_inference(project: dict[str, Any]) -> float:
         )
         run_autonomous_inference(fresh[0] if fresh else project)
     return time.monotonic() - t0
+
+
+def _run_prefilter_after_inference(project: dict[str, Any]) -> None:
+    """Record shadow LiftWing verdicts once this cycle's model work is done.
+
+    Deliberately runs *after* final inference, and on the auto-complete path: shadow verdicts
+    change no behaviour, while a full pre-filter pass can take minutes, so the model must never
+    wait behind it. It still runs for a project this cycle just completed — a sweep would
+    otherwise be the only path covering its backlog.
+
+    Final inference can take long enough for the claim to lapse. A pass on a project that was
+    paused, deleted or taken over by the other worker would spend up to 250 LiftWing calls for
+    nothing, so re-check the project right before it.
+    """
+    if shutdown_requested:
+        return
+    if not _claim_still_ours(project["id"]):
+        return
+    prefilter_images(project)
 
 
 def _log_project_summary(
@@ -3734,17 +4016,10 @@ def process_project(project: dict[str, Any], *, skip_discovery: bool = False) ->
         # 3. Image download and face detection: process all pending images
         t_images, total_processed = _process_pending_images(project)
 
-        # 3a. Experimental LiftWing metadata pre-filter (shadow mode: verdicts are recorded for an
-        #     offline readout and change no behaviour). Runs after detection on purpose: verdicts
-        #     are metadata-only, and selecting already-processed images too means a backlog larger
-        #     than one cycle's cap is fully covered over time. (An eventual `enforce` mode must
-        #     instead select pending images and run *before* the image loop, so drops happen
-        #     before any download.)
-        if not shutdown_requested and _project_still_active(project_id):
-            prefilter_images(project)
-
-        # 3b. Auto-complete if no faces or insufficient faces were detected
+        # 3a. Auto-complete if no faces or insufficient faces were detected. Runs before the
+        #     pre-filter so an unusable project does not spend minutes on a LiftWing pass first.
         if not shutdown_requested and _project_still_active(project_id) and _auto_complete_unusable_project(project):
+            _run_prefilter_after_inference(project)
             _log_project_summary(
                 project_id,
                 t_project_start,
@@ -3756,8 +4031,17 @@ def process_project(project: dict[str, Any], *, skip_discovery: bool = False) ->
             )
             return
 
-        # 4. Final autonomous inference (catch any remaining unclassified faces)
+        # 4. Final autonomous inference (catch any remaining unclassified faces). Runs before
+        #    the experimental pre-filter: LiftWing is slow (~20 s per 20 files, capped at 250)
+        #    and shadow verdicts change no behaviour, so the model must not wait behind it.
         t_inference = _run_final_inference(project)
+
+        # 5. Experimental LiftWing metadata pre-filter (shadow mode: verdicts are recorded for an
+        #    offline readout and change no behaviour). Selecting already-processed images too
+        #    means a backlog larger than one cycle's cap is fully covered over time. (An eventual
+        #    `enforce` mode must instead select pending images and run *before* the image loop, so
+        #    drops happen before any download.)
+        _run_prefilter_after_inference(project)
 
         # SDC writes are handled separately: triggered via the web UI, processed in the main
         # loop when sdc_write_requested=1.
@@ -3809,16 +4093,30 @@ def _record_liftwing_failure(error: str | None) -> None:
     consecutive failures, and a single success flips it back (see
     ``_probe_liftwing_if_due`` and ``_record_liftwing_success``).
     """
-    rows = execute_query("SELECT status, consecutive_failures FROM service_status WHERE name = 'liftwing'", fetch=True)
+    # One atomic UPDATE: two workers can report a failure at the same time and
+    # a read-then-write would lose one of the increments and the threshold.
+    # MariaDB evaluates single-table SET assignments left to right, so ``status``
+    # must come first: written after the increment, its CASE would read the
+    # already-incremented column and cross the threshold one failure early.
+    try:
+        execute_query(
+            "UPDATE service_status SET "
+            "status = CASE WHEN consecutive_failures + 1 >= %s THEN 'down' ELSE status END, "
+            "consecutive_failures = consecutive_failures + 1, "
+            "last_error = %s WHERE name = 'liftwing'",
+            (LIFTWING_FAIL_THRESHOLD, (error or "")[:255] or None),
+            fetch=False,
+        )
+        rows = execute_query(
+            "SELECT status, consecutive_failures FROM service_status WHERE name = 'liftwing'", fetch=True
+        )
+    except DatabaseError:
+        logger.warning("Could not record the LiftWing failure", exc_info=True)
+        return
     if not rows:
         return
-    failures = int(rows[0]["consecutive_failures"]) + 1
-    status = "down" if failures >= LIFTWING_FAIL_THRESHOLD else rows[0]["status"]
-    execute_query(
-        "UPDATE service_status SET status = %s, consecutive_failures = %s, last_error = %s WHERE name = 'liftwing'",
-        (status, failures, (error or "")[:255] or None),
-        fetch=False,
-    )
+    failures = int(rows[0]["consecutive_failures"])
+    status = rows[0]["status"]
     if status == "down":
         logger.warning(f"LiftWing marked down after {failures} consecutive failures: {error}")
     else:
@@ -4105,9 +4403,11 @@ def _drain_inference_queue(active_ids: set[int], seen_ids: set[int]) -> None:
         inference_only = [p for p in claimed if p["id"] not in active_ids and p["id"] not in seen_ids]
         run_ids = {p["id"] for p in inference_only}
         # Release claims we will not run (already processed this cycle, or covered by the
-        # active pipeline) instead of holding them until the claim expiry.
+        # active pipeline) instead of holding them until the claim expiry.  The local
+        # reference from this claim is released even when another thread still uses the
+        # project: the reference count then keeps the DB claim in place.
         for project in claimed:
-            if project["id"] not in run_ids and project["id"] not in active_ids:
+            if project["id"] not in run_ids:
                 _release_project(project["id"])
         if not inference_only:
             break
@@ -4151,6 +4451,10 @@ def _process_active_projects(active_projects: list[dict[str, Any]], seen_ids: se
                     if project["id"] not in seen_ids:
                         logger.info(f"Adding new project {project['id']} to current cycle")
                         submit(project)
+                    else:
+                        # Already being processed this cycle: do not hold a second claim
+                        # (and never leave one claimed but unprocessed).
+                        _release_project(project["id"])
 
             # A classification can make a project inference-ready even when all slots are
             # busy; inference is cheap, so run it inline instead of waiting for the next cycle.

@@ -192,7 +192,9 @@ def test_return_connection_replenish_failure_is_silent(monkeypatch):
     database._return_connection_to_pool(pc)
 
     assert expired_conn._closed is True
-    assert pool.qsize() == 0  # pool stays empty — no crash
+    # Pool capacity is kept: the failed replacement leaves a dead slot for the next caller to retry.
+    assert pool.qsize() == 1
+    assert pool.get_nowait() is database._DEAD_SLOT
 
 
 def test_return_connection_no_replenish_when_pool_full(monkeypatch):
@@ -420,6 +422,86 @@ def test_execute_with_retry_allow_retry_false_no_retries(monkeypatch):
     assert call_count[0] == 1
 
 
+def test_execute_query_sends_a_write_once_and_never_replays_it(monkeypatch):
+    """A lost reply to a write may already have been applied.
+
+    Replaying it would duplicate an INSERT or bump a counter twice, so
+    ``execute_query(fetch=False)`` sends the statement once and hands the failure
+    to the caller, which can consult ``is_transient_error()``.
+    """
+    attempts = []
+    failure = OperationalError(2006, "gone away")
+
+    class FakeCursor:
+        def execute(self, sql, params):
+            attempts.append(sql)
+            raise failure
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    class FakeConn:
+        def cursor(self):
+            return FakeCursor()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(database, "INITIAL_BACKOFF", 0.001)
+    monkeypatch.setattr(database.time, "sleep", lambda *a: None)
+    monkeypatch.setattr(database, "get_connection", lambda *a, **k: FakeConn())
+
+    with pytest.raises(database.DatabaseError) as excinfo:
+        database.execute_query("UPDATE projects SET x = 1 WHERE id = 2", fetch=False)
+
+    assert len(attempts) == 1
+    assert database.is_transient_error(excinfo.value) is True
+
+
+def test_execute_query_still_retries_a_read(monkeypatch):
+    """The single-shot rule is about writes; a read can be replayed safely."""
+    attempts = []
+
+    class FakeCursor:
+        def execute(self, sql, params):
+            attempts.append(sql)
+            raise OperationalError(2006, "gone away")
+
+        def fetchall(self):
+            return []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    class FakeConn:
+        def cursor(self):
+            return FakeCursor()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(database, "INITIAL_BACKOFF", 0.001)
+    monkeypatch.setattr(database.time, "sleep", lambda *a: None)
+    monkeypatch.setattr(database, "get_connection", lambda *a, **k: FakeConn())
+
+    with pytest.raises(database.DatabaseError):
+        database.execute_query("SELECT 1")
+
+    assert len(attempts) == database.MAX_RETRIES
+
+
 def test_execute_with_retry_retries_on_pool_exhausted(monkeypatch):
     """`_execute_with_retry` retries when PoolExhaustedError is raised."""
     call_count = [0]
@@ -543,6 +625,25 @@ def test_close_pool_drains_all_connections(monkeypatch):
 
     assert database._pool is None
     assert len(closed_flags) == 3
+
+
+def test_close_pool_does_not_count_a_dead_slot_as_a_closed_connection(monkeypatch, caplog):
+    """A dead slot stands in for a discarded connection, so it must not inflate the count."""
+    pool = Queue(maxsize=2)
+
+    class TrackConn:
+        def close(self):
+            pass
+
+    pool.put_nowait(database._PooledConnection(TrackConn()))
+    pool.put_nowait(database._DEAD_SLOT)
+    monkeypatch.setattr(database, "_pool", pool)
+
+    with caplog.at_level("INFO", logger="database"):
+        database.close_pool()
+
+    assert database._pool is None
+    assert "Closed 1 database connections" in caplog.text
 
 
 # ---------------------------------------------------------------------------
@@ -757,3 +858,59 @@ def test_closing_a_dedicated_connection_is_idempotent(fake_connect):
     handle.close()
 
     assert fake_connect[0].closed is True
+
+
+def test_a_dead_slot_is_replaced_by_a_new_connection(monkeypatch):
+    """After an outage the reserved slot is filled by the next caller, so the pool keeps its size."""
+    pool = Queue(maxsize=1)
+    pool.put(database._DEAD_SLOT)
+    fresh = database._PooledConnection(_FakeConn())
+    monkeypatch.setattr(database, "_pool", pool)
+    monkeypatch.setattr(database, "_create_connection", lambda: fresh)
+
+    assert database._get_connection_from_pool() is fresh
+    assert pool.qsize() == 0
+
+
+def test_a_dead_slot_stays_reserved_while_the_database_is_down(monkeypatch):
+    pool = Queue(maxsize=1)
+    pool.put(database._DEAD_SLOT)
+    monkeypatch.setattr(database, "_pool", pool)
+
+    def down():
+        raise database.DatabaseError("down")
+
+    monkeypatch.setattr(database, "_create_connection", down)
+
+    with pytest.raises(database.DatabaseError):
+        database._get_connection_from_pool()
+
+    assert pool.qsize() == 1
+    assert pool.get_nowait() is database._DEAD_SLOT
+
+
+# -- is_transient_error ----------------------------------------------------
+
+
+def test_a_deadlock_or_a_lost_connection_counts_as_transient():
+    """The causes a retry can fix: the server, not our SQL."""
+    import pymysql
+
+    for err in (
+        pymysql.err.OperationalError(1213, "Deadlock found"),
+        pymysql.err.OperationalError(1205, "Lock wait timeout exceeded"),
+        pymysql.err.OperationalError(2013, "Lost connection"),
+        pymysql.err.InterfaceError(0, "connection closed"),
+    ):
+        wrapped = database.DatabaseError("Transaction execution failed")
+        wrapped.__cause__ = err
+        assert database.is_transient_error(wrapped) is True, err
+
+
+def test_a_bug_in_the_calling_code_is_not_transient():
+    """`execute_transaction` wraps every failure, so the cause chain decides, not the type."""
+    wrapped = database.DatabaseError("Transaction execution failed")
+    wrapped.__cause__ = ValueError("bad box")
+    assert database.is_transient_error(wrapped) is False
+
+    assert database.is_transient_error(database.DatabaseError("unknown")) is False

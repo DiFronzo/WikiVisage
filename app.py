@@ -21,6 +21,7 @@ import os
 import random
 import re
 import secrets
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -39,6 +40,7 @@ from flask import (
     Flask,
     Response,
     abort,
+    current_app,
     flash,
     g,
     has_request_context,
@@ -94,6 +96,11 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 _flask_secret = os.environ.get("FLASK_SECRET_KEY")
 if not _flask_secret:
+    if os.environ.get("TOOL_TOOLFORGE_API_URL"):
+        # A random key per gunicorn worker means every request may be signed
+        # by a different process: sessions, OAuth state and CSRF tokens break,
+        # and the keys change on every restart.  Fail loudly instead.
+        raise RuntimeError("FLASK_SECRET_KEY must be set on Toolforge; refusing to start with a random key")
     _flask_secret = secrets.token_hex(32)
     logging.getLogger(__name__).warning(
         "FLASK_SECRET_KEY not set — using a random key. "
@@ -198,7 +205,7 @@ _LIMITER_REDIS_OK = False
 try:
     import redis as _redis_mod
 
-    _r = _redis_mod.from_url(_REDIS_URL, socket_connect_timeout=2)
+    _r = _redis_mod.from_url(_REDIS_URL, socket_connect_timeout=2, socket_timeout=2)
     _r.ping()
     redis_client = _r
     _LIMITER_REDIS_OK = True
@@ -211,7 +218,15 @@ limiter = Limiter(
     app=app,
     default_limits=["200 per hour"],
     storage_uri=_limiter_storage_uri,
+    # The limiter opens its own Redis connection, so the timeouts on `_r` above
+    # do not apply to it. Without these, a Redis host that accepts connections
+    # and never answers hangs every request before `swallow_errors` can help.
+    storage_options={"socket_connect_timeout": 2, "socket_timeout": 2} if _LIMITER_REDIS_OK else None,
     key_prefix="wikivisage:",
+    # A Redis blip must not turn every request into a 500.  Fall back to
+    # per-process counters and let the request through when storage fails.
+    swallow_errors=True,
+    in_memory_fallback_enabled=True,
 )
 
 # ---------------------------------------------------------------------------
@@ -430,11 +445,14 @@ def _session_loss_reason() -> str:
     raw = request.cookies.get("session")
     if not raw:
         return "no cookie sent"
-    serializer = app.session_interface.get_signing_serializer(app)  # type: ignore[attr-defined]
+    # The app handling this request, not the module-level singleton: a factory-made or
+    # reloaded app has its own secret key and session lifetime.
+    current = current_app._get_current_object()
+    serializer = current.session_interface.get_signing_serializer(current)  # type: ignore[attr-defined]
     if serializer is None:
         return "bad signature"
     try:
-        serializer.loads(raw, max_age=int(app.permanent_session_lifetime.total_seconds()))
+        serializer.loads(raw, max_age=int(current.permanent_session_lifetime.total_seconds()))
     except SignatureExpired:
         return "expired"
     except BadSignature:
@@ -1265,11 +1283,19 @@ def _maybe_mark_sdc_written(face_id: int, image_id: int, project_id: int) -> boo
             cpid = meta[0]["commons_page_id"]
             qid = meta[0]["wikidata_qid"]
             if _check_p180_exists(cpid, qid):
-                execute_query(
-                    "UPDATE faces SET sdc_written = 1 WHERE id = %s",
-                    (face_id,),
+                marked = execute_query(
+                    "UPDATE faces SET sdc_written = 1 WHERE id = %s AND image_id = %s AND is_target = 1",
+                    (face_id, image_id),
                     fetch=False,
                 )
+                # A concurrent reject or undo can clear is_target while the P180
+                # lookup was in flight, and then this update matches nothing. The
+                # face is not a target any more, so it must not be reported as
+                # written and the image must not become a bootstrap image
+                # (bootstrap images get different gallery and removal handling).
+                if not marked:
+                    logger.debug(f"P180 exists for image {image_id}, but face {face_id} is no longer a target")
+                    return False
                 execute_query(
                     "UPDATE images SET bootstrapped = 1 WHERE id = %s AND bootstrapped = 0",
                     (image_id,),
@@ -1281,9 +1307,28 @@ def _maybe_mark_sdc_written(face_id: int, image_id: int, project_id: int) -> boo
     return False
 
 
+_P18_CACHE_TTL = 600.0
+# A failed lookup is retried much sooner: caching a Wikidata timeout for the full
+# TTL hides a project's thumbnail for ten minutes over a blip.
+_P18_CACHE_FAILURE_TTL = 30.0
+_P18_CACHE_MAX = 512
+_p18_cache: dict[str, tuple[float, str | None]] = {}
+_p18_cache_lock = threading.Lock()
+
+
+def _clear_p18_cache() -> None:
+    """Drop cached P18 lookups (tests, and after a project's QID changes)."""
+    with _p18_cache_lock:
+        _p18_cache.clear()
+
+
 def _fetch_p18_thumb_url(qid: str, width: int = 250) -> str | None:
     """
     Fetch P18 (image) property from Wikidata and return a Commons thumbnail URL.
+
+    Results, including misses, are cached briefly: the dashboard and project
+    page call this for every project on every load, and an entity without P18
+    would otherwise cost a Wikidata request each time.
 
     Args:
         qid: Wikidata entity ID (e.g., "Q42").
@@ -1292,6 +1337,15 @@ def _fetch_p18_thumb_url(qid: str, width: int = 250) -> str | None:
     Returns:
         Thumbnail URL string, or None if no P18 exists or API call fails.
     """
+    key = f"{qid}:{width}"
+    now = time.monotonic()
+    with _p18_cache_lock:
+        cached = _p18_cache.get(key)
+        if cached is not None and cached[0] > now:
+            return cached[1]
+
+    result: str | None = None
+    ttl = _P18_CACHE_TTL
     try:
         data = _wikimedia_api_get(
             WIKIDATA_API_URL,
@@ -1299,17 +1353,20 @@ def _fetch_p18_thumb_url(qid: str, width: int = 250) -> str | None:
         )
 
         claims = data.get("claims", {}).get("P18", [])
-        if not claims:
-            return None
-
-        filename = claims[0].get("mainsnak", {}).get("datavalue", {}).get("value")
-        if not filename:
-            return None
-
-        return commons_thumb_url(filename, width)
+        if claims:
+            filename = claims[0].get("mainsnak", {}).get("datavalue", {}).get("value")
+            if filename:
+                result = commons_thumb_url(filename, width)
     except Exception:
         logger.debug(f"Failed to fetch P18 for {qid}", exc_info=True)
-        return None
+        result = None
+        ttl = _P18_CACHE_FAILURE_TTL
+
+    with _p18_cache_lock:
+        if len(_p18_cache) >= _P18_CACHE_MAX:
+            _p18_cache.clear()
+        _p18_cache[key] = (now + ttl, result)
+    return result
 
 
 def _fetch_wikidata_label(qid: str) -> str | None:
@@ -2602,6 +2659,111 @@ def clear_skips(project_id: int):
     return redirect(url_for("classify", project_id=project_id))
 
 
+def _classify_selected_face(
+    *,
+    project_id: int,
+    image_id: int,
+    selected_face_id: int,
+    user_id: int,
+    is_review_mode: bool,
+    face_filter_sql: str,
+) -> list[int]:
+    """Apply a target click in one transaction; return the image's other classified face ids.
+
+    The selected face must belong to *image_id*: the target UPDATE matches nothing
+    otherwise, but the sibling demotion below would still reject every unclassified
+    face on the image.
+
+    Raises ``ApiError``: 404 when the face is not on this image, 409 when it is no
+    longer classifiable (someone else handled it first).
+    """
+
+    def _classify_target(conn, cursor):
+        _assert_project_access_locked(cursor, project_id, user_id)
+        cursor.execute(
+            "SELECT image_id, is_target, classified_by_user_id FROM faces "
+            "WHERE id = %s AND superseded_by IS NULL FOR UPDATE",
+            (selected_face_id,),
+        )
+        selected = cursor.fetchone()
+        if not selected or selected["image_id"] != image_id:
+            raise ValueError("face_not_in_image")
+
+        cursor.execute(
+            f"SELECT id FROM faces WHERE image_id = %s AND {face_filter_sql}",
+            (image_id,),
+        )
+        rows = cursor.fetchall()
+        ids = [r["id"] for r in rows] if rows else []
+
+        if is_review_mode:
+            cursor.execute(
+                "UPDATE faces SET is_target = 1, classified_by = 'human', "
+                "classified_by_user_id = %s, sdc_removal_pending = 0, classified_at = NOW() "
+                "WHERE id = %s AND image_id = %s "
+                "AND is_target = 0 AND classified_by = 'model' "
+                "AND classified_by_user_id IS NULL AND superseded_by IS NULL",
+                (user_id, selected_face_id, image_id),
+            )
+        else:
+            cursor.execute(
+                "UPDATE faces SET is_target = 1, classified_by = 'human', "
+                "classified_by_user_id = %s, sdc_removal_pending = 0, classified_at = NOW() "
+                "WHERE id = %s AND image_id = %s AND is_target IS NULL",
+                (user_id, selected_face_id, image_id),
+            )
+        target_updated = cursor.rowcount
+
+        if target_updated == 0:
+            # Repeat click by the same user is a harmless no-op.  Any
+            # other state means the face is no longer classifiable
+            # (already handled by another reviewer), so do not touch
+            # its siblings either.
+            if selected["is_target"] == 1 and selected["classified_by_user_id"] == user_id:
+                return ids
+            raise ValueError("face_not_classifiable")
+
+        if is_review_mode:
+            cursor.execute(
+                "UPDATE faces SET classified_by = 'human', "
+                "classified_by_user_id = %s, classified_at = NOW() "
+                "WHERE image_id = %s AND id != %s "
+                "AND is_target = 0 AND classified_by = 'model' "
+                "AND classified_by_user_id IS NULL AND superseded_by IS NULL",
+                (user_id, image_id, selected_face_id),
+            )
+        else:
+            cursor.execute(
+                "UPDATE faces SET is_target = 0, classified_by = 'human', "
+                "classified_by_user_id = %s, classified_at = NOW() "
+                "WHERE image_id = %s AND id != %s AND is_target IS NULL AND superseded_by IS NULL",
+                (user_id, image_id, selected_face_id),
+            )
+
+        cursor.execute(
+            "UPDATE projects SET faces_confirmed = faces_confirmed + 1 WHERE id = %s",
+            (project_id,),
+        )
+
+        # Do NOT queue P180 removal here — the selected face confirms
+        # the person IS depicted, so the P180 claim must stay.
+
+        return ids
+
+    try:
+        affected_ids = _run_authorized_transaction(_classify_target)
+    except ValueError as e:
+        if str(e) == "face_not_in_image":
+            raise ApiError(_("Face not found or access denied"), 404) from None
+        if str(e) == "face_not_classifiable":
+            raise _already_reviewed_error("") from None
+        raise
+
+    if affected_ids:
+        _maybe_mark_sdc_written(selected_face_id, image_id, project_id)
+    return affected_ids
+
+
 @app.route("/api/classify", methods=["POST"])
 @login_required
 @limiter.limit("120 per minute")
@@ -2707,65 +2869,14 @@ def api_classify():
             except (ValueError, TypeError):
                 return jsonify({"error": _("Invalid face ID")}), 400
 
-            def _classify_target(conn, cursor):
-                _assert_project_access_locked(cursor, project_id, g.user["id"])
-                cursor.execute(
-                    f"SELECT id FROM faces WHERE image_id = %s AND {face_filter_sql}",
-                    (image_id,),
-                )
-                rows = cursor.fetchall()
-                ids = [r["id"] for r in rows] if rows else []
-
-                if is_review_mode:
-                    cursor.execute(
-                        "UPDATE faces SET is_target = 1, classified_by = 'human', "
-                        "classified_by_user_id = %s, sdc_removal_pending = 0, classified_at = NOW() "
-                        "WHERE id = %s AND image_id = %s "
-                        "AND is_target = 0 AND classified_by = 'model' "
-                        "AND classified_by_user_id IS NULL AND superseded_by IS NULL",
-                        (g.user["id"], selected_face_id, image_id),
-                    )
-                else:
-                    cursor.execute(
-                        "UPDATE faces SET is_target = 1, classified_by = 'human', "
-                        "classified_by_user_id = %s, sdc_removal_pending = 0, classified_at = NOW() "
-                        "WHERE id = %s AND image_id = %s AND is_target IS NULL",
-                        (g.user["id"], selected_face_id, image_id),
-                    )
-                target_updated = cursor.rowcount
-
-                if is_review_mode:
-                    cursor.execute(
-                        "UPDATE faces SET classified_by = 'human', "
-                        "classified_by_user_id = %s, classified_at = NOW() "
-                        "WHERE image_id = %s AND id != %s "
-                        "AND is_target = 0 AND classified_by = 'model' "
-                        "AND classified_by_user_id IS NULL AND superseded_by IS NULL",
-                        (g.user["id"], image_id, selected_face_id),
-                    )
-                else:
-                    cursor.execute(
-                        "UPDATE faces SET is_target = 0, classified_by = 'human', "
-                        "classified_by_user_id = %s, classified_at = NOW() "
-                        "WHERE image_id = %s AND id != %s AND is_target IS NULL AND superseded_by IS NULL",
-                        (g.user["id"], image_id, selected_face_id),
-                    )
-
-                if target_updated > 0:
-                    cursor.execute(
-                        "UPDATE projects SET faces_confirmed = faces_confirmed + 1 WHERE id = %s",
-                        (project_id,),
-                    )
-
-                # Do NOT queue P180 removal here — the selected face confirms
-                # the person IS depicted, so the P180 claim must stay.
-
-                return ids
-
-            affected_ids = _run_authorized_transaction(_classify_target)
-
-            if affected_ids:
-                _maybe_mark_sdc_written(selected_face_id, image_id, project_id)
+            affected_ids = _classify_selected_face(
+                project_id=project_id,
+                image_id=image_id,
+                selected_face_id=selected_face_id,
+                user_id=g.user["id"],
+                is_review_mode=is_review_mode,
+                face_filter_sql=face_filter_sql,
+            )
 
             session["last_classify"] = {
                 "project_id": project_id,
@@ -2812,8 +2923,12 @@ def _undo_skip(last: dict[str, Any]):
     return jsonify({"status": "ok", "project_id": project_id, "image_id": image_id})
 
 
-def _read_undo_claim_context(image_id: int, project_id: int, touched_ids: list[int]) -> _UndoClaimContext:
-    """Read the claim-related state of the faces an undo touches. Raises ``DatabaseError``."""
+def _read_undo_claim_context(image_id: int, project_id: int, touched_ids: list[int], user_id: int) -> _UndoClaimContext:
+    """Read the claim-related state of the faces an undo touches. Raises ``DatabaseError``.
+
+    Only faces this user classified are returned: the ids come from the signed session, but
+    the undo must never act on another contributor's classification.
+    """
     placeholders = ",".join(["%s"] * len(touched_ids))
     state_rows = execute_query(
         f"SELECT f.id, f.is_target, f.sdc_written, f.sdc_removal_pending, "
@@ -2821,17 +2936,21 @@ def _read_undo_claim_context(image_id: int, project_id: int, touched_ids: list[i
         f"FROM faces f "
         f"JOIN images i ON f.image_id = i.id "
         f"JOIN projects p ON i.project_id = p.id "
-        f"WHERE f.image_id = %s AND f.id IN ({placeholders})",
-        (image_id, *touched_ids),
+        f"WHERE f.image_id = %s AND f.id IN ({placeholders}) AND f.classified_by_user_id = %s",
+        (image_id, *touched_ids, user_id),
     )
-    sibling_rows = execute_query(
-        f"SELECT EXISTS("
-        f"  SELECT 1 FROM faces f2 WHERE f2.image_id = %s "
-        f"  AND f2.is_target = 1 AND f2.superseded_by IS NULL "
-        f"  AND f2.id NOT IN ({placeholders})"
-        f") AS has_sibling",
-        (image_id, *touched_ids),
-    )
+    sibling_rows = ()
+    own_ids = [int(r["id"]) for r in (state_rows or ())]
+    if own_ids:
+        own_placeholders = ",".join(["%s"] * len(own_ids))
+        sibling_rows = execute_query(
+            f"SELECT EXISTS("
+            f"  SELECT 1 FROM faces f2 WHERE f2.image_id = %s "
+            f"  AND f2.is_target = 1 AND f2.superseded_by IS NULL "
+            f"  AND f2.id NOT IN ({own_placeholders})"
+            f") AS has_sibling",
+            (image_id, *own_ids),
+        )
     project_rows = execute_query("SELECT sdc_write_requested FROM projects WHERE id = %s", (project_id,))
     return _UndoClaimContext(
         face_states={int(r["id"]): r for r in (state_rows or ())},
@@ -2943,7 +3062,7 @@ def api_undo_classify():
     undoing_rejection = last.get("action") == "none"
     touched_ids = list(dict.fromkeys([*face_ids, *manual_face_ids]))
     try:
-        context = _read_undo_claim_context(image_id, project_id, touched_ids)
+        context = _read_undo_claim_context(image_id, project_id, touched_ids, g.user["id"])
     except DatabaseError:
         return jsonify({"error": _("Database error")}), 500
 
@@ -2960,15 +3079,20 @@ def api_undo_classify():
         def _undo(conn, cursor) -> bool:
             """Revert the faces; True when any of them now carries a queued removal."""
             _assert_project_access_locked(cursor, project_id, g.user["id"])
+            changed_any = False
             if manual_face_ids:
                 m_placeholders = ",".join(["%s"] * len(manual_face_ids))
                 cursor.execute(
-                    f"DELETE FROM faces WHERE id IN ({m_placeholders}) AND image_id = %s",
-                    (*manual_face_ids, image_id),
+                    f"DELETE FROM faces WHERE id IN ({m_placeholders}) AND image_id = %s "
+                    "AND classified_by_user_id = %s",
+                    (*manual_face_ids, image_id, g.user["id"]),
                 )
+                changed_any = cursor.rowcount > 0
 
             queued_any = False
             for fid in [fid for fid in face_ids if fid not in manual_face_ids]:
+                if int(fid) not in context.face_states:
+                    continue  # another contributor's face, or no longer present
                 pending, written = _undo_claim_flags(
                     context.face_states.get(int(fid)),
                     undoing_rejection=undoing_rejection,
@@ -2983,19 +3107,20 @@ def api_undo_classify():
                         "UPDATE faces SET is_target = 0, classified_by = 'model', "
                         "classified_by_user_id = NULL, sdc_written = %s, "
                         "sdc_removal_pending = %s, classified_at = NULL "
-                        "WHERE id = %s AND image_id = %s",
-                        (written, pending, fid, image_id),
+                        "WHERE id = %s AND image_id = %s AND classified_by_user_id = %s",
+                        (written, pending, fid, image_id, g.user["id"]),
                     )
                 else:
                     cursor.execute(
                         "UPDATE faces SET is_target = NULL, classified_by = NULL, "
                         "classified_by_user_id = NULL, sdc_written = %s, "
                         "sdc_removal_pending = %s, classified_at = NULL "
-                        "WHERE id = %s AND image_id = %s",
-                        (written, pending, fid, image_id),
+                        "WHERE id = %s AND image_id = %s AND classified_by_user_id = %s",
+                        (written, pending, fid, image_id, g.user["id"]),
                     )
+                changed_any = changed_any or cursor.rowcount > 0
 
-            if decrement_counter:
+            if decrement_counter and changed_any:
                 cursor.execute(
                     "UPDATE projects SET faces_confirmed = GREATEST(faces_confirmed - 1, 0) WHERE id = %s",
                     (project_id,),
@@ -3068,7 +3193,11 @@ def api_manual_face():
         return jsonify({"error": _("Image has not finished processing yet")}), 409
 
     try:
-        encoded = _encode_drawn_box(img, box, purpose=f"encoding manual face (image {image_id})")
+        try:
+            encoded = _encode_drawn_box(img, box, purpose=f"encoding manual face (image {image_id})")
+        except ValueError as e:
+            logger.error(f"Failed to download image for manual face: {e}")
+            return jsonify({"error": _("Failed to download image from Commons")}), 502
         if not encoded.aligned:
             logger.info("Manual face on image %s embedded without landmark alignment", image_id)
 
@@ -3307,13 +3436,15 @@ def _load_face_for_reclassify(face_id: int) -> dict[str, Any]:
     try:
         rows = execute_query(
             "SELECT f.id, f.image_id, f.is_target AS old_is_target, f.sdc_written, "
-            "  f.classified_by, "
+            "  f.classified_by, f.classified_by_user_id, "
             "  i.commons_page_id, i.bootstrapped, "
-            "  p.id AS project_id, p.wikidata_qid "
+            "  p.id AS project_id, p.wikidata_qid, "
+            "  u.wiki_username AS prev_classifier_username "
             "FROM faces f "
             "JOIN images i ON f.image_id = i.id "
             "JOIN projects p ON i.project_id = p.id "
             "LEFT JOIN project_members pm ON pm.project_id = p.id AND pm.user_id = %s AND pm.status = 'active' "
+            "LEFT JOIN users u ON u.id = f.classified_by_user_id "
             "WHERE f.id = %s AND (p.user_id = %s OR pm.user_id IS NOT NULL) "
             "AND f.superseded_by IS NULL AND p.status != 'deleted'",
             (g.user["id"], face_id, g.user["id"]),
@@ -3464,6 +3595,13 @@ def api_reclassify():
     sdc_written = face_row["sdc_written"]
     commons_page_id = face_row["commons_page_id"]
 
+    # Check ownership before any Commons side effect: the in-transaction guard
+    # below already refuses another contributor's face, but by then a claim
+    # may have been removed.  Baseline (NULL) faces remain open to everyone.
+    owner_id = face_row.get("classified_by_user_id")
+    if owner_id is not None and owner_id != g.user["id"]:
+        raise _already_reviewed_error(face_row.get("prev_classifier_username") or "")
+
     sdc_removed, sdc_removal_queued = (False, False)
     if is_target == 0:
         sdc_removed, sdc_removal_queued = _settle_claim_for_rejection(face_row, face_id)
@@ -3535,7 +3673,7 @@ def api_update_face_bbox():
     try:
         rows = execute_query(
             "SELECT f.id, f.image_id, f.is_target, f.classified_by, f.confidence, "
-            "  f.classified_by_user_id, f.sdc_written, i.file_title, i.commons_page_id, "
+            "  f.classified_by_user_id, f.sdc_written, f.sdc_removal_pending, i.file_title, i.commons_page_id, "
             "  i.status AS image_status, i.detection_width, i.detection_height, "
             "  p.id AS project_id, p.wikidata_qid, "
             "  u.wiki_username AS prev_classifier_username "
@@ -3569,9 +3707,14 @@ def api_update_face_bbox():
     orig_is_target = face_row["is_target"]
     orig_confidence = face_row["confidence"]
     orig_sdc_written = face_row["sdc_written"]
+    orig_sdc_removal_pending = face_row["sdc_removal_pending"]
 
     try:
-        encoded = _encode_drawn_box(face_row, box, purpose=f"re-encoding face bbox (face {face_id})")
+        try:
+            encoded = _encode_drawn_box(face_row, box, purpose=f"re-encoding face bbox (face {face_id})")
+        except ValueError as e:
+            logger.error(f"Failed to download image for bbox update: {e}")
+            return jsonify({"error": _("Failed to download image from Commons")}), 502
         if not encoded.aligned:
             logger.info("Edited face %s embedded without landmark alignment", face_id)
 
@@ -3599,8 +3742,9 @@ def api_update_face_bbox():
             cursor.execute(
                 "INSERT INTO faces "
                 "(image_id, encoding, embedding_model, aligned, bbox_top, bbox_right, bbox_bottom, bbox_left, "
-                " is_target, classified_by, confidence, classified_by_user_id, sdc_written, classified_at) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'human', %s, %s, %s, NOW())",
+                " is_target, classified_by, confidence, classified_by_user_id, sdc_written, "
+                " sdc_removal_pending, classified_at) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'human', %s, %s, %s, %s, NOW())",
                 (
                     image_id,
                     encoded.encoding,
@@ -3611,6 +3755,7 @@ def api_update_face_bbox():
                     orig_confidence,
                     g.user["id"],
                     orig_sdc_written,
+                    orig_sdc_removal_pending,
                 ),
             )
             new_face_id = cursor.lastrowid
@@ -3961,6 +4106,7 @@ def api_gallery(project_id: int):
             "    WHERE f2.image_id = f.image_id "
             "      AND f2.id <> f.id "
             "      AND f2.is_target = 1 "
+            "      AND f2.superseded_by IS NULL "
             "      AND f2.sdc_removal_pending = 0"
             "  ) AS has_confirmed_target_sibling "
             "FROM faces f "
@@ -4136,10 +4282,17 @@ def project_settings(project_id: int):
     distance_threshold = request.form.get("distance_threshold", str(project["distance_threshold"]))
     min_confirmed = request.form.get("min_confirmed", str(project["min_confirmed"]))
     status = request.form.get("status", project["status"])
-    label = request.form.get("label", project["label"])
+    # An absent field keeps the stored label; a field submitted empty clears it.
+    # (`or project["label"]` treated both as "keep", while a whitespace-only
+    # value still cleared it — three inputs, two behaviours.)
+    raw_label = request.form.get("label")
+    label = (project["label"] if raw_label is None else raw_label or "").strip()
     prefilter_mode = request.form.get("prefilter_mode", project.get("prefilter_mode", "off"))
 
     errors = []
+    if len(label) > 255:
+        errors.append(_("Label must be 255 characters or fewer."))
+        label = project["label"] or ""
     try:
         distance_threshold = float(distance_threshold)
         if not 0.1 <= distance_threshold <= 1.0:
@@ -4894,6 +5047,18 @@ def _liftwing_health_value() -> str:
     return "disabled"
 
 
+_HEALTH_CACHE_TTL = 5.0
+_health_cache: tuple[float, dict[str, Any], int] | None = None
+_health_cache_lock = threading.Lock()
+
+
+def _clear_health_cache() -> None:
+    """Drop the ``/health`` snapshot (tests and deploy preflight need fresh probes)."""
+    global _health_cache
+    with _health_cache_lock:
+        _health_cache = None
+
+
 @app.route("/health")
 @limiter.exempt
 def health():
@@ -4904,7 +5069,19 @@ def health():
     unreachable. In both cases the database is still healthy, so we don't
     return 503, ops can scrape `degraded` and alert. The ``liftwing`` and ``workers``
     fields are informational and never set ``degraded``.
+
+    The whole snapshot is cached for a few seconds: the endpoint is public and
+    unauthenticated, and each miss runs several queries plus a face-service
+    probe.  A deploy's readiness wait still gets a fresh answer because it
+    starts the web service anew.
     """
+    global _health_cache
+    now = time.monotonic()
+    with _health_cache_lock:
+        cached = _health_cache
+    if cached is not None and now - cached[0] < _HEALTH_CACHE_TTL:
+        return jsonify(cached[1]), cached[2]
+
     try:
         rows = execute_query("SELECT 1 AS ok")
         if rows and rows[0].get("ok") == 1:
@@ -4918,6 +5095,8 @@ def health():
                 "workers": _workers_health_value(),
                 "degraded": not _LIMITER_REDIS_OK or not face_service_ok,
             }
+            with _health_cache_lock:
+                _health_cache = (time.monotonic(), payload, 200)
             return jsonify(payload), 200
     except Exception:
         logger.exception("Health check failed")
@@ -5051,6 +5230,8 @@ def bad_request(e):
 def forbidden(e):
     """Handle 403 errors."""
     msg = e.description if hasattr(e, "description") and isinstance(e.description, str) else _("Forbidden")
+    if request.path.startswith("/api/") or request.is_json:
+        return jsonify({"error": msg}), 403
     return render_template("error.html", code=403, message=msg), 403
 
 
@@ -5063,11 +5244,14 @@ def not_found(e):
 @app.errorhandler(429)
 def rate_limited(e):
     """Handle rate limit exceeded."""
+    message = _("Rate limit exceeded. Please try again later.")
+    if request.path.startswith("/api/") or request.is_json:
+        return jsonify({"error": message}), 429
     return (
         render_template(
             "error.html",
             code=429,
-            message=_("Rate limit exceeded. Please try again later."),
+            message=message,
         ),
         429,
     )

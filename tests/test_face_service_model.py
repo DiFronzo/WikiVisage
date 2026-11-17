@@ -126,7 +126,11 @@ def test_service_no_longer_references_dlib():
 def test_requirements_drop_dlib_and_pin_the_onnx_stack():
     text = (MODEL_SERVER / "requirements.txt").read_text()
     pins = {line.split("#")[0].strip() for line in text.splitlines()} - {""}
-    assert {"kserve==0.21.0", "onnxruntime==1.31.0", "opencv-python-headless==5.0.0.93"} <= pins
+    # The exact versions are the lock's business: asserting them here made every
+    # Dependabot bump of the model-server group fail on this literal, so only the
+    # pins that must exist are checked.
+    for package in ("kserve", "onnxruntime", "opencv-python-headless"):
+        assert any(pin.startswith(f"{package}==") for pin in pins), package
     assert not any(p.startswith(("dlib", "face_recognition")) for p in pins)
     # The old face_recognition stack needed a top-level ``setuptools<81`` cap
     # (its models imported pkg_resources). Nothing constrains setuptools at the

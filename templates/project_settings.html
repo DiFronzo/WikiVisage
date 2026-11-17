@@ -227,7 +227,7 @@
             {% for member in active_members %}
             <tr style="border-bottom: 1px solid var(--border);">
                 <td style="padding: 0.5rem 0.75rem;">{{ member.wiki_username }}</td>
-                <td style="padding: 0.5rem 0.75rem;"><span class="badge">{{ member.role }}</span></td>
+                <td style="padding: 0.5rem 0.75rem;"><span class="badge">{{ _('Owner') if member.role == 'owner' else _('Member') }}</span></td>
                 <td style="padding: 0.5rem 0.75rem; color: var(--text-muted); font-size: 0.875rem;">{{ member.joined_at.strftime('%Y-%m-%d') }}</td>
                 <td style="padding: 0.5rem 0.75rem; text-align: right;">
                     {% if is_owner and member.role != 'owner' %}

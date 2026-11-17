@@ -64,6 +64,11 @@
     .result-card:focus-within .result-actions {
         opacity: 1;
     }
+    /* Touch screens have no hover: the buttons must be visible, not just tappable,
+       or a tap near a card's corner can reject a face sight unseen. */
+    @media (hover: none) {
+        .result-actions { opacity: 1; }
+    }
     .btn-icon {
         width: 32px;
         height: 32px;
@@ -165,11 +170,22 @@
         z-index: 9999;
         opacity: 0;
         pointer-events: none;
-        transition: opacity 0.2s;
+        /* visibility keeps a closed dialog out of the tab order and the
+           accessibility tree; opacity alone left its buttons reachable. It is
+           delayed rather than transitioned: visibility is a discrete property,
+           so a 0.2s transition kept the dialog `hidden` for the frame in which
+           it was opened, and focusing the title in that frame silently failed
+           (focus fell back to <body> with the whole page inert). */
+        visibility: hidden;
+        transition: opacity 0.2s, visibility 0s linear 0.2s;
     }
     .modal-overlay.active {
         opacity: 1;
         pointer-events: auto;
+        visibility: visible;
+        /* Visible at once when opening; the delay above only applies to the
+           fade-out, so the dialog is focusable in the frame it appears. */
+        transition: opacity 0.2s, visibility 0s;
     }
     .modal-content {
         background: var(--surface);
@@ -249,8 +265,8 @@
     .stat-box-warning .stat-value { color: var(--warning); }
     .stat-box-info { border-color: var(--info); }
     .stat-box-info .stat-value { color: var(--info); }
-    .stat-box-purple { border-color: #a855f7; }
-    .stat-box-purple .stat-value { color: #a855f7; }
+    .stat-box-purple { border-color: var(--purple); }
+    .stat-box-purple .stat-value { color: var(--purple); }
     .stat-box-primary { border-color: var(--primary); }
     .stat-box-primary .stat-value { color: var(--primary); }
     .project-header-row { display: flex; gap: 1.25rem; align-items: flex-start; }
@@ -543,7 +559,8 @@
         </div>
     </div>
     <div>
-        <span class="badge badge-{{ project.status }} project-status-badge">{{ project.status }}</span>
+        {% set status_labels = {'active': _('Active'), 'paused': _('Paused'), 'completed': _('Completed')} %}
+        <span class="badge badge-{{ project.status }} project-status-badge">{{ status_labels.get(project.status, project.status) }}</span>
     </div>
 </div>
 
@@ -801,7 +818,7 @@
     </select>
 </div>
 
-<div class="results-gallery" id="resultsGallery"></div>
+<div class="results-gallery" id="resultsGallery" tabindex="-1"></div>
 <nav class="pagination" id="resultsPagination" aria-label="{{ _('Gallery pagination') }}"></nav>
 {% endif %}
 
@@ -838,10 +855,10 @@
     <div id="sdcProgress" class="sdc-progress-area">
         <div class="progress-wrap sdc-progress-bar-wrap">
             <div class="progress-bar" id="sdcProgressBar" style="width: 0%; transition: width 0.3s ease;"></div>
-            <div class="progress-text sdc-progress-text" id="sdcProgressText">{{ _('Starting...') }}</div>
+            <div class="progress-text sdc-progress-text" id="sdcProgressText" role="status" aria-live="polite" aria-atomic="true">{{ _('Starting...') }}</div>
         </div>
     </div>
-    <div id="sdcResult" class="sdc-result-area"{% if project.sdc_write_error and not project.sdc_write_requested %} style="display: block;"{% endif %}>
+    <div id="sdcResult" class="sdc-result-area" role="status" aria-live="polite"{% if project.sdc_write_error and not project.sdc_write_requested %} style="display: block;"{% endif %}>
         {% if project.sdc_write_error and not project.sdc_write_requested %}
         <p style="color: var(--danger); font-weight: 700;">{{ _('Worker error: {error}').replace('{error}', project.sdc_write_error) }}</p>
         {% if sdc_needs_reauth %}
@@ -921,7 +938,8 @@
         distance: {{ _('Face distance from target centroid')|tojson }},
         noResults: {{ _('No classification results yet.')|tojson }},
         loadError: {{ _('Failed to load results. Please try again.')|tojson }},
-        autoDetected: {{ _('Auto-detected')|tojson }}
+        autoDetected: {{ _('Auto-detected')|tojson }},
+        imageError: {{ _('The image could not be loaded. Please try again.')|tojson }}
     };
 
     function reclassifyFace(btn, isTarget) {
@@ -1052,9 +1070,10 @@
             loading.classList.remove('active');
             card.dataset.reclassifyInFlight = '0';
             // postForm() throws on non-2xx; surface the server's actual error
-            // message (e.g. "This face was already classified by X") instead
-            // of the generic saveError fallback.
-            var msg = (e && e.data && e.data.error) || (e && e.message) || i18nReclassify.saveError;
+            // message (e.g. "This face was already classified by X"). e.message
+            // is English plumbing text ("Server error (HTTP 200)"), so an answer
+            // without a body falls back to the translated generic message.
+            var msg = (e && e.data && e.data.error) || i18nReclassify.saveError;
             showInlineAlert(msg, reauthHref(e && e.data));
         });
     }
@@ -1076,13 +1095,18 @@
      * applies the result. Idempotent: called again on resize and after the
      * higher-resolution source loads. When the geometry cannot be trusted
      * (legacy rows, rotated originals) the plain contained image is shown.
-     * Bootstrap-classified faces are never zoomed but are still outlined.
+     * Bootstrap-classified faces are never zoomed and never outlined: the worker only
+     * auto-classifies the *single* face detection of an image whose Commons page already
+     * carries a depicts claim (worker.py), so the box is that one detected face, not
+     * necessarily the person the claim names. In a group photo the others may have been too
+     * small or turned away, and a box around the wrong person is worse than none; the whole
+     * thumbnail already says "this image depicts them".
      */
     function cropToFace(img) {
         var thumb = img.parentElement;
         if (!thumb || !thumb.classList.contains('result-thumb')) return;
         var card = thumb.closest('.result-card');
-        var noZoom = !!card && card.dataset.source === 'bootstrap';
+        var isBootstrap = !!card && card.dataset.source === 'bootstrap';
 
         var natW = img.naturalWidth;
         var natH = img.naturalHeight;
@@ -1097,7 +1121,9 @@
         var detW = parseInt(thumb.dataset.detectionWidth) || 0;
         var detH = parseInt(thumb.dataset.detectionHeight) || 0;
         var view = computeFaceView(bbox, detW, detH, natW, natH, thumb.clientWidth, thumb.clientHeight,
-                                   window.devicePixelRatio || 1, { zoom: !noZoom });
+                                   window.devicePixelRatio || 1, { zoom: !isBootstrap });
+
+        var showMarker = !isBootstrap;
 
         var marker = thumb.querySelector('.face-marker');
         if (view && view.mode === 'crop') {
@@ -1114,7 +1140,7 @@
             img.style.top = '';
         }
 
-        if (view && view.markerVisible) {
+        if (view && view.markerVisible && showMarker) {
             if (!marker) {
                 marker = document.createElement('div');
                 marker.className = 'face-marker';
@@ -1203,6 +1229,7 @@
         /* Clear stale image before loading new one — prevents the modal
            from flashing the previous photo while the new one downloads. */
         img.onload = null;
+        img.onerror = null;
         img.src = '';
         img.style.opacity = '0';
         
@@ -1230,20 +1257,28 @@
             positionOldBbox();
             document.getElementById('oldBbox').style.display = 'block';
         };
+        /* Without this the editor stayed at opacity 0 when the thumbnail failed. */
+        img.onerror = function() {
+            img.style.opacity = '1';
+            showInlineAlert(i18nGallery.imageError);
+        };
         
         /* Set src AFTER onload handler is attached so the callback
            always fires, even if the image is cached. */
         img.src = commonsThumbUrl(fileTitle, 1280);
         modal.classList.add('active');
+        setModalBackgroundInert(true);
         document.getElementById('bboxModalTitle').focus();
     }
 
     function closeBboxModal() {
         document.getElementById('bboxModal').classList.remove('active');
         document.getElementById('modalLoading').classList.remove('active');
+        setModalBackgroundInert(false);
         /* Clear image so a stale photo is never shown when reopening. */
         var img = document.getElementById('modalImg');
         img.onload = null;
+        img.onerror = null;
         img.src = '';
         isDrawing = false;
         drawTouchId = null;
@@ -1253,9 +1288,63 @@
         if (bboxTriggerElement) { bboxTriggerElement.focus(); bboxTriggerElement = null; }
     }
 
+    /* While the dialog is open, everything beside it is inert (unreachable by
+       keyboard and ignored by screen readers) and Tab cannot leave it. */
+    function setModalBackgroundInert(on) {
+        var modal = document.getElementById('bboxModal');
+        var parent = modal.parentElement;
+        if (!parent) return;
+        for (var i = 0; i < parent.children.length; i++) {
+            var child = parent.children[i];
+            /* The inline alert reports save errors, so it must stay readable. */
+            if (child === modal || child.tagName === 'SCRIPT' || child.id === 'inline-alert') continue;
+            if (on) child.setAttribute('inert', '');
+            else child.removeAttribute('inert');
+        }
+    }
+
+    function trapModalFocus(e) {
+        var modal = document.getElementById('bboxModal');
+        /* The inline alert is deliberately not inert (it reports save errors and
+           carries the Re-authorize action), so its controls join the cycle.
+           Without this they were reachable only after the dialog was closed. */
+        var containers = [modal];
+        var alert = document.getElementById('inline-alert');
+        if (alert) containers.push(alert);
+        var selector = 'button:not([disabled]), input:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])';
+        var list = [];
+        for (var c = 0; c < containers.length; c++) {
+            var nodes = containers[c].querySelectorAll(selector);
+            for (var i = 0; i < nodes.length; i++) {
+                /* display:none and the [hidden] children of the alert both fail
+                   this, so only the controls actually on screen are tabbed. */
+                if (nodes[i].getClientRects().length) list.push(nodes[i]);
+            }
+        }
+        if (!list.length) return;
+        var first = list[0];
+        var last = list[list.length - 1];
+        var active = document.activeElement;
+        var inside = false;
+        for (var j = 0; j < containers.length; j++) {
+            if (containers[j].contains(active)) inside = true;
+        }
+        if (e.shiftKey) {
+            if (active === first || !inside) { e.preventDefault(); last.focus(); }
+        } else if (active === last) {
+            e.preventDefault();
+            first.focus();
+        }
+    }
+
     document.addEventListener('keydown', function(e) {
-        if (e.key === 'Escape' && document.getElementById('bboxModal').classList.contains('active')) {
+        var modal = document.getElementById('bboxModal');
+        if (!modal.classList.contains('active')) return;
+        if (e.key === 'Escape') {
+            e.preventDefault();
             closeBboxModal();
+        } else if (e.key === 'Tab') {
+            trapModalFocus(e);
         }
     });
 
@@ -1404,6 +1493,7 @@
         isDrawing = false;
         drawTouchId = null;
         drawingBox.style.display = 'none';
+        /* A cancelled drag commits nothing: the previous box is restored. */
         currentBbox = null;
         document.getElementById('saveBboxBtn').disabled = true;
         if (currentOldBbox) {
@@ -1484,6 +1574,7 @@
         
         var loading = document.getElementById('modalLoading');
         loading.classList.add('active');
+        var savedFaceId = currentEditFaceId;
         
         postForm(apiUpdateBboxUrl, csrfToken, {
             face_id: currentEditFaceId,
@@ -1493,7 +1584,13 @@
             bbox_left: currentBbox.left
         }).then(function(data) {
             if (data.status === 'ok') {
-                closeBboxModal();
+                /* A slow answer must not close a dialog the user reopened for
+                   another face in the meantime. */
+                if (currentEditFaceId === savedFaceId) closeBboxModal();
+                loading.classList.remove('active');
+                /* The card may be rebuilt by the reload, so put focus back on
+                   the results instead of leaving it on a detached button. */
+                focusGalleryAfterLoad = true;
                 loadGalleryPage(currentPage);
             } else {
                 showInlineAlert(data.error || i18nReclassify.bboxError, reauthHref(data));
@@ -1502,9 +1599,10 @@
         }).catch(function(e) {
             console.error(e);
             loading.classList.remove('active');
-            // Surface the server's actual error message (postForm() throws
-            // on non-2xx) instead of the generic bboxError fallback.
-            var msg = (e && e.data && e.data.error) || (e && e.message) || i18nReclassify.bboxError;
+            // Surface the server's actual error message (postForm() throws on
+            // non-2xx); e.message is English plumbing text, so a bodiless answer
+            // falls back to the translated generic message.
+            var msg = (e && e.data && e.data.error) || i18nReclassify.bboxError;
             showInlineAlert(msg, reauthHref(e && e.data));
         });
     }
@@ -1515,6 +1613,9 @@
     var activeSortOrder = 'threshold-asc';
     var currentPage = 1;
     var perPage = 27;
+    /* Set when a gallery reload replaces the element that had focus (pagination,
+       bbox save); the reload then moves focus to the results. */
+    var focusGalleryAfterLoad = false;
     var i18nPagination = {
         prev: {{ _('Prev')|tojson }},
         next: {{ _('Next')|tojson }},
@@ -1696,6 +1797,10 @@
                 // them laid out when the gallery is resized).
                 gallery.querySelectorAll('.result-thumb img').forEach(bindFaceLayout);
                 watchGalleryResize(gallery);
+                if (focusGalleryAfterLoad) {
+                    focusGalleryAfterLoad = false;
+                    gallery.focus();
+                }
             })
             .catch(function(e) {
                 if (e.name === 'AbortError') return;
@@ -1747,6 +1852,7 @@
             sp.className = className;
             sp.textContent = text;
             nav.appendChild(sp);
+            return sp;
         }
 
         pageButton(i18nPagination.prev, currentPage - 1, currentPage <= 1);
@@ -1761,7 +1867,8 @@
 
         for (var p = startPage; p <= endPage; p++) {
             if (p === currentPage) {
-                pageSpan('active', String(p));
+                var currentSpan = pageSpan('active', String(p));
+                currentSpan.setAttribute('aria-current', 'page');
             } else {
                 pageButton(String(p), p, false);
             }
@@ -1777,6 +1884,7 @@
 
     function goToPage(page) {
         if (page < 1) return;
+        focusGalleryAfterLoad = true;
         loadGalleryPage(page);
         document.getElementById('resultsGallery').scrollIntoView({ behavior: 'smooth', block: 'start' });
     }
@@ -2250,11 +2358,84 @@
     })();
     {% endif %}
 
+    {% if project.images_processed != project.images_total or project.images_total == 0 or inference_watch %}
+    /* --- One shared /api/progress feed -------------------------------------
+       Both cards used to poll every 5 s on their own, which is ~24 requests a
+       minute per tab against a 30/min limit, and neither backed off when the
+       server answered 429. One request now feeds both, pauses while the tab is
+       hidden, and doubles the delay up to 60 s after an error. */
+    var progressFeed = (function(url) {
+        var BASE_DELAY = 5000;
+        var MAX_DELAY = 60000;
+        var listeners = [];
+        var timer = null;
+        var inFlight = false;
+        var delay = BASE_DELAY;
+        var lastFetchAt = 0;
+        var stopped = false;
+
+        function schedule(ms) {
+            if (timer) clearTimeout(timer);
+            timer = setTimeout(tick, ms);
+        }
+
+        function deliver(data) {
+            listeners.slice().forEach(function(fn) {
+                try { fn(data); } catch (e) { console.error('Progress listener failed', e); }
+            });
+        }
+
+        function tick() {
+            timer = null;
+            if (stopped || listeners.length === 0) return;
+            if (document.hidden) { schedule(BASE_DELAY); return; }
+            if (inFlight) return;
+            inFlight = true;
+            lastFetchAt = Date.now();
+            fetch(url, { headers: { 'Accept': 'application/json' } })
+                .then(function(r) {
+                    if (!r.ok) throw new Error('HTTP ' + r.status);
+                    return r.json();
+                })
+                .then(function(data) {
+                    delay = BASE_DELAY;
+                    deliver(data);
+                    schedule(delay);
+                })
+                .catch(function(e) {
+                    delay = Math.min(delay * 2, MAX_DELAY);
+                    console.error('Progress poll error:', e);
+                    schedule(delay);
+                })
+                .then(function() { inFlight = false; });
+        }
+
+        document.addEventListener('visibilitychange', function() {
+            if (document.hidden || stopped || inFlight || listeners.length === 0) return;
+            if (Date.now() - lastFetchAt < BASE_DELAY) return;
+            schedule(0);
+        });
+
+        return {
+            subscribe: function(fn) {
+                listeners.push(fn);
+                if (listeners.length === 1) { stopped = false; schedule(0); }
+                return function unsubscribe() {
+                    var i = listeners.indexOf(fn);
+                    if (i !== -1) listeners.splice(i, 1);
+                    if (listeners.length === 0) {
+                        stopped = true;
+                        if (timer) { clearTimeout(timer); timer = null; }
+                    }
+                };
+            }
+        };
+    })({{ url_for('api_progress', project_id=project.id)|tojson }});
+    {% endif %}
+
     // --- Processing progress live polling ---
     {% if project.images_processed != project.images_total or project.images_total == 0 %}
     (function() {
-        var apiProgressUrl = {{ url_for('api_progress', project_id=project.id)|tojson }};
-        var pollTimer = null;
         var i18nProgress = {
             complete: {{ _('Complete')|tojson }},
             imagesCount: {{ _('{done} / {total} images')|tojson }},
@@ -2269,6 +2450,8 @@
             inferenceWaitingOne: {{ ngettext('{num} face waiting for model inference. The background worker will classify it automatically within the next minute.', '{num} faces waiting for model inference. The background worker will classify them automatically within the next minute.', 1)|tojson }}
         };
         var minConfirmed = {{ project.min_confirmed }};
+        var projectActive = {{ (project.status == 'active')|tojson }};
+        var unsubscribe = null;
 
         function updateStats(fs) {
             if (!fs) return;
@@ -2295,114 +2478,105 @@
             updateSdcStatusText();
         }
 
-        function pollProgress() {
-            fetch(apiProgressUrl).then(function(r) {
-                if (!r.ok) throw new Error('HTTP ' + r.status);
-                return r.json();
-        }).then(function(data) {
-                var bar = document.getElementById('progressBar');
-                var pctEl = document.getElementById('progressPct');
-                var countEl = document.getElementById('progressCount');
-                var msgEl = document.getElementById('progressMsg');
-                if (!bar || !pctEl) return;
+        function pollProgress(data) {
+            var bar = document.getElementById('progressBar');
+            var pctEl = document.getElementById('progressPct');
+            var countEl = document.getElementById('progressCount');
+            var msgEl = document.getElementById('progressMsg');
+            if (!bar || !pctEl) { if (unsubscribe) unsubscribe(); return; }
 
-                var done = data.images_processed || 0;
-                var total = data.images_total || 0;
+            var done = data.images_processed || 0;
+            var total = data.images_total || 0;
 
-                if (total === 0) {
-                    // Nothing found yet: say whether a worker already has the project.
-                    if (msgEl) msgEl.textContent = data.claimed ? i18nProgress.readingMsg : i18nProgress.waitingMsg;
-                    pctEl.textContent = (data.claimed ? i18nProgress.reading : i18nProgress.waiting) + '\u2026';
-                    return;
+            if (total === 0) {
+                // Nothing found yet: say whether a worker already has the project.
+                if (msgEl) msgEl.textContent = data.claimed ? i18nProgress.readingMsg : i18nProgress.waitingMsg;
+                pctEl.textContent = (data.claimed ? i18nProgress.reading : i18nProgress.waiting) + '\u2026';
+                /* A paused or completed project will never receive images, so
+                   this card has nothing left to report. */
+                if (!projectActive && unsubscribe) unsubscribe();
+                return;
+            }
+
+            if (msgEl) msgEl.style.display = 'none';
+
+            bar.style.opacity = '';
+            bar.style.animation = '';
+            bar.style.transition = 'width 0.3s ease';
+
+            updateStats(data.face_stats);
+
+            if (data.complete) {
+                bar.style.width = '100%';
+                pctEl.textContent = i18nProgress.imagesProcessed.replace('{num}', total);
+                if (countEl) {
+                    countEl.textContent = i18nProgress.complete;
+                    countEl.style.color = 'var(--success)';
                 }
+                var banner = document.getElementById('infoBanner');
+                if (banner && data.pending_images === 0) {
+                    banner.style.display = 'none';
+                }
+                if (unsubscribe) unsubscribe();
+                return;
+            }
 
-                if (msgEl) msgEl.style.display = 'none';
+            var pct = (done / total * 100).toFixed(1);
+            bar.style.width = pct + '%';
+            pctEl.textContent = pct + '%';
+            if (!countEl) {
+                /* A project that rendered with 0 images has no counter yet; add
+                   one now that there is something to count. */
+                var card = document.getElementById('progressCard');
+                var header = card ? card.querySelector('h2') : null;
+                if (header) {
+                    var wrap = document.createElement('div');
+                    wrap.className = 'progress-header';
+                    var span = document.createElement('span');
+                    span.id = 'progressCount';
+                    span.className = 'progress-count-active';
+                    header.parentNode.insertBefore(wrap, header);
+                    wrap.appendChild(header);
+                    wrap.appendChild(span);
+                    countEl = span;
+                }
+            }
+            if (countEl) {
+                countEl.textContent = i18nProgress.imagesCount
+                    .replace('{done}', done)
+                    .replace('{total}', total);
+            }
 
-                bar.style.opacity = '';
-                bar.style.animation = '';
-                bar.style.transition = 'width 0.3s ease';
-
-                updateStats(data.face_stats);
-                syncSdcButtonState();
-                updateSdcStatusText();
-
-                if (data.complete) {
-                    bar.style.width = '100%';
-                    pctEl.textContent = i18nProgress.imagesProcessed.replace('{num}', total);
-                    if (countEl) {
-                        countEl.textContent = i18nProgress.complete;
-                        countEl.style.color = 'var(--success)';
-                    }
-                    var banner = document.getElementById('infoBanner');
-                    if (banner && data.pending_images === 0) {
-                        banner.style.display = 'none';
-                    }
-                    clearInterval(pollTimer);
-                    pollTimer = null;
-                } else {
-                    var pct = (done / total * 100).toFixed(1);
-                    bar.style.width = pct + '%';
-                    pctEl.textContent = pct + '%';
-                    if (countEl) {
-                        countEl.textContent = i18nProgress.imagesCount
-                            .replace('{done}', done)
-                            .replace('{total}', total);
-                    } else {
-                        var card = document.getElementById('progressCard');
-                        var header = card ? card.querySelector('h2') : null;
-                        if (header && !header.nextElementSibling) {
-                            var wrap = document.createElement('div');
-                            wrap.style.cssText = 'display:flex;justify-content:space-between;align-items:flex-end;margin-bottom:1rem';
-                            var span = document.createElement('span');
-                            span.id = 'progressCount';
-                            span.style.cssText = 'font-weight:bold;color:var(--primary)';
-                            span.textContent = i18nProgress.imagesCount
-                                .replace('{done}', done)
-                                .replace('{total}', total);
-                            header.parentNode.insertBefore(wrap, header);
-                            wrap.appendChild(header);
-                            wrap.appendChild(span);
-                        }
-                    }
-
-                    var banner = document.getElementById('infoBanner');
-                    if (banner) {
-                        var p = document.getElementById('infoBannerText') || banner.querySelector('p');
-                        if (p) {
-                            var confirmed = (data.face_stats && data.face_stats.human_confirmed) || 0;
-                            if (data.pending_images > 0) {
-                                p.style.color = 'var(--info)';
-                                p.style.fontWeight = '700';
-                                p.textContent = data.pending_images === 1
-                                    ? i18nProgress.pendingOne.replace('{pending}', '1')
-                                    : i18nProgress.pendingMany.replace('{pending}', data.pending_images);
-                            } else if (data.pending_images === 0 && confirmed >= minConfirmed && (data.inference_eligible || 0) > 0) {
-                                var eligible = data.inference_eligible;
-                                p.style.color = 'var(--info)';
-                                p.style.fontWeight = '700';
-                                p.textContent = eligible === 1
-                                    ? i18nProgress.inferenceWaitingOne.replace('{num}', '1')
-                                    : i18nProgress.inferenceWaiting.replace('{num}', eligible);
-                            }
-                        }
+            var infoBanner = document.getElementById('infoBanner');
+            if (infoBanner) {
+                var p = document.getElementById('infoBannerText') || infoBanner.querySelector('p');
+                if (p) {
+                    var confirmed = (data.face_stats && data.face_stats.human_confirmed) || 0;
+                    if (data.pending_images > 0) {
+                        p.style.color = 'var(--info)';
+                        p.style.fontWeight = '700';
+                        p.textContent = data.pending_images === 1
+                            ? i18nProgress.pendingOne.replace('{pending}', '1')
+                            : i18nProgress.pendingMany.replace('{pending}', data.pending_images);
+                    } else if (data.pending_images === 0 && confirmed >= minConfirmed && (data.inference_eligible || 0) > 0) {
+                        var eligible = data.inference_eligible;
+                        p.style.color = 'var(--info)';
+                        p.style.fontWeight = '700';
+                        p.textContent = eligible === 1
+                            ? i18nProgress.inferenceWaitingOne.replace('{num}', '1')
+                            : i18nProgress.inferenceWaiting.replace('{num}', eligible);
                     }
                 }
-            }).catch(function(e) {
-                console.error('Progress poll error:', e);
-            });
+            }
         }
 
-        pollTimer = setInterval(pollProgress, 5000);
-        pollProgress();
+        unsubscribe = progressFeed.subscribe(pollProgress);
     })();
     {% endif %}
 
     // --- Inference progress live polling ---
     {% if inference_watch %}
     (function() {
-        var apiProgressUrl = {{ url_for('api_progress', project_id=project.id)|tojson }};
-        var inferenceTimer = null;
-        var inferencePollInFlight = false;
         // Observed-work marker: set when the page rendered mid-run, a poll sees
         // eligible faces, or model classifications grew since load (a cycle
         // finished between polls). It is not reset while the inference gate
@@ -2427,128 +2601,116 @@
         var projectActive = {{ (project.status == 'active')|tojson }};
         var initialByModel = {{ (stats.by_model or 0)|tojson }};
         var initialModelMatches = {{ (stats.model_matches or 0)|tojson }};
+        var unsubscribe = null;
 
-        function pollInference() {
-            if (inferencePollInFlight) return;
-            if (!document.getElementById('inferenceBanner')) {
-                // Banner dismissed or removed — stop polling.
-                clearInterval(inferenceTimer);
-                inferenceTimer = null;
-                return;
-            }
-            inferencePollInFlight = true;
-            fetch(apiProgressUrl).then(function(r) {
-                if (!r.ok) throw new Error('HTTP ' + r.status);
-                return r.json();
-            }).then(function(data) {
-                var banner = document.getElementById('inferenceBanner');
-                if (!banner) {
-                    clearInterval(inferenceTimer);
-                    inferenceTimer = null;
-                    return;
-                }
-
-                var fs = data.face_stats || {};
-                var eligible = data.inference_eligible || 0;
-                var textEl = document.getElementById('inferenceText');
-
-                // Update stat boxes live
-                var statMap = {
-                    'statTotalFaces': fs.total_faces,
-                    'statMatches': fs.confirmed_matches,
-                    'statNonMatches': fs.confirmed_non_matches,
-                    'statUnclassified': fs.unclassified,
-                    'statSdcWritten': fs.sdc_written,
-                    'statSdcPending': (fs.sdc_pending || 0) + (fs.sdc_removal_pending_faces || 0),
-                    'statByHuman': fs.by_human,
-                    'statByModel': fs.by_model,
-                    'statByBootstrap': fs.by_bootstrap
-                };
-                for (var id in statMap) {
-                    var el = document.getElementById(id);
-                    if (el) el.textContent = statMap[id] || 0;
-                }
-                syncSdcButtonState();
-                updateSdcStatusText();
-
-                var canInfer = (fs.human_confirmed || 0) >= minConfirmed;
-                var pending = data.pending_images || 0;
-                // The model starts once every image has been processed: until then the card says it
-                // is waiting, and nothing is "in progress".
-                var waiting = projectActive && canInfer && pending > 0;
-                var running = eligible > 0 && canInfer && pending === 0;
-                var quiescent = data.complete && pending === 0;
-
-                // Eligible faces or model-classification growth since load mean a
-                // cycle is (or has been) working; keep that fact across the hidden
-                // gaps so a between-polls cycle still finalizes the card below.
-                if (eligible > 0 || (fs.by_model || 0) > initialByModel) sawWork = true;
-
-                if (waiting || running) {
-                    var msg;
-                    var count;
-                    if (waiting) {
-                        msg = pending === 1 ? i18nInference.waitingOne : i18nInference.waiting;
-                        count = pending;
-                    } else {
-                        msg = eligible === 1 ? i18nInference.inProgressOne : i18nInference.inProgressMany;
-                        count = eligible;
-                    }
-                    if (textEl) textEl.textContent = msg.replace('{num}', count);
-                    if (banner.classList.contains('inference-banner-done')) {
-                        // New work started after a completion card — back to the spinner look
-                        banner.classList.remove('inference-banner-done');
-                        var doneIcon = banner.querySelector('.inference-done-icon');
-                        if (doneIcon) doneIcon.outerHTML = '<div class="inference-spinner" id="inferenceSpinner" aria-hidden="true"></div>';
-                    }
-                    banner.style.display = '';
-                } else if (sawWork && canInfer && quiescent) {
-                    var recordedRun = data.inference_run || 0;
-                    var recorded = recordedRun > baseRun;
-                    if (!recorded && recordWaits < MAX_RECORD_WAITS) {
-                        recordWaits++;  // the record of this cycle is not there yet: look again
-                        return;
-                    }
-                    // Everything finished after observed work — show the completion note
-                    clearInterval(inferenceTimer);
-                    inferenceTimer = null;
-                    // The run's own count once it is recorded, else the growth seen since page load.
-                    var newMatches = (recorded && typeof data.inference_matches === 'number')
-                        ? data.inference_matches
-                        : Math.max(0, (fs.model_matches || 0) - initialModelMatches);
-                    banner.dataset.run = String(recorded ? recordedRun : baseRun);  // closing it remembers this run
-                    banner.classList.add('inference-banner-done');
-                    var spinner = document.getElementById('inferenceSpinner');
-                    if (spinner) spinner.outerHTML = '<span class="inference-done-icon" aria-hidden="true">✓</span>';
-                    if (textEl) textEl.textContent = (newMatches === 1 ? i18nInference.doneOne : i18nInference.done).replace('{num}', newMatches);
-
-                    // Ensure banner is visible (user may have dismissed in-progress state)
-                    banner.style.display = '';
-
-                    // Also hide the info banner if visible (no longer relevant)
-                    var infoBanner = document.getElementById('infoBanner');
-                    if (infoBanner) infoBanner.style.display = 'none';
-
-                    // Refresh gallery to show new model results
-                    if (typeof loadGalleryPage === 'function') loadGalleryPage(1);
-                } else if (quiescent) {
-                    // Nothing left to watch — stop polling (leave the banner as rendered)
-                    clearInterval(inferenceTimer);
-                    inferenceTimer = null;
-                } else {
-                    // More work remains. A finished run's card stays (as it does after a reload) unless
-                    // images are pending again; anything else waits hidden for the next cycle.
-                    if (!banner.classList.contains('inference-banner-done') || pending > 0) banner.style.display = 'none';
-                }
-            }).catch(function(e) {
-                console.error('Inference poll error:', e);
-            }).finally(function() {
-                inferencePollInFlight = false;
-            });
+        function stopInferencePolling() {
+            if (unsubscribe) unsubscribe();
         }
 
-        inferenceTimer = setInterval(pollInference, 5000);
-        pollInference();
+        function pollInference(data) {
+            var banner = document.getElementById('inferenceBanner');
+            if (!banner) {
+                // Banner dismissed or removed — stop polling.
+                stopInferencePolling();
+                return;
+            }
+
+            var fs = data.face_stats || {};
+            var eligible = data.inference_eligible || 0;
+            var textEl = document.getElementById('inferenceText');
+
+            // Update stat boxes live (including the SDC counters the inference
+            // poller used to leave stale until the next progress poll).
+            var statMap = {
+                'statTotalFaces': fs.total_faces,
+                'statMatches': fs.confirmed_matches,
+                'statNonMatches': fs.confirmed_non_matches,
+                'statUnclassified': fs.unclassified,
+                'statSdcWritten': fs.sdc_written,
+                'statSdcPending': (fs.sdc_pending || 0) + (fs.sdc_removal_pending_faces || 0),
+                'statSdcSendCount': fs.sdc_pending || 0,
+                'statSdcRemovalCount': fs.sdc_removal_pending_faces || 0,
+                'statByHuman': fs.by_human,
+                'statByModel': fs.by_model,
+                'statByBootstrap': fs.by_bootstrap
+            };
+            for (var id in statMap) {
+                var el = document.getElementById(id);
+                if (el) el.textContent = statMap[id] || 0;
+            }
+            syncSdcButtonState();
+            updateSdcStatusText();
+
+            var canInfer = (fs.human_confirmed || 0) >= minConfirmed;
+            var pending = data.pending_images || 0;
+            // The model starts once every image has been processed: until then the card says it
+            // is waiting, and nothing is "in progress".
+            var waiting = projectActive && canInfer && pending > 0;
+            var running = eligible > 0 && canInfer && pending === 0;
+            var quiescent = data.complete && pending === 0;
+
+            // Eligible faces or model-classification growth since load mean a
+            // cycle is (or has been) working; keep that fact across the hidden
+            // gaps so a between-polls cycle still finalizes the card below.
+            if (eligible > 0 || (fs.by_model || 0) > initialByModel) sawWork = true;
+
+            if (waiting || running) {
+                var msg;
+                var count;
+                if (waiting) {
+                    msg = pending === 1 ? i18nInference.waitingOne : i18nInference.waiting;
+                    count = pending;
+                } else {
+                    msg = eligible === 1 ? i18nInference.inProgressOne : i18nInference.inProgressMany;
+                    count = eligible;
+                }
+                if (textEl) textEl.textContent = msg.replace('{num}', count);
+                if (banner.classList.contains('inference-banner-done')) {
+                    // New work started after a completion card — back to the spinner look
+                    banner.classList.remove('inference-banner-done');
+                    var doneIcon = banner.querySelector('.inference-done-icon');
+                    if (doneIcon) doneIcon.outerHTML = '<div class="inference-spinner" id="inferenceSpinner" aria-hidden="true"></div>';
+                }
+                banner.style.display = '';
+            } else if (sawWork && canInfer && quiescent) {
+                var recordedRun = data.inference_run || 0;
+                var recorded = recordedRun > baseRun;
+                if (!recorded && recordWaits < MAX_RECORD_WAITS) {
+                    recordWaits++;  // the record of this cycle is not there yet: look again
+                    return;
+                }
+                // Everything finished after observed work — show the completion note
+                stopInferencePolling();
+                // The run's own count once it is recorded, else the growth seen since page load.
+                var newMatches = (recorded && typeof data.inference_matches === 'number')
+                    ? data.inference_matches
+                    : Math.max(0, (fs.model_matches || 0) - initialModelMatches);
+                banner.dataset.run = String(recorded ? recordedRun : baseRun);  // closing it remembers this run
+                banner.classList.add('inference-banner-done');
+                var spinner = document.getElementById('inferenceSpinner');
+                if (spinner) spinner.outerHTML = '<span class="inference-done-icon" aria-hidden="true">✓</span>';
+                if (textEl) textEl.textContent = (newMatches === 1 ? i18nInference.doneOne : i18nInference.done).replace('{num}', newMatches);
+
+                // Ensure banner is visible (user may have dismissed in-progress state)
+                banner.style.display = '';
+
+                // Also hide the info banner if visible (no longer relevant)
+                var infoBanner = document.getElementById('infoBanner');
+                if (infoBanner) infoBanner.style.display = 'none';
+
+                // Refresh gallery to show new model results
+                if (typeof loadGalleryPage === 'function') loadGalleryPage(1);
+            } else if (quiescent) {
+                // Nothing left to watch — stop polling (leave the banner as rendered)
+                stopInferencePolling();
+            } else {
+                // More work remains. A finished run's card stays (as it does after a reload) unless
+                // images are pending again; anything else waits hidden for the next cycle.
+                if (!banner.classList.contains('inference-banner-done') || pending > 0) banner.style.display = 'none';
+            }
+        }
+
+        unsubscribe = progressFeed.subscribe(pollInference);
     })();
     {% endif %}
 </script>

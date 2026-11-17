@@ -406,7 +406,7 @@ def test_only_new_inference_projects_are_run_and_the_rest_are_released() -> None
         worker._drain_inference_queue(active_ids={2}, seen_ids=seen)
 
     assert sorted(c.args[0]["id"] for c in infer.call_args_list) == [1]
-    release.assert_called_once_with(3)  # id 2 belongs to the active pipeline, which releases it
+    assert sorted(c.args[0] for c in release.call_args_list) == [2, 3]  # the drain gives back the claims it took
     assert seen == {1, 3}
 
 
@@ -956,7 +956,7 @@ def test_a_long_maxlag_sleep_is_announced_as_progress() -> None:
     ):
         assert worker._api_request("https://commons.wikimedia.org/w/api.php") is ok
 
-    sleeper.assert_called_once_with(2.0)
+    assert sum(c.args[0] for c in sleeper.call_args_list) == 2.0
     assert call("api_maxlag_sleep") in mark.call_args_list
 
 
@@ -972,4 +972,5 @@ def test_a_failed_request_is_announced_before_the_retry_sleep() -> None:
     ):
         worker._api_request("https://commons.wikimedia.org/w/api.php")
 
-    assert mark.call_args_list.count(call("api_retry_sleep")) == 3
+    # The last failed attempt is final: no sleep follows it.
+    assert mark.call_args_list.count(call("api_retry_sleep")) == 2

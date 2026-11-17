@@ -66,9 +66,38 @@ def require_sample_env() -> bool:
     return os.environ.get("WIKIVISAGE_REQUIRE_SAMPLE", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def require_node_env() -> bool:
+    """True only for an explicit affirmative in ``WIKIVISAGE_REQUIRE_NODE``.
+
+    The JavaScript tests (``static/wikivisage-common.js``, ``static/sw.js``) need
+    ``node``; without this flag a machine that lacks it would skip them silently,
+    which would look green while the shipped script is untested. CI sets it.
+    """
+    return os.environ.get("WIKIVISAGE_REQUIRE_NODE", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 # ---------------------------------------------------------------------------
 # Unit-test fixtures (no DB)
 # ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _app_response_caches_start_empty():
+    """The app keeps a short-lived /health snapshot and a P18 lookup cache at module level.
+
+    Tests share one imported ``app`` module, so a cached answer from one test would leak into the
+    next one. Clear both before and after every test.
+    """
+
+    def _clear() -> None:
+        app = sys.modules.get("app")
+        if app is not None:
+            app._clear_health_cache()
+            app._clear_p18_cache()
+
+    _clear()
+    yield
+    _clear()
 
 
 @pytest.fixture

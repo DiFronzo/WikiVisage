@@ -23,7 +23,7 @@
                     <button type="button" id="check-category-btn" class="btn btn-sm" style="white-space: nowrap; margin-top: 2px;">{{ _('Check') }}</button>
                 </div>
                 <div class="help-text">{{ _('Category name without the "Category:" prefix') }}</div>
-                <div id="category-info" style="display: none; margin-top: 0.5rem; padding: 0.75rem 1rem; font-size: 0.875rem; border-left: 3px solid var(--primary); background: rgba(20, 184, 166, 0.05);"></div>
+                <div id="category-info" role="status" aria-live="polite" style="display: none; margin-top: 0.5rem; padding: 0.75rem 1rem; font-size: 0.875rem; border-left: 3px solid var(--primary); background: rgba(20, 184, 166, 0.05);"></div>
             </div>
 
             <div class="form-group">
@@ -64,12 +64,16 @@ var i18nCatInfo = {
     filesApprox: {{ _('{files}+ files across {subcats}+ subcategories (estimate)')|tojson }},
     notFound: {{ _('Category not found on Commons.')|tojson }},
     emptyCategory: {{ _('This category exists on Commons but contains no files.')|tojson }},
-    error: {{ _('Could not reach Commons API.')|tojson }},
+    error: {{ _('Could not check the category right now. You can still create the project.')|tojson }},
     tipSmall: {{ _('With this category size, the default of 5 confirmed faces should work well.')|tojson }},
     tipMedium: {{ _('This is a medium-sized category. Consider raising Min Confirmed Faces to 10–15 for better accuracy.')|tojson }},
     tipLarge: {{ _('This is a large category. Consider raising Min Confirmed Faces to 40–50 for better accuracy.')|tojson }},
     capNote: {{ _('Note: Only the first 9,000 images will be processed.')|tojson }}
 };
+
+/* Only the newest check may write to the status box. Without this, an answer for
+   an older category (slow request) overwrote the result of the current one. */
+var categoryCheckSeq = 0;
 
 function checkCategory() {
     var input = document.getElementById('commons_category');
@@ -77,6 +81,7 @@ function checkCategory() {
     var btn = document.getElementById('check-category-btn');
     var submitBtn = document.getElementById('submit-btn');
     var category = input.value.trim();
+    var seq = ++categoryCheckSeq;
 
     if (!category) { input.focus(); return; }
 
@@ -84,23 +89,25 @@ function checkCategory() {
     infoDiv.style.display = 'block';
     infoDiv.style.borderLeftColor = 'var(--primary)';
     infoDiv.style.color = 'var(--text-muted)';
+    infoDiv.style.background = 'rgba(20, 184, 166, 0.05)';
     infoDiv.textContent = i18nCatInfo.checking;
 
     fetch('{{ url_for("api_category_info") }}?category=' + encodeURIComponent(category))
         .then(function(r) {
+            if (seq !== categoryCheckSeq) return null;
             if (r.status === 404) {
                 infoDiv.style.borderLeftColor = 'var(--danger)';
                 infoDiv.style.color = 'var(--danger)';
                 infoDiv.style.background = 'rgba(239, 68, 68, 0.1)';
                 infoDiv.textContent = i18nCatInfo.notFound;
                 submitBtn.disabled = true;
-                return;
+                return null;
             }
-            if (!r.ok) throw new Error();
+            if (!r.ok) throw new Error('HTTP ' + r.status);
             return r.json();
         })
         .then(function(data) {
-            if (!data) return;
+            if (!data || seq !== categoryCheckSeq) return;
             if (data.files === 0 && data.subcats === 0) {
                 infoDiv.style.borderLeftColor = 'var(--warning)';
                 infoDiv.style.color = 'var(--warning)';
@@ -138,18 +145,28 @@ function checkCategory() {
             }
         })
         .catch(function() {
-            infoDiv.style.borderLeftColor = 'var(--danger)';
-            infoDiv.style.color = 'var(--danger)';
-            infoDiv.style.background = 'rgba(239, 68, 68, 0.1)';
+            if (seq !== categoryCheckSeq) return;
+            /* The check is advisory: an outage must not block creating the project. */
+            infoDiv.style.borderLeftColor = 'var(--warning)';
+            infoDiv.style.color = 'var(--warning)';
+            infoDiv.style.background = 'rgba(245, 158, 11, 0.1)';
             infoDiv.textContent = i18nCatInfo.error;
-            submitBtn.disabled = true;
+            submitBtn.disabled = false;
         })
-        .finally(function() { btn.disabled = false; });
+        .finally(function() {
+            /* Unconditionally: editing the category while a check is in flight
+               bumps categoryCheckSeq, and a guarded re-enable then left the
+               button disabled until the page was reloaded. The sequence guard
+               belongs on the answer written to the page, not on this. */
+            btn.disabled = false;
+        });
 }
 
 document.getElementById('check-category-btn').addEventListener('click', checkCategory);
 
 document.getElementById('commons_category').addEventListener('input', function() {
+    /* Editing the category invalidates the answer on screen. */
+    categoryCheckSeq++;
     document.getElementById('submit-btn').disabled = false;
     var infoDiv = document.getElementById('category-info');
     infoDiv.style.display = 'none';

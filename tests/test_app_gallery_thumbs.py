@@ -9,8 +9,16 @@ import pytest
 
 from tests._app_preamble import app_module, flask_app
 from tests._app_support import _make_authed_client
+from tests.conftest import require_node_env
 
 _ROOT = Path(__file__).resolve().parent.parent
+_NODE = shutil.which("node")
+
+
+def test_node_is_installed_when_the_suite_requires_it():
+    """The service-worker test skips without node, so CI asserts it is there (WIKIVISAGE_REQUIRE_NODE=1)."""
+    if require_node_env():
+        assert _NODE is not None, "WIKIVISAGE_REQUIRE_NODE=1 but node is not installed"
 
 
 def _face_row(detection_width, file_title="File:Example photo.jpg"):
@@ -113,6 +121,31 @@ def test_gallery_row_urls_follow_the_file_type(monkeypatch, fake_user):
     assert row["thumb_urls"]["960"].endswith("/960px-Scan.tif.jpg")
 
 
+def test_gallery_row_carries_no_per_image_face_count(monkeypatch, fake_user):
+    """Bootstrap cards are never outlined, so the row needs no face count: the count that
+    would matter is the number of *people* in the photo, which detection cannot supply."""
+    row = _gallery_row(monkeypatch, fake_user, 960)
+
+    assert "faces_on_image" not in row
+
+
+@pytest.mark.integration
+def test_gallery_lists_a_bootstrapped_face_without_a_face_count(
+    integration_client, db_conn, seed_project, seed_images, seed_faces
+):
+    """Against MariaDB: a bootstrapped face is listed for the card, with no count to gate on."""
+    client, _, _ = integration_client
+    url = f"/api/project/{seed_project['id']}/gallery?per_page=100"
+
+    with db_conn.cursor() as cur:
+        cur.execute("UPDATE faces SET classified_by = 'bootstrap' WHERE id = %s", (seed_faces["target"][0],))
+
+    faces = client.get(url).get_json()["faces"]
+    boot = [row for row in faces if row["classified_by"] == "bootstrap"]
+    assert boot, "the bootstrapped face is still listed"
+    assert all("faces_on_image" not in row for row in faces)
+
+
 # sw.js has no module system; run it in node with a fake service-worker scope.
 _SW_HARNESS = r"""
 const fs = require('fs');
@@ -123,14 +156,19 @@ const source = fs.readFileSync(process.argv[2], 'utf8');
 async function run(scenario) {
   const listeners = {};
   const store = new Map();
-  if (scenario.cached) store.set(scenario.url, { cachedCopy: true });
+  if (scenario.cached) store.set(scenario.url, { cachedCopy: true, url: scenario.url });
+  if (scenario.stale) store.set(scenario.stale, { cachedCopy: true, url: scenario.stale });
+  const keyOf = (req) => (typeof req === 'string' ? req : req.url);
+  const cache = {
+    put: async (req, res) => { store.set(keyOf(req), res); },
+    addAll: async () => {},
+    match: async (req) => store.get(keyOf(req)),
+    keys: async () => [...store.keys()].map((url) => ({ url })),
+    delete: async (req) => store.delete(keyOf(req)),
+  };
   const caches = {
-    open: async () => ({
-      put: async (req, res) => { store.set(req.url, res); },
-      addAll: async () => {},
-      match: async (req) => store.get(req.url),
-    }),
-    match: async (req) => store.get(req.url),
+    open: async () => cache,
+    match: async (req) => store.get(keyOf(req)),
     keys: async () => [],
     delete: async () => true,
   };
@@ -147,14 +185,17 @@ async function run(scenario) {
   vm.runInContext(source, context);
   let answered;
   let handled = false;
+  const background = [];  // event.waitUntil() work: cache writes must finish before we report
   listeners.fetch({
     request: { url: scenario.url, method: 'GET' },
     respondWith: (promise) => { handled = true; answered = promise; },
+    waitUntil: (promise) => { background.push(promise); },
   });
   if (!handled) return { handled: false };
   const response = await answered;
+  await Promise.allSettled(background);
   return { handled: true, cachedCopy: !!(response && response.cachedCopy), fresh: !!(response && response.fresh),
-           status: response && response.status };
+           status: response && response.status, cachedUrls: [...store.keys()].sort() };
 }
 
 (async () => {
@@ -165,7 +206,7 @@ async function run(scenario) {
 """
 
 
-@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+@pytest.mark.skipif(_NODE is None, reason="node is not installed")
 def test_service_worker_scripts_fall_back_to_the_cache_on_5xx_and_errors(tmp_path):
     js = "https://x.test/static/wikivisage-common.js"
     png = "https://x.test/static/icon.png"
@@ -177,17 +218,20 @@ def test_service_worker_scripts_fall_back_to_the_cache_on_5xx_and_errors(tmp_pat
         {"url": js, "network": 404, "cached": True},  # a 4xx is a real answer, not a fallback case
         {"url": png, "network": 200, "cached": False},  # other static files keep their own strategy
         {"url": "https://x.test/project/1", "network": 200, "cached": False},  # routes: not handled
+        # A page asks for ?v=<release>: the copy of the previous release is dropped, so the
+        # cache cannot grow by one script per release for ever.
+        {"url": js + "?v=2", "network": 200, "cached": False, "stale": js + "?v=1"},
     ]
     harness = tmp_path / "sw_harness.js"
     harness.write_text(_SW_HARNESS)
     done = subprocess.run(  # noqa: S603
-        [shutil.which("node"), str(harness), str(_ROOT / "static" / "sw.js"), json.dumps(cases)],
+        [_NODE, str(harness), str(_ROOT / "static" / "sw.js"), json.dumps(cases)],
         capture_output=True,
         text=True,
         timeout=30,
         check=True,
     )
-    fresh, five_cached, five_bare, offline, four, other_static, route = json.loads(done.stdout)
+    fresh, five_cached, five_bare, offline, four, other_static, route, reversion = json.loads(done.stdout)
 
     assert fresh["fresh"] and not fresh["cachedCopy"]
     assert five_cached["cachedCopy"] and not five_cached["fresh"]
@@ -196,3 +240,4 @@ def test_service_worker_scripts_fall_back_to_the_cache_on_5xx_and_errors(tmp_pat
     assert four["fresh"] and four["status"] == 404
     assert other_static["handled"] and other_static["fresh"]
     assert route["handled"] is False
+    assert reversion["cachedUrls"] == [js + "?v=2"]

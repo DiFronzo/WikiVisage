@@ -54,6 +54,7 @@ def _default_bbox_face_row(**overrides):
         "confidence": 0.23,
         "classified_by_user_id": None,
         "sdc_written": 0,
+        "sdc_removal_pending": 0,
         "file_title": "File:Face.jpg",
         "commons_page_id": 12345,
         "project_id": 1,
@@ -627,6 +628,32 @@ def test_api_update_face_bbox_success_new_face_inserted_original_superseded(monk
     executed_sql = [call.args[0] for call in captured["calls"]]
     assert any(sql.startswith("INSERT INTO faces") for sql in executed_sql)
     assert any("UPDATE faces SET superseded_by" in sql for sql in executed_sql)
+
+
+def test_api_update_face_bbox_keeps_a_queued_removal_on_the_replacement_face(monkeypatch):
+    """Redrawing a rejected face must carry the P180 removal the rejection queued onto the new face."""
+    face_row = _default_bbox_face_row(is_target=0, sdc_removal_pending=1)
+    client, _ = _authed_client(monkeypatch, route_execute_query=_bbox_query_router(face_row=face_row))
+    monkeypatch.setattr(app_module, "_download_image", lambda *_a, **_k: b"image-bytes")
+    captured = {}
+
+    def _transaction(fn):
+        mock_cursor = MagicMock()
+        mock_cursor.lastrowid = 321
+        mock_cursor.fetchone.return_value = {"classified_by_user_id": None, "wiki_username": None}
+        result = fn(MagicMock(), mock_cursor)
+        captured["calls"] = mock_cursor.execute.call_args_list
+        return result
+
+    monkeypatch.setattr(app_module, "execute_transaction", _transaction)
+    monkeypatch.setattr(app_module.face_client, "encode_known_face", lambda *_a, **_k: _known_encoding(3002))
+
+    resp = client.post("/api/update-face-bbox", data=_update_bbox_form())
+
+    assert resp.status_code == 200
+    inserts = [c.args for c in captured["calls"] if c.args[0].startswith("INSERT INTO faces")]
+    assert len(inserts) == 1
+    assert inserts[0][1][-1] == 1  # sdc_removal_pending, copied from the original face
 
 
 def test_api_update_face_bbox_download_error(monkeypatch):

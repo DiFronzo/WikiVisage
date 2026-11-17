@@ -1,5 +1,8 @@
 var THUMB_STEPS = [20, 40, 60, 120, 250, 330, 500, 960, 1280, 1920, 3840];
 function snapThumbWidth(w) {
+    w = Number(w);
+    /* NaN, Infinity and non-positive widths would fall through to the widest step. */
+    if (!isFinite(w) || w <= 0) return THUMB_STEPS[0];
     for (var i = 0; i < THUMB_STEPS.length; i++) {
         if (THUMB_STEPS[i] >= w) return THUMB_STEPS[i];
     }
@@ -16,6 +19,14 @@ function commonsThumbUrl(fileTitle, width) {
  * POST a FormData request with CSRF token. Returns a Promise that resolves
  * to the parsed JSON response body. Rejects on network error or non-2xx status.
  *
+ * The rejection Error carries the parsed body as `data` plus two flags, so a
+ * caller can pick a translated message instead of showing the English text
+ * below: `notJson` says the response's content type was not JSON (it is decided
+ * by the content type, not by a parse failure), and `redirected` says the
+ * browser followed a redirect (an expired session redirects /api/* to the login
+ * page, which used to surface as "Server error (HTTP 200)"). A 2xx with a JSON
+ * content type but an empty or malformed body rejects too.
+ *
  * @param {string} url - The endpoint URL.
  * @param {string} csrfToken - CSRF token value.
  * @param {Object} fields - Key/value pairs to append to the FormData.
@@ -28,16 +39,31 @@ function postForm(url, csrfToken, fields) {
         if (fields.hasOwnProperty(key)) formData.append(key, fields[key]);
     }
     return fetch(url, { method: 'POST', body: formData }).then(function(r) {
-        return r.json().catch(function() {
-            return { error: 'Server error (HTTP ' + r.status + ')' };
-        }).then(function(data) {
-            if (!r.ok) {
-                var err = new Error(data.error || 'Network response was not ok');
-                err.data = data;
+        var contentType = r.headers.get('content-type') || '';
+        return r.text().then(function(text) {
+            var isJson = contentType.indexOf('json') !== -1;
+            var data = null;
+            if (isJson) {
+                try { data = JSON.parse(text); } catch (e) { data = null; }
+            }
+            var redirected = r.redirected || r.status === 0 || r.url.indexOf('/login') !== -1;
+            /* A 2xx is only a saved write when it carried JSON. A page here is a
+               proxy or login interstitial, and accepting it as `{}` made the
+               caller report an unsaved classification as saved. 204/205
+               legitimately carry no body at all. */
+            var bodyless = r.status === 204 || r.status === 205;
+            if (!r.ok || redirected || (!bodyless && (!isJson || !data))) {
+                var err = new Error(
+                    (data && data.error) ||
+                    (redirected ? 'Login required' : 'Server error (HTTP ' + r.status + ')')
+                );
+                err.data = data || {};
                 err.status = r.status;
+                err.notJson = !isJson;
+                err.redirected = redirected;
                 throw err;
             }
-            return data;
+            return data || {};
         });
     });
 }

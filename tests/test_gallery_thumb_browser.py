@@ -349,13 +349,27 @@ def test_resize_relayouts_and_the_marker_stays_on_the_face(open_gallery):
     assert not page.errors
 
 
-def test_bootstrap_row_is_not_zoomed_but_is_marked(open_gallery):
+def test_bootstrap_row_is_not_zoomed_and_never_outlined(open_gallery):
+    # A bootstrap face is the single face detection found on an image that already carries a
+    # depicts claim (worker.py only auto-classifies single-face images), so its box is that
+    # detected face, not necessarily the person the claim names (in a group photo the others
+    # may have been too small or turned away). A box on the wrong person misleads, so
+    # bootstrap cards get neither the zoom nor the marker.
     face = make_face(1, bbox=(470, 700, 490, 720), classified_by="bootstrap")
     page, requests = open_gallery([face], {"File:Photo.jpg": (2000, 3000)})
     assert not is_cropped(page)
     assert widths(requests, "Photo.jpg") == [330]
+    assert page.locator(".face-marker").count() == 0
+    assert not page.errors
+
+
+def test_model_row_in_a_crowd_is_still_cropped_and_outlined(open_gallery):
+    # Only bootstrap rows lose the outline: a model/human card is zoomed into its face,
+    # so the outline agrees with what the card shows.
+    face = make_face(1, bbox=(470, 700, 490, 720))
+    page, _ = open_gallery([face], {"File:Photo.jpg": (2000, 3000)})
+    assert is_cropped(page)
     assert page.locator(".face-marker").count() == 1
-    assert page.evaluate(_MARKER_ERROR_JS, 0) < 1.5
     assert not page.errors
 
 
@@ -589,20 +603,20 @@ def test_other_errors_show_no_reauthorize_button(open_gallery):
     page, _ = open_gallery([make_face(1)], {"File:Photo.jpg": (960, 1440)})
     _reject_first_card(page, 502, {"error": "Failed to remove SDC claim from Commons."})
 
-    assert page.locator("#inline-alert-action").is_hidden()
+    playwright.expect(page.locator("#inline-alert-action")).to_be_hidden()
     assert "Failed to remove" in page.locator("#inline-alert-text").inner_text()
 
 
 def test_reauthorize_button_does_not_linger_on_the_next_error(open_gallery):
     page, _ = open_gallery([make_face(1)], {"File:Photo.jpg": (960, 1440)})
     _reject_first_card(page, 401, _REAUTH_ERROR)
-    assert page.locator("#inline-alert-action").is_visible()
+    playwright.expect(page.locator("#inline-alert-action")).to_be_visible()
 
     page.locator("#inline-alert-close").click()
     page.unroute("**/api/reclassify")
     _reject_first_card(page, 502, {"error": "Failed to remove SDC claim from Commons."})
 
-    assert page.locator("#inline-alert-action").is_hidden()
+    playwright.expect(page.locator("#inline-alert-action")).to_be_hidden()
 
 
 def test_reauthorize_button_ignores_the_url_in_the_api_answer(open_gallery):
@@ -944,10 +958,17 @@ def test_the_card_stops_waiting_for_a_record_that_never_comes(browser, flask_app
     """A run that classified nothing records nothing: the card must still finish, from what the page saw."""
     page, _project, context = _running_after_a_run(browser, flask_app, monkeypatch)
     try:
-        page.counts["eligible"] = 0
-        for _ in range(5):
-            page.clock.run_for(5500)
         card = page.locator("#inferenceBanner")
+        page.counts["eligible"] = 0
+        # The poller holds back the completion for up to MAX_RECORD_WAITS polls, waiting for the
+        # run's record. Polls move on the fake clock, but each one has to answer before the next
+        # interval is due (the feed drops an advance that lands while a request is in flight), so
+        # leave real time between steps instead of firing five intervals at once.
+        for _ in range(8):
+            if "complete" in card.inner_text().lower():
+                break
+            page.clock.run_for(5500)
+            page.wait_for_timeout(100)
         playwright.expect(card).to_contain_text("Model inference complete")
         assert not page.errors
     finally:
