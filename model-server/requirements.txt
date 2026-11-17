@@ -99,8 +99,10 @@ onnxruntime==1.31.0
     # via -r requirements.in
 opencv-python-headless==5.0.0.93
     # via -r requirements.in
-opentelemetry-api==1.45.1
-    # via fastapi
+opentelemetry-api==1.45.2
+    # via
+    #   -r requirements.in
+    #   fastapi
 orjson==3.13.0
     # via kserve
 packaging==26.3
