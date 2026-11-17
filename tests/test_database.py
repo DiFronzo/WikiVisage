@@ -907,6 +907,24 @@ def test_a_deadlock_or_a_lost_connection_counts_as_transient():
         assert database.is_transient_error(wrapped) is True, err
 
 
+def test_pool_exhaustion_counts_as_transient():
+    """A checkout timeout is contention, not a verdict on the row being written.
+
+    ``execute_transaction`` wraps it in a ``DatabaseError`` with the
+    ``PoolExhaustedError`` as its cause, and ``_persist_detection`` treats a
+    non-transient failure as the image's fault (``status = 'error'``). A busy pool
+    must leave the image pending instead — and it is the one failure where the
+    very next statement, ``_mark_image_error``, is the one that gets the free
+    connection.
+    """
+    wrapped = database.DatabaseError("Transaction execution failed")
+    wrapped.__cause__ = database.PoolExhaustedError("Connection pool exhausted after 30s timeout")
+    assert database.is_transient_error(wrapped) is True
+
+    # Also when it is raised directly, without the wrapper.
+    assert database.is_transient_error(database.PoolExhaustedError("exhausted")) is True
+
+
 def test_a_bug_in_the_calling_code_is_not_transient():
     """`execute_transaction` wraps every failure, so the cause chain decides, not the type."""
     wrapped = database.DatabaseError("Transaction execution failed")

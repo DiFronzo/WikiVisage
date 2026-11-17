@@ -183,19 +183,29 @@ async function run(scenario) {
   };
   vm.createContext(context);
   vm.runInContext(source, context);
-  let answered;
-  let handled = false;
-  const background = [];  // event.waitUntil() work: cache writes must finish before we report
-  listeners.fetch({
-    request: { url: scenario.url, method: 'GET' },
-    respondWith: (promise) => { handled = true; answered = promise; },
-    waitUntil: (promise) => { background.push(promise); },
-  });
-  if (!handled) return { handled: false };
-  const response = await answered;
-  await Promise.allSettled(background);
+  // event.waitUntil() work: cache writes must finish before we report.
+  const dispatch = (url) => {
+    const entry = { handled: false, background: [] };
+    listeners.fetch({
+      request: { url, method: 'GET' },
+      respondWith: (promise) => { entry.handled = true; entry.answered = promise; },
+      waitUntil: (promise) => { entry.background.push(promise); },
+    });
+    return entry;
+  };
+  // scenario.urls dispatches several requests before awaiting any of them, which is how
+  // two tabs (or two tabs' reloads) hit the same script concurrently.
+  const dispatched = (scenario.urls || [scenario.url]).map(dispatch);
+  const responses = await Promise.all(dispatched.map((entry) => entry.answered));
+  await Promise.allSettled(dispatched.flatMap((entry) => entry.background));
+  const cachedUrls = [...store.keys()].sort();
+  if (scenario.urls) {
+    return { handled: dispatched.every((entry) => entry.handled), cachedUrls };
+  }
+  const response = responses[0];
+  if (!dispatched[0].handled) return { handled: false };
   return { handled: true, cachedCopy: !!(response && response.cachedCopy), fresh: !!(response && response.fresh),
-           status: response && response.status, cachedUrls: [...store.keys()].sort() };
+           status: response && response.status, cachedUrls };
 }
 
 (async () => {
@@ -221,6 +231,10 @@ def test_service_worker_scripts_fall_back_to_the_cache_on_5xx_and_errors(tmp_pat
         # A page asks for ?v=<release>: the copy of the previous release is dropped, so the
         # cache cannot grow by one script per release for ever.
         {"url": js + "?v=2", "network": 200, "cached": False, "stale": js + "?v=1"},
+        # Two tabs ask for two releases at once. Pruning must not delete the copy the
+        # other request just stored, or the cache is empty and a later 5xx has no
+        # fallback at all.
+        {"urls": [js + "?v=3", js + "?v=4"], "network": 200},
     ]
     harness = tmp_path / "sw_harness.js"
     harness.write_text(_SW_HARNESS)
@@ -231,7 +245,7 @@ def test_service_worker_scripts_fall_back_to_the_cache_on_5xx_and_errors(tmp_pat
         timeout=30,
         check=True,
     )
-    fresh, five_cached, five_bare, offline, four, other_static, route, reversion = json.loads(done.stdout)
+    fresh, five_cached, five_bare, offline, four, other_static, route, reversion, concurrent = json.loads(done.stdout)
 
     assert fresh["fresh"] and not fresh["cachedCopy"]
     assert five_cached["cachedCopy"] and not five_cached["fresh"]
@@ -241,3 +255,8 @@ def test_service_worker_scripts_fall_back_to_the_cache_on_5xx_and_errors(tmp_pat
     assert other_static["handled"] and other_static["fresh"]
     assert route["handled"] is False
     assert reversion["cachedUrls"] == [js + "?v=2"]
+    # One of the two concurrently fetched releases survives; an empty cache means the two
+    # pruning jobs deleted each other's entry.
+    assert concurrent["handled"]
+    assert len(concurrent["cachedUrls"]) == 1, concurrent["cachedUrls"]
+    assert concurrent["cachedUrls"][0] in (js + "?v=3", js + "?v=4")

@@ -51,17 +51,24 @@ class ConfigurationError(DatabaseError):
 
 
 def is_transient_error(error: BaseException) -> bool:
-    """True when *error* came from the server or the socket, not from our own code.
+    """True when *error* is worth retrying, not caused by our own code or the data.
 
     ``execute_transaction`` re-raises every failure as ``DatabaseError``, so a
     caller that wants to retry a deadlock or a lost connection — and to treat a
     genuine bug in its own callback as permanent — has to walk the cause chain.
     A deadlock (1213), a lock-wait timeout (1205), a lost connection (2013) and
     a dropped socket all arrive as ``OperationalError``/``InterfaceError``.
+
+    ``PoolExhaustedError`` counts too: the pool is shared and briefly busy, which
+    says nothing about the row being written. It must not be mistaken for a
+    permanent failure — ``_persist_detection`` writes an image off as ``error``
+    when a failure is not transient, and a checkout timeout is the one failure
+    that is most clearly temporary (the very next statement, ``_mark_image_error``
+    itself, is the one that then finds a free connection).
     """
     cause: BaseException | None = error
     while cause is not None:
-        if isinstance(cause, (InterfaceError, OperationalError)):
+        if isinstance(cause, (InterfaceError, OperationalError, PoolExhaustedError)):
             return True
         cause = cause.__cause__
     return False

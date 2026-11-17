@@ -17,7 +17,7 @@ from pymysql.err import OperationalError
 import face_client
 import liftwing_client
 from config import SDC_AUTH_EXPIRED_MESSAGE
-from database import DatabaseError
+from database import DatabaseError, PoolExhaustedError
 
 with patch("database.init_db"):
     import worker as _worker_module
@@ -5612,6 +5612,30 @@ def test_persist_detection_leaves_the_image_pending_after_a_database_failure():
         patch("worker._mark_image_error") as mark_error,
     ):
         assert _worker_module._persist_detection(10, result, project_id=3) is False
+
+    mark_error.assert_not_called()
+
+
+def test_persist_detection_leaves_the_image_pending_when_the_pool_is_exhausted():
+    """A checkout timeout is contention, not a verdict on the image.
+
+    ``_persist_detection`` writes an image off as ``error`` when the failure is not
+    transient. Pool exhaustion is the failure most clearly worth retrying — and
+    ``_mark_image_error`` is exactly the next statement that would find a free
+    connection and record a permanent error for a perfectly good file.
+    """
+    result = _detection_result(100, 100, [face_client.DetectedFace(1, 50, 50, 1, encoding=_make_embedding(7))])
+
+    def boom(sql, params=None, fetch=True):
+        if sql.startswith("SELECT id FROM projects"):
+            return [{"id": 3}]
+        raise DatabaseError("Transaction execution failed") from PoolExhaustedError("exhausted")
+
+    with (
+        patch("worker.execute_query", side_effect=boom),
+        patch("worker._mark_image_error") as mark_error,
+    ):
+        assert _worker_module._persist_detection(12, result, project_id=3) is False
 
     mark_error.assert_not_called()
 

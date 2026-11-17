@@ -48,6 +48,36 @@ self.addEventListener("activate", (event) => {
   self.clients.claim();
 });
 
+/* Store the fresh copy of a script and drop the other cached versions of the same file, as
+   one serialized step per pathname. Two tabs can ask for two releases at the same moment:
+   without serializing, both `put()` calls finish before either `keys()` call, so each job
+   deletes the copy the other just stored and the cache is left empty — a later 5xx or an
+   offline load then has no fallback at all. A failed write must not block the next one, so
+   each link of the chain swallows its own error. */
+const scriptWrites = new Map();
+
+function storeScriptAndPrune(pathname, request, body) {
+  const previous = scriptWrites.get(pathname) || Promise.resolve();
+  const write = previous.then(async () => {
+    const cache = await caches.open(CACHE_NAME);
+    await cache.put(request, body);
+    const keys = await cache.keys();
+    await Promise.all(
+      keys
+        .filter((key) => new URL(key.url).pathname === pathname && key.url !== request.url)
+        .map((key) => cache.delete(key))
+    );
+  });
+  const settled = write.catch(() => {});
+  scriptWrites.set(pathname, settled);
+  settled.then(() => {
+    if (scriptWrites.get(pathname) === settled) {
+      scriptWrites.delete(pathname);
+    }
+  });
+  return write;
+}
+
 /* Fetch — network-first for scripts, stale-while-revalidate for other static files,
    network-only for everything else */
 self.addEventListener("fetch", (event) => {
@@ -73,20 +103,7 @@ self.addEventListener("fetch", (event) => {
                would keep one copy per release for ever. Keep only the version just
                fetched. waitUntil lets the worker finish the write after the response
                has been handed to the page. */
-            event.waitUntil(
-              caches.open(CACHE_NAME).then(async (cache) => {
-                await cache.put(event.request, copy);
-                const keys = await cache.keys();
-                await Promise.all(
-                  keys
-                    .filter((key) => {
-                      const cachedUrl = new URL(key.url);
-                      return cachedUrl.pathname === url.pathname && key.url !== event.request.url;
-                    })
-                    .map((key) => cache.delete(key))
-                );
-              })
-            );
+            event.waitUntil(storeScriptAndPrune(url.pathname, event.request, copy));
             return response;
           }
           if (response && response.status >= 500) {
