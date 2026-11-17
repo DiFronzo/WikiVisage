@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 
-{% block title %}{{ _('WikiVisage BETA - Active Learning for Wikimedia') }}{% endblock %}
+{% block title %}{{ _('Home') }} - WikiVisage BETA{% endblock %}
 
 {% block meta_description %}{{ _('Train an ML model to recognize specific people in Wikimedia Commons images. Classify faces, review model results, and write P180 depicts Structured Data to Commons automatically.') }}{% endblock %}
 
@@ -13,7 +13,9 @@
         margin-bottom: 3rem;
     }
     .hero h1 {
-        font-size: 4rem;
+        /* A fixed 4rem broke "WIKIVISAGE" mid-word on a 375 px phone; the base
+           clamp() is now kept and only its upper bound is raised. */
+        font-size: clamp(2rem, 11vw, 4rem);
         margin-bottom: 1.5rem;
         color: var(--primary);
         text-shadow: 4px 4px 0px rgba(20, 184, 166, 0.2);

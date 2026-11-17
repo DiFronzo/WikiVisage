@@ -1,5 +1,6 @@
 """Tests for the web app: project pages."""
 
+import re
 from datetime import UTC, datetime, timedelta
 from html.parser import HTMLParser
 from unittest.mock import MagicMock, mock_open, patch
@@ -1087,7 +1088,6 @@ def test_project_new_duplicate_check_db_error_continues_to_create(monkeypatch):
     monkeypatch.setattr(app_module, "_commons_category_has_files", lambda _category: True)
     monkeypatch.setattr(app_module, "_fetch_p18_thumb_url", lambda _qid: "thumb-q42")
     monkeypatch.setattr(app_module, "_fetch_wikidata_label", lambda _qid: "Douglas Adams")
-    monkeypatch.setattr("builtins.open", MagicMock())
 
     client, _ = _make_authenticated_client_chunk3(monkeypatch, _user_aware_execute(fake_user, _handler))
     _set_csrf_chunk3(client)
@@ -1124,7 +1124,6 @@ def test_project_new_join_while_banned_creates_own_project(monkeypatch):
     monkeypatch.setattr(app_module, "_commons_category_has_files", lambda _category: True)
     monkeypatch.setattr(app_module, "_fetch_p18_thumb_url", lambda _qid: "thumb")
     monkeypatch.setattr(app_module, "_fetch_wikidata_label", lambda _qid: "Label")
-    monkeypatch.setattr("builtins.open", MagicMock())
 
     client, _ = _make_authenticated_client_chunk3(monkeypatch, _user_aware_execute(fake_user, _handler))
     _set_csrf_chunk3(client)
@@ -1166,7 +1165,6 @@ def test_project_new_successful_creation_with_label_fetch_and_p18(monkeypatch):
         return "Douglas Adams"
 
     monkeypatch.setattr(app_module, "_fetch_wikidata_label", _fetch_label)
-    monkeypatch.setattr("builtins.open", MagicMock())
 
     client, _ = _make_authenticated_client_chunk3(monkeypatch, _user_aware_execute(fake_user, _handler))
     _set_csrf_chunk3(client)
@@ -1213,7 +1211,6 @@ def test_project_new_successful_creation_with_user_label_skips_wikidata_label_fe
         return "Should Not Be Used"
 
     monkeypatch.setattr(app_module, "_fetch_wikidata_label", _fetch_label)
-    monkeypatch.setattr("builtins.open", MagicMock())
 
     client, _ = _make_authenticated_client_chunk3(monkeypatch, _user_aware_execute(fake_user, _handler))
     _set_csrf_chunk3(client)
@@ -1254,7 +1251,6 @@ def test_project_new_successful_creation_with_missing_p18_thumb(monkeypatch):
     monkeypatch.setattr(app_module, "_commons_category_has_files", lambda _category: True)
     monkeypatch.setattr(app_module, "_fetch_p18_thumb_url", lambda _qid: None)
     monkeypatch.setattr(app_module, "_fetch_wikidata_label", lambda _qid: "Label")
-    monkeypatch.setattr("builtins.open", MagicMock())
 
     client, _ = _make_authenticated_client_chunk3(monkeypatch, _user_aware_execute(fake_user, _handler))
     _set_csrf_chunk3(client)
@@ -2075,8 +2071,8 @@ def test_project_detail_inference_banner_hidden_while_the_category_is_still_bein
     assert _card(body).state == "hidden"
     assert "pollInference" in body
     # Regression pins for the poller's stop/finalize rules (Copilot review, PR #118):
-    # a removed banner must stop the timer, and the observed-work marker must persist.
-    assert "if (!document.getElementById('inferenceBanner')) {" in body
+    # a removed banner must stop the polling, and the observed-work marker must persist.
+    assert re.search(r"if \(!banner\) \{[^}]*stopInferencePolling\(\);", body, re.S)
     assert "var sawWork" in body
 
 
@@ -4693,3 +4689,67 @@ def test_project_rerun_inference_resets_and_worker_reclassifies(
         rows = cur.fetchall()
     assert all(row["is_target"] == 0 for row in rows)
     assert all(row["classified_by"] == "model" for row in rows)
+
+
+def _settings_label_submitted(monkeypatch, fake_user, data: dict):
+    project = _project_settings_base_row()
+    written: list = []
+
+    def route_execute(sql, params, _fetch):
+        if "SELECT * FROM projects" in sql:
+            return [project.copy()]
+        if sql.startswith("UPDATE projects SET distance_threshold"):
+            written.append(params)
+            return 1
+        return []
+
+    client = _make_authed_client(monkeypatch, fake_user, route_execute)
+    _set_csrf_chunk6(client)
+    base = {"csrf_token": "testtoken", "distance_threshold": "0.6", "min_confirmed": "5", "status": "active"}
+    base.update(data)
+    response = client.post("/project/1/settings", data=base)
+    return response, written
+
+
+def test_project_settings_saves_a_new_label(monkeypatch, fake_user):
+    _response, written = _settings_label_submitted(monkeypatch, fake_user, {"label": "  New name  "})
+
+    assert written[0][3] == "New name"
+
+
+def test_project_settings_clears_the_label_when_the_field_is_submitted_empty(monkeypatch, fake_user):
+    """An empty field means "no label"; only an absent field keeps the stored one."""
+    _response, written = _settings_label_submitted(monkeypatch, fake_user, {"label": ""})
+
+    assert written[0][3] == ""
+
+
+def test_project_settings_keeps_the_label_when_the_field_is_absent(monkeypatch, fake_user):
+    project = _project_settings_base_row()
+    written: list = []
+
+    def route_execute(sql, params, _fetch):
+        if "SELECT * FROM projects" in sql:
+            return [project.copy()]
+        if sql.startswith("UPDATE projects SET distance_threshold"):
+            written.append(params)
+            return 1
+        return []
+
+    client = _make_authed_client(monkeypatch, fake_user, route_execute)
+    _set_csrf_chunk6(client)
+    response = client.post(
+        "/project/1/settings",
+        data={"csrf_token": "testtoken", "distance_threshold": "0.6", "min_confirmed": "5", "status": "active"},
+    )
+
+    # A successful save redirects back to the project page.
+    assert response.status_code == 302
+    assert written[0][3] == project["label"]
+
+
+def test_project_settings_rejects_an_over_long_label(monkeypatch, fake_user):
+    response, _written = _settings_label_submitted(monkeypatch, fake_user, {"label": "x" * 256})
+
+    assert response.status_code == 200
+    assert b"Label must be 255 characters or fewer." in response.data

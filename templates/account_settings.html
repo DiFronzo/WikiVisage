@@ -37,7 +37,8 @@
     .switch .slider {
         position: absolute;
         inset: 0;
-        background: var(--border);
+        /* --border is nearly invisible on the card; --text-muted reads as a track. */
+        background: var(--text-muted);
         border-radius: 26px;
         cursor: pointer;
         transition: background 0.2s;
@@ -58,6 +59,11 @@
     }
     .switch input:checked + .slider::before {
         transform: translateX(22px);
+    }
+    /* The native input is invisible, so the focus ring has to be drawn on the track. */
+    .switch input:focus-visible + .slider {
+        outline: 2px solid var(--primary);
+        outline-offset: 3px;
     }
 </style>
 {% endblock %}

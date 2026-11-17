@@ -887,3 +887,65 @@ def test_collisions_that_never_clear_are_raised_after_the_last_attempt() -> None
         app_module._insert_project(a_form(), None)
 
     assert insert.call_count == app_module._MAX_INVITE_CODE_RETRIES
+
+
+# -- _maybe_mark_sdc_written ----------------------------------------------
+
+
+def _sdc_written_db(face_update_rows: int, p180: bool = True) -> tuple[list, Any]:
+    """Scripted execute_query; returns (calls, fake) where calls records (sql, params, rowcount)."""
+    calls: list[tuple[str, Any]] = []
+
+    def fake(sql: str, params: Any = None, fetch: bool = True):
+        calls.append((sql, params))
+        if "i.commons_page_id, p.wikidata_qid" in sql:
+            return [{"commons_page_id": 77, "wikidata_qid": "Q42"}]
+        if sql.startswith("UPDATE faces SET sdc_written = 1"):
+            return face_update_rows
+        if sql.startswith("UPDATE images SET bootstrapped = 1"):
+            return 1
+        raise AssertionError(f"Unexpected query: {sql}")
+
+    return calls, fake
+
+
+def test_marking_a_written_claim_also_makes_the_image_a_bootstrap_image() -> None:
+    calls, fake = _sdc_written_db(face_update_rows=1)
+
+    with (
+        patch.object(app_module, "execute_query", side_effect=fake),
+        patch.object(app_module, "_check_p180_exists", return_value=True),
+    ):
+        assert app_module._maybe_mark_sdc_written(face_id=5, image_id=9, project_id=3) is True
+
+    assert any(sql.startswith("UPDATE images SET bootstrapped = 1") for sql, _ in calls)
+
+
+def test_a_face_that_is_no_longer_a_target_is_not_reported_as_written() -> None:
+    """A concurrent reject or undo can clear is_target while the P180 lookup is in flight.
+
+    The guarded UPDATE then matches no row. Reporting success anyway told the API answer
+    ``sdc_written: 1`` (so the card showed the face as written) and turned the image into a
+    bootstrap image, which changes gallery rendering and claim-removal handling.
+    """
+    calls, fake = _sdc_written_db(face_update_rows=0)
+
+    with (
+        patch.object(app_module, "execute_query", side_effect=fake),
+        patch.object(app_module, "_check_p180_exists", return_value=True),
+    ):
+        assert app_module._maybe_mark_sdc_written(face_id=5, image_id=9, project_id=3) is False
+
+    assert not any(sql.startswith("UPDATE images SET bootstrapped = 1") for sql, _ in calls)
+
+
+def test_no_p180_claim_means_nothing_is_marked() -> None:
+    calls, fake = _sdc_written_db(face_update_rows=1)
+
+    with (
+        patch.object(app_module, "execute_query", side_effect=fake),
+        patch.object(app_module, "_check_p180_exists", return_value=False),
+    ):
+        assert app_module._maybe_mark_sdc_written(face_id=5, image_id=9, project_id=3) is False
+
+    assert not any("UPDATE faces" in sql for sql, _ in calls)

@@ -18,7 +18,10 @@ os.environ.setdefault("TOOL_TOOLSDB_HOST", "localhost")
 os.environ.setdefault("OAUTH_CLIENT_ID", "test-client-id")
 os.environ.setdefault("OAUTH_CLIENT_SECRET", "test-client-secret")
 os.environ.setdefault("OAUTH_REDIRECT_URI", "http://localhost:8000/auth/callback")
-os.environ.setdefault("FLASK_SECRET_KEY", "test-secret-key")
+# Same value as the ``flask_app`` fixture: a test file that reloads ``app``
+# re-signs cookies with that key, and a forged-session test that ran after such a
+# reload no longer verified with a different secret.
+os.environ.setdefault("FLASK_SECRET_KEY", "test-secret")
 os.environ.setdefault("OAUTHLIB_INSECURE_TRANSPORT", "1")
 
 with patch("database.init_db"):

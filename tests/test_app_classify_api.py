@@ -1173,6 +1173,7 @@ def test_api_classify_target_normal_mode_updates_and_counter(monkeypatch):
 
     def tx(fn):
         cursor = MagicMock()
+        cursor.fetchone.return_value = {"image_id": 22, "is_target": None, "classified_by_user_id": None}
 
         def _execute(sql, params=None):
             executed.append((sql, params))
@@ -1223,6 +1224,7 @@ def test_api_classify_target_review_mode_updates_other_faces_human(monkeypatch):
 
     def tx(fn):
         cursor = MagicMock()
+        cursor.fetchone.return_value = {"image_id": 22, "is_target": None, "classified_by_user_id": None}
 
         def _execute(sql, params=None):
             executed.append((sql, params))
@@ -1278,6 +1280,7 @@ def test_api_classify_target_review_mode_does_not_use_is_target_null(monkeypatch
 
     def tx(fn):
         cursor = MagicMock()
+        cursor.fetchone.return_value = {"image_id": 22, "is_target": None, "classified_by_user_id": None}
 
         def _execute(sql, params=None):
             executed.append((sql, params))
@@ -1683,10 +1686,13 @@ def test_api_classify_target_marks_sdc_written_when_p180_exists(monkeypatch):
             return [{"id": 22, "file_title": "File:Test.jpg", "status": "processed"}]
         if "SELECT i.commons_page_id, p.wikidata_qid" in sql:
             return [{"commons_page_id": 555, "wikidata_qid": "Q42"}]
+        if "UPDATE faces SET sdc_written = 1" in sql:
+            return 1  # the guarded update hit: the face is still a target
         return ()
 
     def tx(fn):
         cursor = MagicMock()
+        cursor.fetchone.return_value = {"image_id": 22, "is_target": None, "classified_by_user_id": None}
 
         def _execute(sql, params=None):
             executed_queries.append((sql, params))
@@ -1735,6 +1741,7 @@ def test_api_classify_target_no_sdc_written_when_p180_missing(monkeypatch):
 
     def tx(fn):
         cursor = MagicMock()
+        cursor.fetchone.return_value = {"image_id": 22, "is_target": None, "classified_by_user_id": None}
 
         def _execute(sql, params=None):
             executed_queries.append((sql, params))
@@ -1779,6 +1786,7 @@ def test_api_classify_target_p180_check_db_error_non_fatal(monkeypatch):
 
     def tx(fn):
         cursor = MagicMock()
+        cursor.fetchone.return_value = {"image_id": 22, "is_target": None, "classified_by_user_id": None}
 
         def _execute(sql, params=None):
             if "WHERE id = %s AND image_id = %s AND is_target IS NULL" in sql:
@@ -1798,3 +1806,41 @@ def test_api_classify_target_p180_check_db_error_non_fatal(monkeypatch):
 
     assert response.status_code == 200
     assert response.get_json()["status"] == "ok"
+
+
+def test_api_classify_target_rejects_a_face_from_another_image(monkeypatch):
+    """A face id from another image must neither be confirmed nor demote this image's faces."""
+    executed = []
+
+    def eq(sql, params=None, fetch=True):
+        del params, fetch
+        if "FROM users WHERE id = %s" in sql:
+            return [
+                {
+                    "id": 1,
+                    "wiki_username": "tester",
+                    "access_token": "token",
+                    "refresh_token": "refresh",
+                    "token_expires_at": datetime.now(UTC) + timedelta(hours=4),
+                }
+            ]
+        if "SELECT i.id, i.file_title, i.status, i.detection_width, i.detection_height FROM images i" in sql:
+            return [{"id": 22, "file_title": "File:Test.jpg", "status": "processed"}]
+        return ()
+
+    def tx(fn):
+        cursor = MagicMock()
+        cursor.execute.side_effect = lambda sql, params=None: executed.append((sql, params))
+        cursor.fetchone.return_value = {"image_id": 99, "is_target": None, "classified_by_user_id": None}
+        return fn(MagicMock(), cursor)
+
+    monkeypatch.setattr(app_module, "execute_transaction", tx)
+    client, _ = _auth_client_chunk4(monkeypatch, eq)
+    _set_csrf_chunk4(client)
+    response = client.post(
+        "/api/classify",
+        data={"csrf_token": "testtoken", "selected_face_id": "10", "project_id": "1", "image_id": "22"},
+    )
+
+    assert response.status_code == 404
+    assert not any("SET is_target = 0" in sql or "SET is_target = 1" in sql for sql, _ in executed)

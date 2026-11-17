@@ -171,8 +171,10 @@ def assert_aborted(page):
     assert page.evaluate("isDrawing") is False
     assert page.evaluate("drawTouchId") is None
     assert page.locator("#saveBboxBtn").is_disabled()
-    assert not page.locator("#drawingBox").is_visible()
-    assert page.locator("#oldBbox").is_visible()
+    # The modal fades in with a visibility transition, so a one-shot is_visible() races it:
+    # let the expectation retry instead of reading the state mid-transition.
+    playwright.expect(page.locator("#drawingBox")).to_be_hidden()
+    playwright.expect(page.locator("#oldBbox")).to_be_visible()
 
 
 def test_touch_drag_records_detection_coordinates_and_final_position(editor):
@@ -260,7 +262,7 @@ def test_losing_image_geometry_clears_partial_box(editor):
     touch(editor, "touchend", [], [(7, 300, 500)])
     assert editor.evaluate("currentBbox") is None
     assert editor.locator("#saveBboxBtn").is_disabled()
-    assert not editor.locator("#drawingBox").is_visible()
+    playwright.expect(editor.locator("#drawingBox")).to_be_hidden()
 
 
 def test_mouse_drawing_still_records_detection_coordinates(editor):

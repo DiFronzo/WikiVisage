@@ -22,9 +22,12 @@
             --primary: #14b8a6;
             --primary-hover: #0d9488;
             --danger: #ef4444;
+            --danger-hover: #dc2626;
             --success: #10b981;
+            --success-hover: #059669;
             --warning: #f59e0b;
             --info: #3b82f6;
+            --purple: #a855f7;
             --shadow: 6px 6px 0px rgba(20, 184, 166, 0.2);
             --shadow-hover: 8px 8px 0px rgba(20, 184, 166, 0.4);
         }
@@ -52,7 +55,9 @@
         .container { max-width: 900px; margin: 0 auto; padding: 0 1.5rem; width: 100%; }
         .nav-container { max-width: 1100px; margin: 0 auto; padding: 0 1.5rem; width: 100%; }
 
-        nav {
+        /* The page's own <nav> elements (dashboard pagination) must not inherit the
+           header's frame, so this is scoped to the body-level navigation bar. */
+        body > nav {
             border-bottom: 2px solid var(--border);
             padding: 1.75rem 0;
             margin-bottom: 3rem;
@@ -68,6 +73,11 @@
         .lang-select { background-color: var(--bg); color: var(--text-main); border: 2px solid var(--border); padding: 0.5rem 2.5rem 0.5rem 0.75rem; font-size: 0.75rem; font-weight: 700; text-transform: uppercase; cursor: pointer; font-family: inherit; letter-spacing: 0.05em; transition: border-color 0.2s; width: auto; }
         .lang-select:hover { border-color: var(--primary); }
         .lang-select:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; border-color: var(--primary); }
+        /* Picking a language loads the page in that language straight away. The
+           hint element tells screen-reader users before they change the value
+           (WCAG 3.2.2: no change of context without advance notice). */
+        .lang-picker { display: inline-flex; align-items: center; }
+        .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 
         .nav-links a:not(.btn):hover, .nav-links a.active:not(.btn) { text-decoration: none; }
         .nav-links a.active:not(.btn) { color: var(--text-main); border-bottom: 2px solid var(--primary); padding-bottom: 0.15rem; }
@@ -75,7 +85,9 @@
         /* A long Wikimedia username must not widen the nav past its container:
            cap the label and truncate with an ellipsis (13rem keeps the longest
            realistic log-out label, the French one, fully visible). */
-        .nav-logout { display: inline-block; max-width: 13rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        /* min-height keeps the log-out target at the 44 px touch size; the inline
+           padding was zeroed when the form was introduced. */
+        .nav-logout { display: inline-flex; align-items: center; max-width: 13rem; min-height: 44px; padding: 0 0.25rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
         /* Collapse to the hamburger below the nav container's max width. The
            full row (brand + 3 links + log-out + language picker) needs about
@@ -250,7 +262,7 @@
         .flash.warning { border-color: var(--warning); color: var(--warning); }
         .flash.info { border-color: var(--info); color: var(--info); }
 
-        nav:has(+ .system-banner) { margin-bottom: 0; }
+        body > nav:has(+ .system-banner) { margin-bottom: 0; }
         .system-banner {
             background-color: color-mix(in srgb, var(--warning) 12%, var(--bg));
             border-bottom: 2px solid var(--warning);
@@ -312,7 +324,10 @@
 
         .stats-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+            /* Three per row: six tiles in one row left each label ~98px, where
+               "CORRESPONDANCES" (141px at 12px) had to be broken mid-word. The
+               breakdown row below also uses three, so both grids line up. */
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
             gap: 1rem;
             margin: 2rem 0;
         }
@@ -343,6 +358,9 @@
             animation: stat-entrance 0.6s cubic-bezier(0.16, 1, 0.3, 1) backwards;
             z-index: 1;
             overflow: hidden;
+            /* The value and label size themselves from the box (cqi), so a narrow
+               column in a translated layout never clips its content. */
+            container-type: inline-size;
         }
 
         .stat-box::before {
@@ -370,7 +388,10 @@
         .stat-value {
             font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
             font-variant-numeric: tabular-nums;
-            font-size: 2.5rem;
+            /* Follows the box width instead of a fixed 2.5rem: a six-column row on a
+               laptop leaves ~100px of content, where five digits used to be clipped
+               by the box's overflow. cqi needs container-type on .stat-box. */
+            font-size: clamp(1.3rem, 21cqi, 2.5rem);
             letter-spacing: -0.05em;
             text-shadow: 0 0 20px color-mix(in srgb, var(--stat-color) 40%, transparent);
             animation: data-readout 3s infinite alternate;
@@ -380,6 +401,12 @@
         .stat-label {
             font-weight: 900;
             letter-spacing: 0.1em;
+            /* Never break inside a word: the three-per-row grid leaves room for the
+               longest translation whole (see .stats-grid). If a future string does
+               not fit, the box clips instead of hyphenating, and
+               tests/test_stats_grid_browser.py fails on that in all four locales. */
+            overflow-wrap: normal;
+            hyphens: manual;
             position: relative;
         }
 
@@ -411,7 +438,10 @@
 
         @media (max-width: 600px) {
             .stat-value { font-size: 2rem; }
-            .stat-label { font-size: 0.7rem; }
+            /* Two columns on a phone leave 108px of label at 320px wide, where
+               "CORRESPONDANCES" needs 141px at 12px. Since the label may not break
+               inside a word, it follows the box and tightens its spacing. */
+            .stat-label { font-size: clamp(0.5rem, 8.2cqi, 0.7rem); letter-spacing: 0.03em; }
         }
 
         .header-actions { display: flex; justify-content: space-between; align-items: center; margin-bottom: 2rem; flex-wrap: wrap; gap: 1rem; }
@@ -512,10 +542,35 @@
         .decorated-card > * {
             position: relative; z-index: 3;
         }
+
+        /* Keyboard users get a way past the header without tabbing the whole nav. */
+        .skip-link {
+            position: absolute;
+            left: -9999px;
+            top: 0;
+            z-index: 10001;
+            background-color: var(--primary);
+            color: var(--bg);
+            padding: 0.75rem 1rem;
+            font-weight: 800;
+            text-decoration: none;
+        }
+        .skip-link:focus { left: 0; color: var(--bg); text-decoration: none; }
+
+        /* Several decorations animate for ever; honour the OS setting. */
+        @media (prefers-reduced-motion: reduce) {
+            *, *::before, *::after {
+                animation-duration: 0.001ms !important;
+                animation-iteration-count: 1 !important;
+                transition-duration: 0.001ms !important;
+                scroll-behavior: auto !important;
+            }
+        }
     </style>
     {% block extra_head %}{% endblock %}
 </head>
 <body>
+    <a class="skip-link" href="#main-content">{{ _('Skip to content') }}</a>
     <div id="ptr-indicator" class="ptr-indicator" aria-hidden="true">
         <svg class="ptr-spinner" viewBox="0 0 32 32" width="26" height="26">
             <line class="ptr-seg" x1="16" y1="2" x2="16" y2="7" stroke-width="2.4" stroke-linecap="round"/>
@@ -540,7 +595,7 @@
                     <span class="nav-separator"></span>
                     <form action="{{ url_for('logout') }}" method="post" style="display: inline;">
                         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                        <button type="submit" class="nav-logout" style="background: none; border: none; color: var(--text-muted); cursor: pointer; font: inherit; padding: 0;">{{ _('Logout') }} ({{ g.user.wiki_username }})</button>
+                        <button type="submit" class="nav-logout" style="background: none; border: none; color: var(--text-muted); cursor: pointer; font: inherit;">{{ _('Logout') }} ({{ g.user.wiki_username }})</button>
                     </form>
                 {% else %}
                     <a href="{{ url_for('leaderboard') }}" {% if request.endpoint == 'leaderboard' %}class="active"{% endif %}>{{ _('Leaderboard') }}</a>
@@ -548,11 +603,14 @@
                     <a href="{{ url_for('login') }}" class="btn btn-primary btn-sm">{{ _('Log in') }}</a>
                 {% endif %}
                 <span class="nav-separator"></span>
-                <select class="lang-select" id="langSelect" aria-label="{{ _('Language') }}">
-                    {% for code, name in languages.items() %}
-                    <option value="{{ code }}" {% if current_locale == code %}selected{% endif %}>🌐 {{ name }}</option>
-                    {% endfor %}
-                </select>
+                <span class="lang-picker">
+                    <select class="lang-select" id="langSelect" aria-label="{{ _('Language') }}" aria-describedby="langHint">
+                        {% for code, name in languages.items() %}
+                        <option value="{{ code }}" {% if current_locale == code %}selected{% endif %}>🌐 {{ name }}</option>
+                        {% endfor %}
+                    </select>
+                    <span class="sr-only" id="langHint">{{ _('Choosing a language loads this page in that language.') }}</span>
+                </span>
             </div>
         </div>
         <script nonce="{{ csp_nonce }}">
@@ -574,7 +632,32 @@
             (function() {
                 var langSelect = document.getElementById('langSelect');
                 if (langSelect) {
-                    langSelect.addEventListener('change', function() { handleLanguageChange(langSelect); });
+                    /* Picking a language applies it immediately. A keyboard user who
+                       arrows through the list must not reload the page on every
+                       step, so a change that follows an arrow key waits for Enter
+                       or for the select to lose focus before it navigates. */
+                    var keyboardBrowsing = false;
+                    var browseKeys = ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight',
+                                      'Home', 'End', 'PageUp', 'PageDown'];
+                    langSelect.addEventListener('keydown', function(e) {
+                        if (browseKeys.indexOf(e.key) !== -1) {
+                            keyboardBrowsing = true;
+                        } else if (e.key === 'Enter') {
+                            keyboardBrowsing = false;
+                            handleLanguageChange(langSelect);
+                        } else if (e.key === 'Escape') {
+                            keyboardBrowsing = false;
+                        }
+                    });
+                    langSelect.addEventListener('change', function() {
+                        if (!keyboardBrowsing) handleLanguageChange(langSelect);
+                    });
+                    langSelect.addEventListener('blur', function() {
+                        if (keyboardBrowsing) {
+                            keyboardBrowsing = false;
+                            handleLanguageChange(langSelect);
+                        }
+                    });
                 }
 
                 var navToggle = document.getElementById('navToggle');
@@ -660,7 +743,7 @@
     <div class="system-banner"><span>⚠ {{ _('The LiftWing AI service used for the metadata filter is currently unavailable. Image processing continues without it.') }}</span><button class="banner-close" type="button" data-dismiss-parent aria-label="{{ _('Close') }}">&times;</button></div>
     {% endif %}
 
-    <main class="container">
+    <main class="container" id="main-content" tabindex="-1">
         <div class="flash-messages">
             {% for category, message in get_flashed_messages(with_categories=true) %}
                 <div class="flash {{ category }}"><span>{{ message }}</span><button class="flash-close" type="button" data-dismiss-parent aria-label="{{ _('Close') }}">&times;</button></div>
@@ -869,7 +952,11 @@
     </script>
     <script nonce="{{ csp_nonce }}">
         if ("serviceWorker" in navigator) {
-            navigator.serviceWorker.register("/sw.js", { scope: "/" });
+            navigator.serviceWorker.register("/sw.js", { scope: "/" }).catch(function(err) {
+                /* Registration is an enhancement (install prompt, asset cache); the
+                   app works without it, so never let it break the page. */
+                console.warn("Service worker registration failed", err);
+            });
         }
     </script>
     <script nonce="{{ csp_nonce }}">
@@ -1089,9 +1176,8 @@
         })();
     </script>
 
-    <div id="jimmy-pet-init" style="position:fixed;bottom:0;cursor:pointer;z-index:50;transition:transform 0.3s ease;transform:translateY(75%);display:none"
-         aria-hidden="true">
-        <button id="jimmy-pet-close" style="position:absolute;top:-8px;right:-8px;width:22px;height:22px;background:var(--surface);color:var(--text-muted);border:2px solid var(--border);font-size:14px;line-height:1;cursor:pointer;z-index:51;display:none;align-items:center;justify-content:center;padding:0" aria-label="Dismiss">&times;</button>
+    <div id="jimmy-pet-init" style="position:fixed;bottom:0;cursor:pointer;z-index:50;transition:transform 0.3s ease;transform:translateY(75%);display:none">
+        <button id="jimmy-pet-close" type="button" style="position:absolute;top:-8px;right:-8px;width:22px;height:22px;background:var(--surface);color:var(--text-muted);border:2px solid var(--border);font-size:14px;line-height:1;cursor:pointer;z-index:51;display:none;align-items:center;justify-content:center;padding:0" aria-label="{{ _('Dismiss') }}">&times;</button>
         <img src="{{ url_for('static', filename='jimmy-pet.png') }}" alt="" width="80" draggable="false"
              title="Photo: Gus Freedman, CC BY-SA 2.5" style="display:block;">
     </div>
@@ -1173,7 +1259,11 @@
             initPet.addEventListener("mouseenter", function() { if (isPeeking(initPet)) closeBtn.style.display = "flex"; });
             initPet.addEventListener("mouseleave", function() { closeBtn.style.display = "none"; });
 
+            var MAX_PETS = 6;
             function spawnPet(x, y) {
+                /* Each click adds a wandering mascot; without a cap they pile up and
+                   cover the page's own controls. */
+                if (document.querySelectorAll(".jimmy-pet-clone").length >= MAX_PETS) return null;
                 var el = document.createElement("div");
                 el.className = "jimmy-pet-clone";
                 el.style.cssText = "position:fixed;cursor:pointer;z-index:50;transition:all 0.8s cubic-bezier(0.34,1.56,0.64,1);";

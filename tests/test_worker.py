@@ -12,11 +12,12 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 import requests
+from pymysql.err import OperationalError
 
 import face_client
 import liftwing_client
 from config import SDC_AUTH_EXPIRED_MESSAGE
-from database import DatabaseError
+from database import DatabaseError, PoolExhaustedError
 
 with patch("database.init_db"):
     import worker as _worker_module
@@ -25,6 +26,7 @@ with patch("database.init_db"):
         _claim_inference_projects,
         _claim_sdc_projects,
         _claim_shadow_project,
+        _claim_still_ours,
         _fetch_metadata,
         _infer_and_release,
         _plain_text,
@@ -35,7 +37,9 @@ with patch("database.init_db"):
         _refresh_claims,
         _release_all_claims,
         _release_project,
+        _retain_claim,
         _run_new_inference_projects,
+        _run_prefilter_after_inference,
         _shadow_prefilter_loop,
         _sweep_shadow_prefilter,
         _touch_heartbeat_file,
@@ -44,6 +48,7 @@ with patch("database.init_db"):
         process_images,
         process_project,
         run_autonomous_inference,
+        traverse_category,
         write_sdc_claims,
     )
 
@@ -59,6 +64,49 @@ def _make_embedding(seed: int, dim: int = 512) -> bytes:
 
 MODEL_ID = face_client.EXPECTED_MODEL_ID
 DIM = face_client.EMBEDDING_DIM
+
+
+def _recording_transaction(fn):
+    """Run a worker write transaction over the ``execute_query`` mock.
+
+    The worker writes through ``execute_transaction``. Tests script their SQL
+    through ``worker.execute_query``, so the autouse fixture below replays each
+    statement of a transaction through that same mock and mirrors what a real
+    cursor would answer: ``rowcount`` for writes, ``fetchone``/``fetchall`` for
+    reads.
+    """
+    cursor = MagicMock()
+
+    def execute(sql, params=None):
+        result = _worker_module.execute_query(sql, params, fetch=sql.lstrip().upper().startswith("SELECT"))
+        if isinstance(result, int):
+            cursor.rowcount = result
+            rows = []
+        else:
+            rows = list(result or ())
+            cursor.rowcount = len(rows)
+        cursor.fetchone.return_value = rows[0] if rows else None
+        cursor.fetchall.return_value = rows
+
+    cursor.execute.side_effect = execute
+    return fn(MagicMock(), cursor)
+
+
+@pytest.fixture(autouse=True)
+def _writes_go_through_execute_query():
+    """Route the worker's transactions through the per-test ``execute_query`` mock.
+
+    Without this every write path reaches the real connection pool, which no unit
+    test initialises.
+    """
+    # The claim reference count is module state: a test that retains a claim without
+    # releasing it (or an integration test that leaves one held) would make the next
+    # test's single ``_release_project`` keep the database claim, and its re-claim
+    # then finds the row already taken.
+    _worker_module._claim_refs.clear()
+    with patch.object(_worker_module, "execute_transaction", _recording_transaction):
+        yield
+    _worker_module._claim_refs.clear()
 
 
 def _detection_result(width: int, height: int, faces: list) -> face_client.DetectionResult:
@@ -97,8 +145,20 @@ def _fake_inference_transaction(fn):
 
 
 @pytest.fixture
-def inference_transaction(monkeypatch):
-    monkeypatch.setattr(_worker_module, "execute_transaction", _fake_inference_transaction)
+def inference_transaction():
+    """Fake the inference write transaction for the algorithm tests.
+
+    Uses ``patch``'s own teardown instead of ``monkeypatch``: the autouse
+    ``_writes_go_through_execute_query`` fixture is entered *after* the
+    ``monkeypatch`` fixture, so its patch is exited before monkeypatch's undo
+    runs, and the undo would restore the autouse MagicMock rather than the real
+    ``execute_transaction``. That leaked a MagicMock into every later test in
+    the file, which made the real-DB inference and shadow-claim tests see an
+    empty cursor. ``patch`` nests LIFO with the autouse fixture and unwinds
+    correctly.
+    """
+    with patch.object(_worker_module, "execute_transaction", _fake_inference_transaction):
+        yield
 
 
 def test_persist_inference_batch_rechecks_sibling_targets_under_project_lock():
@@ -2050,15 +2110,14 @@ def test_bootstrap_flags_existing_images_at_cap():
         if "SELECT COUNT(*) AS cnt FROM images" in sql_s:
             return [{"cnt": _worker_module.MAX_IMAGES_PER_PROJECT}]
 
-        # SELECT existing image by page_id
-        if "SELECT id, status FROM images WHERE project_id" in sql_s:
+        # Batched lookup of this project's existing rows
+        if "SELECT id, commons_page_id, status FROM images" in sql_s:
             assert params is not None
-            page_id = params[1]
-            if page_id == 5001:
-                return [{"id": 101, "status": "processed"}]
-            if page_id == 5002:
-                return [{"id": 102, "status": "processed"}]
-            return []
+            known = {
+                5001: {"id": 101, "commons_page_id": 5001, "status": "processed"},
+                5002: {"id": 102, "commons_page_id": 5002, "status": "processed"},
+            }
+            return [row for page_id, row in known.items() if page_id in params[1:]]
 
         if "UPDATE images SET bootstrapped = 1 WHERE id" in sql_s:
             return 1
@@ -2548,6 +2607,59 @@ def test_api_request_maxlag_503_retries():
 
     assert result is ok_resp
     assert call_count[0] == 2
+
+
+def test_a_maxlag_refusal_of_a_write_is_still_waited_out():
+    """A maxlag 503 is the server declining the edit, never an applied write.
+
+    So a write sent once (``retry=False``) is still waited out and retried; only a
+    lost/errored response must not be replayed.
+    """
+    lag_resp = MagicMock()
+    lag_resp.status_code = 503
+    lag_resp.headers = {"Retry-After": "0.01"}
+    lag_resp.close = MagicMock()
+
+    ok_resp = MagicMock()
+    ok_resp.status_code = 200
+    ok_resp.headers = {}
+
+    calls = []
+
+    def mock_post(*args, **kwargs):
+        calls.append(kwargs)
+        return lag_resp if len(calls) == 1 else ok_resp
+
+    with (
+        patch("worker._get_no_retry_session") as mock_session,
+        patch("worker.time.sleep"),
+        patch("worker.shutdown_requested", False),
+    ):
+        mock_session.return_value.post = mock_post
+        result = _worker_module._api_request("https://commons.wikimedia.org/w/api.php", method="post", retry=False)
+
+    assert result is ok_resp
+    assert len(calls) == 2
+
+
+def test_a_write_whose_connection_fails_is_sent_once_and_not_replayed():
+    """A lost write response may already have been applied: send it once, then give up."""
+    calls = []
+
+    def mock_post(*args, **kwargs):
+        calls.append(kwargs)
+        raise ConnectionError("connection reset")
+
+    with (
+        patch("worker._get_no_retry_session") as mock_session,
+        patch("worker.time.sleep"),
+        patch("worker.shutdown_requested", False),
+    ):
+        mock_session.return_value.post = mock_post
+        with pytest.raises(ConnectionError):
+            _worker_module._api_request("https://commons.wikimedia.org/w/api.php", method="post", retry=False)
+
+    assert len(calls) == 1
 
 
 def test_api_request_maxlag_200_json_retries():
@@ -3338,8 +3450,8 @@ def test_bootstrap_existing_image_gets_flagged():
         db_calls.append((sql.strip(), params))
         if "SELECT COUNT(*) AS cnt FROM images" in sql:
             return [{"cnt": 5}]
-        if "SELECT id, status FROM images" in sql:
-            return [{"id": 99, "status": "processed"}]
+        if "SELECT id, commons_page_id, status FROM images" in sql:
+            return [{"id": 99, "commons_page_id": 200, "status": "processed"}]
         if "UPDATE images SET bootstrapped = 1" in sql:
             return 1
         if "UPDATE faces SET sdc_written = 1" in sql:
@@ -5466,6 +5578,87 @@ def test_persist_detection_stores_embedding_model_and_detector_score():
     assert len(params) == 16
 
 
+def test_persist_detection_clears_leftover_faces_only_while_the_image_is_pending():
+    """A retry after an ambiguous COMMIT must not double this image's faces.
+
+    The cleanup is scoped to ``status = 'pending'``: a processed image may legitimately
+    carry manual faces, and those must never be deleted by a re-detection.
+    """
+    calls = []
+    result = _detection_result(100, 100, [face_client.DetectedFace(1, 50, 50, 1, encoding=_make_embedding(4))])
+
+    with patch(
+        "worker.execute_query", side_effect=lambda sql, params=None, fetch=True: calls.append((sql, params)) or 1
+    ):
+        assert _worker_module._persist_detection(9, result) is True
+
+    delete_sql, delete_params = calls[0]
+    assert delete_sql.startswith("DELETE f FROM faces f JOIN images i")
+    assert "i.status = 'pending'" in delete_sql
+    assert delete_params == (9,)
+
+
+def test_persist_detection_leaves_the_image_pending_after_a_database_failure():
+    """A deadlock or a dropped connection says nothing about the image."""
+    result = _detection_result(100, 100, [face_client.DetectedFace(1, 50, 50, 1, encoding=_make_embedding(5))])
+
+    def boom(sql, params=None, fetch=True):
+        if sql.startswith("SELECT id FROM projects"):
+            return [{"id": 3}]
+        raise OperationalError(1213, "Deadlock found when trying to get lock")
+
+    with (
+        patch("worker.execute_query", side_effect=boom),
+        patch("worker._mark_image_error") as mark_error,
+    ):
+        assert _worker_module._persist_detection(10, result, project_id=3) is False
+
+    mark_error.assert_not_called()
+
+
+def test_persist_detection_leaves_the_image_pending_when_the_pool_is_exhausted():
+    """A checkout timeout is contention, not a verdict on the image.
+
+    ``_persist_detection`` writes an image off as ``error`` when the failure is not
+    transient. Pool exhaustion is the failure most clearly worth retrying — and
+    ``_mark_image_error`` is exactly the next statement that would find a free
+    connection and record a permanent error for a perfectly good file.
+    """
+    result = _detection_result(100, 100, [face_client.DetectedFace(1, 50, 50, 1, encoding=_make_embedding(7))])
+
+    def boom(sql, params=None, fetch=True):
+        if sql.startswith("SELECT id FROM projects"):
+            return [{"id": 3}]
+        raise DatabaseError("Transaction execution failed") from PoolExhaustedError("exhausted")
+
+    with (
+        patch("worker.execute_query", side_effect=boom),
+        patch("worker._mark_image_error") as mark_error,
+    ):
+        assert _worker_module._persist_detection(12, result, project_id=3) is False
+
+    mark_error.assert_not_called()
+
+
+def test_persist_detection_marks_the_image_error_on_a_genuine_failure():
+    """A broken box is this image's problem, so it stops consuming batch slots."""
+    result = _detection_result(100, 100, [face_client.DetectedFace(1, 50, 50, 1, encoding=_make_embedding(6))])
+
+    def boom(sql, params=None, fetch=True):
+        if sql.startswith("DELETE f FROM faces f"):
+            raise ValueError("bad box")
+        return 1
+
+    with (
+        patch("worker.execute_query", side_effect=boom),
+        patch("worker._mark_image_error") as mark_error,
+    ):
+        assert _worker_module._persist_detection(11, result) is False
+
+    mark_error.assert_called_once()
+    assert mark_error.call_args.args[0] == 11
+
+
 def test_persist_detection_bootstrap_auto_classify_clears_queued_removal():
     """Auto-classifying the single face of a bootstrapped image drops any queued
     P180 removal — the pre-existing claim on Commons must stay."""
@@ -5743,7 +5936,7 @@ def test_prefilter_fail_open_when_client_returns_none():
             return rows
         if sql.startswith("SELECT status, consecutive_failures"):
             return [{"status": "up", "consecutive_failures": 0}]
-        if sql.startswith("UPDATE service_status SET status = %s"):
+        if _liftwing_failure_update_sql(sql):
             failure_updates.append(params)
             return 1
         raise AssertionError(f"Unexpected query: {sql}")
@@ -5767,7 +5960,7 @@ def test_prefilter_fail_open_when_client_returns_none():
     assert stored == []
     # H3: a real failed batch is a recorded failure, not just a log line, so the
     # banner cannot claim "up" while completions fail.
-    assert failure_updates == [("up", 1, "pre-filter request failed (see worker log)")]
+    assert failure_updates == [(3, "pre-filter request failed (see worker log)")]
 
 
 def test_prefilter_leaves_rows_unchecked_when_metadata_lookup_fails():
@@ -5864,6 +6057,324 @@ def test_process_project_runs_prefilter_after_image_processing():
         process_project(project)
 
     assert order == ["images", "prefilter"]
+
+
+def test_prefilter_runs_after_final_inference():
+    """The model must never wait behind up to 250 LiftWing calls."""
+    project = {
+        "id": 99,
+        "user_id": 1,
+        "wikidata_qid": "Q42",
+        "commons_category": "Some_Category",
+        "status": "active",
+        "distance_threshold": 0.6,
+        "min_confirmed": 5,
+        "prefilter_mode": "shadow",
+    }
+    order: list[str] = []
+
+    def mock_eq(sql, params=None, fetch=True):
+        sql_s = sql if isinstance(sql, str) else str(sql)
+        if "SELECT status, worker_claimed_by FROM projects" in sql_s:
+            return [{"status": "active", "worker_claimed_by": "test-worker"}]
+        if "UPDATE projects SET worker_claimed_at" in sql_s:
+            return 1
+        if "COUNT(*) AS cnt FROM faces" in sql_s:
+            return [{"cnt": 6}]
+        return ()
+
+    with (
+        patch("worker.execute_query", side_effect=mock_eq),
+        patch("worker.traverse_category", return_value=0),
+        patch("worker.bootstrap_from_sparql", return_value=0),
+        patch("worker.process_images", return_value=0),
+        patch("worker._pending_image_count", return_value=0),
+        patch("worker.run_autonomous_inference", side_effect=lambda _p: order.append("inference")),
+        patch("worker.prefilter_images", side_effect=lambda _p: order.append("prefilter")),
+        patch("worker.shutdown_requested", False),
+        patch("worker._worker_id", "test-worker"),
+    ):
+        process_project(project)
+
+    assert order == ["inference", "prefilter"]
+
+
+def test_prefilter_still_runs_when_the_project_auto_completes_without_inference():
+    """An unusable project finishes before the model runs, but its verdicts still land.
+
+    The pre-filter gate is the pre-filter mode, not the model: skipping it here meant the
+    sweep thread was the only path covering those images.
+    """
+    project = {
+        "id": 100,
+        "user_id": 1,
+        "wikidata_qid": "Q42",
+        "commons_category": "Some_Category",
+        "status": "active",
+        "distance_threshold": 0.6,
+        "min_confirmed": 5,
+        "prefilter_mode": "shadow",
+    }
+    order: list[str] = []
+
+    with (
+        patch("worker._project_still_active", return_value=True),
+        patch("worker._claim_still_ours", return_value=True),
+        patch("worker.execute_query", return_value=()),
+        patch("worker.traverse_category", return_value=0),
+        patch("worker.bootstrap_from_sparql", return_value=0),
+        patch("worker.process_images", return_value=0),
+        patch("worker._auto_complete_unusable_project", return_value=True),
+        patch("worker.run_autonomous_inference", side_effect=lambda _p: order.append("inference")),
+        patch("worker.prefilter_images", side_effect=lambda _p: order.append("prefilter")),
+        patch("worker.shutdown_requested", False),
+        patch("worker._worker_id", "test-worker"),
+    ):
+        process_project(project)
+
+    assert order == ["prefilter"]
+
+
+def test_a_claim_stays_in_the_database_while_another_local_thread_holds_it():
+    """Two local paths can share one project claim (an active cycle and an SDC run).
+
+    The first one to finish must not clear the DB claim, or the other worker can claim the
+    project and write the same P180 claims concurrently.
+    """
+    updates: list = []
+
+    def mock_execute_query(sql, params=None, fetch=True):
+        updates.append((sql, params))
+        return 1
+
+    with (
+        patch("worker.execute_query", side_effect=mock_execute_query),
+        patch("worker._worker_id", "test-worker"),
+    ):
+        _retain_claim(31)
+        _retain_claim(31)
+        _release_project(31)
+        assert updates == []  # one reference left: the claim stays
+
+        _release_project(31)
+
+    assert len(updates) == 1
+    assert updates[0][1] == (31, "test-worker")
+
+
+def test_traverse_category_flags_a_crawl_that_read_no_page():
+    """A total API outage must not read as "this category has no files"."""
+    project = {"id": 1, "commons_category": "TestCat"}
+
+    with (
+        patch("worker.execute_query", return_value=[{"cnt": 0}]),
+        patch("worker._api_request", side_effect=RuntimeError("API down")),
+        patch("worker.shutdown_requested", False),
+    ):
+        traverse_category(project)
+
+    assert project["crawl_failed"] is True
+
+
+def test_traverse_category_does_not_flag_a_crawl_that_read_pages():
+    project = {"id": 1, "commons_category": "TestCat"}
+    page = {"query": {"categorymembers": [{"title": "File:A.jpg", "ns": 6, "pageid": 11}]}}
+
+    with (
+        patch("worker.execute_query", return_value=[{"cnt": 0}]),
+        patch("worker._api_request", return_value=MagicMock(json=lambda: page)),
+        patch("worker._refresh_images_total"),
+        patch("worker.shutdown_requested", False),
+    ):
+        traverse_category(project)
+
+    assert "crawl_failed" not in project
+
+
+def _metadata_response(titles, categories, continuation=None):
+    payload = {
+        "query": {
+            "pages": {str(i + 1): {"title": t} for i, t in enumerate(titles)},
+            "normalized": [{"from": t, "to": t.replace("_", " ")} for t in titles],
+        }
+    }
+    if categories:
+        payload["query"]["pages"]["1"]["categories"] = [{"title": f"Category:{c}"} for c in categories]
+    if continuation:
+        payload["continue"] = continuation
+    return MagicMock(json=lambda: payload)
+
+
+def test_fetch_metadata_follows_the_category_continuation():
+    """A file with more than ``cllimit`` categories keeps the rest on later pages."""
+    first = _metadata_response(["File:A.jpg"], ["One", "Two"], {"clcontinue": "next|9"})
+    second = _metadata_response(["File:A.jpg"], ["Three"])
+
+    with patch("worker._api_request", side_effect=[first, second]) as api:
+        meta = _fetch_metadata(["File:A.jpg"])
+
+    assert api.call_count == 2
+    assert api.call_args_list[1][1]["data"]["clcontinue"] == "next|9"
+    entry = meta["File:A.jpg"]
+    assert entry["categories"] == ("Category:One", "Category:Two", "Category:Three")
+
+
+def test_fetch_metadata_stops_following_the_continuation_after_a_failure():
+    """A half-read category list is worse than none: the batch stays unchecked."""
+    first = _metadata_response(["File:A.jpg"], ["One"], {"clcontinue": "next|9"})
+
+    with patch("worker._api_request", side_effect=[first, RuntimeError("down")]):
+        assert _fetch_metadata(["File:A.jpg"]) == {}
+
+
+def _completion_db(*, total=0, pending=0, faces=0, min_confirmed=5, updates=None):
+    """execute_query mock for _auto_complete_unusable_project."""
+
+    def mock_execute_query(sql, params=None, fetch=True):
+        if "SELECT COUNT(*) AS total, SUM(status = 'pending')" in sql:
+            return [{"total": total, "pending": pending}]
+        if "COUNT(*) AS cnt FROM faces" in sql:
+            return [{"cnt": faces}]
+        if "SELECT min_confirmed FROM projects" in sql:
+            return [{"min_confirmed": min_confirmed}]
+        if updates is not None:
+            updates.append((sql, params))
+            return 1
+        raise AssertionError(f"Unexpected query: {sql}")
+
+    return mock_execute_query
+
+
+def test_auto_complete_finishes_a_crawl_that_found_no_images():
+    """A crawl that completed and recorded nothing is a real answer.
+
+    Every file may be a video or audio, or the category may only hold empty
+    subcategories. Refusing here kept the project active and re-crawled every
+    poll for ever, and inference (which waits for every image) never ran.
+    """
+    updates = []
+
+    with (
+        patch("worker.execute_query", side_effect=_completion_db(updates=updates)),
+        patch("worker.shutdown_requested", False),
+    ):
+        assert _worker_module._auto_complete_unusable_project({"id": 4, "min_confirmed": 5}) is True
+
+    assert updates == [(_worker_module._AUTO_COMPLETE_SQL["no_faces"], (4,))]
+
+
+def test_auto_complete_is_still_refused_after_a_failed_crawl():
+    """An unread category is not an empty one: a Wikimedia outage must be retried."""
+    updates = []
+
+    with (
+        patch("worker.execute_query", side_effect=_completion_db(updates=updates)),
+        patch("worker.shutdown_requested", False),
+    ):
+        project = {"id": 4, "crawl_failed": True}
+        assert _worker_module._auto_complete_unusable_project(project) is False
+
+    assert updates == []
+
+
+def test_auto_complete_waits_while_images_are_pending():
+    updates = []
+
+    with (
+        patch("worker.execute_query", side_effect=_completion_db(total=10, pending=3, updates=updates)),
+        patch("worker.shutdown_requested", False),
+    ):
+        assert _worker_module._auto_complete_unusable_project({"id": 5, "min_confirmed": 5}) is False
+
+    assert updates == []
+
+
+def test_auto_complete_marks_a_project_with_no_faces_after_a_full_crawl():
+    updates = []
+
+    with (
+        patch("worker.execute_query", side_effect=_completion_db(total=12, faces=0, updates=updates)),
+        patch("worker.shutdown_requested", False),
+    ):
+        assert _worker_module._auto_complete_unusable_project({"id": 6, "min_confirmed": 5}) is True
+
+    assert updates == [(_worker_module._AUTO_COMPLETE_SQL["no_faces"], (6,))]
+
+
+def test_auto_complete_marks_a_project_with_too_few_faces():
+    updates = []
+
+    with (
+        patch("worker.execute_query", side_effect=_completion_db(total=12, faces=4, min_confirmed=5, updates=updates)),
+        patch("worker.shutdown_requested", False),
+    ):
+        assert _worker_module._auto_complete_unusable_project({"id": 7, "min_confirmed": 5}) is True
+
+    assert updates == [(_worker_module._AUTO_COMPLETE_SQL["insufficient_faces"], (7,))]
+
+
+def test_auto_complete_leaves_a_usable_project_alone():
+    updates = []
+
+    with (
+        patch("worker.execute_query", side_effect=_completion_db(total=12, faces=6, updates=updates)),
+        patch("worker.shutdown_requested", False),
+    ):
+        assert _worker_module._auto_complete_unusable_project({"id": 8, "min_confirmed": 5}) is False
+
+    assert updates == []
+
+
+@pytest.mark.parametrize(
+    "row,expected,why",
+    [
+        ([{"status": "active", "worker_claimed_by": "test-worker"}], True, "active and ours"),
+        ([{"status": "completed", "worker_claimed_by": "test-worker"}], True, "a project we just completed"),
+        ([{"status": "paused", "worker_claimed_by": "test-worker"}], True, "paused only stops the pipeline"),
+        ([], False, "the project is gone"),
+        ([{"status": "deleted", "worker_claimed_by": "test-worker"}], False, "the project was deleted"),
+        ([{"status": "active", "worker_claimed_by": "other-worker"}], False, "another worker took it over"),
+    ],
+)
+def test_claim_still_ours_reads_the_live_row(row, expected, why):
+    with (
+        patch("worker.execute_query", return_value=row),
+        patch("worker._worker_id", "test-worker"),
+    ):
+        assert _claim_still_ours(12) is expected, why
+
+
+def test_an_unreadable_project_still_counts_as_ours():
+    """A database blip must never look like someone else owning the project."""
+    with (
+        patch("worker.execute_query", side_effect=DatabaseError("gone away")),
+        patch("worker._worker_id", "test-worker"),
+    ):
+        assert _claim_still_ours(12) is True
+
+
+def test_the_post_inference_prefilter_runs_for_a_project_this_cycle_completed():
+    with (
+        patch("worker._claim_still_ours", return_value=True),
+        patch("worker.prefilter_images") as prefilter,
+        patch("worker.shutdown_requested", False),
+    ):
+        _run_prefilter_after_inference({"id": 13})
+
+    prefilter.assert_called_once()
+
+
+@pytest.mark.parametrize("stopping,lost_claim", [(True, False), (False, True)])
+def test_the_post_inference_prefilter_skips_a_lapsed_cycle(stopping, lost_claim):
+    """Final inference can outlive the claim: do not spend 250 LiftWing calls on it."""
+    with (
+        patch("worker._claim_still_ours", return_value=not lost_claim),
+        patch("worker.prefilter_images") as prefilter,
+        patch("worker.shutdown_requested", stopping),
+    ):
+        _run_prefilter_after_inference({"id": 14})
+
+    prefilter.assert_not_called()
 
 
 def test_claim_shadow_project_claims_and_refetches():
@@ -6088,6 +6599,17 @@ def test_probe_claims_with_the_interval_and_marks_up_on_success():
     fake_client.probe.assert_called_once()
 
 
+def _liftwing_failure_update_sql(sql: str) -> bool:
+    """The atomic status update that must decide status before incrementing.
+
+    MariaDB evaluates a single-table ``SET`` left to right, so
+    ``status = CASE ... consecutive_failures + 1 >= threshold`` followed by
+    ``consecutive_failures = consecutive_failures + 1`` tests the pre-increment
+    counter. Incrementing first made the threshold fire one failure early.
+    """
+    return sql.startswith("UPDATE service_status SET status = CASE WHEN consecutive_failures + 1 >= %s")
+
+
 def test_probe_records_failure_without_marking_down_below_threshold():
     captured: list = []
 
@@ -6098,7 +6620,7 @@ def test_probe_records_failure_without_marking_down_below_threshold():
             return 1
         if sql.startswith("SELECT status, consecutive_failures"):
             return [{"status": "unknown", "consecutive_failures": 0}]
-        if sql.startswith("UPDATE service_status SET status = %s"):
+        if _liftwing_failure_update_sql(sql):
             captured.append((sql, params))
             return 1
         raise AssertionError(f"Unexpected query: {sql}")
@@ -6116,8 +6638,9 @@ def test_probe_records_failure_without_marking_down_below_threshold():
 
     assert len(captured) == 1
     sql, params = captured[0]
-    assert "status = %s" in sql
-    assert params == ("unknown", 1, "HTTP 429")
+    assert "ELSE status END" in sql  # one failure of three: the status stays
+    assert sql.index("status = CASE") < sql.index("consecutive_failures = consecutive_failures + 1")
+    assert params == (3, "HTTP 429")
 
 
 def test_record_liftwing_failure_below_threshold_keeps_status():
@@ -6126,8 +6649,8 @@ def test_record_liftwing_failure_below_threshold_keeps_status():
     def mock_execute_query(sql, params=None, fetch=True):
         if sql.startswith("SELECT status, consecutive_failures"):
             return [{"status": "up", "consecutive_failures": 1}]
-        if sql.startswith("UPDATE service_status SET status = %s"):
-            captured.append(params)
+        if _liftwing_failure_update_sql(sql):
+            captured.append((sql, params))
             return 1
         raise AssertionError(f"Unexpected query: {sql}")
 
@@ -6137,7 +6660,9 @@ def test_record_liftwing_failure_below_threshold_keeps_status():
     ):
         _record_liftwing_failure("timeout")
 
-    assert captured == [("up", 2, "timeout")]
+    sql, params = captured[0]
+    assert "ELSE status END" in sql  # 1 + 1 < 3
+    assert params == (3, "timeout")
 
 
 def test_record_liftwing_failure_at_threshold_marks_down():
@@ -6146,8 +6671,8 @@ def test_record_liftwing_failure_at_threshold_marks_down():
     def mock_execute_query(sql, params=None, fetch=True):
         if sql.startswith("SELECT status, consecutive_failures"):
             return [{"status": "up", "consecutive_failures": 2}]
-        if sql.startswith("UPDATE service_status SET status = %s"):
-            captured.append(params)
+        if _liftwing_failure_update_sql(sql):
+            captured.append((sql, params))
             return 1
         raise AssertionError(f"Unexpected query: {sql}")
 
@@ -6157,7 +6682,9 @@ def test_record_liftwing_failure_at_threshold_marks_down():
     ):
         _record_liftwing_failure("HTTP 500")
 
-    assert captured == [("down", 3, "HTTP 500")]
+    sql, params = captured[0]
+    assert "THEN 'down'" in sql  # 2 + 1 >= 3
+    assert params == (3, "HTTP 500")
 
 
 def test_fetch_metadata_parses_extmetadata_and_categories():

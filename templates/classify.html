@@ -315,28 +315,29 @@
     .btn-yes {
         background-color: var(--success);
         border-color: var(--success);
-        color: white;
+        /* White on --success is 2.5:1; the page background colour reads at 5.4:1. */
+        color: var(--bg);
         font-size: 1.25rem;
         padding: 1.5rem;
         box-shadow: 6px 6px 0px rgba(16, 185, 129, 0.3);
     }
     .btn-yes:hover {
-        background-color: #059669;
+        background-color: var(--success-hover);
         box-shadow: 8px 8px 0px rgba(16, 185, 129, 0.5);
-        color: white;
+        color: var(--bg);
     }
     .btn-no {
         background-color: var(--danger);
         border-color: var(--danger);
-        color: white;
+        color: var(--bg);
         font-size: 1.25rem;
         padding: 1.5rem;
         box-shadow: 6px 6px 0px rgba(239, 68, 68, 0.3);
     }
     .btn-no:hover {
-        background-color: #dc2626;
+        background-color: var(--danger-hover);
         box-shadow: 8px 8px 0px rgba(239, 68, 68, 0.5);
-        color: white;
+        color: var(--bg);
     }
     .header-project-link { color: var(--text-main); text-decoration: none; }
     .badge-review { font-size: 0.75rem; padding: 0.25rem 0.5rem; background-color: var(--warning); color: var(--bg); }
@@ -357,14 +358,14 @@
 
     /* Desktop short screens: compress vertical spacing so image is visible without scroll */
     @media (min-width: 601px) and (max-height: 900px) {
-        nav:not(:has(+ .system-banner)) { margin-bottom: 0.5rem !important; }
+        body > nav:not(:has(+ .system-banner)) { margin-bottom: 0.5rem !important; }
         .image-wrapper { margin-bottom: 0.5rem; }
         .image-wrapper img { max-height: calc(100vh - 16rem); }
         .hotkey-hints { margin-top: 0.5rem; }
     }
 
     @media (max-width: 600px) {
-        nav:not(:has(+ .system-banner)) { margin-bottom: 0.5rem !important; }
+        body > nav:not(:has(+ .system-banner)) { margin-bottom: 0.5rem !important; }
         
         .classify-header { margin-top: 0.5rem; margin-bottom: 0.25rem; padding: 0 0.5rem; }
         .classify-header h1 { font-size: 0.95rem; min-width: 0; }
@@ -508,7 +509,7 @@
         {% endif %}
 
         <div class="manual-controls">
-            <button class="btn btn-manual" id="btnDrawFace" type="button" data-action="toggle-draw" title="{{ _('Draw a box around a missed face') }}">{{ _('+ Add Missing Face') }}</button>
+            <button class="btn btn-manual" id="btnDrawFace" type="button" data-action="toggle-draw" aria-pressed="false" title="{{ _('Draw a box around a missed face') }}">{{ _('+ Add Missing Face') }}</button>
             {% if faces | length > 1 %}
             <button class="btn btn-manual" id="btnToggleLabels" type="button" data-action="toggle-labels" aria-pressed="true" title="{{ _('Show or hide the face labels') }}">{{ _('Hide labels') }}</button>
             {% endif %}
@@ -586,6 +587,7 @@
         detectingFace: {{ _('Detecting face...')|tojson }},
         errorSaving: {{ _('An error occurred while saving. Please try again.')|tojson }},
         errorManualFace: {{ _('Failed to add manual face. Please try again.')|tojson }},
+        imageError: {{ _('The image could not be loaded. Please reload the page.')|tojson }},
         cancelDrawing: {{ _('Cancel Drawing')|tojson }},
         addMissingFace: {{ _('+ Add Missing Face')|tojson }},
         hideLabels: {{ _('Hide labels')|tojson }},
@@ -694,6 +696,11 @@
     }
 
     img.addEventListener('load', onImageReady);
+    /* Without this a broken thumbnail left the skeleton pulsing for ever. */
+    img.addEventListener('error', function() {
+        document.getElementById('imageWrapper').classList.add('loaded');
+        showInlineAlert(i18n.imageError);
+    });
     window.addEventListener('resize', positionBoxes);
     if (img.complete) onImageReady();
 
@@ -709,13 +716,44 @@
         });
     });
 
+    /* --- One busy state for every action -----------------------------------
+       A click or key press while a request was in flight used to start a second
+       one: Skip rewrote last_classify in the session cookie while a save was
+       still writing it, so Undo could then undo the wrong face. */
     var inFlight = false;
+
+    function loadingOverlay() { return document.getElementById('loadingOverlay'); }
+
+    function showBusy(text) {
+        inFlight = true;
+        var overlay = loadingOverlay();
+        /* Show first, then set the text: a live region that becomes visible with
+           its text already in place is often not announced. */
+        overlay.style.display = 'flex';
+        overlay.textContent = text;
+    }
+
+    function clearBusy() {
+        inFlight = false;
+        var overlay = loadingOverlay();
+        overlay.style.display = 'none';
+        overlay.textContent = i18n.saving;
+    }
+
+    /* Back/forward cache: the browser restores the page exactly as it was left,
+       so coming Back after a successful classify restored the "Saving..." overlay
+       with inFlight=true and every action blocked. */
+    window.addEventListener('pageshow', function(e) {
+        if (!e.persisted) return;
+        clearBusy();
+        isDrawing = false;
+        removeDrawRect();
+        if (drawMode) toggleDrawMode();
+    });
 
     function selectFace(faceId) {
         if (inFlight) return;
-        inFlight = true;
-        var overlay = document.getElementById('loadingOverlay');
-        overlay.style.display = 'flex';
+        showBusy(i18n.saving);
 
         var fields = {
             project_id: '{{ project.id }}',
@@ -730,8 +768,7 @@
         .then(function(data) {
             if (data.error) {
                 showInlineAlert(i18n.errorPrefix.replace('{message}', data.error));
-                overlay.style.display = 'none';
-                inFlight = false;
+                clearBusy();
             } else {
                 window.location.href = '{{ url_for("classify", project_id=project.id) }}';
             }
@@ -739,12 +776,13 @@
         .catch(function(error) {
             console.error('Error:', error);
             showInlineAlert(i18n.errorSaving);
-            overlay.style.display = 'none';
-            inFlight = false;
+            clearBusy();
         });
     }
 
     function skipImage() {
+        /* Skipping while a save is in flight would race the save's session write. */
+        if (inFlight) return;
         {% if reviewing_model %}
         window.location.href = '{{ url_for("classify", project_id=project.id) }}?skip_image_id={{ image.image_id }}&skip_reviewing=1';
         {% else %}
@@ -754,18 +792,13 @@
 
     function undoClassify() {
         if (inFlight) return;
-        inFlight = true;
-        var overlay = document.getElementById('loadingOverlay');
-        overlay.style.display = 'flex';
-        overlay.textContent = i18n.undoing;
+        showBusy(i18n.undoing);
 
         postForm('{{ url_for("api_undo_classify") }}', csrfToken, {})
         .then(function(data) {
             if (data.error) {
                 showInlineAlert(data.error);
-                overlay.style.display = 'none';
-                overlay.textContent = i18n.saving;
-                inFlight = false;
+                clearBusy();
             } else {
                 var url = '{{ url_for("classify", project_id=project.id) }}';
                 if (data.image_id) {
@@ -780,9 +813,7 @@
             // the one-click re-authorize); the generic text covers errors without a body.
             var reauth = reauthHref(error && error.data);
             showInlineAlert((error && error.data && error.data.error) || i18n.errorUndo, reauth);
-            overlay.style.display = 'none';
-            overlay.textContent = i18n.saving;
-            inFlight = false;
+            clearBusy();
         });
     }
 
@@ -803,9 +834,17 @@
 
     {% if faces | length == 1 %}
     document.addEventListener('keydown', function(e) {
-        if (drawMode) return;
+        /* Never act on a browser shortcut: Alt+Left/Right (Back/Forward),
+           Ctrl/Cmd+Z (undo), Ctrl+Y, Ctrl/Cmd+S and Ctrl/Cmd+1..9 all used to
+           classify or skip the face. */
+        if (e.ctrlKey || e.metaKey || e.altKey || e.isComposing || e.defaultPrevented) return;
         var tag = (e.target.tagName || '').toLowerCase();
         if (tag === 'input' || tag === 'textarea' || tag === 'select' || e.target.isContentEditable) return;
+        if (drawMode) {
+            /* The hint promises Esc cancels; this returned before handling it. */
+            if (e.key === 'Escape') toggleDrawMode();
+            return;
+        }
         if (e.key === 'y' || e.key === 'Y' || e.key === 'ArrowLeft') {
             selectFace({{ faces[0].face_id }});
         } else if (e.key === 'n' || e.key === 'N' || e.key === 'ArrowRight') {
@@ -818,12 +857,13 @@
     });
     {% else %}
     document.addEventListener('keydown', function(e) {
+        if (e.ctrlKey || e.metaKey || e.altKey || e.isComposing || e.defaultPrevented) return;
+        var tag = (e.target.tagName || '').toLowerCase();
+        if (tag === 'input' || tag === 'textarea' || tag === 'select' || e.target.isContentEditable) return;
         if (drawMode) {
             if (e.key === 'Escape') toggleDrawMode();
             return;
         }
-        var tag = (e.target.tagName || '').toLowerCase();
-        if (tag === 'input' || tag === 'textarea' || tag === 'select' || e.target.isContentEditable) return;
         if (e.key === 'n' || e.key === 'N') {
             selectFace('none');
         } else if (e.key === 's' || e.key === 'S') {
@@ -852,6 +892,9 @@
         drawMode = !drawMode;
         var btn = document.getElementById('btnDrawFace');
         var hint = document.getElementById('drawHint');
+        if (!btn || !hint) return;
+        /* aria-pressed makes the toggle state readable; .active was visual only. */
+        btn.setAttribute('aria-pressed', drawMode ? 'true' : 'false');
         if (drawMode) {
             wrapper.classList.add('drawing-mode');
             btn.classList.add('active');
@@ -886,15 +929,28 @@
             clientX = e.clientX;
             clientY = e.clientY;
         }
+        /* Children are positioned from the wrapper's padding box, so its 4px
+           border (2px on phones) must not count — it put every drawn box a few
+           pixels off. The image can also be narrower than the wrapper, and a
+           drag that started in the empty strip beside it produced a negative
+           box the server rejected; clamp to the image itself. */
+        var left = img.offsetLeft;
+        var top = img.offsetTop;
+        var right = left + img.clientWidth;
+        var bottom = top + img.clientHeight;
+        var x = clientX - rect.left - wrapper.clientLeft;
+        var y = clientY - rect.top - wrapper.clientTop;
         return {
-            x: Math.max(0, Math.min(clientX - rect.left, rect.width)),
-            y: Math.max(0, Math.min(clientY - rect.top, rect.height))
+            x: Math.max(left, Math.min(x, right)),
+            y: Math.max(top, Math.min(y, bottom))
         };
     }
 
     function onDrawStart(e) {
         if (!drawMode) return;
         if (e.type === 'mousedown' && e.button !== 0) return;
+        /* Nothing to draw on until the photo is laid out. */
+        if (!img.clientWidth || !img.clientHeight) return;
         e.preventDefault();
         isDrawing = true;
         var pos = getRelativePos(e);
@@ -961,19 +1017,21 @@
     wrapper.addEventListener('touchstart', onDrawStart, { passive: false });
     wrapper.addEventListener('touchmove', onDrawMove, { passive: false });
     wrapper.addEventListener('touchend', onDrawEnd, { passive: false });
+    /* A cancelled touch (a system gesture, a call) must not commit a partial box. */
+    wrapper.addEventListener('touchcancel', function() {
+        isDrawing = false;
+        removeDrawRect();
+    });
 
     document.addEventListener('mouseup', function() {
         if (isDrawing) isDrawing = false;
     });
 
-    var submittingManualFace = false;
-
     function submitManualFace(top, right, bottom, left) {
-        if (submittingManualFace) return;
-        submittingManualFace = true;
-        var overlay = document.getElementById('loadingOverlay');
-        overlay.style.display = 'flex';
-        overlay.textContent = i18n.detectingFace;
+        /* Shares the one busy flag with Yes/No/Skip/Undo: two requests in
+           flight at once corrupted the session's last_classify. */
+        if (inFlight) return;
+        showBusy(i18n.detectingFace);
 
         var formData = new FormData();
         formData.append('csrf_token', csrfToken);
@@ -1003,9 +1061,8 @@
         .then(function(result) {
             if (!result.ok || result.data.error) {
                 showInlineAlert(i18n.errorPrefix.replace('{message}', result.data.error || i18n.unknownError));
-                overlay.style.display = 'none';
                 removeDrawRect();
-                submittingManualFace = false;
+                clearBusy();
             } else {
                 window.location.href = '{{ url_for("classify", project_id=project.id) }}';
             }
@@ -1013,9 +1070,8 @@
         .catch(function(error) {
             console.error('Error:', error);
             showInlineAlert(i18n.errorManualFace);
-            overlay.style.display = 'none';
             removeDrawRect();
-            submittingManualFace = false;
+            clearBusy();
         });
     }
 </script>

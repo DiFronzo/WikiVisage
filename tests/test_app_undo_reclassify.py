@@ -60,9 +60,26 @@ def _undo_session(client, **overrides):
         }
 
 
+def _own_face_rows(*face_ids):
+    """Face state rows as the undo's ownership-filtered read returns them: all this user's, target, unwritten."""
+    return [
+        {
+            "id": fid,
+            "is_target": 1,
+            "sdc_written": 0,
+            "sdc_removal_pending": 0,
+            "commons_page_id": 555,
+            "bootstrapped": 0,
+            "wikidata_qid": "Q42",
+        }
+        for fid in face_ids
+    ]
+
+
 def _undo_tx(executed):
     def tx(fn):
         cursor = MagicMock()
+        cursor.rowcount = 1
         cursor.execute.side_effect = lambda sql, params=None: executed.append((sql, params))
         return fn(MagicMock(), cursor)
 
@@ -319,10 +336,13 @@ def test_api_undo_classify_target_normal_decrements_counter(monkeypatch):
             ]
         if "SELECT i.id, i.file_title, i.status, i.detection_width, i.detection_height FROM images i" in sql:
             return [{"id": 2, "file_title": "File:Test.jpg", "status": "processed"}]
+        if "FROM faces f" in sql and "sdc_removal_pending" in sql:
+            return _own_face_rows(10, 11, 12)
         return ()
 
     def tx(fn):
         cursor = MagicMock()
+        cursor.rowcount = 1
         cursor.execute.side_effect = lambda sql, params=None: executed.append((sql, params))
         return fn(MagicMock(), cursor)
 
@@ -363,10 +383,13 @@ def test_api_undo_classify_none_review_restores_model(monkeypatch):
             ]
         if "SELECT i.id, i.file_title, i.status, i.detection_width, i.detection_height FROM images i" in sql:
             return [{"id": 2, "file_title": "File:Test.jpg", "status": "processed"}]
+        if "FROM faces f" in sql and "sdc_removal_pending" in sql:
+            return _own_face_rows(10, 11, 12)
         return ()
 
     def tx(fn):
         cursor = MagicMock()
+        cursor.rowcount = 1
         cursor.execute.side_effect = lambda sql, params=None: executed.append((sql, params))
         return fn(MagicMock(), cursor)
 
@@ -405,10 +428,13 @@ def test_api_undo_classify_manual_face_deletion_and_exclusion(monkeypatch):
             ]
         if "SELECT i.id, i.file_title, i.status, i.detection_width, i.detection_height FROM images i" in sql:
             return [{"id": 2, "file_title": "File:Test.jpg", "status": "processed"}]
+        if "FROM faces f" in sql and "sdc_removal_pending" in sql:
+            return _own_face_rows(10, 11, 12)
         return ()
 
     def tx(fn):
         cursor = MagicMock()
+        cursor.rowcount = 1
         cursor.execute.side_effect = lambda sql, params=None: executed.append((sql, params))
         return fn(MagicMock(), cursor)
 
@@ -429,7 +455,7 @@ def test_api_undo_classify_manual_face_deletion_and_exclusion(monkeypatch):
     delete_sql = [sql for sql, _ in executed if sql.startswith("DELETE FROM faces")]
     assert delete_sql
     update_params = [params for sql, params in executed if "SET is_target = NULL" in sql][0]
-    assert update_params == (0, 0, 10, 2)
+    assert update_params == (0, 0, 10, 2, 1)
 
 
 def test_api_undo_removes_written_claim_immediately(monkeypatch):
@@ -463,7 +489,7 @@ def test_api_undo_removes_written_claim_immediately(monkeypatch):
     remove_mock.assert_called_once_with(555, "Q42", "valid-token")
     assert ("info", "SDC claim was removed.") in _get_flashes(client)
     update_params = [params for sql, params in executed if "SET is_target = NULL" in sql][0]
-    assert update_params == (0, 0, 10, 2)
+    assert update_params == (0, 0, 10, 2, 1)
 
 
 def test_api_undo_removal_failure_queues_pending(monkeypatch):
@@ -495,7 +521,7 @@ def test_api_undo_removal_failure_queues_pending(monkeypatch):
     assert payload["sdc_removal_queued"] is True
     assert ("info", "SDC claim removal queued.") in _get_flashes(client)
     update_params = [params for sql, params in executed if "SET is_target = NULL" in sql][0]
-    assert update_params == (1, 1, 10, 2)
+    assert update_params == (1, 1, 10, 2, 1)
 
 
 def test_api_undo_missing_token_queues_pending(monkeypatch):
@@ -560,7 +586,7 @@ def test_api_undo_sibling_target_keeps_claim(monkeypatch):
     assert _get_flashes(client) == []
     remove_mock.assert_not_called()
     update_params = [params for sql, params in executed if "SET is_target = NULL" in sql][0]
-    assert update_params == (0, 0, 10, 2)
+    assert update_params == (0, 0, 10, 2, 1)
 
 
 def test_api_undo_in_flight_write_queues_removal(monkeypatch):
@@ -589,7 +615,7 @@ def test_api_undo_in_flight_write_queues_removal(monkeypatch):
     assert payload["sdc_removed"] is False
     assert payload["sdc_removal_queued"] is True
     update_params = [params for sql, params in executed if "SET is_target = NULL" in sql][0]
-    assert update_params == (0, 1, 10, 2)
+    assert update_params == (0, 1, 10, 2, 1)
 
 
 def test_api_undo_no_in_flight_write_does_not_queue(monkeypatch):
@@ -619,7 +645,7 @@ def test_api_undo_no_in_flight_write_does_not_queue(monkeypatch):
     assert payload["sdc_removal_queued"] is False
     assert _get_flashes(client) == []
     update_params = [params for sql, params in executed if "SET is_target = NULL" in sql][0]
-    assert update_params == (0, 0, 10, 2)
+    assert update_params == (0, 0, 10, 2, 1)
 
 
 def test_api_undo_none_action_cancels_the_removal_it_queued(monkeypatch):
@@ -658,7 +684,7 @@ def test_api_undo_none_action_cancels_the_removal_it_queued(monkeypatch):
     remove_mock.assert_not_called()
     assert _get_flashes(client) == []
     update_params = [params for sql, params in executed if "SET is_target = NULL" in sql][0]
-    assert update_params == (0, 0, 10, 2)
+    assert update_params == (0, 0, 10, 2, 1)
 
 
 def test_api_undo_none_action_keeps_written_marker_without_touching_commons(monkeypatch):
@@ -691,7 +717,7 @@ def test_api_undo_none_action_keeps_written_marker_without_touching_commons(monk
     assert payload["sdc_removal_queued"] is False
     remove_mock.assert_not_called()
     update_params = [params for sql, params in executed if "SET is_target = NULL" in sql][0]
-    assert update_params == (1, 0, 10, 2)
+    assert update_params == (1, 0, 10, 2, 1)
 
 
 def test_api_undo_none_action_preserves_a_preexisting_worker_queue(monkeypatch):
@@ -730,7 +756,7 @@ def test_api_undo_none_action_preserves_a_preexisting_worker_queue(monkeypatch):
     remove_mock.assert_not_called()
     assert ("info", "SDC claim removal queued.") in _get_flashes(client)
     update_params = [params for sql, params in executed if "SET is_target = NULL" in sql][0]
-    assert update_params == (0, 1, 10, 2)
+    assert update_params == (0, 1, 10, 2, 1)
 
 
 def test_api_undo_manual_face_claim_removal_failure_blocks_undo(monkeypatch):
@@ -812,10 +838,13 @@ def test_api_undo_classify_manual_face_review_action_decrements(monkeypatch):
             ]
         if "SELECT i.id, i.file_title, i.status, i.detection_width, i.detection_height FROM images i" in sql:
             return [{"id": 2, "file_title": "File:Test.jpg", "status": "processed"}]
+        if "FROM faces f" in sql and "sdc_removal_pending" in sql:
+            return _own_face_rows(10, 11, 12)
         return ()
 
     def tx(fn):
         cursor = MagicMock()
+        cursor.rowcount = 1
         cursor.execute.side_effect = lambda sql, params=None: executed.append((sql, params))
         return fn(MagicMock(), cursor)
 
@@ -1596,6 +1625,8 @@ def test_api_reclassify_approve_marks_sdc_written_when_p180_exists(monkeypatch):
             return [face_row]
         if "FROM images i JOIN projects p" in sql and "commons_page_id" in sql:
             return [{"commons_page_id": face_row["commons_page_id"], "wikidata_qid": face_row["wikidata_qid"]}]
+        if "UPDATE faces SET sdc_written = 1" in sql:
+            return 1  # the guarded update hit: the face is still a target
         return []
 
     def eq(sql, params=None, fetch=True):
@@ -1769,3 +1800,24 @@ def test_api_reclassify_approve_rejects_sibling_target_faces(monkeypatch):
 
     counter_decrement_sqls = [s for s in executed_sql if "GREATEST" in s]
     assert len(counter_decrement_sqls) > 0, "Expected faces_confirmed decrement for rejected siblings"
+
+
+def test_api_undo_reads_only_the_faces_this_user_classified(monkeypatch):
+    """The undo's state read is limited to the caller's own classifications (never another contributor's)."""
+    state_reads = []
+    base = _undo_state_eq([])
+
+    def eq(sql, params=None, fetch=True):
+        if "f.sdc_removal_pending" in sql and "FROM faces f" in sql:
+            state_reads.append(params)
+        return base(sql, params, fetch)
+
+    monkeypatch.setattr(app_module, "execute_transaction", _undo_tx([]))
+    client, _ = _auth_client_chunk4(monkeypatch, eq)
+    _set_csrf_chunk4(client)
+    _undo_session(client)
+
+    response = client.post("/api/undo-classify", data={"csrf_token": "testtoken"})
+
+    assert response.status_code == 200
+    assert state_reads == [(2, 10, 1)]  # image id, the touched face, then the signed-in user

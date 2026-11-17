@@ -28,7 +28,7 @@ jobs:
       # formatting and turn this job red on unchanged code. Bump together
       # with the local version used for `ruff format .`.
       - name: Install Ruff
-        run: pip install "ruff==0.17.2"
+        run: pip install "ruff==0.17.5"
 
       - name: Ruff check
         run: ruff check .
@@ -41,7 +41,7 @@ jobs:
       # Scope (the small modules first) lives in [tool.mypy] in pyproject.toml.
       - name: Type check (mypy)
         run: |
-          pip install -r requirements.txt "mypy==2.4.0" types-requests types-PyMySQL
+          pip install -r requirements.txt "mypy==2.4.1" types-requests types-PyMySQL
           mypy
 
       # The Toolforge build service does a plain clone. The ONNX weights must be
@@ -74,7 +74,11 @@ jobs:
       - name: Install Python dependencies
         run: pip install -r requirements-dev.txt
 
+      # The JavaScript tests (static/wikivisage-common.js, static/sw.js) need node and
+      # would otherwise skip silently, so this job fails instead when it is absent.
       - name: Run tests
+        env:
+          WIKIVISAGE_REQUIRE_NODE: "1"
         run: pytest --tb=short -q
 
   # The race-condition fixes (SDC writes, inference persistence, project claims,
@@ -117,6 +121,7 @@ jobs:
       - name: Run unit + integration tests with coverage
         env:
           WIKIVISAGE_TEST_DB: "1"
+          WIKIVISAGE_REQUIRE_NODE: "1"
         run: pytest --tb=short -q --cov --cov-report=term --cov-report=json:coverage.json
 
       - name: Coverage floors per module
@@ -147,7 +152,7 @@ jobs:
       - name: Run browser regressions
         env:
           WIKIVISAGE_BROWSER_TESTS: "1"
-        run: pytest tests/test_bbox_editor_browser.py tests/test_gallery_thumb_browser.py tests/test_session_persistence_browser.py -v --tb=short
+        run: pytest tests/test_bbox_editor_browser.py tests/test_gallery_thumb_browser.py tests/test_session_persistence_browser.py tests/test_language_picker_browser.py tests/test_stats_grid_browser.py -v --tb=short
 
   face-service-unit:
     name: Face service (backend + model unit tests)

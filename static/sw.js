@@ -12,7 +12,9 @@
  * designed for offline use (requires DB, OAuth, Commons API).
  */
 
-const CACHE_NAME = "wikivisage-v2";
+/* Bump this whenever the caching rules below change: activate deletes every other
+ * cache, so existing clients drop their stale copies instead of keeping them. */
+const CACHE_NAME = "wikivisage-v3";
 
 /* Not cached up front: shared scripts must always match the page that loads them. */
 const PRECACHE_URLS = [
@@ -29,7 +31,7 @@ self.addEventListener("install", (event) => {
   event.waitUntil(
     caches.open(CACHE_NAME).then((cache) => cache.addAll(PRECACHE_URLS))
   );
-  self.skipWaiting();
+  event.waitUntil(self.skipWaiting());
 });
 
 /* Activate — clean up old caches */
@@ -45,6 +47,36 @@ self.addEventListener("activate", (event) => {
   );
   self.clients.claim();
 });
+
+/* Store the fresh copy of a script and drop the other cached versions of the same file, as
+   one serialized step per pathname. Two tabs can ask for two releases at the same moment:
+   without serializing, both `put()` calls finish before either `keys()` call, so each job
+   deletes the copy the other just stored and the cache is left empty — a later 5xx or an
+   offline load then has no fallback at all. A failed write must not block the next one, so
+   each link of the chain swallows its own error. */
+const scriptWrites = new Map();
+
+function storeScriptAndPrune(pathname, request, body) {
+  const previous = scriptWrites.get(pathname) || Promise.resolve();
+  const write = previous.then(async () => {
+    const cache = await caches.open(CACHE_NAME);
+    await cache.put(request, body);
+    const keys = await cache.keys();
+    await Promise.all(
+      keys
+        .filter((key) => new URL(key.url).pathname === pathname && key.url !== request.url)
+        .map((key) => cache.delete(key))
+    );
+  });
+  const settled = write.catch(() => {});
+  scriptWrites.set(pathname, settled);
+  settled.then(() => {
+    if (scriptWrites.get(pathname) === settled) {
+      scriptWrites.delete(pathname);
+    }
+  });
+  return write;
+}
 
 /* Fetch — network-first for scripts, stale-while-revalidate for other static files,
    network-only for everything else */
@@ -67,7 +99,11 @@ self.addEventListener("fetch", (event) => {
         .then((response) => {
           if (response && response.ok) {
             const copy = response.clone();
-            caches.open(CACHE_NAME).then((cache) => cache.put(event.request, copy));
+            /* Templates ask for a new ?v=<release> URL after every update, so the cache
+               would keep one copy per release for ever. Keep only the version just
+               fetched. waitUntil lets the worker finish the write after the response
+               has been handed to the page. */
+            event.waitUntil(storeScriptAndPrune(url.pathname, event.request, copy));
             return response;
           }
           if (response && response.status >= 500) {

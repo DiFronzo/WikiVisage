@@ -40,6 +40,7 @@ class World:
         self.project: dict[str, Any] = {"id": 5, "user_id": 1, "wikidata_qid": QID}
         self.calls: list[tuple[str, Any]] = []
         self.api_calls: list[tuple[str, dict[str, Any], dict[str, str] | None]] = []
+        self.retry_flags: list[tuple[str, bool]] = []
         self.write_batches: list[list[dict[str, int]]] | Callable[[], list[dict[str, int]]] = []
         self.removal_batches: list[list[dict[str, int]]] = []
         self.requested: Callable[[], int] = lambda: 1
@@ -84,10 +85,11 @@ class World:
         return [] if fetch else 1
 
     # -- fake Commons API and token helpers -------------------------------
-    def api(self, url: str, params=None, headers=None, method="get", data=None, timeout=30) -> MagicMock:
+    def api(self, url: str, params=None, headers=None, method="get", data=None, timeout=30, retry=True) -> MagicMock:
         body = data if data is not None else params
         action = body["action"]
         self.api_calls.append((action, body, headers))
+        self.retry_flags.append((action, retry))
         queue = self.api_script[action]
         payload = queue.pop(0) if queue else ({"claims": {}} if action == "wbgetclaims" else {"success": 1})
         if isinstance(payload, Exception):
@@ -485,6 +487,49 @@ def test_no_such_entity_during_the_edit_marks_the_face_terminal(world: World) ->
 
     assert world.sql_like("UPDATE faces SET sdc_written = 1 WHERE id = %s") != []
     assert world.project_updates() == [None]
+
+
+@pytest.mark.parametrize("code", ["no-such-claim", "no-such-statement", "notfound"])
+def test_claim_level_codes_do_not_mark_a_face_written(world: World, code: str) -> None:
+    """On the write side these mean the claim was not created, not that it is gone.
+
+    Marking the face ``sdc_written=1`` hid a missing P180 claim: the face showed as
+    done and was never retried. The run now stops with the server's message instead.
+    """
+    world.write_batches = [[_face()]]
+    world.api_script["wbeditentity"] = [{"error": {"code": code, "info": "gone"}}]
+
+    assert world.run() == 0
+
+    assert world.sql_like("UPDATE faces SET sdc_written = 1 WHERE id = %s") == []
+    assert world.project_updates() == [worker._SDC_ERROR_MESSAGES[code]]
+
+
+@pytest.mark.parametrize("code", ["no-such-claim", "no-such-statement", "notfound"])
+@pytest.mark.parametrize("step", ["lookup", "removal"])
+def test_claim_level_codes_still_settle_a_removal(world: World, code: str, step: str) -> None:
+    """The removal phase asks for the claim to be gone, so 'already gone' is success."""
+    world.removal_batches = [[{"commons_page_id": PAGE}]]
+    error = {"error": {"code": code, "info": "gone"}}
+    if step == "lookup":
+        world.api_script["wbgetclaims"] = [error]
+    else:
+        world.api_script["wbgetclaims"] = [CLAIM_PRESENT]
+        world.api_script["wbremoveclaims"] = [error]
+
+    world.run()
+
+    assert len(clears_removal_flags(world)) == 1
+    assert world.project_updates() == [None]
+
+
+def test_an_edit_is_sent_once_while_the_lookup_before_it_may_retry(world: World) -> None:
+    world.write_batches = [[_face()]]
+
+    assert world.run() == 1
+
+    assert ("wbgetclaims", True) in world.retry_flags
+    assert ("wbeditentity", False) in world.retry_flags
 
 
 def test_unexpected_api_exception_aborts_the_run_with_its_message(world: World) -> None:
