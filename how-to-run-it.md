@@ -221,9 +221,18 @@ toolforge jobs logs ml-worker-2
 
 ## Automated Deployment (CD)
 
-Publishing a GitHub release deploys **both tools** via
-`.github/workflows/deploy.yml`, with no manual steps. Order matters: the face
-service is updated and proven healthy *before* the workers are allowed to start.
+Releases are automated by `.github/workflows/release.yml`, and the deploy itself
+takes **both tools** through `.github/workflows/deploy.yml` with no manual
+steps. Order matters: the face service is updated and proven healthy *before*
+the workers are allowed to start.
+
+Cutting a release: merge as many changes to `main` as you like (nothing is
+released while the version in `pyproject.toml` is already tagged), then open the
+**Release** workflow in the Actions tab and press **Run workflow**, choosing
+`patch`/`minor`/`major`. It opens a `chore: release vX.Y.Z` pull request;
+merging that pull request is the release — the tag is created, the GitHub
+release is published with generated notes and this deploy is started. A release
+published by hand still deploys too.
 
 0. **Check configuration** on both tools before touching either: the face tool
    must have `WIKIVISAGE_FACE_SERVICE_TOKEN`, the main tool
@@ -413,7 +422,7 @@ toolforge jobs logs ml-worker-2
 
 ### Rebuild after code changes
 
-The recommended approach is to create a GitHub release, which triggers the CD workflow automatically. For manual rebuilds:
+The recommended approach is to cut a release (see [Automated Deployment](#automated-deployment-cd)), which triggers the CD workflow automatically. For manual rebuilds:
 
 ```bash
 # Rebuild the image
