@@ -169,7 +169,22 @@ jobs:
           # Re-dispatching is harmless: the pending release is reported, and its
           # content does not go stale (the release notes are generated from the
           # PRs merged before the release, not from this branch).
-          EXISTING=$(gh pr list --head "$BRANCH" --state open --json url --jq '.[0].url // ""')
+          #
+          # A pull request only counts as OURS when its head branch lives in this
+          # repository (not a fork), it targets main and the branch is
+          # `release/v*`. `gh pr list --head` matches the branch name alone, and
+          # a plain `headRefName` match matches a fork's too — either would let a
+          # contributor PR be reused here, or closed and its branch deleted
+          # below. Authorship is deliberately not checked: the documented
+          # fallback is a pull request a human opens by hand from the same
+          # branch, and a branch in this repository already requires push access.
+          #
+          # The same-version lookup goes through the REST API because its `head`
+          # filter is owner-qualified and exact (no listing page limit can hide
+          # the PR); the extra `head.repo` check rejects a fork that lives under
+          # the same owner name.
+          EXISTING=$(gh api "repos/${GITHUB_REPOSITORY}/pulls?state=open&head=${GITHUB_REPOSITORY_OWNER}:${BRANCH}" \
+            | jq -r --arg repo "$GITHUB_REPOSITORY" '[.[] | select(.base.ref == "main" and .head.repo.full_name == $repo)] | .[0].html_url // ""')
           if [ -n "$EXISTING" ]; then
             echo "pr-url=$EXISTING" >> "$GITHUB_OUTPUT"
             echo "A release pull request for v${VERSION} is already open: ${EXISTING}"
@@ -178,9 +193,11 @@ jobs:
 
           # Dispatching a different bump while another release pull request is
           # open (patch first, then minor) would leave two PRs that both edit the
-          # same line and cannot both be merged. The newer request wins.
-          gh pr list --state open --limit 100 --json number,headRefName \
-            | jq -r '.[] | select(.headRefName | startswith("release/v")) | .number' \
+          # same line and cannot both be merged. The newer request wins; only our
+          # own release branches are touched (same-repository head, targeting
+          # main), so a contributor's `release/v*` pull request is never closed.
+          gh pr list --state open --limit 200 --json number,headRefName,baseRefName,isCrossRepository \
+            | jq -r --arg branch "$BRANCH" '.[] | select(.isCrossRepository == false and .baseRefName == "main" and (.headRefName | startswith("release/v")) and .headRefName != $branch) | .number' \
             | while read -r NUMBER; do
                 [ -n "$NUMBER" ] || continue
                 echo "Closing release pull request #${NUMBER}: superseded by v${VERSION}."
@@ -290,6 +307,7 @@ jobs:
 
       - name: Create the tag and publish the release
         if: steps.plan.outputs.mode == 'release' && steps.ci.outputs.state != 'superseded'
+        id: publish
         run: |
           set -euo pipefail
           TAG="${{ steps.plan.outputs.tag }}"
@@ -304,6 +322,7 @@ jobs:
       # and when it still fails say exactly how to deploy by hand.
       - name: Start the deploy
         if: steps.plan.outputs.mode == 'release' && steps.ci.outputs.state != 'superseded'
+        id: deploy
         run: |
           set -euo pipefail
           TAG="${{ steps.plan.outputs.tag }}"
@@ -328,6 +347,8 @@ jobs:
           VERSION: ${{ steps.plan.outputs.version || steps.version.outputs.main-version }}
           PR_URL: ${{ steps.release_pr.outputs.pr-url || '' }}
           PR_MANUAL: ${{ steps.release_pr.outputs.pr-manual || '' }}
+          PUBLISH_OUTCOME: ${{ steps.publish.outcome || 'not run' }}
+          DEPLOY_OUTCOME: ${{ steps.deploy.outcome || 'not run' }}
         run: |
           set -euo pipefail
           case "$JOB_STATUS" in
@@ -338,10 +359,20 @@ jobs:
           esac
           case "$MODE" in
             release)
+              # The summary must not claim more than happened: this workflow
+              # publishes the release and DISPATCHES the deploy (a separate run
+              # that can still fail), and a failed run may have stopped before
+              # the tag existed or before the deploy was started.
               if [ "$CI_STATE" = "superseded" ]; then
                 ACTION="skipped — a newer push on main will release it"
+              elif [ "$PUBLISH_OUTCOME" != "success" ]; then
+                ACTION="NOT released — the run stopped before the tag and release were created"
+              elif [ "$DEPLOY_OUTCOME" = "success" ]; then
+                ACTION="tagged and published — deployment dispatched (watch the Deploy run)"
+              elif [ "$DEPLOY_OUTCOME" = "cancelled" ]; then
+                ACTION="tagged and published — the deploy dispatch was interrupted, check Actions > Deploy"
               else
-                ACTION="tagged, published and deployed"
+                ACTION="tagged and published — the deploy was NOT started, run Actions > Deploy with tag=v${VERSION}"
               fi
               ;;
             release-pr)
@@ -364,6 +395,10 @@ jobs:
             echo "|---|---|"
             echo "| **Version** | \`${VERSION:-unknown}\` |"
             echo "| **Outcome** | ${ACTION} |"
+            if [ "$MODE" = "release" ] && [ "$CI_STATE" != "superseded" ]; then
+              echo "| **Tag and release** | ${PUBLISH_OUTCOME} |"
+              echo "| **Deploy dispatched** | ${DEPLOY_OUTCOME} |"
+            fi
             if [ -n "$PR_URL" ]; then echo "| **Pull request** | ${PR_URL} |"; fi
             echo "| **Commit** | \`${GITHUB_SHA}\` |"
             echo "| **Triggered by** | \`${{ github.actor }}\` |"
