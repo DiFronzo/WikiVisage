@@ -95,7 +95,7 @@ The landing page and `/health` endpoint work without OAuth. See [test-local.md](
 | `pyproject.toml` | Ruff config, pytest config, project metadata |
 | `requirements.in` / `requirements.txt` | Runtime dependencies: edit the `.in`, then regenerate the lock (command in its header); never hand-edit the `.txt` |
 | `requirements-dev.txt` | Dev/test deps (pytest, pytest-cov, ruff) |
-| `.github/workflows/` | CI (lint, tests on Python 3.12/3.15.1, face-service Docker/buildpack jobs) and CD (release-triggered deploy of both Toolforge tools) |
+| `.github/workflows/` | CI (lint, tests on Python 3.12/3.15.1, face-service Docker/buildpack jobs), release automation (`release.yml`) and CD (Toolforge deploy of both tools) |
 | `SECURITY.md` | Vulnerability reporting policy |
 | `TESTING.md` | Face service: build, run, verify, troubleshoot |
 
@@ -215,6 +215,20 @@ Face-service tests need extra dependencies or a live service: `tests/test_face_s
 6. If you changed the schema, add a migration in `migrate.py`.
 7. Test locally (see [test-local.md](test-local.md)).
 8. Open a pull request with a clear description of what changed and why.
+
+## Releasing
+
+Releases are driven by the version in `pyproject.toml`, and you rarely have to type it:
+
+1. Merge as many changes to `main` as you like. Nothing is released — a push only releases when it carries a version that has no `v<version>` tag yet.
+2. When the batch is ready, open the **Release** workflow in the Actions tab and press **Run workflow**, choosing `patch`, `minor` or `major`. It opens (or refreshes) a `chore: release vX.Y.Z` pull request that bumps the one line in `pyproject.toml`.
+3. Merge that pull request. `release.yml` then waits for CI on the merge commit, creates the tag, publishes the GitHub release with generated notes and dispatches `deploy.yml`, which deploys the face service and then the web app and workers.
+
+You can still bump `pyproject.toml` yourself (strictly `X.Y.Z`) in any pull request; merging it releases exactly the same way. Run the workflow from `main` only — other branches are refused. Pressing **Run workflow** again with a different bump replaces the open release pull request.
+
+Opening the pull request needs *Settings → Actions → General → Allow GitHub Actions to create and approve pull requests*. Without it the workflow still pushes the `release/vX.Y.Z` branch and links to the page where you open the pull request yourself.
+
+The tag is the record: a released version is never released twice, so bump it again for the next release. Changes merged after a release belong to the next version.
 
 ## License
 

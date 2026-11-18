@@ -1,4 +1,7 @@
 name: Deploy
+# Normally started by .github/workflows/release.yml (via workflow_dispatch, after
+# it tags and publishes the release). The `release: published` trigger is the
+# path for a release created by hand and the fallback when that dispatch fails.
 on:
   release:
     types: [published]
